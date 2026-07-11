@@ -1,207 +1,148 @@
-# Web Rev Action 个人版实施计划
+# Web Rev Action 功能实现计划
 
-## 1. 目标
+## 1. 项目定位
 
-`web_rev_action` 是给 GPT-5.6 GPT Actions 使用的个人 Web 逆向与协议复现工具层。
+`web_rev_action` 是给个人 GPT-5.6 GPT Actions 使用的 Web 逆向执行层。
 
-它不是企业级多租户平台，也不是重新实现一套 Playwright/CDP 框架。目标是把已经存在的两个项目组合起来，让 GPT-5.6 用 Skill 指导分析流程，用少量高层 Actions 完成最新版网页协议分析、证据读取、文件整理和最小请求复现。
+它不重新实现浏览器自动化、CDP 调试器或文件系统工具，而是把已有工具组合成一套适合 GPT 调用的高层能力：
 
-核心原则：
+- `playwright-cli`：页面行为执行器。
+- `js-reverse-mcp`：网络、脚本、断点、调用栈和运行时证据采集器。
+- `github-gpt-actions-gateway` workspace 工具：本地分析目录、文件读写、搜索、编辑和 PowerShell 7 执行。
+- `web_rev_action`：GPT Action 契约、工具编排、session 映射、证据索引和结果查询。
 
-1. **复用现有工具，不重复造轮子。**
-2. **GPT-5.6 足够聪明，工具不需要过度拆碎。**
-3. **浏览器行为交给 `playwright-cli`。**
-4. **网络、脚本、断点、调用栈交给 `js-reverse-mcp`。**
-5. **文件、diff、schema、HTTP 重放交给 `github-gpt-actions-gateway` 的 workspace 工具；它只是一个记录目录，不走 Git/PR 流程。**
-6. **Action 分成只读证据查询和有副作用浏览器实验两个操作。**
-7. **只保留必要安全边界：不泄露凭据、不越权访问、不执行危险宿主操作。**
-
-最终工具面：
-
-```text
-Skill API
-  ├── retrieveSkillContext
-  ├── readSkillContent
-  └── searchSkillDocs
-
-Browser Analysis Actions
-  ├── inspectBrowserEvidence     # 只读，x-openai-isConsequential: false
-  └── runBrowserExperiment       # 执行交互，x-openai-isConsequential: true
-
-Workspace Tools（复用 github-gpt-actions-gateway，本地目录模式）
-  ├── workspaceExecPwsh          # PowerShell 7，工作目录限定在 workspace
-  ├── workspaceInspect           # 查询目录、搜索并读相关片段
-  ├── workspaceSearch            # ripgrep 搜索文件内容
-  ├── workspaceReadFiles         # 带行号读取多个 UTF-8 文件
-  ├── workspaceWriteFile         # 创建或覆盖 UTF-8 文件
-  └── workspaceApplyPatch        # 小范围文本补丁
-```
-
-Workspace Tools 直接复用 `github-gpt-actions-gateway` 已有的 workspace 查询、搜索、读取、执行和编辑工具，但在本项目中按“本地分析目录”使用：给 LLM 一个文件夹，随便写实验记录、脚本、schema 和报告；不暴露 Git、PR、CI、commit、push、merge 等发布维护能力。
+`PLAN.md` 只描述本项目要实现的功能。Pandora 类复现方法单独写在根目录 `PANDORA_REPRODUCTION.md`。
 
 ---
 
-## 2. 上游项目分工
+## 2. 不做什么
 
-本方案复用两个已有项目。
+本项目不做以下事情：
 
-### 2.1 playwright-cli：行为执行器
+- 不复制 `playwright-cli` 的页面操作能力。
+- 不复制 `js-reverse-mcp` 的 CDP、网络、脚本、断点和调用栈能力。
+- 不复制 `github-gpt-actions-gateway` 的 workspace 文件工具。
+- 不把两个上游项目的所有原子工具直接暴露给 GPT。
+- 不实现企业级多租户后台、复杂审计系统、CI/PR 发布流。
+- 不把分析 workspace 当 Git 仓库管理。
 
-仓库：`https://github.com/qqq694637644/playwright-cli`
+本项目只实现三件事：
 
-用途：制造可重复的页面行为。
+1. 面向 GPT Actions 的简洁操作接口。
+2. 对三个已有工具层的组合编排。
+3. 分析证据的轻量索引、读取和比较。
 
-直接复用能力：
+---
 
-- 打开和连接浏览器。
-- 复用登录后的浏览器 profile。
-- 页面导航、刷新、前进、后退。
-- 元素定位、snapshot、find。
-- click、fill、type、press、select、check、hover。
-- 文件上传和下载。
-- 多标签页切换。
-- 截图、PDF、Trace。
-- 保存和加载 storage state。
-- 关闭 session 和清理测试数据。
-
-它负责回答：
+## 3. 总体架构
 
 ```text
-我怎样稳定地复现一次用户操作？
-```
+GPT-5.6
+  │
+  ├── Skill API
+  │   ├── retrieveSkillContext
+  │   ├── readSkillContent
+  │   └── searchSkillDocs
+  │
+  ├── Browser Actions
+  │   ├── inspectBrowserEvidence
+  │   └── runBrowserExperiment
+  │
+  └── Gateway Workspace Tools
+      ├── workspaceExecPwsh
+      ├── workspaceInspect
+      ├── workspaceSearch
+      ├── workspaceReadFiles
+      ├── workspaceWriteFile
+      └── workspaceApplyPatch
 
-### 2.2 js-reverse-mcp：协议显微镜
+web_rev_action
+  ├── Action schema
+  ├── Orchestrator
+  ├── Session registry
+  ├── Playwright CLI adapter
+  ├── JS Reverse MCP adapter
+  ├── Gateway workspace adapter
+  ├── Artifact manifest
+  ├── Evidence index
+  └── Capture diff
 
-仓库：`https://github.com/qqq694637644/js-reverse-mcp`
-
-用途：解释页面行为背后的网络、脚本和运行时状态。
-
-直接复用能力：
-
-- 页面和 frame 选择。
-- 网络请求列表。
-- 请求头、请求体、响应头、响应体导出。
-- 请求 initiator 和调用栈。
-- WebSocket 消息。
-- 控制台日志。
-- 脚本列表。
-- 脚本源码读取和保存。
-- bundle 文本搜索。
-- XHR/fetch 断点。
-- 断点暂停状态、局部变量、作用域和调用栈。
-- 单步和恢复执行。
-- 清理站点状态。
-
-它负责回答：
-
-```text
-这个请求从哪里来？请求体怎么构造？响应流怎么返回？
-```
-
-### 2.3 两者的关系
-
-```text
-playwright-cli 负责制造事件
-js-reverse-mcp 负责解释事件
-web_rev_action 负责组织实验、整理证据、给 GPT 返回结构化结果
-github-gpt-actions-gateway workspace 负责保存、diff、schema、重放脚本和报告
+Shared Chrome / Chromium
+  ├── playwright-cli attaches to CDP endpoint
+  └── js-reverse-mcp attaches to same CDP endpoint
 ```
 
 ---
 
-## 3. 不重复实现的内容
-
-`web_rev_action` 不做以下事情：
-
-- 不重新实现 Playwright 页面操作。
-- 不重新实现 Chrome DevTools Protocol collector。
-- 不重新实现断点、调用栈、脚本搜索、WebSocket 抓取。
-- 不重新实现 Trace。
-- 不把 `playwright-cli` 和 `js-reverse-mcp` 的所有原子工具直接塞进 GPT Action schema。
-- 不做企业级权限系统、多租户隔离、复杂审计后台。
-
-`web_rev_action` 只做：
-
-- GPT Action 契约。
-- 两个上游工具的轻量 Adapter。
-- 共享浏览器 session 映射。
-- Evidence ID 和 Artifact 索引。
-- 两个 capture 的基础 diff。
-- 缺口工具的最小补丁规划。
-- Skill 文档与执行流程绑定。
-
----
-
-## 4. 推荐 Action 方案
-
-采用两个浏览器相关 Action。
+## 4. GPT 可见 Actions
 
 ### 4.1 inspectBrowserEvidence
 
-只读证据查询 Action。
+只读 Action。
 
 ```yaml
 operationId: inspectBrowserEvidence
 x-openai-isConsequential: false
 ```
 
-用途：
+功能范围：
 
-- 查看已有 session。
-- 查看已有 experiment。
+- 查询 session。
+- 查询 experiment。
 - 查询请求列表。
-- 读取指定 request 的 headers/body/response。
-- 读取 request initiator。
-- 读取 WebSocket 消息。
+- 读取请求详情。
+- 读取请求体和响应体。
+- 读取请求 initiator。
+- 查询 WebSocket 连接和消息。
 - 搜索已保存脚本。
-- 读取 Artifact。
+- 读取脚本源码。
+- 读取 artifact。
 - 比较两个 capture。
 - 查询 capture health。
 
-这个 Action 不执行页面点击、输入、上传、清理站点状态或请求重放。
+不允许做：
+
+- 页面点击、输入、上传。
+- 清理站点状态。
+- 设置断点。
+- HTTP 重放。
+- 关闭浏览器 session。
 
 ### 4.2 runBrowserExperiment
 
-有副作用的浏览器实验 Action。
+执行 Action。
 
 ```yaml
 operationId: runBrowserExperiment
 x-openai-isConsequential: true
 ```
 
-用途：
+功能范围：
 
 - 打开或连接浏览器 session。
 - 导航页面。
-- 执行点击、输入、上传等页面交互。
+- 执行页面动作 flow。
 - 开始和停止 Trace。
 - 清理当前站点状态。
-- 设置 XHR/fetch 断点。
+- 设置和移除 XHR/fetch 断点。
 - 重放一个已定义页面流程。
-- 执行独立 HTTP 重放实验。
-- 关闭 session。
-
-拆成这两个 Action 的原因：
-
-- 读证据不需要每次确认。
-- 执行页面交互、发送消息、上传文件、清理状态属于 consequential。
-- GPT-5.6 可以根据 Skill 文档决定何时读证据、何时执行实验。
-- 这个拆分比单一万能 Action 更符合 GPT Actions 语义，也不会显著增加复杂度。
+- 执行 workspace 中的 HTTP 重放脚本。
+- 关闭浏览器 session。
 
 ---
 
-## 5. inspectBrowserEvidence 设计
+## 5. Action 契约
 
-### 5.1 请求结构
+### 5.1 inspectBrowserEvidence 请求
 
 ```json
 {
   "contract_version": "1.0",
   "mode": "list_requests",
-  "session_id": "sess_01",
-  "experiment_id": "exp_01",
+  "session_id": "sess_001",
+  "experiment_id": "exp_001",
   "filter": {
-    "url_contains": ["conversation", "responses"],
+    "url_contains": ["api"],
     "method": "POST"
   },
   "cursor": null,
@@ -210,7 +151,7 @@ x-openai-isConsequential: true
 }
 ```
 
-### 5.2 mode 枚举
+`mode` 枚举：
 
 ```text
 get_session
@@ -230,46 +171,16 @@ compare_captures
 get_capture_health
 ```
 
-### 5.3 返回结构
-
-```json
-{
-  "ok": true,
-  "mode": "list_requests",
-  "session_id": "sess_01",
-  "experiment_id": "exp_01",
-  "items": [
-    {
-      "evidence_id": "ev_req_001",
-      "method": "POST",
-      "url": "https://example.com/api/conversation",
-      "status": 200,
-      "request_body_artifact_id": "art_req_body_001",
-      "response_body_artifact_id": "art_resp_body_001",
-      "initiator_evidence_id": "ev_stack_001"
-    }
-  ],
-  "artifacts": [],
-  "truncated": false,
-  "next_cursor": null,
-  "warnings": []
-}
-```
-
----
-
-## 6. runBrowserExperiment 设计
-
-### 6.1 请求结构
+### 5.2 runBrowserExperiment 请求
 
 ```json
 {
   "contract_version": "1.0",
+  "operation": "capture_flow",
   "skill_binding": {
     "skill_id": "web-protocol-analysis",
     "content_hash": "sha256:..."
   },
-  "operation": "capture_flow",
   "session": {
     "session_id": null,
     "profile_ref": "default",
@@ -278,28 +189,14 @@ get_capture_health
   "target": {
     "start_url": "https://example.com/app"
   },
-  "objective": "观察首次发送消息时产生的请求、流和请求构造代码",
-  "flow": [
-    {
-      "action": "fill",
-      "locator": {
-        "kind": "role",
-        "role": "textbox",
-        "name": "Message"
-      },
-      "value": "TEST"
-    },
-    {
-      "action": "press",
-      "key": "Enter"
-    }
-  ],
+  "objective": "capture one browser flow",
+  "flow": [],
   "capture": {
     "network": true,
     "websocket": true,
     "console": true,
     "trace": true,
-    "source_queries": ["conversation", "parent_message_id"]
+    "source_queries": []
   },
   "limits": {
     "timeout_ms": 30000,
@@ -308,7 +205,7 @@ get_capture_health
 }
 ```
 
-### 6.2 operation 枚举
+`operation` 枚举：
 
 ```text
 open_session
@@ -320,11 +217,7 @@ http_replay
 close_session
 ```
 
-`inspect_request`、`inspect_source`、`compare_captures` 这类只读操作放到 `inspectBrowserEvidence`，不要混在执行 Action 里。
-
-### 6.3 页面动作 DSL
-
-`flow` 支持：
+页面动作 `flow` 支持：
 
 ```text
 navigate
@@ -344,337 +237,130 @@ wait
 assert
 ```
 
-这部分直接映射到 `playwright-cli`。GPT 不需要知道底层 CLI 参数格式。
-
 Locator 支持：
 
 ```text
 snapshot_ref
-role + accessible name
+role
 label
 placeholder
-test id
+test_id
 text
 css
 ```
 
-个人工具可以保留 CSS 作为实用兜底，不需要过度限制。
+---
+
+## 6. 上游工具 Adapter
+
+### 6.1 PlaywrightCliAdapter
+
+职责：把 `runBrowserExperiment.flow` 转换成 `playwright-cli` 调用。
+
+需要实现：
+
+- attach/open session。
+- goto/reload。
+- snapshot/find。
+- click/fill/type/press/select/check/hover/upload。
+- wait/assert。
+- tracing start/stop。
+- screenshot。
+- session close。
+- 输出解析和错误归一化。
+
+不得实现：
+
+- 自研 locator 引擎。
+- 自研浏览器自动化。
+- 任意 shell 命令拼接。
+
+### 6.2 JsReverseMcpAdapter
+
+职责：以 MCP client 方式调用 `js-reverse-mcp`。
+
+需要实现：
+
+- select page/frame。
+- clear/list network requests。
+- export request/response body。
+- get request initiator。
+- list WebSocket messages。
+- list/search/read scripts。
+- break on XHR/fetch。
+- get paused info。
+- step/resume/remove breakpoint。
+- list console messages。
+- clear site data。
+
+不得实现：
+
+- 自研 CDP Network collector。
+- 自研 Debugger controller。
+- 自研 Runtime inspector。
+
+### 6.3 GatewayWorkspaceAdapter
+
+职责：复用 `github-gpt-actions-gateway` 的 workspace 工具。
+
+需要暴露：
+
+- `workspaceExecPwsh`
+- `workspaceInspect`
+- `workspaceSearch`
+- `workspaceReadFiles`
+- `workspaceWriteFile`
+- `workspaceApplyPatch`
+
+不暴露：
+
+- Git commit / push。
+- PR 创建 / 更新 / 合并。
+- CI 查询。
+- workflow dispatch。
+- GitHub artifact 同步。
+
+workspace 是普通分析目录，不是 Git 发布目录。
 
 ---
 
-## 7. Workspace 工具设计
+## 7. Session 与共享浏览器
 
-文件能力直接复用 `github-gpt-actions-gateway` 的 workspace 工具，不再单独设计 Filesystem MCP。
-
-本项目对 gateway 的使用方式不是“代码维护 / GitHub PR 工作流”，而是“本地分析目录工作流”：
+两个上游工具必须连接同一个 Chrome / Chromium CDP endpoint。
 
 ```text
-analysis-workspace/
-  captures/
-  experiments/
-  schemas/
-  scripts/
-  reports/
-  notes/
-```
-
-LLM 可以在这个目录里自由保存抓包、脚本、schema、diff 结果和分析笔记。这个目录只是工作记录区，不自动 commit、不 push、不建 PR、不查 CI。
-
-### 7.1 使用的 gateway workspace 工具
-
-| 工具 | 用途 |
-| --- | --- |
-| `workspaceExecPwsh` | 在 workspace 根目录运行 PowerShell 7，用于整理文件、跑 diff、跑 httpx/HTTP 客户端/Node 脚本和生成报告 |
-| `workspaceInspect` | 列目录树、搜索关键词、返回相关文件片段，适合快速了解记录目录现状 |
-| `workspaceSearch` | 使用 ripgrep 搜索 workspace 文本内容 |
-| `workspaceReadFiles` | 带行号读取多个 UTF-8 文件 |
-| `workspaceWriteFile` | 创建或完整覆盖 UTF-8 文本文件 |
-| `workspaceApplyPatch` | 对已有文本文件做小范围补丁修改 |
-
-这些工具来自 `github-gpt-actions-gateway`，本项目只做复用和必要配置，不再实现一套新的文件工具。
-
-### 7.2 不暴露的 gateway 能力
-
-个人逆向分析场景不需要 GitHub 维护流。因此 GPT Action schema 中不要暴露：
-
-```text
-workspaceCommitAndPush
-createPullRequest
-updatePullRequest
-mergePullRequest
-close PR
-queryCiStatus
-workflow dispatch
-branch 管理
-GitHub artifact 同步
-```
-
-`workspaceDiff` 也不是必需能力。需要比较文件时，直接在 workspace 里用 PowerShell、Python、Node、jq、rg 或自写脚本生成记录即可。
-
-### 7.3 workspaceExecPwsh 使用方式
-
-要求：
-
-- 当前目录固定为 analysis workspace 根目录。
-- 允许读写该目录内文件。
-- 输出包含 exit code、stdout、stderr 和截断标记。
-- 不要求 Git 仓库存在。
-- 不自动持有 GitHub 发布凭据。
-- 不返回宿主真实绝对路径。
-
-常见用途：
-
-- 整理 capture 文件。
-- 写 JSON schema。
-- 比较请求体。
-- 运行 Python/Node diff 脚本。
-- 用 HTTP 客户端或 httpx 做独立请求重放。
-- 生成 Markdown 报告。
-- 维护 `notes/` 下的实验记录。
-
-### 7.4 workspace 记录目录建议
-
-```text
-analysis-workspace/
-  captures/
-    baseline/
-    new-conversation/
-    second-turn/
-    regenerate/
-    edit-message/
-    stop-generation/
-    file-upload/
-  experiments/
-    exp_001/
-      manifest.json
-      playwright/
-      js-reverse/
-      reports/
-  schemas/
-    request.schema.json
-    stream-events.schema.json
-    conversation-state.md
-  scripts/
-    diff-request.ps1
-    diff-json.py
-    replay-http.py
-  reports/
-    protocol-map.md
-  notes/
-    timeline.md
-    open-questions.md
-```
-
----
-
-## 8. 完整工具组合
-
-### 8.1 必需工具
-
-| 工具 | 作用 |
-| --- | --- |
-| Skill API | 加载分析流程和方法论 |
-| `playwright-cli` | 页面操作、登录态、Trace、快照 |
-| `js-reverse-mcp` | 网络、脚本、断点、调用栈、WebSocket |
-| `inspectBrowserEvidence` | 只读查询证据和 Artifact |
-| `runBrowserExperiment` | 执行页面实验和重放 |
-| `github-gpt-actions-gateway` workspace | 文件、diff、schema、报告、HTTP 重放、实验记录 |
-| gateway workspace 文件工具 | inspect/search/read/write/patch/PowerShell |
-
-### 8.2 需要补的缺口工具
-
-只补三个最小能力。
-
-#### 缺口 1：Raw CDP Stream Capture
-
-用途：SSE、chunked fetch、长连接和实时增量响应。
-
-优先补到 `js-reverse-mcp`，不要在 `web_rev_action` 里重写 CDP 网络采集。
-
-建议工具：
-
-```text
-start_stream_capture
-get_stream_chunks
-stop_stream_capture
-export_stream_capture
-```
-
-至少记录：
-
-```text
-requestId
-sequence
-timestamp
-encodedDataLength
-dataLength
-mimeType
-url
-loadingFinished/loadingFailed
-```
-
-能拿到 chunk 文本时保存文本，拿不到也要保存 chunk 顺序和大小。这样至少能判断响应是否持续、是否完成、是否漏帧。
-
-#### 缺口 2：Worker / Service Worker Target 元数据
-
-用途：确定请求来自 page、iframe、worker 还是 service worker。
-
-优先补到 `js-reverse-mcp` 的请求结构中。
-
-建议每个请求增加：
-
-```json
-{
-  "targetType": "page | iframe | worker | service_worker | shared_worker",
-  "targetId": "...",
-  "frameId": "...",
-  "workerUrl": "..."
-}
-```
-
-并确认内部使用：
-
-```text
-Target.setAutoAttach
-Target.attachedToTarget
-```
-
-#### 缺口 3：独立请求重放和差异分析
-
-不需要单独 MCP。
-
-使用 `github-gpt-actions-gateway` 的 workspace 工具即可：
-
-- Python `httpx`。
-- Node `fetch` / `undici`。
-- curl。
-- 自写 JSON diff 脚本。
-- JSON Schema。
-- SQLite/DuckDB 可选。
-
-目录建议：
-
-```text
-analysis-workspace/
-  captures/
-    baseline/
-    new-conversation/
-    second-turn/
-    regenerate/
-    edit-message/
-    stop-generation/
-    file-upload/
-  schemas/
-    request.schema.json
-    stream-events.schema.json
-    conversation-state.md
-  scripts/
-    diff-request.ps1
-    diff-json.py
-    replay-http.py
-  reports/
-    protocol-map.md
-```
-
----
-
-## 9. 共享浏览器方案
-
-两个上游工具必须连同一个浏览器。
-
-推荐：
-
-```text
-Chrome / Chromium with remote debugging
+Chrome / Chromium
   ├── playwright-cli attach --cdp=<endpoint>
   └── js-reverse-mcp --browserUrl <endpoint>
 ```
 
-`web_rev_action` 保存映射：
+`web_rev_action` 维护逻辑 session：
 
 ```text
 session_id
-playwright_session_name
-js_reverse_session/process
+profile_ref
+browser_endpoint_ref
+playwright_session_ref
+js_reverse_session_ref
 selected_page
 selected_frame
 analysis_workspace_dir
-profile_ref
+created_at
+updated_at
+expires_at
 ```
 
-个人使用场景中，profile 可以简单很多：
+个人版只需要三类 profile：
 
-- 一个默认 profile。
-- 一个干净测试 profile。
-- 一个临时 profile。
-
-不需要复杂多租户 profile 隔离。
+- `default`：日常授权浏览器 profile。
+- `clean`：干净测试 profile。
+- `temp`：一次性临时 profile。
 
 ---
 
-## 10. Orchestrator 调用流程
+## 8. Artifact 与 Evidence
 
-### 10.1 capture_baseline
-
-```text
-1. 连接或打开浏览器 session
-2. playwright-cli goto / snapshot
-3. js-reverse-mcp clear_network_requests
-4. 等待页面稳定
-5. js-reverse-mcp list_network_requests
-6. js-reverse-mcp list_console_messages
-7. js-reverse-mcp get_websocket_messages
-8. playwright-cli screenshot / trace 可选
-9. 保存 baseline manifest
-```
-
-### 10.2 capture_flow
-
-```text
-1. 确认 session 和页面
-2. js-reverse-mcp clear_network_requests
-3. playwright-cli tracing-start
-4. playwright-cli 执行 flow
-5. 等待网络、流或页面稳定
-6. playwright-cli tracing-stop
-7. js-reverse-mcp list_network_requests
-8. 对关键请求 get_request_initiator
-9. 对目标关键字 search_in_sources
-10. 保存 request/response/source/trace 到 workspace
-11. 返回 evidence summary
-```
-
-### 10.3 trace_request
-
-```text
-1. 根据已有 capture 选择 URL pattern
-2. js-reverse-mcp break_on_xhr
-3. playwright-cli 重放 flow
-4. js-reverse-mcp get_paused_info
-5. 必要时 step / resume
-6. remove_breakpoint
-7. 保存 paused info、scope 摘要、调用栈、源码片段
-```
-
-### 10.4 http_replay
-
-```text
-1. 从 Artifact 复制一个已捕获请求到 workspace
-2. 由 GPT 编写 replay 脚本或 curl/httpx 命令
-3. 在 `workspaceExecPwsh` 中运行
-4. 保存响应、错误和 diff
-5. 不把浏览器 Cookie/Token 明文写入报告
-```
-
-个人使用可以允许 GPT 在 analysis workspace 里写 replay 脚本和实验记录；只要不要把账号凭据写入报告或共享文件即可。
-
----
-
-## 11. Artifact 和 Evidence
-
-`web_rev_action` 只做轻量索引，不做复杂对象存储。
-
-目录：
+分析结果存入 workspace。
 
 ```text
 analysis-workspace/
@@ -696,9 +382,10 @@ analysis-workspace/
         summary.json
 ```
 
-Evidence ID：
+ID 规则：
 
 ```text
+sess_001
 exp_001
 cap_001
 ev_req_001
@@ -709,160 +396,143 @@ ev_script_001
 art_001
 ```
 
-`manifest.json` 保存：
+`manifest.json` 最少保存：
 
 ```json
 {
   "experiment_id": "exp_001",
   "operation": "capture_flow",
-  "objective": "first message",
+  "objective": "...",
   "created_at": "...",
   "actions": [],
   "requests": [],
   "websockets": [],
   "scripts": [],
-  "artifacts": []
+  "artifacts": [],
+  "warnings": [],
+  "errors": []
 }
 ```
 
-读取大文件时使用 `inspectBrowserEvidence.read_artifact` 或 gateway workspace 的 `workspaceReadFiles` / `workspaceExecPwsh`。
+Action 响应只返回摘要、ID、hash、preview 和 cursor。大文件通过 `inspectBrowserEvidence.read_artifact` 或 workspace 工具读取。
 
 ---
 
-## 12. Skill 设计
+## 9. Capture Health
 
-新增主 Skill：
+每次实验返回 `capture_health`：
 
-```text
-skills/web-protocol-analysis/
-  SKILL.md
-  docs/
-    action-contract.md
-    browser-experiment.md
-    network-analysis.md
-    stream-analysis.md
-    websocket-analysis.md
-    source-tracing.md
-    request-replay.md
-    evidence-report.md
+```json
+{
+  "network_capture_started_before_action": true,
+  "trace_started_before_action": true,
+  "websocket_observed": false,
+  "page_aligned": true,
+  "frame_aligned": true,
+  "breakpoints_removed": true,
+  "paused_execution_resumed": true,
+  "response_bodies_available": true,
+  "stream_capture_complete": null,
+  "warnings": []
+}
 ```
 
-`SKILL.md` 写高层流程，不写太多限制。
+这不是复杂安全系统，而是避免 GPT 把“不完整抓取”误认为“事实不存在”。
 
-建议内容：
+---
+
+## 10. Diff 能力
+
+`web_rev_action` 只做轻量 diff，不做完整协议推理。
+
+需要支持：
+
+- 请求集合 diff。
+- URL / method / status diff。
+- Header 名称 diff。
+- JSON 请求体字段 diff。
+- JSON 响应字段 diff。
+- WebSocket 消息序列 diff。
+- initiator 脚本位置 diff。
+- Artifact hash diff。
+
+动态值识别：
 
 ```text
-1. 先 baseline，再执行动作。
-2. 一次只改变一个变量。
-3. 用 playwright-cli 制造事件。
-4. 用 js-reverse-mcp 解释事件。
-5. 网络请求先看 list_network_requests。
-6. 关键请求再看 get_request_initiator。
-7. 看不懂请求体来源时再 break_on_xhr。
-8. 长流或 SSE 需要 stream capture。
-9. Worker 请求需要检查 targetType。
-10. 浏览器外复现放到 workspace，用脚本保存结果。
-11. 结论分为：已观察、已验证、推测、未验证。
-12. 结论引用 experiment/evidence/artifact。
+timestamp
+uuid
+nonce
+request_id
+message_id
+conversation_id
+trace_id
+build_hash
+session_id
+```
+
+diff 结果写入 workspace，例如：
+
+```text
+analysis-workspace/experiments/exp_002/reports/diff.json
 ```
 
 ---
 
-## 13. 实际分析流程
+## 11. 需要补到上游的最小能力
 
-### 阶段 1：协议地图
+先用集成测试验证现有能力。只有确实缺失时才补上游，不在 `web_rev_action` 中复制实现。
 
-记录以下实验：
+### 11.1 Raw CDP Stream Capture
 
-```text
-01 打开首页
-02 新建会话
-03 第一轮消息
-04 第二轮消息
-05 停止生成
-06 重新生成
-07 修改旧消息
-08 切换模型
-09 删除会话
-10 上传文件
-11 启用网页搜索
-12 生成图片
-```
+优先补到 `js-reverse-mcp`。
 
-每个实验保存：
+建议工具：
 
 ```text
-页面动作
-请求列表
-请求头
-请求体
-响应体或流事件
-WebSocket 数据
-请求发起调用栈
-相关脚本位置
-前后页面状态
-Trace
+start_stream_capture
+get_stream_chunks
+stop_stream_capture
+export_stream_capture
 ```
 
-### 阶段 2：状态机
+用途：
 
-整理：
+- SSE。
+- chunked fetch。
+- 长连接响应。
+- 流式增量事件。
+
+至少记录：
 
 ```text
-会话如何创建
-消息如何关联
-parent/child/branch 如何表达
-重新生成如何表达
-停止生成是否发取消请求
-流式事件有哪些类型
-工具调用如何开始和结束
-文件如何上传和绑定
-错误如何返回
+requestId
+sequence
+timestamp
+encodedDataLength
+dataLength
+mimeType
+url
+loadingFinished/loadingFailed
 ```
 
-### 阶段 3：请求构造代码
+### 11.2 Worker / Service Worker Target 元数据
 
-对核心请求执行：
+优先补到 `js-reverse-mcp` 的 request 结果。
 
-```text
-list_network_requests
-get_request_initiator
-search_in_sources
-break_on_xhr
-get_paused_info
-保存源码和调用栈
+建议字段：
+
+```json
+{
+  "targetType": "page | iframe | worker | service_worker | shared_worker",
+  "targetId": "...",
+  "frameId": "...",
+  "workerUrl": "..."
+}
 ```
-
-目标是区分：
-
-```text
-后端真正需要的字段
-前端生成的状态字段
-A/B 实验字段
-埋点字段
-动态 ID
-```
-
-### 阶段 4：独立重放
-
-在 workspace 中完成：
-
-```text
-保存请求样本
-写 replay-http.py 或 curl 脚本
-一次删一个字段
-一次改一个 header
-保存响应和 diff
-更新 schema
-```
-
-不要一开始复现登录。浏览器负责正常登录，重放只研究登录后的业务协议。
 
 ---
 
-## 14. 代码结构
-
-保留当前 `skill_temple` 运行时，新增轻量项目模块。
+## 12. 代码结构
 
 ```text
 src/skill_temple/
@@ -870,23 +540,29 @@ src/skill_temple/
   runtime.py
 
 src/web_rev_action/
-  actions.py              # inspectBrowserEvidence / runBrowserExperiment
-  models.py               # Action request/response schema
-  orchestrator.py         # 调度 playwright-cli 和 js-reverse-mcp
-  sessions.py             # session 映射
-  artifacts.py            # manifest 和 artifact 索引
-  evidence.py             # evidence id 和查询
-  diff.py                 # capture diff
+  actions.py
+  models.py
+  orchestrator.py
+  sessions.py
+  artifacts.py
+  evidence.py
+  diff.py
   adapters/
     playwright_cli.py
     js_reverse_mcp.py
-  workspace/
-    gateway_adapter.py      # 复用 github-gpt-actions-gateway workspace 工具
+    gateway_workspace.py
 
 skills/
   web-protocol-analysis/
     SKILL.md
     docs/
+      action-contract.md
+      browser-experiment.md
+      network-analysis.md
+      stream-analysis.md
+      source-tracing.md
+      request-replay.md
+      evidence-report.md
 
 analysis-workspace/
   captures/
@@ -894,122 +570,88 @@ analysis-workspace/
   schemas/
   scripts/
   reports/
+  notes/
 ```
 
-MVP 不做大规模重命名，避免把模板改名和功能开发混在一起。
+MVP 不做包名大迁移，避免把模板重命名和功能实现混在一起。
 
 ---
 
-## 15. 开发阶段
+## 13. 开发阶段
 
-### 阶段 1：文档和 Action 契约
+### 阶段 1：Action 契约
 
-- 更新 `PLAN.md`。
 - 定义 `inspectBrowserEvidence` schema。
 - 定义 `runBrowserExperiment` schema。
-- 更新 OpenAPI。
+- 加入 OpenAPI。
 - Fake adapter 返回固定数据。
+- 补契约测试。
 
-### 阶段 2：Gateway Workspace 集成
+### 阶段 2：Gateway workspace 集成
 
-- 复用 `github-gpt-actions-gateway` 的 workspace 工具。
-- 暴露 `workspaceExecPwsh` / `workspaceInspect` / `workspaceSearch` / `workspaceReadFiles` / `workspaceWriteFile` / `workspaceApplyPatch`。
-- 使用 analysis workspace 本地目录模式。
-- 不暴露 Git、PR、CI、commit/push/merge 相关 operation。
+- 接入 `github-gpt-actions-gateway` workspace 工具。
+- 创建 analysis workspace 根目录。
+- 实现 artifact 读写、preview、cursor。
+- 禁用 Git/PR/CI 类 operation。
 
 ### 阶段 3：Playwright CLI Adapter
 
-- attach/open session。
-- snapshot。
+- 连接 session。
 - 执行 flow。
-- trace start/stop。
-- 保存 snapshot、trace、screenshot。
+- 归档 snapshot、screenshot、trace。
+- 返回结构化 action result。
 
 ### 阶段 4：JS Reverse MCP Adapter
 
-- MCP client。
-- list_network_requests。
-- get_request_initiator。
-- get_websocket_messages。
-- search_in_sources。
-- get_script_source。
-- break_on_xhr / get_paused_info / resume。
+- 连接 MCP server。
+- 获取网络请求、响应、initiator、WebSocket、脚本、控制台。
+- 支持 XHR/fetch 断点工作流。
+- 返回结构化 evidence。
 
-### 阶段 5：共享 session 和 capture_flow
+### 阶段 5：Orchestrator
 
-- 同一个 Chrome CDP endpoint。
-- Playwright 与 js-reverse 当前页面对齐。
-- baseline。
-- capture_flow。
-- evidence manifest。
+- 实现 `open_session`。
+- 实现 `capture_baseline`。
+- 实现 `capture_flow`。
+- 实现 `trace_request`。
+- 实现失败清理和 breakpoint 恢复。
 
-### 阶段 6：缺口补丁验证
+### 阶段 6：Evidence 与 diff
 
-- 验证 SSE/chunk 是否足够。
-- 验证 Worker/Service Worker target 元数据。
-- 必要时给 `js-reverse-mcp` 补：
-  - `start_stream_capture`
-  - `get_stream_chunks`
-  - `stop_stream_capture`
-  - `export_stream_capture`
-  - request target metadata
+- 生成 manifest。
+- 生成 evidence ID。
+- 实现 artifact 查询。
+- 实现 capture diff。
+- 实现 capture health。
 
-### 阶段 7：diff、HTTP replay 和 Skill
+### 阶段 7：上游缺口验证
 
-- compare_captures。
-- workspace replay 示例脚本。
-- `web-protocol-analysis` Skill。
-- 示例报告模板。
+- 验证 SSE/chunk 能力。
+- 验证 Worker / Service Worker 请求归属。
+- 必要时向 `js-reverse-mcp` 补最小工具。
+
+### 阶段 8：Skill 文档
+
+- 新增 `web-protocol-analysis` Skill。
+- 写 Action 使用说明。
+- 写证据报告格式。
+- 写 request replay 的 workspace 用法。
 
 ---
 
-## 16. MVP 完成标准
-
-第一版完成时应满足：
+## 14. MVP 完成标准
 
 1. GPT 可见浏览器 Action 只有两个：`inspectBrowserEvidence` 和 `runBrowserExperiment`。
 2. 只读查询不触发 consequential 确认。
 3. 页面交互触发 consequential 确认。
 4. `playwright-cli` 和 `js-reverse-mcp` 连接同一个浏览器。
 5. `web_rev_action` 不重复实现 Playwright 或 CDP collector。
-6. 能执行 baseline 和 capture_flow。
-7. 能拿到请求、响应、initiator、WebSocket、源码搜索结果和 Trace。
-8. 能把证据保存到 workspace。
-9. 能用 gateway workspace 工具写 diff/replay/schema/report/notes。
-10. 能识别或补齐 SSE/chunk capture 缺口。
-11. 能识别或补齐 Worker/Service Worker target 元数据缺口。
-12. 能用 evidence ID 和 artifact ID 写可追溯报告。
-13. 不把 Cookie、Token、profile 路径、CDP endpoint 明文写进报告或共享文件。
-
----
-
-## 17. 最终最小工具组合
-
-```text
-1. Skill API
-   - retrieveSkillContext
-   - readSkillContent
-   - searchSkillDocs
-
-2. Browser Actions
-   - inspectBrowserEvidence
-   - runBrowserExperiment
-
-3. Browser Engines
-   - playwright-cli
-   - js-reverse-mcp
-
-4. Gateway Workspace Tools（本地目录模式）
-   - workspaceExecPwsh
-   - workspaceInspect
-   - workspaceSearch
-   - workspaceReadFiles
-   - workspaceWriteFile
-   - workspaceApplyPatch
-
-5. 必要补丁
-   - Raw CDP stream capture，优先补到 js-reverse-mcp
-   - Worker / Service Worker target metadata，优先补到 js-reverse-mcp
-```
-
-这套组合已经足够完成最新版网页端协议分析和第一版 Pandora 类复现。不要再增加大型 MCP、移动端工具、Frida、mitmproxy 或自研浏览器框架，除非网页端协议画像完成后证明必须需要。
+6. 能执行 `capture_baseline` 和 `capture_flow`。
+7. 能保存请求、响应、initiator、WebSocket、脚本搜索结果、Trace 和截图。
+8. 能通过 evidence ID 和 artifact ID 查询证据。
+9. 能用 gateway workspace 工具写脚本、schema、diff、报告和 notes。
+10. 能比较两个 capture。
+11. 能报告 capture health。
+12. 能验证是否需要补 Raw CDP stream capture。
+13. 能验证是否需要补 Worker / Service Worker target metadata。
+14. 不把 Cookie、Token、profile 路径、CDP endpoint 明文写进报告或共享文件。
