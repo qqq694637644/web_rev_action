@@ -157,7 +157,7 @@ x-openai-isConsequential: false
 
 ```yaml
 operationId: runBrowserExperiment
-x-openai-isConsequential: true
+x-openai-isConsequential: false
 ```
 
 功能范围：
