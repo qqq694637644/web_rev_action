@@ -1,412 +1,432 @@
-# Skill Temple
+# web_rev_action
 
-Skill Temple is a reusable **Codex-style Skill runtime adapted to Custom GPT Actions**.
-It provides a small OpenAPI surface for projects that want filesystem-based `SKILL.md`
-instructions, model-driven Skill selection, and progressive disclosure without copying
-all domain documentation into the Custom GPT Instructions field.
+`web_rev_action` 是一个单用户、自用的 GPT 5.6 网页协议分析后端。
 
-The runtime was synchronized from the generic Skill layer used by `ida_skill`. It does
-not include IDA Actions or any project-specific backend operations.
+它不重新实现浏览器自动化和 CDP collector，而是原子编排：
 
-## What this template provides
+- `playwright-cli`：页面操作、snapshot、截图和 Trace。
+- `js-reverse-mcp`：网络、SSE、initiator、脚本和断点证据。
+- 本地 analysis workspace：manifest、artifact、报告、schema 和重放脚本。
+- 现有 Skill runtime：向 GPT 提供 `SKILL.md` 和渐进式文档读取。
 
-- `SKILL.md` is the only required Skill entrypoint.
-- Discovery uses only frontmatter `name` and `description`.
-- The model chooses Skills; the server does not perform semantic keyword ranking.
-- Codex-style `$skill-name` mentions are supported.
-- `@skill-name` is also supported as a gateway convenience extension.
-- Selected `SKILL.md` files are returned within a shared response budget.
-- Referenced resources are read progressively by safe relative path.
-- Keyword search is available as a fallback inside one selected Skill.
-- Multiple explicit Skills are loaded together up to a maximum of three.
-- The discovery catalog has a separate 20,000-character budget.
-- Optional Bearer authentication is supported for `/v1/*` routes.
-- Only three operations are exposed to GPT Actions.
+当前已实现 `PLAN.md` 的阶段 1 和阶段 2：Action schema、真实 adapter、session、页面对齐、统一 deadline、最小原子 Orchestrator、experiment store 和 fake-adapter 验收测试。
 
 ## Public GPT Actions
 
-| operationId | Method | Path | Purpose |
+| operationId | Path | Consequential | 作用 |
 | --- | --- | --- | --- |
-| `retrieveSkillContext` | `POST` | `/v1/skills/retrieve` | Return a bounded Skill catalog or load explicitly selected `SKILL.md` files. |
-| `readSkillContent` | `POST` | `/v1/skills/read` | Read an exact safe relative path with continuation metadata. |
-| `searchSkillDocs` | `POST` | `/v1/skills/search` | Search indexed resources inside one selected Skill. |
+| `retrieveSkillContext` | `POST /v1/skills/retrieve` | false | 发现或读取明确选择的 Skill。 |
+| `readSkillContent` | `POST /v1/skills/read` | false | 读取 Skill 内的安全相对路径。 |
+| `searchSkillDocs` | `POST /v1/skills/search` | false | 搜索一个 Skill 的资源。 |
+| `inspectBrowserEvidence` | `POST /v1/browser/inspect` | false | 查询 session、experiment、stream 状态和 artifact。 |
+| `runBrowserExperiment` | `POST /v1/browser/run` | true | 打开/关闭 session，或运行一次原子浏览器实验。 |
 
-All three operations publish:
-
-```json
-{"x-openai-isConsequential": false}
-```
-
-Projects can add their own domain Actions beside these three operations.
-
-## Skill directory contract
-
-A Skill requires one entrypoint:
+GPT 看不到内部 MCP 工具。`web_rev_action` 私下调用：
 
 ```text
-skills/
-  example-skill/
-    SKILL.md
-    docs/
-      reference.md
-    scripts/
-      helper.py
-    assets/
-      template.txt
+start_stream_capture
+get_stream_status
+stop_stream_capture
 ```
 
-`SKILL.md` must begin with YAML frontmatter:
+## Atomic capture flow
 
-```yaml
----
-name: example-skill
-description: Use for tasks that require the example domain. 中文：用于示例领域任务。
----
+一次 `capture_flow` 在一个 HTTP 请求内完成：
+
+```text
+page alignment
+→ create experiment
+→ optional Trace start
+→ stream capture start
+→ before screenshot
+→ Playwright flow
+→ private stream/page wait
+→ stream stop/finalize
+→ network summary
+→ after screenshot
+→ Trace archive
+→ primary/objective integrity
+→ atomic manifest write
 ```
 
-Rules:
+页面动作失败时仍会尝试 stop/finalize，并写出失败 manifest。
 
-- `name` becomes the stable `skill_id` selection handle.
-- `name` is limited to 64 characters and must match the Skill ID format.
-- `description` is required and limited to 1,024 characters.
-- Use a bilingual description when the GPT serves more than one language.
-- Do not add `skill.json` or `INDEX.md`; the runtime ignores them.
-- Put task routing and behavior in `SKILL.md`.
-- Put detailed reference material in `docs/`, `references/`, `scripts/`, or `assets/`.
-- Point to exact relative paths from `SKILL.md` when the model should read them.
+## Implemented operations
 
-Example:
+### `runBrowserExperiment`
 
-```markdown
----
-name: api-review
-description: Use for reviewing API schemas, compatibility, and versioning risks.
----
-
-# API review
-
-1. Read this file completely.
-2. For OpenAPI compatibility, read `docs/openapi.md`.
-3. For migration rules, read `docs/versioning.md`.
-4. Return findings, evidence, and unverified risks separately.
+```text
+open_session
+capture_baseline
+capture_flow
+close_session
 ```
 
-## Selection flow
+### `inspectBrowserEvidence`
 
-Custom GPT Instructions cannot receive a dynamic server catalog before the model turn,
-so this template uses a two-call GPT Actions adaptation.
+```text
+get_session
+list_experiments
+get_experiment
+list_artifacts
+read_artifact
+get_stream_status
+```
 
-### 1. Discover
+请求模型使用 OpenAPI discriminated union / `oneOf`，不同 operation 不共享一堆无关可选字段。
 
-Call without explicit hints:
+## Flow steps
+
+支持：
+
+```text
+navigate
+reload
+click
+fill
+type
+press
+select
+check
+uncheck
+hover
+upload
+wait
+assert
+snapshot
+```
+
+Locator 支持：
+
+```text
+ref
+role + name
+label
+placeholder
+test_id
+text
+css
+```
+
+示例：
 
 ```json
 {
-  "query": "Review this API migration",
-  "hinted_skill_ids": [],
-  "allow_skill_chaining": false
+  "step_id": "send_message",
+  "action": "fill",
+  "locator": {"placeholder": "Message"},
+  "value": "hello",
+  "timeout_ms": 5000
 }
 ```
 
-The response contains a bounded `available_skills` catalog:
+Stop step 可以声明：
 
 ```json
 {
-  "selected_skills": [],
-  "available_skills": [
-    {
-      "skill_id": "api-review",
-      "name": "api-review",
-      "description": "Use for reviewing API schemas...",
-      "description_truncated": false,
-      "entrypoint": "SKILL.md",
-      "content_hash": "sha256:..."
-    }
-  ],
-  "available_skill_count": 1,
-  "included_skill_count": 1,
-  "omitted_skill_count": 0,
-  "descriptions_truncated": false,
-  "catalog_char_limit": 20000,
-  "catalog_included": true,
-  "decision": {
-    "selected": false,
-    "next_action": "selectSkillOrAnswer",
-    "stop_retrieval": false
+  "step_id": "stop_generation",
+  "action": "click",
+  "locator": {"role": "button", "name": "Stop"},
+  "intent": "stop_generation"
+}
+```
+
+底层 `network_canceled` 只有在主请求、Stop step、时间窗口、页面对齐且无后续导航同时匹配时，才在 experiment manifest 中派生为 `expected_user_cancel`。
+
+## Wait conditions
+
+```text
+timeout
+selector_visible
+selector_hidden
+request_observed
+response_observed
+network_idle
+first_event
+event_predicate
+default_done_marker
+network_finished
+network_canceled
+failed
+page_url
+```
+
+Event predicate 支持：
+
+```text
+exact_data
+event_name
+json_path_equals
+network_terminal
+selector_state
+```
+
+`[DONE]` 只是 `default_done_marker` 的默认语义，不是通用协议完成定义。
+
+## Deadline
+
+每个 Action 使用一个不超过 42 秒的总 deadline。
+
+- step 使用总 deadline 的子预算。
+- wait 使用 condition timeout 与总 deadline 的较小值。
+- Orchestrator 在执行新动作前为 stop/finalize 预留时间。
+- Playwright subprocess 超时会被终止。
+- MCP tool 调用使用剩余 deadline。
+- `stop_stream_capture` 获得剩余的 `finalizeTimeoutMs`。
+
+## Primary request and integrity
+
+实验请求声明目标请求：
+
+```json
+{
+  "url_contains": "/conversation",
+  "method": "POST",
+  "resource_types": ["fetch"],
+  "expected_min_matches": 1,
+  "expected_max_matches": 1,
+  "allow_supporting_failures": true,
+  "include_in_flight": false
+}
+```
+
+Manifest 分开返回：
+
+```text
+collector_integrity
+primary_request_integrity
+objective_integrity
+```
+
+遥测或 supporting request 失败，不会在 `allow_supporting_failures=true` 时覆盖主消息实验结果。
+
+上游 request 的详细维度也被保留：
+
+```text
+rawCaptureIntegrity
+semanticParseIntegrity
+requestSnapshotIntegrity
+artifactIntegrity
+```
+
+## Workspace
+
+默认目录：
+
+```text
+data/analysis-workspace/
+  sessions/
+    session_one.json
+  experiments/
+    exp_<timestamp>_<id>/
+      manifest.json
+      playwright/
+        screenshots/
+        traces/
+      js-reverse/
+        capture-<uuid>/
+      reports/
+```
+
+`web_rev_action` 把 `experiment_id` 作为受限 `artifactNamespace` 传给 `js-reverse-mcp`，因此两个服务必须看到同一个 workspace 目录。
+
+Workspace 是普通文件夹，不包含 Git/PR 语义。
+
+## Credential artifacts
+
+完整 request/response headers 可能包含 Cookie、Authorization、CSRF 或 Set-Cookie。
+
+Artifact descriptor 可以声明：
+
+```text
+sensitivity = credential
+containsCredentials = true
+redactedArtifactId = ...
+```
+
+`read_artifact` 默认读取关联的脱敏 artifact：
+
+```json
+{
+  "operation": "read_artifact",
+  "payload": {
+    "experiment_id": "exp_...",
+    "artifact_id": "art_...",
+    "credential_mode": "redacted"
   }
 }
 ```
 
-The model reviews the visible `name` and `description`. The server does not score the
-query against descriptions.
-
-When `omitted_skill_count > 0` or `descriptions_truncated=true`, the visible catalog is
-not the complete installed set.
-
-### 2. Load an exact Skill
-
-When one description clearly applies, retry once with the exact selection handle:
-
-```json
-{
-  "query": "Review this API migration",
-  "hinted_skill_ids": ["api-review"],
-  "allow_skill_chaining": false
-}
-```
-
-A selected packet contains:
-
-```json
-{
-  "skill_id": "api-review",
-  "name": "api-review",
-  "description": "Use for reviewing API schemas...",
-  "role": "primary",
-  "source_path": "SKILL.md",
-  "instructions": "---\nname: api-review\n...",
-  "content_hash": "sha256:...",
-  "total_lines": 42,
-  "truncated": false,
-  "next_start_line": null,
-  "referenced_paths": ["docs/openapi.md", "docs/versioning.md"]
-}
-```
-
-Selected responses omit the repeated catalog:
-
-```json
-{
-  "available_skills": [],
-  "catalog_included": false
-}
-```
-
-## Explicit mentions
-
-Codex-style mention:
-
-```text
-$api-review
-```
-
-Gateway extension:
-
-```text
-@api-review
-```
-
-Unknown textual mentions are returned in:
-
-```json
-{"unknown_skill_mentions": ["missing-skill"]}
-```
-
-Unknown `hinted_skill_ids` return the existing structured HTTP 404 because hints are
-strict selection handles supplied by the caller.
-
-## Multiple Skills
-
-Two or three exact hints or mentions load automatically together. The caller does not
-need to set `allow_skill_chaining=true`; that field remains only for backward
-compatibility.
-
-```json
-{
-  "query": "Use $api-review and $release-notes",
-  "hinted_skill_ids": []
-}
-```
-
-Packets receive `primary` and `secondary` roles in explicit selection order.
-
-More than three explicit selections are never partially executed. The runtime returns:
-
-```json
-{
-  "selected_skills": [],
-  "explicit_skill_ids": ["one", "two", "three", "four"],
-  "omitted_explicit_skill_ids": ["four"],
-  "decision": {
-    "selected": false,
-    "next_action": "retryWithFewerSkills"
-  }
-}
-```
-
-## Response budgets
-
-- Catalog budget: 20,000 serialized JSON characters.
-- Single `SKILL.md` budget: 24,000 characters.
-- Combined selected instructions budget: 60,000 characters.
-- Maximum selected Skills per call: 3.
-
-When a selected entrypoint is truncated, the packet returns `next_start_line`. Continue
-with `readSkillContent`; do not call `retrieveSkillContext` again just to continue the
-same file.
-
-## Reading referenced resources
-
-```json
-{
-  "skill_id": "api-review",
-  "path": "docs/openapi.md",
-  "start_line": 1,
-  "max_lines": 300
-}
-```
-
-The response includes:
-
-```text
-start_line
-end_line
-total_lines
-content
-content_hash
-truncated
-next_start_line
-```
-
-Paths are constrained to the selected Skill root. Absolute paths and traversal such as
-`../README.md` are rejected.
-
-A single line longer than the normal character budget is returned intact rather than
-silently losing the remainder of that line.
-
-## Search fallback
-
-Use `searchSkillDocs` only when the selected `SKILL.md` does not identify an exact
-resource path:
-
-```json
-{
-  "skill_id": "api-review",
-  "query": "breaking change schema compatibility",
-  "paths": null,
-  "limit": 5
-}
-```
-
-Search uses SQLite FTS5 over section-level chunks and boosts exact symbols, path terms,
-and headings. Search is scoped to one explicit `skill_id`.
+自用本地重放需要原值时可显式使用 `credential_mode=full`。
 
 ## Configuration
 
-Copy `.env.example` to `.env`:
+复制 `.env.example` 到 `.env`。
+
+最小浏览器配置：
 
 ```dotenv
-SKILL_TEMPLE_SERVER_URL=https://skills.example.com
-SKILL_TEMPLE_SKILLS_DIR=C:/path/to/project/skills
+WEB_REV_BROWSER_CDP_URL=http://127.0.0.1:9222
+WEB_REV_WORKSPACE_DIR=C:/path/to/web_rev_action/data/analysis-workspace
+WEB_REV_PLAYWRIGHT_CLI=playwright-cli
+WEB_REV_JS_REVERSE_COMMAND=js-reverse-mcp
+```
+
+默认情况下，后端自动用以下参数启动私有 MCP：
+
+```text
+--browserUrl <WEB_REV_BROWSER_CDP_URL>
+--allowedRoots <WEB_REV_WORKSPACE_DIR>
+--streamArtifactRoot 0
+```
+
+需要自定义完整参数时：
+
+```dotenv
+WEB_REV_JS_REVERSE_ARGS=["--browserUrl","http://127.0.0.1:9222","--allowedRoots","C:/workspace","--streamArtifactRoot","0"]
+```
+
+`WEB_REV_JS_REVERSE_ARGS` 必须是 JSON 字符串数组。
+
+Skill 与 Action 服务配置：
+
+```dotenv
+SKILL_TEMPLE_SERVER_URL=https://example.com
+SKILL_TEMPLE_SKILLS_DIR=C:/path/to/skills
 SKILL_TEMPLE_BEARER_TOKEN=replace-with-a-long-random-secret
 ```
 
-`SKILL_TEMPLE_SKILLS_DIR` lookup order:
-
-1. explicit `create_app(skills_dir=...)` or `SkillRuntime(path)` argument;
-2. environment variable;
-3. `.env` in the current working directory;
-4. local `./skills` directory;
-5. packaged example Skills.
-
-When `SKILL_TEMPLE_BEARER_TOKEN` is set, `/v1/*` and `/console/retrieve` require:
+配置了 Bearer token 后，所有 `/v1/*` 路由需要：
 
 ```text
 Authorization: Bearer <token>
 ```
 
-`/openapi.json`, `/health`, and `/console` remain public so the schema can be imported
-and the debug console can load.
+## Install
 
-## Install and run
+要求：
+
+- Python 3.11+
+- Node.js 18+
+- 可用的 `playwright-cli`
+- 当前 stream PR 版本的 `js-reverse-mcp`
+- 已开启 remote debugging 的 Chrome/Edge
+
+安装：
 
 ```powershell
 py -3 -m pip install -e .[dev]
-skill-temple --host 127.0.0.1 --port 8765
 ```
 
-With a custom Skill directory:
+启动：
 
 ```powershell
-skill-temple --skills-dir C:/path/to/project/skills --host 127.0.0.1 --port 8765
+web-rev-action --host 127.0.0.1 --port 8765
 ```
 
-OpenAPI:
+兼容命令 `skill-temple` 仍保留。
+
+OpenAPI：
 
 ```text
 http://127.0.0.1:8765/openapi.json
 ```
 
-Health:
+## Example
 
-```text
-http://127.0.0.1:8765/health
+打开 session：
+
+```json
+{
+  "operation": "open_session",
+  "payload": {
+    "session_id": "chatgpt_research",
+    "target": {
+      "start_url": "https://example.com/app"
+    }
+  }
+}
 ```
 
-Debug console:
+运行实验：
 
-```text
-http://127.0.0.1:8765/console
+```json
+{
+  "operation": "capture_flow",
+  "payload": {
+    "session_id": "chatgpt_research",
+    "objective": "capture the first conversation request and stream",
+    "target": {
+      "expected_url_contains": "/app"
+    },
+    "primary_request": {
+      "url_contains": "/conversation",
+      "method": "POST",
+      "resource_types": ["fetch"],
+      "expected_min_matches": 1,
+      "expected_max_matches": 1,
+      "allow_supporting_failures": true,
+      "include_in_flight": false
+    },
+    "flow": [
+      {
+        "step_id": "fill_message",
+        "action": "fill",
+        "locator": {"placeholder": "Message"},
+        "value": "hello"
+      },
+      {
+        "step_id": "send",
+        "action": "click",
+        "locator": {"role": "button", "name": "Send"}
+      }
+    ],
+    "wait_for": {
+      "type": "default_done_marker",
+      "request_matcher": {
+        "url_contains": "/conversation",
+        "method": "POST"
+      }
+    },
+    "deadline_ms": 42000
+  }
+}
 ```
-
-## Add project-specific Actions
-
-Keep the Skill runtime generic and register project-specific Actions in a separate
-module:
-
-```python
-from fastapi import FastAPI
-
-
-def register_project_actions(app: FastAPI) -> None:
-    @app.post(
-        "/v1/project/read",
-        operation_id="readProjectData",
-        openapi_extra={"x-openai-isConsequential": False},
-    )
-    def read_project_data(request: ProjectRequest) -> dict[str, object]:
-        return {"result": "..."}
-```
-
-Then call `register_project_actions(app)` near the end of `create_app()`.
-
-Do not put project-specific tool rules into the global Skill runtime. Put domain behavior
-inside the selected `SKILL.md` and keep operationId names aligned with the project's
-OpenAPI schema.
 
 ## Validation
 
 ```powershell
-py -3 -m ruff check .
-py -3 -m pytest
-py -3 -m skill_temple.evals evals/skill_queries.jsonl
+python -m ruff check .
+python -m pytest
+python -m skill_temple.evals evals/skill_queries.jsonl
 ```
 
-The test suite covers:
+阶段 1/2 测试覆盖：
 
-- `SKILL.md`-only discovery;
-- exact hints and `$skill` / `@skill` mentions;
-- no server-side semantic routing;
-- bounded catalog and instruction responses;
-- multi-Skill explicit selection;
-- unknown mentions;
-- continuation and path safety;
-- OpenAPI operation/schema stability;
-- optional Bearer authentication;
-- deterministic search/eval behavior.
+- OpenAPI 的两个 Browser Action 和 `oneOf` schema。
+- consequential 属性。
+- page alignment。
+- `stream start → flow → wait → stop` 顺序。
+- 失败时仍 finalize。
+- baseline 默认模型。
+- primary/supporting integrity。
+- Stop cancellation correlation。
+- experiment namespace。
+- include-in-flight 传递。
+- screenshot/Trace/manifest artifact。
+- credential 默认脱敏。
+- 私有 MCP stream primitive 调用。
+- 同一 CDP endpoint 和 workspace 启动参数。
 
-## Packaged example
+## Next stages
 
-The repository includes an `idapython` Skill only as a realistic progressive-disclosure
-example:
+尚未实现：
 
-```text
-src/skill_temple/example_skills/idapython/
-  SKILL.md
-  docs/
-    idautils.md
-    ida_hexrays.md
-```
+- `trace_request` 和 XHR/fetch breakpoint orchestration。
+- capture diff。
+- browser-context replay。
+- external HTTP replay。
+- Worker/Service Worker Target auto-attach。
+- Pandora 实际站点实验和协议报告生成。
 
-It does not add IDA Actions to this template. Replace it with the Skills for your own
-project or point `SKILL_TEMPLE_SKILLS_DIR` at another directory.
+详细路线见 `PLAN.md`，分析方法见 `PANDORA_REPRODUCTION.md`。

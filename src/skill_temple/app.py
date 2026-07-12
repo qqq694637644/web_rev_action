@@ -22,6 +22,8 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from .browser_routes import register_browser_actions
+from .browser_service import BrowserActionService, build_browser_service_from_environment
 from .runtime import (
     DEFAULT_MAX_SKILLS,
     SkillNotFoundError,
@@ -252,7 +254,11 @@ def _add_bearer_auth_security(schema: dict[str, Any]) -> dict[str, Any]:
     return schema
 
 
-def create_app(skills_dir: str | Path | None = None, server_url: str | None = None) -> FastAPI:
+def create_app(
+    skills_dir: str | Path | None = None,
+    server_url: str | None = None,
+    browser_service: BrowserActionService | None = None,
+) -> FastAPI:
     runtime = load_runtime(skills_dir)
     configured_server_url = _normalize_server_url(
         server_url or env_value_from_environment_or_dotenv("SKILL_TEMPLE_SERVER_URL")
@@ -262,12 +268,11 @@ def create_app(skills_dir: str | Path | None = None, server_url: str | None = No
     )
 
     app = FastAPI(
-        title="Skill Temple Gateway",
-        version="0.2.0",
+        title="Web Reverse Action Gateway",
+        version="0.3.0",
         description=(
-            "Codex-style model-driven skill selection adapted to Custom GPT Actions. "
-            "The model chooses from a bounded catalog, then the gateway loads explicit "
-            "SKILL.md entrypoints and supports progressive disclosure."
+            "Codex-style Skill retrieval plus two browser-analysis Actions. Browser experiments "
+            "atomically coordinate playwright-cli, private js-reverse-mcp, and workspace evidence."
         ),
         openapi_url=None,
         servers=([{"url": configured_server_url}] if configured_server_url else None),
@@ -439,6 +444,13 @@ def create_app(skills_dir: str | Path | None = None, server_url: str | None = No
             detail = structured_error("unsafe_or_missing_path", str(exc), "check_path")
             raise HTTPException(status_code=404, detail=detail) from exc
 
+    resolved_browser_service = browser_service or build_browser_service_from_environment()
+    register_browser_actions(app, resolved_browser_service)
+
+    async def close_browser_service() -> None:
+        await resolved_browser_service.close()
+
+    app.router.add_event_handler("shutdown", close_browser_service)
     return app
 
 
