@@ -30,7 +30,15 @@ class ToolchainValidationHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         path = urlsplit(self.path).path
         if path == "/":
-            self._send_file(self.fixture_root / "index.html", "text/html; charset=utf-8")
+            self._send_file(
+                self.fixture_root / "index.html",
+                "text/html; charset=utf-8",
+                extra_headers={
+                    "Set-Cookie": (
+                        "pandora_session=fixture-session; Path=/; HttpOnly; SameSite=Lax"
+                    )
+                },
+            )
             return
         if path == "/app.js":
             self._send_file(self.fixture_root / "app.js", "text/javascript; charset=utf-8")
@@ -65,6 +73,9 @@ class ToolchainValidationHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         path = urlsplit(self.path).path
+        if path == "/api/pandora/conversation":
+            self._handle_pandora_conversation()
+            return
         if path != "/api/echo":
             self.send_error(HTTPStatus.NOT_FOUND)
             return
@@ -85,15 +96,84 @@ class ToolchainValidationHandler(BaseHTTPRequestHandler):
             }
         )
 
+    def _handle_pandora_conversation(self) -> None:
+        cookie = self.headers.get("Cookie", "")
+        authorization = self.headers.get("Authorization", "")
+        if (
+            "pandora_session=fixture-session" not in cookie
+            and authorization != "Bearer fixture-token"
+        ):
+            self._send_json(
+                {"ok": False, "error": "authentication-required"},
+                HTTPStatus.UNAUTHORIZED,
+            )
+            return
+        content_length = int(self.headers.get("Content-Length", "0"))
+        raw_body = self.rfile.read(content_length)
+        try:
+            payload = json.loads(raw_body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._send_json(
+                {"ok": False, "error": "invalid-json"},
+                HTTPStatus.BAD_REQUEST,
+            )
+            return
+        message = payload.get("message") if isinstance(payload, dict) else None
+        required = {
+            "conversation_id": payload.get("conversation_id")
+            if isinstance(payload, dict)
+            else None,
+            "model": payload.get("model") if isinstance(payload, dict) else None,
+            "message.id": message.get("id") if isinstance(message, dict) else None,
+            "message.parent_id": (
+                message.get("parent_id") if isinstance(message, dict) else None
+            ),
+            "message.content": (
+                message.get("content") if isinstance(message, dict) else None
+            ),
+        }
+        missing = [name for name, value in required.items() if not value]
+        if missing:
+            self._send_json(
+                {
+                    "ok": False,
+                    "error": "missing-required-fields",
+                    "missing": missing,
+                },
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+            )
+            return
+        self._send_json(
+            {
+                "ok": True,
+                "conversation_id": payload["conversation_id"],
+                "accepted_message_id": message["id"],
+                "parent_message_id": message["parent_id"],
+                "assistant_message_id": f"assistant-{message['id']}",
+                "current_node": f"assistant-{message['id']}",
+                "model": payload["model"],
+                "optional_timezone_seen": "timezone" in payload,
+                "tracking_seen": "tracking_id" in payload,
+            }
+        )
+
     def log_message(self, format: str, *args: object) -> None:
         return
 
-    def _send_file(self, path: Path, content_type: str) -> None:
+    def _send_file(
+        self,
+        path: Path,
+        content_type: str,
+        *,
+        extra_headers: dict[str, str] | None = None,
+    ) -> None:
         body = path.read_bytes()
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
         self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)

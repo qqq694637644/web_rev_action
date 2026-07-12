@@ -8,6 +8,36 @@ function stage0RequestBuilder() {
   };
 }
 
+function buildPandoraConversationRequest() {
+  return {
+    conversation_id: "conversation-fixture",
+    model: "fixture-model",
+    message: {
+      id: "user-message-1",
+      parent_id: "root-message",
+      content: "hello fixture",
+    },
+    timezone: "UTC",
+    tracking_id: "tracking-only-value",
+  };
+}
+
+async function sendPandoraConversation() {
+  const response = await fetch("/api/pandora/conversation", {
+    method: "POST",
+    headers: {
+      "Authorization": "Bearer fixture-token",
+      "Content-Type": "application/json",
+    },
+    credentials: "include",
+    body: JSON.stringify(buildPandoraConversationRequest()),
+  });
+  const payload = await response.json();
+  document.querySelector("#result").textContent = JSON.stringify(payload, null, 2);
+  document.querySelector("#status").textContent = `pandora-${response.status}`;
+  return payload;
+}
+
 async function sendEcho() {
   const response = await fetch("/api/echo", {
     method: "POST",
@@ -58,3 +88,4 @@ async function runCapture() {
 
 document.querySelector("#run-capture").addEventListener("click", runCapture);
 document.querySelector("#send-echo").addEventListener("click", sendEcho);
+document.querySelector("#send-pandora").addEventListener("click", sendPandoraConversation);

@@ -62,6 +62,7 @@ class WorkspaceReadFilesRequest(WorkspaceModel):
     max_bytes_per_file: int | None = Field(default=None, ge=1, le=4_000_000)
     max_bytes: int | None = Field(default=None, ge=1_024, le=8_000_000)
     include_sha256: bool = True
+    include_credentials: bool = False
 
 
 class WorkspaceReadFilesResponse(WorkspaceModel):
@@ -86,6 +87,7 @@ class WorkspaceSearchRequest(WorkspaceModel):
     context_lines: int = Field(default=2, ge=0, le=20)
     max_matches: int = Field(default=100, ge=1, le=1_000)
     max_bytes: int | None = Field(default=None, ge=1_024, le=8_000_000)
+    include_credentials: bool = False
 
 
 class WorkspaceSearchResponse(WorkspaceModel):
@@ -109,6 +111,7 @@ class WorkspaceInspectRequest(WorkspaceModel):
     max_bytes_per_file: int | None = Field(default=None, ge=1, le=4_000_000)
     max_bytes: int | None = Field(default=None, ge=1_024, le=8_000_000)
     include_sha256: bool = False
+    include_credentials: bool = False
 
 
 class WorkspaceInspectSearchResult(WorkspaceModel):

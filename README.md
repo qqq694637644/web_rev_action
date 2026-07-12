@@ -77,6 +77,21 @@ web_rev_action
 
 ## Browser Actions
 
+协议复刻采用三层职责：
+
+```text
+Skill
+  决定六组实验、单变量 mutation、证据解释和报告完成标准
+
+Browser Actions
+  原子执行 capture、browser-context replay、取消和受控查询
+
+Analysis workspace
+  保存 evidence_id、artifact 和派生报告
+```
+
+内置 `pandora-protocol-reproduction` Skill 不直接执行 fetch，也不读取凭据后自行拼请求；它只调用结构化 Action。
+
 ### `runBrowserExperiment`
 
 支持：
@@ -85,6 +100,7 @@ web_rev_action
 open_session
 capture_baseline
 capture_flow
+replay_request
 close_session
 cancel_experiment
 ```
@@ -103,6 +119,20 @@ cancel_experiment
 ```
 
 GPT 不直接协调 start、click、wait、stop。
+
+一次 `replay_request` 同样由后端原子执行：
+
+```text
+验证 source_experiment_id + source_evidence_id
+→ 本地读取 exact network snapshot
+→ 应用结构化 header/query/JSON mutation
+→ 启动新 experiment 和 capture/checkpoint
+→ 在当前页面上下文执行 fetch(credentials=include)
+→ 导出新 network/page/console evidence
+→ 保存 request diff 与 response artifact
+```
+
+公开 payload 不接受任意本地路径，也不返回 Cookie、Authorization 或 CSRF。普通 JSON replay 默认不要求 SSE raw capture；流式 replay 可显式开启 stream requirements。
 
 Capture 阶段禁止 `target.start_url`。需要观察页面初始化请求、重定向、首屏脚本或初始 SSE 时，必须把导航写成 flow 的第一个显式 `navigate` step。这样 running manifest、Trace 和 stream collector 都会在导航前创建。
 
@@ -125,6 +155,12 @@ get_session
 list_experiments
 get_experiment
 get_stream_status
+list_evidence
+get_network_evidence
+get_request_initiator
+search_scripts
+get_script_source
+list_console_errors
 ```
 
 公开 `get_stream_status` 使用：
@@ -139,6 +175,14 @@ capture_uuid (optional)
 需要查看 `manifest.json`、`events.jsonl`、源码、schema、脚本或报告时，使用 workspace Actions。
 
 执行 endpoint 和 `get_experiment` 只返回有界实验摘要及 `manifest_relative_path`。完整 manifest、network summary、requests 和 artifact 索引通过 `workspaceReadFiles` 读取。
+
+核心结论使用稳定引用：
+
+```text
+experiment_id + evidence_id + artifact_id
+```
+
+`capture_flow.network_evidence` 在第一条页面 mutation 前记录 reqid high-water mark，finalize 时只选择本 experiment 窗口中的请求，并在 MCP generation 仍有效时导出 exact headers/body/initiator。`series` 字段保存 analysis series、scenario、predecessor、sequence 和 conversation key。
 
 Stream 和普通 network status 都会读取全部分页，并在执行 event predicate 前锁定具体 primary request ID；`matchedRequestId` 不属于该 request 时不会满足等待。同一 session 重复提交返回 `409 session_busy`，其他 browser operation 返回 `409 browser_busy`。Protected workspace mutation 与 browser operation 通过同一 RuntimeCoordinator 双向互斥，避免 TOCTOU。
 
@@ -410,8 +454,15 @@ data/analysis-workspace/
       manifest.json
       playwright/
         screenshots/
+        snapshots/
         traces/
       js-reverse/
+        network/
+          ev_<experiment>_network_request_<selector>_<reqid>/
+            all.json
+            initiator.json
+        console/
+          console.jsonl
         capture-<uuid>/
           capture.json
           request-0001/
@@ -425,6 +476,10 @@ data/analysis-workspace/
             request-body.txt
             response-headers.json
             initiator.json
+      replay/
+        request-spec.json
+        request-diff.json
+        response.json
   schemas/
   scripts/
   reports/
@@ -437,7 +492,7 @@ data/analysis-workspace/
 
 完整 headers 可能包含 Cookie、Authorization、CSRF 和 Set-Cookie。上游同时生成完整文件和 redacted 文件。
 
-这是单用户本地工具，因此 workspace 工具不会再创建一套 `credential_mode` API。GPT 应默认读取 `*.redacted.json`；只有本地重放明确需要时才读取完整文件，并且不要把真实凭据复制到自然语言回复。
+Workspace inspect/search/read 通过统一 `include_credentials` 开关执行默认隔离：默认值为 `false`，manifest 标记为 `credential` 或 `containsCredentials=true` 的 artifact 不返回正文。只有显式 `include_credentials=true` 才允许本机专家读取。`replay_request` 由后端直接使用 exact artifact，不需要把凭据送进 GPT 上下文，也不得把真实凭据复制到自然语言回复、diff 或生成脚本。
 
 ## Configuration
 

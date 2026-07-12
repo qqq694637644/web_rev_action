@@ -32,6 +32,7 @@ from skill_temple.browser_models import (
     CaptureFlowRequest,
     CloseSessionRequest,
     OpenSessionRequest,
+    ReplayRequestRequest,
 )
 from skill_temple.browser_service import BrowserActionService, ExperimentStore
 from skill_temple.workspace_models import (
@@ -45,9 +46,13 @@ SESSION_ID = "browser-action-windows-smoke"
 
 
 def artifact_by_kind(manifest: dict[str, Any], *kinds: str) -> dict[str, Any]:
-    for item in manifest.get("artifacts", []):
-        if isinstance(item, dict) and item.get("kind") in kinds:
-            return item
+    artifacts = [
+        item for item in manifest.get("artifacts", []) if isinstance(item, dict)
+    ]
+    for kind in kinds:
+        for item in artifacts:
+            if item.get("kind") == kind:
+                return item
     raise AssertionError(f"Missing artifact kinds {kinds}: {manifest.get('artifacts')}")
 
 
@@ -56,6 +61,28 @@ def relative_path(descriptor: dict[str, Any]) -> str:
     if not isinstance(value, str):
         raise AssertionError(f"Artifact has no relative path: {descriptor}")
     return value
+
+
+def find_numeric_status(value: Any) -> int | None:
+    if isinstance(value, dict):
+        status = value.get("status")
+        if isinstance(status, int):
+            return status
+        for child in value.values():
+            found = find_numeric_status(child)
+            if found is not None:
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = find_numeric_status(child)
+            if found is not None:
+                return found
+    elif isinstance(value, str):
+        try:
+            return find_numeric_status(json.loads(value))
+        except json.JSONDecodeError:
+            return None
+    return None
 
 
 def process_matches(patterns: list[str], excluded_pid: int) -> list[str]:
@@ -224,7 +251,8 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
                         "stream": True,
                         "trace": True,
                         "screenshots": True,
-                        "scripts": False,
+                        "page_snapshots": True,
+                        "console_errors": True,
                     },
                 },
             )
@@ -256,7 +284,6 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
         headers = artifact_by_kind(
             manifest,
             "request_headers_redacted",
-            "request_headers",
         )
         raw_relative = relative_path(raw)
         events_relative = relative_path(events)
@@ -319,6 +346,201 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
         if f"sha256={expected_sha}" not in binary.stdout:
             raise AssertionError(binary.stdout)
 
+        pandora_capture = await service.run(
+            CaptureFlowRequest(
+                operation="capture_flow",
+                payload={
+                    "session_id": SESSION_ID,
+                    "objective": "capture one authenticated Pandora-like request",
+                    "primary_request": {
+                        "url_contains": "/api/pandora/conversation",
+                        "method": "POST",
+                        "resource_types": ["fetch"],
+                        "expected_min_matches": 1,
+                        "expected_max_matches": 1,
+                        "allow_supporting_failures": True,
+                        "include_in_flight": False,
+                    },
+                    "flow": [
+                        {
+                            "step_id": "send_pandora_request",
+                            "action": "click",
+                            "locator": {"css": "#send-pandora"},
+                            "timeout_ms": 10_000,
+                        },
+                        {
+                            "step_id": "wait_pandora_200",
+                            "action": "wait",
+                            "condition": {
+                                "type": "selector_visible",
+                                "locator": {"text": "pandora-200"},
+                                "timeout_ms": 10_000,
+                            },
+                        },
+                    ],
+                    "execution_mode": "sync",
+                    "deadline_ms": 30_000,
+                    "capture": {
+                        "network": True,
+                        "stream": False,
+                        "trace": False,
+                        "screenshots": False,
+                        "page_snapshots": True,
+                        "console_errors": True,
+                    },
+                    "requirements": {
+                        "require_raw_capture": False,
+                        "require_semantic_parse": False,
+                        "require_request_snapshot": True,
+                        "require_artifacts": True,
+                    },
+                    "network_evidence": [
+                        {
+                            "selector_id": "pandora_conversation",
+                            "matcher": {
+                                "url_contains": "/api/pandora/conversation",
+                                "method": "POST",
+                                "resource_types": ["fetch"],
+                            },
+                            "max_matches": 1,
+                            "export_parts": ["all"],
+                            "include_initiator": True,
+                        }
+                    ],
+                    "series": {
+                        "analysis_series_id": "pandora-fixture-series",
+                        "scenario_type": "first_message",
+                        "sequence_index": 1,
+                        "conversation_key": "conversation-fixture",
+                    },
+                },
+            )
+        )
+        if pandora_capture.status != "completed":
+            raise AssertionError(pandora_capture.model_dump())
+        pandora_manifest_path = (
+            evidence_root
+            / "experiments"
+            / str(pandora_capture.experiment_id)
+            / "manifest.json"
+        )
+        pandora_manifest = json.loads(
+            pandora_manifest_path.read_text(encoding="utf-8")
+        )
+        source_evidence = next(
+            item
+            for item in pandora_manifest.get("evidence", [])
+            if item.get("kind") == "network_request"
+            and item.get("selector_id") == "pandora_conversation"
+        )
+        if source_evidence.get("request_ids", {}).get("reqid") in {
+            None,
+            0,
+        }:
+            raise AssertionError(source_evidence)
+        public_evidence = json.dumps(source_evidence, ensure_ascii=False)
+        if "fixture-token" in public_evidence or "fixture-session" in public_evidence:
+            raise AssertionError("Public evidence leaked fixture credentials")
+
+        async def run_replay(
+            *,
+            scenario_type: str,
+            sequence_index: int,
+            mutation: dict[str, Any],
+        ) -> tuple[dict[str, Any], int]:
+            replay = await service.run(
+                ReplayRequestRequest(
+                    operation="replay_request",
+                    payload={
+                        "session_id": SESSION_ID,
+                        "objective": f"Pandora-like replay: {scenario_type}",
+                        "source_experiment_id": pandora_capture.experiment_id,
+                        "source_evidence_id": source_evidence["evidence_id"],
+                        "mutations": [mutation],
+                        "execution_mode": "sync",
+                        "deadline_ms": 20_000,
+                        "capture": {
+                            "network": True,
+                            "stream": False,
+                            "trace": False,
+                            "screenshots": False,
+                            "page_snapshots": True,
+                            "console_errors": True,
+                        },
+                        "series": {
+                            "analysis_series_id": "pandora-fixture-series",
+                            "scenario_type": scenario_type,
+                            "predecessor_experiment_id": pandora_capture.experiment_id,
+                            "sequence_index": sequence_index,
+                            "conversation_key": "conversation-fixture",
+                        },
+                    },
+                )
+            )
+            if replay.status != "completed":
+                raise AssertionError(replay.model_dump())
+            replay_manifest = json.loads(
+                (
+                    evidence_root
+                    / "experiments"
+                    / str(replay.experiment_id)
+                    / "manifest.json"
+                ).read_text(encoding="utf-8")
+            )
+            response_artifact = artifact_by_kind(
+                replay_manifest,
+                "replay_response",
+            )
+            response_value = json.loads(
+                (evidence_root / relative_path(response_artifact)).read_text(
+                    encoding="utf-8"
+                )
+            )
+            response_status = find_numeric_status(response_value)
+            if response_status is None:
+                raise AssertionError(response_value)
+            return replay_manifest, response_status
+
+        tracking_manifest, tracking_status = await run_replay(
+            scenario_type="remove_tracking_field",
+            sequence_index=2,
+            mutation={
+                "type": "remove_json_path",
+                "path": "$.tracking_id",
+            },
+        )
+        if tracking_status != 200:
+            raise AssertionError(tracking_manifest)
+        required_manifest, required_status = await run_replay(
+            scenario_type="remove_required_parent",
+            sequence_index=3,
+            mutation={
+                "type": "remove_json_path",
+                "path": "$.message.parent_id",
+            },
+        )
+        if required_status != 422:
+            raise AssertionError(required_manifest)
+        for replay_manifest in [tracking_manifest, required_manifest]:
+            replay_attempt = next(
+                item
+                for item in replay_manifest.get("evidence", [])
+                if item.get("kind") == "replay_attempt"
+            )
+            if replay_attempt.get("source_evidence_id") != source_evidence.get(
+                "evidence_id"
+            ):
+                raise AssertionError(replay_attempt)
+            diff_artifact = artifact_by_kind(
+                replay_manifest,
+                "replay_request_diff",
+            )
+            diff_text = (
+                evidence_root / relative_path(diff_artifact)
+            ).read_text(encoding="utf-8")
+            if "fixture-token" in diff_text or "fixture-session" in diff_text:
+                raise AssertionError("Replay diff leaked fixture credentials")
+
         cancellation_started = await service.run(
             CaptureFlowRequest(
                 operation="capture_flow",
@@ -349,7 +571,8 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
                         "stream": True,
                         "trace": True,
                         "screenshots": False,
-                        "scripts": False,
+                        "page_snapshots": False,
+                        "console_errors": False,
                     },
                 },
             )
@@ -433,6 +656,10 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
             ),
             "collector_stopped": health.get("collector_stopped"),
             "sequential_request_ids": matched_ids[-2:],
+            "pandora_source_experiment_id": pandora_capture.experiment_id,
+            "pandora_source_evidence_id": source_evidence["evidence_id"],
+            "pandora_tracking_replay_status": tracking_status,
+            "pandora_required_replay_status": required_status,
             "cancellation_status": cancellation_manifest.get("status"),
             "cancellation_step_status": cancellation_steps[0].get("status"),
             "cancellation_collector_cleanup": cancellation_health.get(

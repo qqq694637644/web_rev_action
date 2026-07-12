@@ -144,6 +144,19 @@ class FakePlaywright:
         screenshot.write_bytes(b"png")
         return screenshot.as_posix()
 
+    async def capture_snapshot(
+        self,
+        session_ref: str,
+        experiment_dir: Path,
+        name: str,
+        deadline: Deadline,
+    ) -> str:
+        self.events.append(f"playwright.snapshot:{name}")
+        snapshot = experiment_dir / "playwright" / "snapshots" / f"{name}.yaml"
+        snapshot.parent.mkdir(parents=True, exist_ok=True)
+        snapshot.write_text("- button: Send\n", encoding="utf-8")
+        return snapshot.as_posix()
+
     async def close_session(self, session_ref: str, deadline: Deadline) -> None:
         self.events.append("playwright.close")
 
@@ -181,6 +194,13 @@ class FakeJsReverse:
         self.status_payload: dict[str, Any] = {}
         self.aligned_page_ids: list[str | None] = []
         self.alignment_calls = 0
+        self.network_calls = 0
+        self.console_calls = 0
+        self.replay_executed = False
+
+    @property
+    def transport_generation(self) -> int:
+        return 1
 
     async def align_page(
         self,
@@ -362,7 +382,194 @@ class FakeJsReverse:
         self, matcher: RequestMatcher, deadline: Deadline
     ) -> dict[str, Any]:
         self.events.append("js.network")
-        return {"requests": self.status_payload.get("requests", [])}
+        self.network_calls += 1
+        requests = [
+            {
+                "reqid": 1,
+                "url": "https://example.test/preexisting",
+                "method": "GET",
+                "resourceType": "fetch",
+                "status": "[success - 200]",
+                "pending": False,
+            }
+        ]
+        if self.network_calls > 1:
+            requests.append(
+                {
+                    "reqid": 2,
+                    "url": "https://example.test/conversation",
+                    "method": "POST",
+                    "resourceType": "fetch",
+                    "status": "[success - 200]",
+                    "pending": False,
+                }
+            )
+        if self.replay_executed:
+            requests.append(
+                {
+                    "reqid": 3,
+                    "url": "https://example.test/conversation",
+                    "method": "POST",
+                    "resourceType": "fetch",
+                    "status": "[success - 200]",
+                    "pending": False,
+                }
+            )
+        return {"requests": requests}
+
+    async def export_network_request(
+        self,
+        reqid: int,
+        output_file: Path,
+        output_part: str,
+        deadline: Deadline,
+    ) -> dict[str, Any]:
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        snapshot = {
+            "url": "https://example.test/conversation?tracking=abc",
+            "method": "POST",
+            "resourceType": "fetch",
+            "status": 200,
+            "statusText": "OK",
+            "requestHeadersArray": [
+                {"name": "authorization", "value": "Bearer secret"},
+                {"name": "content-type", "value": "application/json"},
+                {"name": "cookie", "value": "session=secret"},
+            ],
+            "responseHeadersArray": [
+                {"name": "content-type", "value": "application/json"}
+            ],
+            "requestBody": {
+                "available": True,
+                "size": 52,
+                "encoding": "utf8",
+                "text": json.dumps(
+                    {
+                        "required": "yes",
+                        "optional": "keep",
+                        "tracking": "abc",
+                    }
+                ),
+            },
+            "responseBody": {
+                "available": True,
+                "size": 11,
+                "encoding": "utf8",
+                "text": "{\"ok\":true}",
+            },
+            "observedAt": int(time.time() * 1000),
+        }
+        if output_part == "all":
+            output_file.write_text(json.dumps(snapshot), encoding="utf-8")
+        elif output_part in {"requestBody", "responseBody"}:
+            key = output_part
+            output_file.write_bytes(snapshot[key]["text"].encode("utf-8"))
+        else:
+            output_file.write_text(json.dumps(snapshot), encoding="utf-8")
+        return {"filename": output_file.as_posix(), "byteLength": output_file.stat().st_size}
+
+    async def get_request_initiator(
+        self, reqid: int, deadline: Deadline
+    ) -> dict[str, Any]:
+        return {
+            "requestId": reqid,
+            "initiator": {
+                "type": "script",
+                "stack": {"callFrames": [{"url": "https://example.test/app.js", "lineNumber": 12}]},
+            },
+        }
+
+    async def search_scripts(
+        self,
+        query: str,
+        deadline: Deadline,
+        *,
+        url_filter: str | None = None,
+        max_results: int = 30,
+        exclude_minified: bool = False,
+    ) -> dict[str, Any]:
+        return {
+            "query": query,
+            "totalMatches": 1,
+            "matches": [
+                {
+                    "scriptId": "script-1",
+                    "url": "https://example.test/app.js",
+                    "lineNumber": 12,
+                    "lineContent": "buildConversationRequest(payload)",
+                }
+            ],
+        }
+
+    async def get_script_source(
+        self,
+        deadline: Deadline,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        return {"source": "function buildConversationRequest(payload) { return payload; }"}
+
+    async def list_console_messages(
+        self,
+        deadline: Deadline,
+        *,
+        types: list[str] | None = None,
+        include_preserved_messages: bool = False,
+    ) -> dict[str, Any]:
+        self.console_calls += 1
+        messages = [
+            {
+                "msgid": 1,
+                "type": "warn",
+                "text": "old warning",
+                "url": "https://example.test/app.js",
+            }
+        ]
+        if self.console_calls > 1:
+            messages.append(
+                {
+                    "msgid": 2,
+                    "type": "error",
+                    "text": "new error",
+                    "url": "https://example.test/app.js",
+                    "lineNumber": 20,
+                }
+            )
+        return {"messages": messages, "pagination": {"hasNextPage": False}}
+
+    async def trace_cookie_provenance(
+        self, cookie_name: str, deadline: Deadline
+    ) -> dict[str, Any]:
+        return {
+            "cookieName": cookie_name,
+            "cookieFlow": [{"reqid": 2, "setCookieValues": [f"{cookie_name}=secret"]}],
+        }
+
+    async def evaluate_browser_replay(
+        self,
+        spec_file: Path,
+        output_file: Path,
+        deadline: Deadline,
+    ) -> dict[str, Any]:
+        spec = json.loads(spec_file.read_text(encoding="utf-8"))
+        self.replay_executed = True
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        output_file.write_text(
+            json.dumps(
+                {
+                    "status": 200,
+                    "ok": True,
+                    "url": spec["url"],
+                    "bodyByteLength": 11,
+                    "bodyPreview": "{\"ok\":true}",
+                }
+            ),
+            encoding="utf-8",
+        )
+        return {
+            "filename": output_file.as_posix(),
+            "byteLength": output_file.stat().st_size,
+            "resultType": "object",
+        }
 
     async def wait_for_stream_condition(
         self,
@@ -551,7 +758,17 @@ class BrowserActionTests(unittest.TestCase):
         run_variants = str(run_schema)
         inspect_variants = str(inspect_schema)
         self.assertIn("CancelExperimentRequest", run_variants)
+        self.assertIn("ReplayRequestRequest", run_variants)
         self.assertIn("GetStreamStatusRequest", inspect_variants)
+        for variant in [
+            "ListEvidenceRequest",
+            "GetNetworkEvidenceRequest",
+            "GetRequestInitiatorRequest",
+            "SearchScriptsRequest",
+            "GetScriptSourceRequest",
+            "ListConsoleErrorsRequest",
+        ]:
+            self.assertIn(variant, inspect_variants)
         status_payload = schema["components"]["schemas"]["GetStreamStatusPayload"]
         self.assertIn("experiment_id", status_payload["properties"])
         self.assertIn("capture_uuid", status_payload["properties"])
@@ -3053,6 +3270,324 @@ class BrowserActionTests(unittest.TestCase):
                 ).read_text(encoding="utf-8")
             )
             self.assertEqual(manifest["collector_integrity"], "not_required")
+
+    def test_network_evidence_window_public_inspection_and_script_queries(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            client, _, _ = self.make_client(root, include_supporting_failure=False)
+            request = self.capture_request()
+            request["payload"]["network_evidence"] = [
+                {
+                    "selector_id": "conversation_submit",
+                    "matcher": {
+                        "url_contains": "/conversation",
+                        "method": "POST",
+                        "resource_types": ["fetch"],
+                    },
+                    "max_matches": 2,
+                    "export_parts": ["all"],
+                    "include_initiator": True,
+                }
+            ]
+            request["payload"]["series"] = {
+                "analysis_series_id": "series_one",
+                "scenario_type": "first_message",
+                "sequence_index": 1,
+                "conversation_key": "conversation-local",
+            }
+
+            with client:
+                self.open_session(client)
+                captured = client.post("/v1/browser/run", json=request)
+                self.assertEqual(captured.status_code, 200, captured.text)
+                experiment_id = captured.json()["experiment_id"]
+
+                listed = client.post(
+                    "/v1/browser/inspect",
+                    json={
+                        "operation": "list_evidence",
+                        "payload": {"experiment_id": experiment_id},
+                    },
+                )
+                self.assertEqual(listed.status_code, 200, listed.text)
+                network_evidence = next(
+                    item
+                    for item in listed.json()["result"]["evidence"]
+                    if item["kind"] == "network_request"
+                )
+                evidence_id_value = network_evidence["evidence_id"]
+
+                network = client.post(
+                    "/v1/browser/inspect",
+                    json={
+                        "operation": "get_network_evidence",
+                        "payload": {
+                            "experiment_id": experiment_id,
+                            "evidence_id": evidence_id_value,
+                        },
+                    },
+                )
+                initiator = client.post(
+                    "/v1/browser/inspect",
+                    json={
+                        "operation": "get_request_initiator",
+                        "payload": {
+                            "experiment_id": experiment_id,
+                            "evidence_id": evidence_id_value,
+                        },
+                    },
+                )
+                console = client.post(
+                    "/v1/browser/inspect",
+                    json={
+                        "operation": "list_console_errors",
+                        "payload": {"experiment_id": experiment_id},
+                    },
+                )
+                scripts = client.post(
+                    "/v1/browser/inspect",
+                    json={
+                        "operation": "search_scripts",
+                        "payload": {
+                            "session_id": "session_one",
+                            "query": "buildConversationRequest",
+                        },
+                    },
+                )
+                source = client.post(
+                    "/v1/browser/inspect",
+                    json={
+                        "operation": "get_script_source",
+                        "payload": {
+                            "session_id": "session_one",
+                            "url": "https://example.test/app.js",
+                            "start_line": 10,
+                            "end_line": 20,
+                        },
+                    },
+                )
+
+            manifest = json.loads(
+                (root / "experiments" / experiment_id / "manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(manifest["network_checkpoint"]["max_reqid"], 1)
+            self.assertEqual(
+                [item["reqid"] for item in manifest["network_summary"]["requests"]],
+                [2],
+            )
+            self.assertEqual(network_evidence["request_ids"]["reqid"], 2)
+            self.assertNotIn("Bearer secret", json.dumps(network_evidence))
+            self.assertNotIn("session=secret", json.dumps(network_evidence))
+            headers = {
+                item["name"].lower(): item["value"]
+                for item in network_evidence["summary"]["request_headers"]
+            }
+            self.assertEqual(headers["authorization"], "<redacted>")
+            self.assertEqual(headers["cookie"], "<redacted>")
+            all_artifact_id = next(
+                item
+                for item in network_evidence["artifact_ids"]
+                if item.endswith("_all")
+            )
+            descriptor = next(
+                item
+                for item in manifest["artifacts"]
+                if item["artifactId"] == all_artifact_id
+            )
+            self.assertEqual(descriptor["sensitivity"], "credential")
+            self.assertTrue(descriptor["containsCredentials"])
+            self.assertEqual(network.status_code, 200, network.text)
+            self.assertNotIn("Bearer secret", network.text)
+            self.assertEqual(initiator.status_code, 200, initiator.text)
+            self.assertIn("app.js", initiator.text)
+            self.assertEqual(console.status_code, 200, console.text)
+            self.assertEqual(console.json()["result"]["count"], 1)
+            self.assertIn("new error", console.text)
+            self.assertEqual(scripts.status_code, 200, scripts.text)
+            self.assertIn("buildConversationRequest", scripts.text)
+            self.assertEqual(source.status_code, 200, source.text)
+            self.assertIn("function buildConversationRequest", source.text)
+            evidence_kinds = {item["kind"] for item in manifest["evidence"]}
+            self.assertIn("page_snapshot", evidence_kinds)
+            self.assertIn("console_message", evidence_kinds)
+
+    def test_browser_context_replay_uses_source_evidence_and_single_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            client, _, _ = self.make_client(root, include_supporting_failure=False)
+            capture = self.capture_request()
+            capture["payload"]["network_evidence"] = [
+                {
+                    "selector_id": "conversation_submit",
+                    "matcher": {
+                        "url_contains": "/conversation",
+                        "method": "POST",
+                    },
+                    "export_parts": ["all"],
+                }
+            ]
+            capture["payload"]["series"] = {
+                "analysis_series_id": "series_replay",
+                "scenario_type": "first_message",
+                "sequence_index": 1,
+            }
+            with client:
+                self.open_session(client)
+                source_response = client.post("/v1/browser/run", json=capture)
+                self.assertEqual(source_response.status_code, 200, source_response.text)
+                source_experiment_id = source_response.json()["experiment_id"]
+                source_manifest = json.loads(
+                    (
+                        root
+                        / "experiments"
+                        / source_experiment_id
+                        / "manifest.json"
+                    ).read_text(encoding="utf-8")
+                )
+                source_evidence = next(
+                    item
+                    for item in source_manifest["evidence"]
+                    if item["kind"] == "network_request"
+                )
+
+                replay = client.post(
+                    "/v1/browser/run",
+                    json={
+                        "operation": "replay_request",
+                        "payload": {
+                            "session_id": "session_one",
+                            "objective": "test whether tracking is required",
+                            "source_experiment_id": source_experiment_id,
+                            "source_evidence_id": source_evidence["evidence_id"],
+                            "mutations": [
+                                {
+                                    "type": "remove_json_path",
+                                    "path": "$.tracking",
+                                }
+                            ],
+                            "execution_mode": "sync",
+                            "deadline_ms": 10_000,
+                            "capture": {
+                                "network": True,
+                                "stream": False,
+                                "trace": False,
+                                "screenshots": False,
+                                "page_snapshots": False,
+                                "console_errors": False,
+                            },
+                            "series": {
+                                "analysis_series_id": "series_replay",
+                                "scenario_type": "field_replay",
+                                "predecessor_experiment_id": source_experiment_id,
+                                "sequence_index": 2,
+                            },
+                        },
+                    },
+                )
+            self.assertEqual(replay.status_code, 200, replay.text)
+            self.assertEqual(replay.json()["status"], "completed")
+            replay_experiment_id = replay.json()["experiment_id"]
+            replay_manifest = json.loads(
+                (
+                    root / "experiments" / replay_experiment_id / "manifest.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                replay_manifest["replay_source"]["source_experiment_id"],
+                source_experiment_id,
+            )
+            self.assertEqual(
+                replay_manifest["replay_source"]["source_evidence_id"],
+                source_evidence["evidence_id"],
+            )
+            self.assertEqual(replay_manifest["series"]["sequence_index"], 2)
+            self.assertEqual(replay_manifest["objective_integrity"], "complete")
+            self.assertEqual(
+                [item["reqid"] for item in replay_manifest["network_summary"]["requests"]],
+                [3],
+            )
+            replay_attempt = next(
+                item
+                for item in replay_manifest["evidence"]
+                if item["kind"] == "replay_attempt"
+            )
+            self.assertEqual(
+                replay_attempt["source_evidence_id"], source_evidence["evidence_id"]
+            )
+            replay_network = next(
+                item
+                for item in replay_manifest["evidence"]
+                if item["kind"] == "network_request"
+            )
+            self.assertEqual(replay_network["request_ids"]["reqid"], 3)
+            spec = json.loads(
+                (
+                    root
+                    / "experiments"
+                    / replay_experiment_id
+                    / "replay"
+                    / "request-spec.json"
+                ).read_text(encoding="utf-8")
+            )
+            body = json.loads(spec["body"]["text"])
+            header_names = {item["name"].lower() for item in spec["headers"]}
+            self.assertNotIn("tracking", body)
+            self.assertNotIn("cookie", header_names)
+            self.assertIn("authorization", header_names)
+            diff = (
+                root
+                / "experiments"
+                / replay_experiment_id
+                / "replay"
+                / "request-diff.json"
+            ).read_text(encoding="utf-8")
+            self.assertNotIn("Bearer secret", diff)
+            self.assertNotIn("session=secret", diff)
+
+    def test_stop_sequence_accepts_finished_or_timeout_observation(self) -> None:
+        for condition in [
+            {
+                "type": "network_finished",
+                "request_matcher": {"url_contains": "/conversation"},
+            },
+            {"type": "timeout", "timeout_ms": 1_000},
+        ]:
+            request = {
+                "operation": "capture_flow",
+                "payload": {
+                    "session_id": "session_one",
+                    "objective": "observe Stop without assuming cancel",
+                    "primary_request": {"expected_min_matches": 0},
+                    "flow": [
+                        {
+                            "step_id": "wait_started",
+                            "action": "wait",
+                            "condition": {
+                                "type": "first_event",
+                                "request_matcher": {
+                                    "url_contains": "/conversation"
+                                },
+                            },
+                        },
+                        {
+                            "step_id": "stop",
+                            "action": "click",
+                            "locator": {"css": "#stop"},
+                            "intent": "stop_generation",
+                        },
+                        {
+                            "step_id": "observe",
+                            "action": "wait",
+                            "condition": condition,
+                        },
+                    ],
+                },
+            }
+            with self.subTest(condition=condition["type"]):
+                parsed = CaptureFlowRequest.model_validate(request)
+                self.assertEqual(parsed.payload.flow[-1].condition.type, condition["type"])
 
     def test_action_experiment_summary_is_bounded(self) -> None:
         manifest = {

@@ -250,6 +250,7 @@ class AnalysisWorkspaceService:
             request.max_bytes, minimum=_MIN_STRUCTURED_RESPONSE_BYTES
         )
         async with self._lock:
+            credential_paths = self._credential_artifact_paths()
             tree, tree_truncated = self._tree_entries(
                 request.paths,
                 max_depth=request.max_depth,
@@ -265,6 +266,7 @@ class AnalysisWorkspaceService:
                         context_lines=request.context_lines,
                         max_matches=request.max_search_matches,
                         max_bytes=max_response_bytes,
+                        include_credentials=request.include_credentials,
                     )
                 )
                 searches.append(
@@ -287,6 +289,8 @@ class AnalysisWorkspaceService:
                     max_lines=request.max_file_lines,
                     max_bytes=max_file_bytes,
                     include_sha256=request.include_sha256,
+                    include_credentials=request.include_credentials,
+                    credential_paths=credential_paths,
                 )
                 for path, first_line in list(related.items())[: request.max_read_files]
             ]
@@ -315,6 +319,7 @@ class AnalysisWorkspaceService:
             request.max_bytes, minimum=_MIN_STRUCTURED_RESPONSE_BYTES
         )
         async with self._lock:
+            credential_paths = self._credential_artifact_paths()
             files = [
                 self._read_file_content(
                     path,
@@ -322,6 +327,8 @@ class AnalysisWorkspaceService:
                     max_lines=request.max_lines,
                     max_bytes=max_file_bytes,
                     include_sha256=request.include_sha256,
+                    include_credentials=request.include_credentials,
+                    credential_paths=credential_paths,
                 )
                 for path in request.paths
             ]
@@ -644,6 +651,7 @@ class AnalysisWorkspaceService:
                 500,
             )
         paths = self._normalize_existing_paths(request.paths)
+        credential_paths = self._credential_artifact_paths()
         args = [
             rg,
             "--json",
@@ -726,6 +734,8 @@ class AnalysisWorkspaceService:
             raw_path = ((data.get("path") or {}).get("text") or "").replace("\\", "/")
             if self._path_is_excluded(raw_path):
                 continue
+            if not request.include_credentials and raw_path in credential_paths:
+                continue
             line_number = int(data.get("line_number") or 0)
             line_text = str((data.get("lines") or {}).get("text") or "").rstrip("\r\n")
             submatches = data.get("submatches") or []
@@ -739,6 +749,8 @@ class AnalysisWorkspaceService:
                 max_lines=(request.context_lines * 2) + 1,
                 max_bytes=min(max_bytes, _SEARCH_SNIPPET_MAX_BYTES),
                 include_sha256=False,
+                include_credentials=request.include_credentials,
+                credential_paths=credential_paths,
             )
             truncated = truncated or line_truncated or snippet.truncated
             matches.append(
@@ -852,9 +864,21 @@ class AnalysisWorkspaceService:
         max_lines: int,
         max_bytes: int,
         include_sha256: bool,
+        include_credentials: bool,
+        credential_paths: set[str],
     ) -> WorkspaceFileContent:
         try:
             normalized = normalize_workspace_path(path)
+            if not include_credentials and normalized in credential_paths:
+                return WorkspaceFileContent(
+                    path=normalized,
+                    start_line=start_line,
+                    error=(
+                        "Credential artifact content is hidden by default. "
+                        "Set include_credentials=true for explicit local access."
+                    ),
+                    truncated=False,
+                )
             if normalized == ".":
                 raise WorkspaceToolError(
                     "workspace_write_invalid_path", "A file path is required.", 400
@@ -1176,6 +1200,35 @@ class AnalysisWorkspaceService:
         return (
             filename == ".env" or filename.startswith(".env.")
         ) and filename not in _ALLOWED_ENV_READ_FILES
+
+    def _credential_artifact_paths(self) -> set[str]:
+        paths: set[str] = set()
+        experiments = self.root / "experiments"
+        if not experiments.is_dir():
+            return paths
+        for manifest_path in experiments.glob("*/manifest.json"):
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            artifacts = manifest.get("artifacts")
+            if not isinstance(artifacts, list):
+                continue
+            for artifact in artifacts:
+                if not isinstance(artifact, dict):
+                    continue
+                credential = (
+                    artifact.get("sensitivity") == "credential"
+                    or artifact.get("containsCredentials") is True
+                    or artifact.get("contains_credentials") is True
+                )
+                relative = artifact.get("relativePath") or artifact.get("relative_path")
+                if credential and isinstance(relative, str):
+                    try:
+                        paths.add(normalize_workspace_path(relative))
+                    except WorkspaceToolError:
+                        continue
+        return paths
 
     def _relative_path(self, path: Path) -> str:
         return path.resolve().relative_to(self.root).as_posix()

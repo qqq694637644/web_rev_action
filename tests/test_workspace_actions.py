@@ -463,6 +463,102 @@ class WorkspaceActionTests(unittest.TestCase):
             self.assertEqual(item.bytes, len(payload))
             self.assertTrue(item.truncated)
 
+    def test_credential_artifacts_are_hidden_unless_explicitly_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            experiment = root / "experiments" / "exp_credential"
+            credential = experiment / "js-reverse" / "network" / "request.json"
+            public = experiment / "reports" / "summary.txt"
+            credential.parent.mkdir(parents=True)
+            public.parent.mkdir(parents=True)
+            credential.write_text(
+                '{"authorization":"Bearer workspace-secret"}\n',
+                encoding="utf-8",
+            )
+            public.write_text("public-marker\n", encoding="utf-8")
+            (experiment / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "experiment_id": "exp_credential",
+                        "status": "completed",
+                        "artifacts": [
+                            {
+                                "artifactId": "art_credential",
+                                "relativePath": (
+                                    "experiments/exp_credential/js-reverse/"
+                                    "network/request.json"
+                                ),
+                                "sensitivity": "credential",
+                                "containsCredentials": True,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            service = AnalysisWorkspaceService(root)
+            relative = (
+                "experiments/exp_credential/js-reverse/network/request.json"
+            )
+
+            hidden_read = asyncio.run(
+                service.read_files(WorkspaceReadFilesRequest(paths=[relative]))
+            )
+            explicit_read = asyncio.run(
+                service.read_files(
+                    WorkspaceReadFilesRequest(
+                        paths=[relative],
+                        include_credentials=True,
+                    )
+                )
+            )
+            hidden_search = asyncio.run(
+                service.search(
+                    WorkspaceSearchRequest(
+                        query="workspace-secret",
+                        paths=["experiments/exp_credential"],
+                    )
+                )
+            )
+            explicit_search = asyncio.run(
+                service.search(
+                    WorkspaceSearchRequest(
+                        query="workspace-secret",
+                        paths=["experiments/exp_credential"],
+                        include_credentials=True,
+                    )
+                )
+            )
+            hidden_inspect = asyncio.run(
+                service.inspect(
+                    WorkspaceInspectRequest(
+                        paths=["experiments/exp_credential"],
+                        queries=["workspace-secret"],
+                    )
+                )
+            )
+            explicit_inspect = asyncio.run(
+                service.inspect(
+                    WorkspaceInspectRequest(
+                        paths=["experiments/exp_credential"],
+                        queries=["workspace-secret"],
+                        include_credentials=True,
+                    )
+                )
+            )
+
+            self.assertIn("hidden by default", hidden_read.files[0].error or "")
+            self.assertNotIn("workspace-secret", hidden_read.files[0].content)
+            self.assertIn("workspace-secret", explicit_read.files[0].content)
+            self.assertEqual(hidden_search.match_count, 0)
+            self.assertEqual(explicit_search.match_count, 1)
+            self.assertEqual(hidden_inspect.searches[0].match_count, 0)
+            self.assertEqual(explicit_inspect.searches[0].match_count, 1)
+            self.assertIn(
+                "workspace-secret",
+                explicit_inspect.searches[0].matches[0].line,
+            )
+
     def test_search_stops_at_match_limit_without_buffering_all_results(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

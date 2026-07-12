@@ -28,6 +28,23 @@ data/analysis-workspace/
 
 以下规则优先于具体 API 和实现细节。
 
+### 2.0 Skill、执行接口与证据分层
+
+系统分成三个职责面：
+
+```text
+Skill
+  定义实验序列、单变量策略、证据解释、报告和完成标准
+
+Browser Actions
+  原子执行 capture、browser-context replay、取消和受控查询
+
+analysis workspace
+  保存原始事实、稳定 evidence index、artifact 和派生报告
+```
+
+Skill 不能自行拼接任意 JavaScript、读取 credential artifact 后再发请求，或手工协调 MCP 生命周期。执行接口不负责决定 Pandora 六组实验顺序或 required/optional/tracking-only 结论。
+
 ### 2.1 一个 workspace、一个服务进程
 
 同一个 analysis workspace 只能由一个 `web_rev_action` 进程持有：
@@ -46,7 +63,7 @@ data/analysis-workspace/
 
 ```text
 browser operation owner
-  open_session | close_session | capture_baseline | capture_flow
+  open_session | close_session | capture_baseline | capture_flow | replay_request
 
 protected workspace mutation owner
   workspaceWriteFile | workspaceApplyPatch | workspaceExecPwsh
@@ -66,10 +83,11 @@ protected workspace mutation owner
 
 ### 2.3 浏览器实验由后端原子拥有
 
-GPT 只调用：
+GPT 只调用结构化原子 operation：
 
 ```text
 runBrowserExperiment(capture_flow)
+runBrowserExperiment(replay_request)
 ```
 
 后端完整执行：
@@ -89,9 +107,11 @@ create running manifest
 
 GPT 看不到内部 stream primitive，也不能在多个 HTTP 请求之间手工协调 start、click、wait 和 stop。
 
+`replay_request` 同样由后端原子执行：从 source experiment 的 exact network evidence 读取请求，在本地应用一个或多个结构化 mutation，通过当前页面上下文发起 fetch，并捕获新 network/stream/page/console evidence。Cookie、Authorization 和 CSRF 不进入 Action JSON。
+
 ### 2.4 证据以文件为主，Action 返回摘要
 
-原始响应、事件、headers、Trace 和截图写入 analysis workspace。Action 只返回：
+原始响应、事件、headers、Trace、页面 snapshot、console、普通 network snapshot 和 replay 结果写入 analysis workspace。Action 只返回：
 
 ```text
 experiment_id
@@ -100,9 +120,18 @@ objective_integrity
 primary request summary
 capture health summary
 manifest_relative_path
+evidence_id / artifact_id metadata
 ```
 
 完整内容通过现有 workspace 工具读取。
+
+Manifest 的 `evidence` 数组为语义索引。核心结论使用：
+
+```text
+experiment_id + evidence_id + artifact_id
+```
+
+而不是临时 reqid 或目录排序。
 
 ### 2.5 原始证据不可由分析工具改写
 
@@ -184,6 +213,9 @@ private runtime
 - Stop cancellation 归因。
 - complete/partial/failed 判定。
 - cleanup 和 terminal manifest。
+- 普通 network high-water checkpoint、精确导出和 evidence index。
+- browser-context replay 与 source evidence 绑定。
+- experiment series/predecessor 校验。
 
 `ExperimentStore` 只负责生命周期持久化：
 
@@ -196,7 +228,7 @@ private runtime
 
 `PlaywrightCliAdapter` 负责页面动作，不解释网络语义。
 
-`JsReverseMcpAdapter` 负责把上游 MCP 的分页、稳定 request ID、source-specific event predicate 和 artifact 索引转换为内部结构，不解释用户业务意图。
+`JsReverseMcpAdapter` 负责把上游 MCP 的分页、稳定 request ID、source-specific event predicate、精确 network 导出、initiator、source search、console 和受控 evaluate 转换为内部结构，不解释用户业务意图。
 
 `AnalysisWorkspaceService` 负责本地文件分析，不参与浏览器生命周期。
 
@@ -226,6 +258,12 @@ get_session
 list_experiments
 get_experiment
 get_stream_status
+list_evidence
+get_network_evidence
+get_request_initiator
+search_scripts
+get_script_source
+list_console_errors
 ```
 
 `runBrowserExperiment` 当前 operation：
@@ -234,6 +272,7 @@ get_stream_status
 open_session
 capture_baseline
 capture_flow
+replay_request
 close_session
 cancel_experiment
 ```
@@ -252,6 +291,8 @@ workspaceExecPwsh          consequential
 ```
 
 没有 `list_artifacts`、`read_artifact`、`search_artifacts`、`export_experiment` 或 ZIP endpoint。
+
+`workspaceInspect`、`workspaceSearch` 和 `workspaceReadFiles` 默认隐藏 manifest 标记为 `credential` 或 `containsCredentials=true` 的 artifact 正文。只有显式 `include_credentials=true` 才允许本机专家读取；自然语言 Action 摘要永远不返回完整凭据。
 
 ## 5. Session 模型
 
@@ -677,8 +718,16 @@ data/analysis-workspace/
       manifest.json
       playwright/
         screenshots/
+        snapshots/
         traces/
       js-reverse/
+        network/
+          ev_<experiment>_network_request_<selector>_<reqid>/
+            all.json
+            initiator.json
+            cookie-*.json
+        console/
+          console.jsonl
         capture-<uuid>/
           capture.json
           request-0001/
@@ -696,6 +745,9 @@ data/analysis-workspace/
       reports/
       derived/
       replay/
+        request-spec.json
+        request-diff.json
+        response.json
   reports/
   scripts/
   notes/
@@ -725,6 +777,11 @@ objective_integrity
 objective_requirements
 primary_integrity_dimensions
 capture_health
+network_checkpoint
+console_checkpoint
+series
+replay_source
+evidence
 capture_uuid
 capture_relative_dir
 capture_metadata_artifact_id
@@ -734,6 +791,20 @@ errors
 created_at
 updated_at
 ```
+
+每个 evidence entry 至少包含：
+
+```text
+evidence_id
+kind
+artifact_ids
+artifact_paths
+step_ids / request_ids（按 kind）
+redacted summary
+source_experiment_id / source_evidence_id（replay）
+```
+
+当前 evidence kind：`network_request`、`console_message`、`page_screenshot`、`page_snapshot`、`replay_attempt`。
 
 ## 14. Workspace 服务
 
@@ -750,6 +821,8 @@ truncation metadata
 
 `max_depth` 相对于每个 requested base path 计算。
 
+默认 `include_credentials=false`。Tree 可以显示 credential artifact 路径和大小，但 search/related snippet 不返回正文。
+
 ### 14.2 workspaceSearch
 
 使用 `rg --json`，逐行消费 stdout：
@@ -758,6 +831,7 @@ truncation metadata
 - 达到 byte budget 后终止进程。
 - 达到 timeout 或 Action cancellation 后终止进程树。
 - 不使用无界 `communicate()`。
+- 默认过滤 manifest 标记为 credential 的 artifact match；显式 `include_credentials=true` 才返回。
 
 ### 14.3 workspaceReadFiles
 
@@ -772,6 +846,8 @@ optional incremental SHA-256
 ```
 
 请求可设置 `include_sha256=false`，查看少量行时不计算全文件 hash。读取前后比较 size、mtime 和 file identity；文件增长或替换时返回 `changed_during_read=true`，不宣称稳定 SHA。二进制文件返回 per-file error，使用 PowerShell 定向读取。
+
+Credential artifact 默认返回明确的 hidden error，不返回内容。`include_credentials=true` 只用于本机专家验证；Skill 和自然语言报告不得复制其值。
 
 ### 14.4 workspaceWriteFile / workspaceApplyPatch
 
@@ -810,7 +886,7 @@ stdout/stderr 并发流式消费，只保留 byte budget 内内容。Timeout、A
 
 完整 request/response headers 可能包含 Cookie、Authorization、CSRF 和 Set-Cookie。
 
-默认分析使用 redacted artifacts。完整 credential 文件只用于明确的本地 replay，不复制到自然语言回复、summary 或 diff。
+默认分析使用 redacted summaries。完整 credential 文件只用于后端 `replay_request` 或显式本机专家读取，不复制到自然语言回复、summary 或 diff。`workspaceInspect/Search/ReadFiles` 默认执行该策略，而不是只依赖文档约定。
 
 大型 Base64、binary payload 和 raw stream 不通过 Action JSON 返回：
 
@@ -851,6 +927,10 @@ start Chrome remote debugging
 → source-specific SSE predicate
 → stop/finalize
 → inspect raw/events/headers
+→ capture authenticated Pandora-like JSON request
+→ export exact network evidence with evidence_id
+→ browser-context replay removing tracking field (200)
+→ browser-context replay removing required parent field (422)
 → workspace PowerShell SHA verification
 → close_session
 → residual process check
@@ -895,11 +975,19 @@ workerCoverage = false
 
 Worker / Service Worker auto-attach 不属于当前完成契约。
 
+当前已实现 browser-context replay、ordinary network evidence、initiator/source read-only queries、console/page snapshots、series 和 packaged Pandora Skill。尚未完成：
+
+```text
+trace_request atomic breakpoint lifecycle
+automatic six-scenario Pandora-like fixture series
+source-map materialization
+external HTTP replay
+```
+
 未来扩展必须保持现有不变量，可增加：
 
 ```text
 trace_request
-browser-context replay
 external HTTP replay
 capture diff
 Worker / Service Worker target coverage
@@ -910,7 +998,7 @@ Worker / Service Worker target coverage
 ## 18. 验收标准
 
 1. GPT 看不到内部 MCP lifecycle 工具。
-2. Capture flow 由后端原子完成。
+2. Capture flow 与 browser-context replay 由后端原子完成。
 3. 全局只允许一个活动实验，第二个实验立即返回 busy。
 4. Running manifest、Trace 和 collector 早于第一条页面变更动作。
 5. Playwright、MCP、PowerShell 和 ripgrep cancellation 都完成进程树 cleanup。
@@ -933,3 +1021,8 @@ Worker / Service Worker target coverage
 22. OS 进程锁早于 ExperimentStore recovery。
 23. Stage 0、BrowserAction success、cancellation 和 causal multi-stream gates 全部通过。
 24. 产品不包含 Git、PR、CI、ZIP 或第二套 artifact 文件 API。
+25. Ordinary network evidence 使用 experiment high-water checkpoint，只导出窗口内 reqid。
+26. 每个核心证据拥有稳定 evidence_id，并链接 artifact_id。
+27. Replay 只能从 source experiment/evidence 读取 exact snapshot，不能接受任意本地路径。
+28. Credential artifact 默认不被 workspace inspect/search/read 返回。
+29. Packaged Pandora Skill 负责六组实验、单变量矩阵和报告完成标准。

@@ -8,6 +8,7 @@ import os
 import re
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from datetime import UTC, datetime
@@ -35,14 +36,33 @@ from .browser_models import (
     CloseSessionRequest,
     FlowStepResult,
     GetExperimentRequest,
+    GetNetworkEvidenceRequest,
+    GetRequestInitiatorRequest,
+    GetScriptSourceRequest,
     GetSessionRequest,
     GetStreamStatusRequest,
     InspectBrowserEvidenceRequest,
+    ListConsoleErrorsRequest,
+    ListEvidenceRequest,
     ListExperimentsRequest,
     OpenSessionRequest,
+    PrimaryRequest,
+    ReplayRequestPayload,
+    ReplayRequestRequest,
     RequestMatcher,
     RunBrowserExperimentRequest,
+    SearchScriptsRequest,
     WaitCondition,
+)
+from .protocol_evidence import (
+    build_replay_spec,
+    evidence_id,
+    load_snapshot,
+    network_checkpoint,
+    network_request_matches,
+    public_network_summary,
+    requests_after_checkpoint,
+    select_network_evidence,
 )
 from .runtime import env_value_from_environment_or_dotenv
 from .runtime_coordinator import (
@@ -253,6 +273,7 @@ class ExperimentStore:
         artifact_id: str,
         kind: str,
         sensitivity: str = "private",
+        contains_credentials: bool = False,
     ) -> dict[str, Any] | None:
         path = Path(path_value)
         if not path.is_absolute():
@@ -270,7 +291,7 @@ class ExperimentStore:
             "relativePath": relative.as_posix(),
             "bytes": path.stat().st_size,
             "sensitivity": sensitivity,
-            "containsCredentials": False,
+            "containsCredentials": contains_credentials,
         }
 
     def relative_path(self, path_value: str) -> str | None:
@@ -393,6 +414,49 @@ class BrowserActionService:
     async def _release_browser_operation(self, owner_id: str) -> None:
         await self.coordinator.release_browser(owner_id)
 
+    async def _run_aligned_inspection(
+        self,
+        *,
+        session_id: str,
+        operation: str,
+        callback: Callable[[Deadline], Awaitable[dict[str, Any]]],
+    ) -> dict[str, Any]:
+        owner_id = f"inspect_{uuid.uuid4().hex}"
+        await self._reserve_browser_operation(
+            session_id=session_id,
+            owner_id=owner_id,
+            operation=operation,
+        )
+        deadline = Deadline(15_000)
+        try:
+            async with self._locked_browser_session(session_id, deadline):
+                session = self._get_session(session_id)
+                if session.get("status") != "open":
+                    raise BrowserServiceError(
+                        "session_closed",
+                        "Browser session is not open.",
+                        409,
+                    )
+                page = await self.playwright.current_page(session_id, deadline.child(3_000))
+                alignment = await self.js_reverse.align_page(
+                    page,
+                    deadline.child(3_000),
+                    page_id=(
+                        str(session["js_reverse_page_id"])
+                        if session.get("js_reverse_page_id")
+                        else None
+                    ),
+                )
+                if alignment.status != "aligned":
+                    raise BrowserServiceError(
+                        "page_alignment_failed",
+                        "Playwright and js-reverse pages are not aligned.",
+                        409,
+                    )
+                return await callback(deadline)
+        finally:
+            await self._release_browser_operation(owner_id)
+
     @staticmethod
     def _manifest_relative_path(experiment_id: str) -> str:
         return (Path("experiments") / experiment_id / "manifest.json").as_posix()
@@ -472,6 +536,432 @@ class BrowserActionService:
         self.experiments.write_manifest(experiment_id, manifest)
 
     @staticmethod
+    def _evidence_index(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+        value = manifest.get("evidence")
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+        manifest["evidence"] = []
+        return manifest["evidence"]
+
+    @classmethod
+    def _find_evidence(
+        cls, manifest: dict[str, Any], target_evidence_id: str
+    ) -> dict[str, Any]:
+        for item in cls._evidence_index(manifest):
+            if item.get("evidence_id") == target_evidence_id:
+                return item
+        raise BrowserServiceError(
+            "evidence_not_found",
+            f"Evidence was not found: {target_evidence_id}",
+            404,
+        )
+
+    def _validate_and_store_series(
+        self,
+        *,
+        session_id: str,
+        manifest: dict[str, Any],
+        payload: CaptureFlowPayload | ReplayRequestPayload,
+    ) -> None:
+        series = payload.series.model_dump(mode="json", exclude_none=True)
+        predecessor_id = series.get("predecessor_experiment_id")
+        if predecessor_id:
+            predecessor = self.experiments.load_manifest(str(predecessor_id))
+            if predecessor.get("session_id") != session_id:
+                raise BrowserServiceError(
+                    "predecessor_session_mismatch",
+                    "The predecessor experiment belongs to a different session.",
+                    409,
+                )
+            predecessor_series = predecessor.get("series")
+            predecessor_series = (
+                predecessor_series if isinstance(predecessor_series, dict) else {}
+            )
+            requested_series = series.get("analysis_series_id")
+            existing_series = predecessor_series.get("analysis_series_id")
+            if requested_series and existing_series and requested_series != existing_series:
+                raise BrowserServiceError(
+                    "predecessor_series_mismatch",
+                    "The predecessor experiment belongs to a different analysis series.",
+                    409,
+                )
+        manifest["series"] = series
+
+    async def _all_network_requests(self, deadline: Deadline) -> list[dict[str, Any]]:
+        payload = await self.js_reverse.list_network_requests(
+            RequestMatcher(),
+            deadline,
+        )
+        requests = payload.get("requests")
+        return [item for item in requests if isinstance(item, dict)] if isinstance(
+            requests, list
+        ) else []
+
+    async def _export_network_evidence(
+        self,
+        *,
+        experiment_id: str,
+        experiment_dir: Path,
+        selectors: list[Any],
+        requests: list[dict[str, Any]],
+        deadline: Deadline,
+        step_ids: list[str],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+        evidence_entries: list[dict[str, Any]] = []
+        artifacts: list[dict[str, Any]] = []
+        warnings: list[str] = []
+        network_root = experiment_dir / "js-reverse" / "network"
+        network_root.mkdir(parents=True, exist_ok=True)
+        for selector in selectors:
+            matches = select_network_evidence(requests, selector)
+            for ordinal, request in enumerate(matches, start=1):
+                reqid = request.get("reqid")
+                if not isinstance(reqid, int):
+                    continue
+                ev_id = evidence_id(
+                    experiment_id,
+                    "network_request",
+                    selector_id=selector.selector_id,
+                    stable_id=reqid,
+                    ordinal=ordinal,
+                )
+                target_dir = network_root / ev_id
+                target_dir.mkdir(parents=True, exist_ok=True)
+                artifact_ids: list[str] = []
+                artifact_paths: dict[str, str] = {}
+                snapshot: dict[str, Any] | None = None
+                for part in list(dict.fromkeys(selector.export_parts)):
+                    suffix = ".bin" if part in {"requestBody", "responseBody"} else ".json"
+                    output_file = target_dir / f"{part}{suffix}"
+                    try:
+                        await self.js_reverse.export_network_request(
+                            reqid,
+                            output_file,
+                            part,
+                            deadline.child(min(5_000, deadline.remaining_ms())),
+                        )
+                    except Exception as exc:
+                        warnings.append(
+                            f"network evidence {selector.selector_id} reqid={reqid} "
+                            f"part={part}: {str(exc)[:2000]}"
+                        )
+                        continue
+                    artifact_id = f"art_{ev_id}_{part}"
+                    descriptor = self.experiments.describe_local_artifact(
+                        str(output_file),
+                        artifact_id=artifact_id,
+                        kind=f"network_{part}",
+                        sensitivity=(
+                            "credential"
+                            if part in {"all", "responseHeaders"}
+                            else "private"
+                        ),
+                        contains_credentials=part in {"all", "responseHeaders"},
+                    )
+                    if descriptor:
+                        artifacts.append(descriptor)
+                        artifact_ids.append(artifact_id)
+                        artifact_paths[part] = str(descriptor["relativePath"])
+                    if part == "all" and output_file.is_file():
+                        try:
+                            snapshot = load_snapshot(output_file)
+                        except (OSError, ValueError, json.JSONDecodeError) as exc:
+                            warnings.append(
+                                f"network evidence snapshot reqid={reqid}: {str(exc)[:1000]}"
+                            )
+                if selector.include_initiator:
+                    try:
+                        initiator = await self.js_reverse.get_request_initiator(
+                            reqid,
+                            deadline.child(min(3_000, deadline.remaining_ms())),
+                        )
+                        initiator_file = target_dir / "initiator.json"
+                        initiator_file.write_text(
+                            json.dumps(initiator, ensure_ascii=False, indent=2) + "\n",
+                            encoding="utf-8",
+                        )
+                        initiator_artifact_id = f"art_{ev_id}_initiator"
+                        descriptor = self.experiments.describe_local_artifact(
+                            str(initiator_file),
+                            artifact_id=initiator_artifact_id,
+                            kind="request_initiator",
+                            sensitivity="private",
+                        )
+                        if descriptor:
+                            artifacts.append(descriptor)
+                            artifact_ids.append(initiator_artifact_id)
+                            artifact_paths["initiator"] = str(
+                                descriptor["relativePath"]
+                            )
+                    except Exception as exc:
+                        warnings.append(
+                            f"request initiator reqid={reqid}: {str(exc)[:2000]}"
+                        )
+                cookie_artifacts: list[str] = []
+                if selector.include_cookie_provenance:
+                    for cookie_name in selector.cookie_names:
+                        try:
+                            cookie_flow = await self.js_reverse.trace_cookie_provenance(
+                                cookie_name,
+                                deadline.child(min(3_000, deadline.remaining_ms())),
+                            )
+                            safe_cookie = re.sub(
+                                r"[^A-Za-z0-9_.-]+", "-", cookie_name
+                            )
+                            cookie_file = target_dir / f"cookie-{safe_cookie}.json"
+                            cookie_file.write_text(
+                                json.dumps(cookie_flow, ensure_ascii=False, indent=2) + "\n",
+                                encoding="utf-8",
+                            )
+                            cookie_artifact_id = f"art_{ev_id}_cookie_{safe_cookie}"
+                            descriptor = self.experiments.describe_local_artifact(
+                                str(cookie_file),
+                                artifact_id=cookie_artifact_id,
+                                kind="cookie_provenance",
+                                sensitivity="credential",
+                                contains_credentials=True,
+                            )
+                            if descriptor:
+                                artifacts.append(descriptor)
+                                artifact_ids.append(cookie_artifact_id)
+                                cookie_artifacts.append(cookie_artifact_id)
+                        except Exception as exc:
+                            warnings.append(
+                                f"cookie provenance {cookie_name}: {str(exc)[:2000]}"
+                            )
+                evidence_entries.append(
+                    {
+                        "evidence_id": ev_id,
+                        "kind": "network_request",
+                        "selector_id": selector.selector_id,
+                        "request_ids": {
+                            "reqid": reqid,
+                            "collector_generation": self._transport_generation(),
+                        },
+                        "artifact_ids": artifact_ids,
+                        "artifact_paths": artifact_paths,
+                        "cookie_artifact_ids": cookie_artifacts,
+                        "step_ids": step_ids,
+                        "summary": (
+                            public_network_summary(snapshot)
+                            if snapshot is not None
+                            else {
+                                "url": str(request.get("url", ""))[:8192],
+                                "method": request.get("method"),
+                                "resource_type": request.get("resourceType"),
+                                "status": request.get("status"),
+                            }
+                        ),
+                    }
+                )
+        return evidence_entries, artifacts, warnings
+
+    async def _console_checkpoint(self, deadline: Deadline) -> dict[str, Any]:
+        payload = await self.js_reverse.list_console_messages(
+            deadline,
+            types=["error", "warn"],
+        )
+        messages = payload.get("messages")
+        values = [item for item in messages if isinstance(item, dict)] if isinstance(
+            messages, list
+        ) else []
+        ids = [int(item["msgid"]) for item in values if isinstance(item.get("msgid"), int)]
+        return {"max_msgid": max(ids, default=0)}
+
+    async def _export_console_evidence(
+        self,
+        *,
+        experiment_id: str,
+        experiment_dir: Path,
+        checkpoint: dict[str, Any],
+        deadline: Deadline,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+        try:
+            payload = await self.js_reverse.list_console_messages(
+                deadline,
+                types=["error", "warn"],
+            )
+        except Exception as exc:
+            return [], [], [f"console evidence: {str(exc)[:2000]}"]
+        messages = payload.get("messages")
+        values = [item for item in messages if isinstance(item, dict)] if isinstance(
+            messages, list
+        ) else []
+        max_msgid = int(checkpoint.get("max_msgid", 0) or 0)
+        selected = [
+            item
+            for item in values
+            if isinstance(item.get("msgid"), int) and int(item["msgid"]) > max_msgid
+        ]
+        if not selected:
+            return [], [], []
+        console_dir = experiment_dir / "js-reverse" / "console"
+        console_dir.mkdir(parents=True, exist_ok=True)
+        console_file = console_dir / "console.jsonl"
+        console_file.write_text(
+            "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in selected),
+            encoding="utf-8",
+        )
+        artifact_id = f"art_{experiment_id}_console_errors"
+        descriptor = self.experiments.describe_local_artifact(
+            str(console_file),
+            artifact_id=artifact_id,
+            kind="console_errors",
+            sensitivity="private",
+        )
+        artifacts = [descriptor] if descriptor else []
+        evidence_entries = [
+            {
+                "evidence_id": evidence_id(
+                    experiment_id,
+                    "console_message",
+                    stable_id=item.get("msgid"),
+                    ordinal=index,
+                ),
+                "kind": "console_message",
+                "message_id": item.get("msgid"),
+                "artifact_ids": [artifact_id] if descriptor else [],
+                "artifact_paths": {
+                    "console": descriptor["relativePath"] if descriptor else None
+                },
+                "message_index": index - 1,
+                "summary": {
+                    key: item.get(key)
+                    for key in (
+                        "type",
+                        "text",
+                        "url",
+                        "lineNumber",
+                        "columnNumber",
+                        "timestamp",
+                    )
+                    if key in item
+                },
+            }
+            for index, item in enumerate(selected, start=1)
+        ]
+        return evidence_entries, artifacts, []
+
+    def _prepare_replay_execution(
+        self,
+        request: ReplayRequestRequest,
+    ) -> tuple[CaptureFlowPayload, dict[str, Any]]:
+        payload = request.payload
+        source_manifest = self.experiments.load_manifest(payload.source_experiment_id)
+        if source_manifest.get("session_id") != payload.session_id:
+            raise BrowserServiceError(
+                "source_experiment_session_mismatch",
+                "Replay source evidence belongs to a different browser session.",
+                409,
+            )
+        source_evidence = self._find_evidence(
+            source_manifest,
+            payload.source_evidence_id,
+        )
+        if source_evidence.get("kind") != "network_request":
+            raise BrowserServiceError(
+                "replay_source_kind_invalid",
+                "replay_request requires network_request evidence.",
+                409,
+            )
+        artifact_paths = source_evidence.get("artifact_paths")
+        artifact_paths = artifact_paths if isinstance(artifact_paths, dict) else {}
+        snapshot_relative = artifact_paths.get("all")
+        if not isinstance(snapshot_relative, str):
+            raise BrowserServiceError(
+                "replay_source_snapshot_missing",
+                "The source evidence has no exact full network snapshot artifact.",
+                409,
+            )
+        snapshot_path = (self.experiments.root / snapshot_relative).resolve()
+        try:
+            snapshot_path.relative_to(self.experiments.root)
+        except ValueError as exc:
+            raise BrowserServiceError(
+                "replay_source_path_invalid",
+                "The source snapshot is outside the analysis workspace.",
+                409,
+            ) from exc
+        if not snapshot_path.is_file():
+            raise BrowserServiceError(
+                "replay_source_snapshot_missing",
+                "The source network snapshot file is missing.",
+                404,
+            )
+        try:
+            snapshot = load_snapshot(snapshot_path)
+            spec, diff = build_replay_spec(snapshot, payload.mutations)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise BrowserServiceError(
+                "replay_source_invalid",
+                str(exc),
+                409,
+            ) from exc
+        source_url = str(snapshot.get("url", ""))
+        source_method = str(snapshot.get("method", "GET")).upper()
+        source_resource_type = str(snapshot.get("resourceType", "fetch"))
+        matcher = RequestMatcher(
+            url_contains=source_url.split("?", 1)[0],
+            method=source_method,
+            resource_types=[source_resource_type] if source_resource_type else [],
+        )
+        primary = PrimaryRequest(
+            url_contains=matcher.url_contains,
+            method=matcher.method,
+            resource_types=matcher.resource_types,
+            mime_types=["text/event-stream"],
+            expected_min_matches=1,
+            expected_max_matches=5,
+            allow_supporting_failures=True,
+            include_in_flight=False,
+        )
+        selectors: list[Any] = list(payload.network_evidence)
+        if not selectors:
+            selectors = [
+                {
+                    "selector_id": "replay_request",
+                    "matcher": matcher.model_dump(mode="json", exclude_none=True),
+                    "max_matches": 5,
+                    "export_parts": ["all"],
+                    "include_initiator": True,
+                }
+            ]
+        normalized = CaptureFlowPayload.model_validate(
+            {
+                "session_id": payload.session_id,
+                "objective": payload.objective,
+                "target": payload.target.model_dump(mode="json", exclude_none=True),
+                "primary_request": primary.model_dump(mode="json"),
+                "flow": [],
+                "wait_for": (
+                    payload.wait_for.model_dump(mode="json", exclude_none=True)
+                    if payload.wait_for
+                    else None
+                ),
+                "execution_mode": payload.execution_mode,
+                "deadline_ms": payload.deadline_ms,
+                "job_timeout_ms": payload.job_timeout_ms,
+                "capture": payload.capture.model_dump(mode="json"),
+                "requirements": payload.requirements.model_dump(mode="json"),
+                "network_evidence": [
+                    item.model_dump(mode="json", exclude_none=True)
+                    if hasattr(item, "model_dump")
+                    else item
+                    for item in selectors
+                ],
+                "series": payload.series.model_dump(mode="json", exclude_none=True),
+            }
+        )
+        return normalized, {
+            "source_experiment_id": payload.source_experiment_id,
+            "source_evidence_id": payload.source_evidence_id,
+            "source_snapshot_path": snapshot_path,
+            "source_evidence": source_evidence,
+            "spec": spec,
+            "diff": diff,
+        }
+
+    @staticmethod
     def _experiment_summary(manifest: dict[str, Any]) -> dict[str, Any]:
         primary_requests = manifest.get("primary_requests")
         request_summaries: list[dict[str, Any]] = []
@@ -518,6 +1008,14 @@ class BrowserActionService:
                 len(primary_requests) if isinstance(primary_requests, list) else 0
             ),
             "capture_health": dict(health) if isinstance(health, dict) else {},
+            "series": (
+                dict(manifest["series"])
+                if isinstance(manifest.get("series"), dict)
+                else {}
+            ),
+            "evidence_count": len(manifest.get("evidence", []))
+            if isinstance(manifest.get("evidence"), list)
+            else 0,
             "warnings": [str(item)[:1000] for item in manifest.get("warnings", [])[:10]],
             "errors": [str(item)[:1000] for item in manifest.get("errors", [])[:10]],
             "created_at": manifest.get("created_at"),
@@ -565,24 +1063,33 @@ class BrowserActionService:
                 return await self._close_session(request)
             finally:
                 await self._release_browser_operation(owner_id)
-        if isinstance(request, (CaptureFlowRequest, CaptureBaselineRequest)):
+        if isinstance(
+            request,
+            (CaptureFlowRequest, CaptureBaselineRequest, ReplayRequestRequest),
+        ):
+            replay_plan: dict[str, Any] | None = None
+            if isinstance(request, ReplayRequestRequest):
+                payload, replay_plan = self._prepare_replay_execution(request)
+            else:
+                payload = request.payload
             experiment_id = self.experiments.new_experiment_id()
             await self._reserve_browser_operation(
-                session_id=request.payload.session_id,
+                session_id=payload.session_id,
                 owner_id=experiment_id,
                 operation=request.operation,
                 experiment_id=experiment_id,
             )
-            if request.payload.execution_mode == "job":
+            if payload.execution_mode == "job":
                 try:
                     return self._start_capture_job(
                         request,
                         experiment_id=experiment_id,
+                        payload=payload,
+                        replay_plan=replay_plan,
                     )
                 except Exception:
                     await self._release_browser_operation(experiment_id)
                     raise
-            payload = request.payload
             deadline = Deadline(payload.deadline_ms)
             try:
                 experiment_id, experiment_dir, manifest = (
@@ -598,11 +1105,23 @@ class BrowserActionService:
                 manifest["primary_request_matcher"] = (
                     payload.primary_request.model_dump(mode="json", exclude_none=True)
                 )
+                self._validate_and_store_series(
+                    session_id=payload.session_id,
+                    manifest=manifest,
+                    payload=payload,
+                )
+                if replay_plan:
+                    manifest["replay_source"] = {
+                        "source_experiment_id": replay_plan["source_experiment_id"],
+                        "source_evidence_id": replay_plan["source_evidence_id"],
+                    }
                 self.experiments.write_manifest(experiment_id, manifest)
                 return await self._capture_flow(
                     request,
                     deadline=deadline,
                     prepared=(experiment_id, experiment_dir, manifest),
+                    payload=payload,
+                    replay_plan=replay_plan,
                 )
             finally:
                 await self._release_browser_operation(experiment_id)
@@ -684,6 +1203,129 @@ class BrowserActionService:
                         request.payload.experiment_id
                     ),
                 },
+            )
+        if isinstance(request, ListEvidenceRequest):
+            manifest = self.experiments.load_manifest(request.payload.experiment_id)
+            evidence = self._evidence_index(manifest)
+            if request.payload.kind:
+                evidence = [
+                    item for item in evidence if item.get("kind") == request.payload.kind
+                ]
+            evidence = evidence[: request.payload.limit]
+            return BrowserActionResponse(
+                operation=request.operation,
+                status="completed",
+                session_id=manifest.get("session_id"),
+                experiment_id=request.payload.experiment_id,
+                result={"evidence": evidence, "count": len(evidence)},
+            )
+        if isinstance(request, GetNetworkEvidenceRequest):
+            manifest = self.experiments.load_manifest(request.payload.experiment_id)
+            item = self._find_evidence(manifest, request.payload.evidence_id)
+            if item.get("kind") != "network_request":
+                raise BrowserServiceError(
+                    "evidence_kind_mismatch",
+                    "The requested evidence is not network_request evidence.",
+                    409,
+                )
+            return BrowserActionResponse(
+                operation=request.operation,
+                status="completed",
+                session_id=manifest.get("session_id"),
+                experiment_id=request.payload.experiment_id,
+                result={"evidence": item},
+            )
+        if isinstance(request, GetRequestInitiatorRequest):
+            manifest = self.experiments.load_manifest(request.payload.experiment_id)
+            item = self._find_evidence(manifest, request.payload.evidence_id)
+            paths = item.get("artifact_paths")
+            paths = paths if isinstance(paths, dict) else {}
+            relative = paths.get("initiator")
+            if not isinstance(relative, str):
+                raise BrowserServiceError(
+                    "initiator_evidence_missing",
+                    "The network evidence has no saved initiator artifact.",
+                    404,
+                )
+            path = (self.experiments.root / relative).resolve()
+            try:
+                path.relative_to(self.experiments.root)
+                initiator = json.loads(path.read_text(encoding="utf-8"))
+            except (ValueError, OSError, json.JSONDecodeError) as exc:
+                raise BrowserServiceError(
+                    "initiator_evidence_invalid",
+                    "The saved initiator artifact is unavailable or invalid.",
+                    409,
+                ) from exc
+            return BrowserActionResponse(
+                operation=request.operation,
+                status="completed",
+                session_id=manifest.get("session_id"),
+                experiment_id=request.payload.experiment_id,
+                result={
+                    "evidence_id": request.payload.evidence_id,
+                    "initiator": initiator,
+                },
+            )
+        if isinstance(request, ListConsoleErrorsRequest):
+            manifest = self.experiments.load_manifest(request.payload.experiment_id)
+            evidence = [
+                item
+                for item in self._evidence_index(manifest)
+                if item.get("kind") == "console_message"
+            ][: request.payload.limit]
+            return BrowserActionResponse(
+                operation=request.operation,
+                status="completed",
+                session_id=manifest.get("session_id"),
+                experiment_id=request.payload.experiment_id,
+                result={"console_errors": evidence, "count": len(evidence)},
+            )
+        if isinstance(request, SearchScriptsRequest):
+
+            async def search(deadline: Deadline) -> dict[str, Any]:
+                return await self.js_reverse.search_scripts(
+                    request.payload.query,
+                    deadline,
+                    url_filter=request.payload.url_filter,
+                    max_results=request.payload.max_results,
+                    exclude_minified=request.payload.exclude_minified,
+                )
+
+            result = await self._run_aligned_inspection(
+                session_id=request.payload.session_id,
+                operation=request.operation,
+                callback=search,
+            )
+            return BrowserActionResponse(
+                operation=request.operation,
+                status="completed",
+                session_id=request.payload.session_id,
+                result={"search": result},
+            )
+        if isinstance(request, GetScriptSourceRequest):
+
+            async def source(deadline: Deadline) -> dict[str, Any]:
+                return await self.js_reverse.get_script_source(
+                    deadline,
+                    url=request.payload.url,
+                    script_id=request.payload.script_id,
+                    start_line=request.payload.start_line,
+                    end_line=request.payload.end_line,
+                    offset=request.payload.offset,
+                    length=request.payload.length,
+                )
+
+            result = await self._run_aligned_inspection(
+                session_id=request.payload.session_id,
+                operation=request.operation,
+                callback=source,
+            )
+            return BrowserActionResponse(
+                operation=request.operation,
+                status="completed",
+                session_id=request.payload.session_id,
+                result={"source": result},
             )
         if isinstance(request, GetStreamStatusRequest):
             manifest = self.experiments.load_manifest(request.payload.experiment_id)
@@ -1257,11 +1899,12 @@ class BrowserActionService:
 
     def _start_capture_job(
         self,
-        request: CaptureFlowRequest | CaptureBaselineRequest,
+        request: CaptureFlowRequest | CaptureBaselineRequest | ReplayRequestRequest,
         *,
         experiment_id: str,
+        payload: CaptureFlowPayload,
+        replay_plan: dict[str, Any] | None,
     ) -> BrowserActionResponse:
-        payload = request.payload
         session = self._get_session(payload.session_id)
         if session.get("status") != "open":
             raise BrowserServiceError("session_closed", "Browser session is not open", 409)
@@ -1282,12 +1925,24 @@ class BrowserActionService:
                 ),
             }
         )
+        self._validate_and_store_series(
+            session_id=payload.session_id,
+            manifest=manifest,
+            payload=payload,
+        )
+        if replay_plan:
+            manifest["replay_source"] = {
+                "source_experiment_id": replay_plan["source_experiment_id"],
+                "source_evidence_id": replay_plan["source_evidence_id"],
+            }
         self.experiments.write_manifest(experiment_id, manifest)
         task = asyncio.create_task(
             self._run_capture_job(
                 request,
                 deadline=deadline,
                 prepared=(experiment_id, experiment_dir, manifest),
+                payload=payload,
+                replay_plan=replay_plan,
             ),
             name=f"browser-experiment-{experiment_id}",
         )
@@ -1314,10 +1969,12 @@ class BrowserActionService:
 
     async def _run_capture_job(
         self,
-        request: CaptureFlowRequest | CaptureBaselineRequest,
+        request: CaptureFlowRequest | CaptureBaselineRequest | ReplayRequestRequest,
         *,
         deadline: Deadline,
         prepared: tuple[str, Path, dict[str, Any]],
+        payload: CaptureFlowPayload,
+        replay_plan: dict[str, Any] | None,
     ) -> None:
         experiment_id = prepared[0]
         try:
@@ -1326,6 +1983,8 @@ class BrowserActionService:
                     request,
                     deadline=deadline,
                     prepared=prepared,
+                    payload=payload,
+                    replay_plan=replay_plan,
                 )
             except asyncio.CancelledError:
                 manifest = self.experiments.load_manifest(experiment_id)
@@ -1380,6 +2039,7 @@ class BrowserActionService:
             "final_status_payload": {},
             "trace_paths": [],
             "screenshot_paths": [],
+            "snapshot_paths": [],
             "network_payload": {},
             "collector_stopped": (
                 not payload.capture.stream
@@ -1458,11 +2118,11 @@ class BrowserActionService:
             and not entered_reserve
             and execution_deadline.remaining_ms() > 1_000
         ):
-            if payload.capture.network:
+            if payload.capture.network or payload.network_evidence:
                 try:
                     result["network_payload"] = (
                         await self.js_reverse.list_network_requests(
-                            self._request_matcher(payload),
+                            RequestMatcher(),
                             execution_deadline.child(
                                 min(2_000, execution_deadline.remaining_ms())
                             ),
@@ -1488,16 +2148,38 @@ class BrowserActionService:
                     result["warnings"].append(
                         f"final screenshot: {str(exc)[:3500]}"
                     )
+            if payload.capture.page_snapshots and execution_deadline.remaining_ms() > 500:
+                try:
+                    result["snapshot_paths"].append(
+                        await self.playwright.capture_snapshot(
+                            session_id,
+                            experiment_dir,
+                            "after-flow",
+                            execution_deadline.child(
+                                min(2_000, execution_deadline.remaining_ms())
+                            ),
+                        )
+                    )
+                except Exception as exc:
+                    result["warnings"].append(
+                        f"final page snapshot: {str(exc)[:3500]}"
+                    )
         return result
 
     async def _capture_flow(
         self,
-        request: CaptureFlowRequest | CaptureBaselineRequest,
+        request: CaptureFlowRequest | CaptureBaselineRequest | ReplayRequestRequest,
         *,
         deadline: Deadline | None = None,
         prepared: tuple[str, Path, dict[str, Any]] | None = None,
+        payload: CaptureFlowPayload | None = None,
+        replay_plan: dict[str, Any] | None = None,
     ) -> BrowserActionResponse:
-        payload = request.payload
+        if payload is None:
+            if isinstance(request, ReplayRequestRequest):
+                payload, replay_plan = self._prepare_replay_execution(request)
+            else:
+                payload = request.payload
         deadline = deadline or Deadline(payload.deadline_ms)
         session_id = payload.session_id
         if prepared is None:
@@ -1584,7 +2266,12 @@ class BrowserActionService:
             wait_result: dict[str, Any] | None = None
             trace_paths: list[str] = []
             screenshot_paths: list[str] = []
+            snapshot_paths: list[str] = []
             network_payload: dict[str, Any] = {}
+            network_checkpoint_value: dict[str, Any] = {}
+            console_checkpoint_value: dict[str, Any] = {}
+            replay_result: dict[str, Any] = {}
+            replay_artifacts: list[dict[str, Any]] = []
             step_results: list[FlowStepResult] = []
             wait_observations: list[dict[str, Any]] = []
             errors: list[str] = []
@@ -1599,6 +2286,32 @@ class BrowserActionService:
             cancelled_error: asyncio.CancelledError | None = None
             cleanup_result: dict[str, Any] = {}
             try:
+                if payload.capture.network or payload.network_evidence:
+                    try:
+                        checkpoint_requests = await self._all_network_requests(
+                            self._operation_deadline(
+                                deadline,
+                                2_000,
+                                "network checkpoint",
+                            )
+                        )
+                        network_checkpoint_value = network_checkpoint(
+                            checkpoint_requests,
+                            generation=self._transport_generation(),
+                        )
+                    except Exception as exc:
+                        warnings.append(f"network checkpoint: {str(exc)[:2000]}")
+                if payload.capture.console_errors:
+                    try:
+                        console_checkpoint_value = await self._console_checkpoint(
+                            self._operation_deadline(
+                                deadline,
+                                2_000,
+                                "console checkpoint",
+                            )
+                        )
+                    except Exception as exc:
+                        warnings.append(f"console checkpoint: {str(exc)[:2000]}")
                 if payload.capture.trace:
                     await self.playwright.start_trace(
                         session_id,
@@ -1780,6 +2493,122 @@ class BrowserActionService:
                         )
                     except Exception as exc:
                         warnings.append(f"initial screenshot: {str(exc)[:3500]}")
+                if payload.capture.page_snapshots:
+                    try:
+                        snapshot_paths.append(
+                            await self.playwright.capture_snapshot(
+                                session_id,
+                                experiment_dir,
+                                "before-flow",
+                                self._operation_deadline(
+                                    deadline,
+                                    3_000,
+                                    "initial page snapshot",
+                                ),
+                            )
+                        )
+                    except Exception as exc:
+                        warnings.append(f"initial page snapshot: {str(exc)[:3500]}")
+                if replay_plan is not None:
+                    if capture_id is not None:
+                        stream_checkpoint = await self._stream_checkpoint(
+                            capture_id,
+                            request_matcher,
+                            self._operation_deadline(
+                                deadline,
+                                1_500,
+                                "checkpoint before replay",
+                            ),
+                        )
+                    first_mutation_wall_time_ms = int(time.time() * 1000)
+                    replay_dir = experiment_dir / "replay"
+                    replay_dir.mkdir(parents=True, exist_ok=True)
+                    spec_file = replay_dir / "request-spec.json"
+                    diff_file = replay_dir / "request-diff.json"
+                    result_file = replay_dir / "response.json"
+                    spec_file.write_text(
+                        json.dumps(replay_plan["spec"], ensure_ascii=False, indent=2)
+                        + "\n",
+                        encoding="utf-8",
+                    )
+                    diff_file.write_text(
+                        json.dumps(replay_plan["diff"], ensure_ascii=False, indent=2)
+                        + "\n",
+                        encoding="utf-8",
+                    )
+                    started = utc_now()
+                    try:
+                        replay_result = await self.js_reverse.evaluate_browser_replay(
+                            spec_file,
+                            result_file,
+                            self._operation_deadline(
+                                deadline,
+                                20_000,
+                                "browser-context replay",
+                            ),
+                        )
+                        step_results.append(
+                            FlowStepResult(
+                                step_id="replay_request",
+                                status="completed",
+                                started_at=started,
+                                ended_at=utc_now(),
+                            )
+                        )
+                    except asyncio.CancelledError:
+                        step_results.append(
+                            FlowStepResult(
+                                step_id="replay_request",
+                                status="canceled_outcome_unknown",
+                                started_at=started,
+                                ended_at=utc_now(),
+                                error="Browser-context replay was canceled after dispatch.",
+                            )
+                        )
+                        raise
+                    except Exception as exc:
+                        step_results.append(
+                            FlowStepResult(
+                                step_id="replay_request",
+                                status="failed",
+                                started_at=started,
+                                ended_at=utc_now(),
+                                error=str(exc)[:4000],
+                            )
+                        )
+                        raise
+                    for path, suffix, kind, sensitivity, credentials in [
+                        (
+                            spec_file,
+                            "spec",
+                            "replay_request_spec",
+                            "credential",
+                            True,
+                        ),
+                        (
+                            diff_file,
+                            "diff",
+                            "replay_request_diff",
+                            "private",
+                            False,
+                        ),
+                        (
+                            result_file,
+                            "response",
+                            "replay_response",
+                            "private",
+                            False,
+                        ),
+                    ]:
+                        descriptor = self.experiments.describe_local_artifact(
+                            str(path),
+                            artifact_id=f"art_{experiment_id}_replay_{suffix}",
+                            kind=kind,
+                            sensitivity=sensitivity,
+                            contains_credentials=credentials,
+                        )
+                        if descriptor:
+                            replay_artifacts.append(descriptor)
                 for step_index, step in enumerate(payload.flow):
                     self._ensure_finalize_reserve(deadline, f"step {step.step_id}")
                     started = utc_now()
@@ -1968,6 +2797,10 @@ class BrowserActionService:
                     str(item)
                     for item in cleanup_result.get("screenshot_paths", [])
                 )
+                snapshot_paths.extend(
+                    str(item)
+                    for item in cleanup_result.get("snapshot_paths", [])
+                )
                 network_payload = dict(
                     cleanup_result.get("network_payload") or {}
                 )
@@ -2007,6 +2840,98 @@ class BrowserActionService:
                 except Exception as exc:
                     warnings.append(f"post-flow alignment: {str(exc)[:3500]}")
 
+            raw_network_requests = network_payload.get("requests")
+            raw_network_requests = (
+                [item for item in raw_network_requests if isinstance(item, dict)]
+                if isinstance(raw_network_requests, list)
+                else []
+            )
+            window_requests = requests_after_checkpoint(
+                raw_network_requests,
+                network_checkpoint_value,
+                include_in_flight=payload.primary_request.include_in_flight,
+            )
+            network_payload["requests"] = window_requests
+            network_payload["window"] = {
+                **network_checkpoint_value,
+                "matched_request_count": len(window_requests),
+                "collector_generation_at_finalize": self._transport_generation(),
+            }
+            primary_network_payload = {
+                **network_payload,
+                "requests": [
+                    item
+                    for item in window_requests
+                    if network_request_matches(item, request_matcher)
+                ],
+            }
+            evidence_entries = self._evidence_index(manifest)
+            evidence_artifacts: list[dict[str, Any]] = []
+            if (
+                cancelled_error is None
+                and payload.network_evidence
+                and self._transport_generation()
+                == int(
+                    network_checkpoint_value.get(
+                        "collector_generation", self._transport_generation()
+                    )
+                )
+            ):
+                try:
+                    exported_entries, exported_artifacts, export_warnings = (
+                        await self._export_network_evidence(
+                            experiment_id=experiment_id,
+                            experiment_dir=experiment_dir,
+                            selectors=payload.network_evidence,
+                            requests=window_requests,
+                            deadline=Deadline(8_000),
+                            step_ids=[
+                                item.step_id
+                                for item in step_results
+                                if item.status == "completed"
+                            ],
+                        )
+                    )
+                    evidence_entries.extend(exported_entries)
+                    evidence_artifacts.extend(exported_artifacts)
+                    warnings.extend(export_warnings)
+                except Exception as exc:
+                    warnings.append(f"network evidence export: {str(exc)[:3000]}")
+            if cancelled_error is None and payload.capture.console_errors:
+                console_entries, console_artifacts, console_warnings = (
+                    await self._export_console_evidence(
+                        experiment_id=experiment_id,
+                        experiment_dir=experiment_dir,
+                        checkpoint=console_checkpoint_value,
+                        deadline=Deadline(4_000),
+                    )
+                )
+                evidence_entries.extend(console_entries)
+                evidence_artifacts.extend(console_artifacts)
+                warnings.extend(console_warnings)
+            exported_reqids = {
+                int(request_ids["reqid"])
+                for item in evidence_entries
+                if item.get("kind") == "network_request"
+                and isinstance((request_ids := item.get("request_ids")), dict)
+                and isinstance(request_ids.get("reqid"), int)
+            }
+            primary_network_payload["requests"] = [
+                {
+                    **item,
+                    **(
+                        {
+                            "integrityStatus": "complete",
+                            "requestSnapshotIntegrity": "complete",
+                            "artifactIntegrity": "complete",
+                        }
+                        if item.get("reqid") in exported_reqids
+                        else {}
+                    ),
+                }
+                for item in primary_network_payload["requests"]
+            ]
+
             (
                 primary_requests,
                 primary_integrity,
@@ -2015,7 +2940,7 @@ class BrowserActionService:
             ) = self._primary_result(
                 payload,
                 final_status_payload,
-                network_payload,
+                primary_network_payload,
             )
             cancellation_classifications = self._classify_cancellations(
                 payload,
@@ -2142,6 +3067,8 @@ class BrowserActionService:
                 stop_payload,
                 network_payload,
             )
+            artifacts.extend(evidence_artifacts)
+            artifacts.extend(replay_artifacts)
             for index, screenshot_path in enumerate(screenshot_paths, start=1):
                 descriptor = self.experiments.describe_local_artifact(
                     screenshot_path,
@@ -2151,6 +3078,43 @@ class BrowserActionService:
                 )
                 if descriptor:
                     artifacts.append(descriptor)
+                    evidence_entries.append(
+                        {
+                            "evidence_id": evidence_id(
+                                experiment_id,
+                                "page_screenshot",
+                                stable_id=index,
+                            ),
+                            "kind": "page_screenshot",
+                            "artifact_ids": [descriptor["artifactId"]],
+                            "artifact_paths": {
+                                "screenshot": descriptor["relativePath"]
+                            },
+                        }
+                    )
+            for index, snapshot_path in enumerate(snapshot_paths, start=1):
+                descriptor = self.experiments.describe_local_artifact(
+                    snapshot_path,
+                    artifact_id=f"art_{experiment_id}_page_snapshot_{index}",
+                    kind="playwright_page_snapshot",
+                    sensitivity="private",
+                )
+                if descriptor:
+                    artifacts.append(descriptor)
+                    evidence_entries.append(
+                        {
+                            "evidence_id": evidence_id(
+                                experiment_id,
+                                "page_snapshot",
+                                stable_id=index,
+                            ),
+                            "kind": "page_snapshot",
+                            "artifact_ids": [descriptor["artifactId"]],
+                            "artifact_paths": {
+                                "snapshot": descriptor["relativePath"]
+                            },
+                        }
+                    )
             for index, trace_path in enumerate(trace_paths, start=1):
                 descriptor = self.experiments.describe_local_artifact(
                     trace_path,
@@ -2165,11 +3129,47 @@ class BrowserActionService:
                 for path in screenshot_paths
                 if (relative := self.experiments.relative_path(path)) is not None
             ]
+            relative_snapshot_paths = [
+                relative
+                for path in snapshot_paths
+                if (relative := self.experiments.relative_path(path)) is not None
+            ]
             relative_trace_paths = [
                 relative
                 for path in trace_paths
                 if (relative := self.experiments.relative_path(path)) is not None
             ]
+            if replay_plan is not None:
+                replay_artifact_ids = [
+                    str(item.get("artifactId"))
+                    for item in replay_artifacts
+                    if item.get("artifactId")
+                ]
+                evidence_entries.append(
+                    {
+                        "evidence_id": evidence_id(
+                            experiment_id,
+                            "replay_attempt",
+                            stable_id=1,
+                        ),
+                        "kind": "replay_attempt",
+                        "source_experiment_id": replay_plan["source_experiment_id"],
+                        "source_evidence_id": replay_plan["source_evidence_id"],
+                        "artifact_ids": replay_artifact_ids,
+                        "step_ids": ["replay_request"],
+                        "summary": {
+                            key: replay_result.get(key)
+                            for key in (
+                                "resultType",
+                                "filename",
+                                "byteLength",
+                                "charLength",
+                                "truncated",
+                            )
+                            if key in replay_result
+                        },
+                    }
+                )
             manifest.update(
                 {
                     "status": response_status,
@@ -2199,9 +3199,14 @@ class BrowserActionService:
                     "cancellation_classifications": cancellation_classifications,
                     "post_flow_alignment": asdict(post_alignment),
                     "capture_health": capture_health,
+                    "network_checkpoint": network_checkpoint_value,
                     "network_summary": network_payload,
+                    "console_checkpoint": console_checkpoint_value,
                     "screenshot_paths": relative_screenshot_paths,
+                    "snapshot_paths": relative_snapshot_paths,
                     "trace_paths": relative_trace_paths,
+                    "replay_result": replay_result,
+                    "evidence": evidence_entries,
                     "artifacts": artifacts,
                     "warnings": warnings,
                     "errors": errors,

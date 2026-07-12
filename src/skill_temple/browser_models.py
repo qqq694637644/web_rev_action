@@ -263,7 +263,43 @@ class CaptureOptions(StrictModel):
     stream: bool = True
     trace: bool = True
     screenshots: bool = True
-    scripts: bool = False
+    page_snapshots: bool = True
+    console_errors: bool = True
+
+
+NetworkExportPart = Literal[
+    "all",
+    "responseHeaders",
+    "responseBody",
+    "requestBody",
+    "queryParams",
+]
+
+
+class NetworkEvidenceSelector(StrictModel):
+    selector_id: str = Field(
+        pattern=r"^[a-zA-Z0-9_.-]+$", min_length=1, max_length=128
+    )
+    matcher: RequestMatcher = Field(default_factory=RequestMatcher)
+    max_matches: int = Field(default=5, ge=1, le=50)
+    export_parts: list[NetworkExportPart] = Field(
+        default_factory=lambda: ["all"], min_length=1, max_length=5
+    )
+    include_initiator: bool = True
+    include_cookie_provenance: bool = False
+    cookie_names: list[str] = Field(default_factory=list, max_length=20)
+
+
+class ExperimentSeries(StrictModel):
+    analysis_series_id: str | None = Field(
+        default=None, pattern=r"^[a-zA-Z0-9_.-]+$", max_length=128
+    )
+    scenario_type: str | None = Field(default=None, max_length=128)
+    predecessor_experiment_id: str | None = Field(
+        default=None, pattern=r"^[a-zA-Z0-9_.-]+$", max_length=128
+    )
+    sequence_index: int | None = Field(default=None, ge=0, le=100_000)
+    conversation_key: str | None = Field(default=None, max_length=512)
 
 
 class ObjectiveRequirements(StrictModel):
@@ -302,6 +338,10 @@ class CaptureFlowPayload(StrictModel):
     job_timeout_ms: int = Field(default=300_000, ge=10_000, le=1_800_000)
     capture: CaptureOptions = Field(default_factory=CaptureOptions)
     requirements: ObjectiveRequirements = Field(default_factory=ObjectiveRequirements)
+    network_evidence: list[NetworkEvidenceSelector] = Field(
+        default_factory=list, max_length=20
+    )
+    series: ExperimentSeries = Field(default_factory=ExperimentSeries)
 
     @model_validator(mode="after")
     def validate_stop_sequence(self) -> CaptureFlowPayload:
@@ -324,20 +364,128 @@ class CaptureFlowPayload(StrictModel):
                 and step.condition.type in {"first_event", "event_predicate"}
                 for step in before
             )
-            has_canceled_wait = any(
+            has_terminal_observation = any(
                 step.action in {"wait", "assert"}
                 and step.condition is not None
-                and step.condition.type == "network_canceled"
+                and step.condition.type
+                in {
+                    "network_canceled",
+                    "network_finished",
+                    "event_predicate",
+                    "request_observed",
+                    "response_observed",
+                    "selector_visible",
+                    "selector_hidden",
+                    "timeout",
+                    "failed",
+                }
                 for step in after
-            ) or (self.wait_for is not None and self.wait_for.type == "network_canceled")
+            ) or (
+                self.wait_for is not None
+                and self.wait_for.type
+                in {
+                    "network_canceled",
+                    "network_finished",
+                    "event_predicate",
+                    "request_observed",
+                    "response_observed",
+                    "selector_visible",
+                    "selector_hidden",
+                    "timeout",
+                    "failed",
+                }
+            )
             if not has_started_stream:
                 raise ValueError(
                     "stop_generation requires an earlier first_event or event_predicate wait"
                 )
-            if not has_canceled_wait:
+            if not has_terminal_observation:
                 raise ValueError(
-                    "stop_generation requires a later network_canceled wait for the same experiment"
+                    "stop_generation requires a later network, event, selector, "
+                    "or timeout observation"
                 )
+        return self
+
+
+class RemoveJsonPathMutation(StrictModel):
+    type: Literal["remove_json_path"]
+    path: str = Field(pattern=r"^\$\.[A-Za-z0-9_.-]+$", max_length=512)
+
+
+class ReplaceJsonPathMutation(StrictModel):
+    type: Literal["replace_json_path"]
+    path: str = Field(pattern=r"^\$\.[A-Za-z0-9_.-]+$", max_length=512)
+    value: Any
+
+
+class RemoveHeaderMutation(StrictModel):
+    type: Literal["remove_header"]
+    name: str = Field(min_length=1, max_length=256)
+
+
+class ReplaceHeaderMutation(StrictModel):
+    type: Literal["replace_header"]
+    name: str = Field(min_length=1, max_length=256)
+    value: str = Field(max_length=32_000)
+
+
+class RemoveQueryParameterMutation(StrictModel):
+    type: Literal["remove_query_parameter"]
+    name: str = Field(min_length=1, max_length=512)
+
+
+class ReplaceQueryParameterMutation(StrictModel):
+    type: Literal["replace_query_parameter"]
+    name: str = Field(min_length=1, max_length=512)
+    value: str = Field(max_length=32_000)
+
+
+ReplayMutation = Annotated[
+    RemoveJsonPathMutation
+    | ReplaceJsonPathMutation
+    | RemoveHeaderMutation
+    | ReplaceHeaderMutation
+    | RemoveQueryParameterMutation
+    | ReplaceQueryParameterMutation,
+    Field(discriminator="type"),
+]
+
+
+class ReplayRequestPayload(StrictModel):
+    session_id: str = Field(pattern=r"^[a-zA-Z0-9_.-]+$", max_length=128)
+    objective: str = Field(min_length=1, max_length=2048)
+    source_experiment_id: str = Field(
+        pattern=r"^[a-zA-Z0-9_.-]+$", max_length=128
+    )
+    source_evidence_id: str = Field(
+        pattern=r"^[a-zA-Z0-9_.-]+$", max_length=256
+    )
+    mode: Literal["browser_context"] = "browser_context"
+    mutations: list[ReplayMutation] = Field(default_factory=list, max_length=64)
+    target: BrowserTarget = Field(default_factory=BrowserTarget)
+    wait_for: WaitCondition | None = None
+    execution_mode: Literal["job", "sync"] = "job"
+    deadline_ms: int = Field(default=42_000, ge=1_000, le=42_000)
+    job_timeout_ms: int = Field(default=300_000, ge=10_000, le=1_800_000)
+    capture: CaptureOptions = Field(
+        default_factory=lambda: CaptureOptions(stream=False)
+    )
+    requirements: ObjectiveRequirements = Field(
+        default_factory=lambda: ObjectiveRequirements(
+            require_raw_capture=False,
+            require_request_snapshot=True,
+            require_artifacts=True,
+        )
+    )
+    network_evidence: list[NetworkEvidenceSelector] = Field(
+        default_factory=list, max_length=20
+    )
+    series: ExperimentSeries = Field(default_factory=ExperimentSeries)
+
+    @model_validator(mode="after")
+    def validate_replay(self) -> ReplayRequestPayload:
+        if self.target.start_url is not None:
+            raise ValueError("replay_request does not allow target.start_url")
         return self
 
 
@@ -387,6 +535,13 @@ class CancelExperimentRequest(StrictModel):
     skill_binding: SkillBinding | None = None
 
 
+class ReplayRequestRequest(StrictModel):
+    contract_version: Literal["1.0"] = "1.0"
+    operation: Literal["replay_request"]
+    payload: ReplayRequestPayload
+    skill_binding: SkillBinding | None = None
+
+
 class GetSessionPayload(StrictModel):
     session_id: str = Field(pattern=r"^[a-zA-Z0-9_.-]+$", max_length=128)
 
@@ -403,6 +558,56 @@ class GetExperimentPayload(StrictModel):
 class GetStreamStatusPayload(StrictModel):
     experiment_id: str = Field(pattern=r"^[a-zA-Z0-9_.-]+$", max_length=128)
     capture_uuid: str | None = Field(default=None, max_length=128)
+
+
+class ListEvidencePayload(StrictModel):
+    experiment_id: str = Field(pattern=r"^[a-zA-Z0-9_.-]+$", max_length=128)
+    kind: str | None = Field(default=None, max_length=128)
+    limit: int = Field(default=100, ge=1, le=500)
+
+
+class GetNetworkEvidencePayload(StrictModel):
+    experiment_id: str = Field(pattern=r"^[a-zA-Z0-9_.-]+$", max_length=128)
+    evidence_id: str = Field(pattern=r"^[a-zA-Z0-9_.-]+$", max_length=256)
+
+
+class GetRequestInitiatorPayload(GetNetworkEvidencePayload):
+    pass
+
+
+class SearchScriptsPayload(StrictModel):
+    session_id: str = Field(pattern=r"^[a-zA-Z0-9_.-]+$", max_length=128)
+    query: str = Field(min_length=1, max_length=4096)
+    url_filter: str | None = Field(default=None, max_length=4096)
+    max_results: int = Field(default=30, ge=1, le=100)
+    exclude_minified: bool = False
+
+
+class GetScriptSourcePayload(StrictModel):
+    session_id: str = Field(pattern=r"^[a-zA-Z0-9_.-]+$", max_length=128)
+    url: str | None = Field(default=None, max_length=8192)
+    script_id: str | None = Field(default=None, max_length=512)
+    start_line: int | None = Field(default=None, ge=1)
+    end_line: int | None = Field(default=None, ge=1)
+    offset: int | None = Field(default=None, ge=0)
+    length: int | None = Field(default=None, ge=1, le=200_000)
+
+    @model_validator(mode="after")
+    def validate_selector(self) -> GetScriptSourcePayload:
+        if bool(self.url) == bool(self.script_id):
+            raise ValueError("provide exactly one of url or script_id")
+        if (self.start_line is None) != (self.end_line is None):
+            raise ValueError("start_line and end_line must be provided together")
+        if (self.offset is None) != (self.length is None):
+            raise ValueError("offset and length must be provided together")
+        if self.start_line is not None and self.offset is not None:
+            raise ValueError("line range and offset range are mutually exclusive")
+        return self
+
+
+class ListConsoleErrorsPayload(StrictModel):
+    experiment_id: str = Field(pattern=r"^[a-zA-Z0-9_.-]+$", max_length=128)
+    limit: int = Field(default=100, ge=1, le=500)
 
 
 class GetSessionRequest(StrictModel):
@@ -428,7 +633,8 @@ RunBrowserExperimentRequest = Annotated[
     | CaptureBaselineRequest
     | CaptureFlowRequest
     | CloseSessionRequest
-    | CancelExperimentRequest,
+    | CancelExperimentRequest
+    | ReplayRequestRequest,
     Field(discriminator="operation"),
 ]
 
@@ -439,11 +645,53 @@ class GetStreamStatusRequest(StrictModel):
     payload: GetStreamStatusPayload
 
 
+class ListEvidenceRequest(StrictModel):
+    contract_version: Literal["1.0"] = "1.0"
+    operation: Literal["list_evidence"]
+    payload: ListEvidencePayload
+
+
+class GetNetworkEvidenceRequest(StrictModel):
+    contract_version: Literal["1.0"] = "1.0"
+    operation: Literal["get_network_evidence"]
+    payload: GetNetworkEvidencePayload
+
+
+class GetRequestInitiatorRequest(StrictModel):
+    contract_version: Literal["1.0"] = "1.0"
+    operation: Literal["get_request_initiator"]
+    payload: GetRequestInitiatorPayload
+
+
+class SearchScriptsRequest(StrictModel):
+    contract_version: Literal["1.0"] = "1.0"
+    operation: Literal["search_scripts"]
+    payload: SearchScriptsPayload
+
+
+class GetScriptSourceRequest(StrictModel):
+    contract_version: Literal["1.0"] = "1.0"
+    operation: Literal["get_script_source"]
+    payload: GetScriptSourcePayload
+
+
+class ListConsoleErrorsRequest(StrictModel):
+    contract_version: Literal["1.0"] = "1.0"
+    operation: Literal["list_console_errors"]
+    payload: ListConsoleErrorsPayload
+
+
 InspectBrowserEvidenceRequest = Annotated[
     GetSessionRequest
     | ListExperimentsRequest
     | GetExperimentRequest
-    | GetStreamStatusRequest,
+    | GetStreamStatusRequest
+    | ListEvidenceRequest
+    | GetNetworkEvidenceRequest
+    | GetRequestInitiatorRequest
+    | SearchScriptsRequest
+    | GetScriptSourceRequest
+    | ListConsoleErrorsRequest,
     Field(discriminator="operation"),
 ]
 

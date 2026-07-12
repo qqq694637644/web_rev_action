@@ -69,6 +69,30 @@ class RuntimeTests(unittest.TestCase):
         self.assertFalse((root / "skill.json").exists())
         self.assertFalse((root / "INDEX.md").exists())
 
+    def test_packaged_pandora_skill_exposes_protocol_reproduction_workflow(self) -> None:
+        runtime = load_runtime()
+        result = runtime.retrieve(
+            "use $pandora-protocol-reproduction for protocol replay",
+            hinted_skill_ids=["pandora-protocol-reproduction"],
+        )
+
+        selected = result["selected_skills"][0]
+        self.assertEqual(selected["skill_id"], "pandora-protocol-reproduction")
+        self.assertIn("browser-context request replay", selected["instructions"])
+        self.assertEqual(
+            set(selected["referenced_paths"]),
+            {
+                "docs/evidence-contract.md",
+                "docs/experiment-matrix.md",
+                "docs/report-templates.md",
+            },
+        )
+        root = Path(runtime.skills_dir) / "pandora-protocol-reproduction"
+        self.assertTrue((root / "SKILL.md").is_file())
+        self.assertTrue((root / "docs" / "experiment-matrix.md").is_file())
+        self.assertTrue((root / "docs" / "evidence-contract.md").is_file())
+        self.assertTrue((root / "docs" / "report-templates.md").is_file())
+
     def test_resolve_uses_exact_mentions_and_explicit_hints(self) -> None:
         runtime = load_runtime()
         results = [
@@ -120,8 +144,8 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(result["selected_skills"], [])
         self.assertEqual(result["decision"]["next_action"], "selectSkillOrAnswer")
         self.assertTrue(result["catalog_included"])
-        self.assertEqual(result["available_skill_count"], 1)
-        self.assertEqual(result["included_skill_count"], 1)
+        self.assertEqual(result["available_skill_count"], 2)
+        self.assertEqual(result["included_skill_count"], 2)
         self.assertEqual(result["omitted_skill_count"], 0)
 
     def test_multiple_explicit_skills_auto_chain_and_preserve_order(self) -> None:

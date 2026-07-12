@@ -19,6 +19,7 @@ from .browser_models import (
     ExactDataPredicate,
     FlowStep,
     Locator,
+    NetworkExportPart,
     RequestMatcher,
     WaitCondition,
 )
@@ -285,6 +286,14 @@ class PlaywrightAdapter(Protocol):
     ) -> list[str]: ...
 
     async def capture_screenshot(
+        self,
+        session_ref: str,
+        experiment_dir: Path,
+        name: str,
+        deadline: DeadlineLike,
+    ) -> str: ...
+
+    async def capture_snapshot(
         self,
         session_ref: str,
         experiment_dir: Path,
@@ -593,6 +602,23 @@ class PlaywrightCliAdapter:
         await self._run(
             session_ref,
             "screenshot",
+            f"--filename={filename}",
+            deadline=deadline,
+        )
+        return filename.as_posix()
+
+    async def capture_snapshot(
+        self,
+        session_ref: str,
+        experiment_dir: Path,
+        name: str,
+        deadline: DeadlineLike,
+    ) -> str:
+        filename = experiment_dir / "playwright" / "snapshots" / f"{name}.yaml"
+        filename.parent.mkdir(parents=True, exist_ok=True)
+        await self._run(
+            session_ref,
+            "snapshot",
             f"--filename={filename}",
             deadline=deadline,
         )
@@ -972,6 +998,59 @@ class JsReverseAdapter(Protocol):
         deadline: DeadlineLike,
     ) -> dict[str, Any]: ...
 
+    async def export_network_request(
+        self,
+        reqid: int,
+        output_file: Path,
+        output_part: NetworkExportPart,
+        deadline: DeadlineLike,
+    ) -> dict[str, Any]: ...
+
+    async def get_request_initiator(
+        self, reqid: int, deadline: DeadlineLike
+    ) -> dict[str, Any]: ...
+
+    async def search_scripts(
+        self,
+        query: str,
+        deadline: DeadlineLike,
+        *,
+        url_filter: str | None = None,
+        max_results: int = 30,
+        exclude_minified: bool = False,
+    ) -> dict[str, Any]: ...
+
+    async def get_script_source(
+        self,
+        deadline: DeadlineLike,
+        *,
+        url: str | None = None,
+        script_id: str | None = None,
+        start_line: int | None = None,
+        end_line: int | None = None,
+        offset: int | None = None,
+        length: int | None = None,
+    ) -> dict[str, Any]: ...
+
+    async def list_console_messages(
+        self,
+        deadline: DeadlineLike,
+        *,
+        types: list[str] | None = None,
+        include_preserved_messages: bool = False,
+    ) -> dict[str, Any]: ...
+
+    async def trace_cookie_provenance(
+        self, cookie_name: str, deadline: DeadlineLike
+    ) -> dict[str, Any]: ...
+
+    async def evaluate_browser_replay(
+        self,
+        spec_file: Path,
+        output_file: Path,
+        deadline: DeadlineLike,
+    ) -> dict[str, Any]: ...
+
     async def wait_for_stream_condition(
         self,
         *,
@@ -998,6 +1077,8 @@ class JsReverseMcpAdapter:
             "get_request_initiator",
             "search_in_sources",
             "get_script_source",
+            "evaluate_script",
+            "list_console_messages",
             "break_on_xhr",
             "get_paused_info",
             "pause_or_resume",
@@ -1263,6 +1344,213 @@ class JsReverseMcpAdapter:
             "hasPreviousPage": False,
         }
         return combined
+
+    async def export_network_request(
+        self,
+        reqid: int,
+        output_file: Path,
+        output_part: NetworkExportPart,
+        deadline: DeadlineLike,
+    ) -> dict[str, Any]:
+        return await self._call(
+            "list_network_requests",
+            {
+                "reqid": reqid,
+                "outputFile": str(output_file.resolve()),
+                "outputPart": output_part,
+                "confirmOverwrite": False,
+            },
+            deadline,
+        )
+
+    async def get_request_initiator(
+        self, reqid: int, deadline: DeadlineLike
+    ) -> dict[str, Any]:
+        return await self._call(
+            "get_request_initiator",
+            {"requestId": reqid},
+            deadline,
+        )
+
+    async def search_scripts(
+        self,
+        query: str,
+        deadline: DeadlineLike,
+        *,
+        url_filter: str | None = None,
+        max_results: int = 30,
+        exclude_minified: bool = False,
+    ) -> dict[str, Any]:
+        arguments: dict[str, Any] = {
+            "query": query,
+            "maxResults": max_results,
+            "excludeMinified": exclude_minified,
+        }
+        if url_filter:
+            arguments["urlFilter"] = url_filter
+        return await self._call("search_in_sources", arguments, deadline)
+
+    async def get_script_source(
+        self,
+        deadline: DeadlineLike,
+        *,
+        url: str | None = None,
+        script_id: str | None = None,
+        start_line: int | None = None,
+        end_line: int | None = None,
+        offset: int | None = None,
+        length: int | None = None,
+    ) -> dict[str, Any]:
+        arguments: dict[str, Any] = {}
+        if url:
+            arguments["url"] = url
+        if script_id:
+            arguments["scriptId"] = script_id
+        if start_line is not None:
+            arguments["startLine"] = start_line
+        if end_line is not None:
+            arguments["endLine"] = end_line
+        if offset is not None:
+            arguments["offset"] = offset
+        if length is not None:
+            arguments["length"] = length
+        return await self._call("get_script_source", arguments, deadline)
+
+    async def list_console_messages(
+        self,
+        deadline: DeadlineLike,
+        *,
+        types: list[str] | None = None,
+        include_preserved_messages: bool = False,
+    ) -> dict[str, Any]:
+        page_idx = 0
+        messages: list[dict[str, Any]] = []
+        combined: dict[str, Any] = {}
+        while True:
+            arguments: dict[str, Any] = {
+                "pageIdx": page_idx,
+                "pageSize": 100,
+                "includePreservedMessages": include_preserved_messages,
+            }
+            if types:
+                arguments["types"] = types
+            page = await self._call("list_console_messages", arguments, deadline)
+            if not combined:
+                combined = {
+                    key: value
+                    for key, value in page.items()
+                    if key not in {"messages", "pagination"}
+                }
+            page_messages = page.get("messages")
+            if isinstance(page_messages, list):
+                messages.extend(item for item in page_messages if isinstance(item, dict))
+            pagination = (
+                page.get("pagination")
+                if isinstance(page.get("pagination"), dict)
+                else {}
+            )
+            if not pagination.get("hasNextPage"):
+                break
+            page_idx += 1
+            if page_idx >= int(pagination.get("totalPages", page_idx + 1)):
+                break
+        combined["messages"] = messages
+        combined["pagination"] = {
+            "pageIdx": 0,
+            "pageSize": 100,
+            "totalItems": len(messages),
+            "totalPages": max(1, page_idx + 1),
+            "hasNextPage": False,
+            "hasPreviousPage": False,
+        }
+        return combined
+
+    async def trace_cookie_provenance(
+        self, cookie_name: str, deadline: DeadlineLike
+    ) -> dict[str, Any]:
+        page_idx = 0
+        entries: list[dict[str, Any]] = []
+        while True:
+            page = await self._call(
+                "list_network_requests",
+                {
+                    "cookieName": cookie_name,
+                    "pageIdx": page_idx,
+                    "pageSize": 100,
+                },
+                deadline,
+            )
+            values = page.get("cookieFlow")
+            if isinstance(values, list):
+                entries.extend(item for item in values if isinstance(item, dict))
+            pagination = (
+                page.get("pagination")
+                if isinstance(page.get("pagination"), dict)
+                else {}
+            )
+            if not pagination.get("hasNextPage"):
+                break
+            page_idx += 1
+            if page_idx >= int(pagination.get("totalPages", page_idx + 1)):
+                break
+        return {"cookieName": cookie_name, "cookieFlow": entries}
+
+    async def evaluate_browser_replay(
+        self,
+        spec_file: Path,
+        output_file: Path,
+        deadline: DeadlineLike,
+    ) -> dict[str, Any]:
+        function = """async ({localFile}) => {
+          const spec = JSON.parse(localFile.text);
+          const headers = new Headers();
+          for (const entry of spec.headers || []) {
+            headers.append(String(entry.name), String(entry.value));
+          }
+          let body;
+          if (spec.body && spec.body.encoding === 'utf8') {
+            body = spec.body.text;
+          } else if (spec.body && spec.body.encoding === 'base64') {
+            const binary = atob(spec.body.base64 || '');
+            const bytes = new Uint8Array(binary.length);
+            for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+            body = bytes;
+          }
+          const response = await fetch(spec.url, {
+            method: spec.method,
+            headers,
+            body: ['GET', 'HEAD'].includes(String(spec.method).toUpperCase()) ? undefined : body,
+            credentials: 'include',
+            redirect: 'follow',
+          });
+          const bytes = new Uint8Array(await response.arrayBuffer());
+          const previewBytes = bytes.subarray(0, 8192);
+          let preview = '';
+          try { preview = new TextDecoder('utf-8', {fatal: false}).decode(previewBytes); }
+          catch { preview = ''; }
+          return {
+            status: response.status,
+            statusText: response.statusText,
+            url: response.url,
+            redirected: response.redirected,
+            ok: response.ok,
+            headers: Array.from(response.headers.entries()),
+            bodyByteLength: bytes.byteLength,
+            bodyPreview: preview,
+          };
+        }"""
+        return await self._call(
+            "evaluate_script",
+            {
+                "confirm": True,
+                "function": function,
+                "mainWorld": True,
+                "localFilePath": str(spec_file.resolve()),
+                "outputFile": str(output_file.resolve()),
+                "confirmOverwrite": False,
+            },
+            deadline,
+        )
 
     @staticmethod
     def _request_matches(request: dict[str, Any], matcher: RequestMatcher) -> bool:
