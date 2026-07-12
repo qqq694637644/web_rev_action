@@ -16,6 +16,7 @@ from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from .browser_adapters import (
     AlignmentResult,
@@ -50,8 +51,10 @@ from .browser_models import (
     ListExperimentsRequest,
     OpenSessionRequest,
     PrimaryRequest,
+    ReplayControlPayload,
     ReplayRequestPayload,
     ReplayRequestRequest,
+    ReplayTreatmentPayload,
     RequestMatcher,
     RunBrowserExperimentRequest,
     SaveScriptSourceRequest,
@@ -60,14 +63,19 @@ from .browser_models import (
     WaitCondition,
 )
 from .protocol_evidence import (
-    assess_mutation_effectiveness,
+    assess_control_wire_baseline,
+    assess_paired_mutation_effectiveness,
     build_replay_spec,
+    canonical_json_sha256,
+    classify_replay_response,
     evidence_id,
     load_snapshot,
     network_checkpoint,
     network_request_matches,
     public_network_summary,
     redacted_request_body_from_snapshot,
+    request_body_canonical_sha256_from_snapshot,
+    request_body_canonical_sha256_from_spec,
     request_shape_from_snapshot,
     requests_after_checkpoint,
     response_content_type,
@@ -698,12 +706,97 @@ class BrowserActionService:
             404,
         )
 
+    @staticmethod
+    def _pointer_tokens(path: str) -> list[str]:
+        if path == "/":
+            return []
+        return [
+            token.replace("~1", "/").replace("~0", "~")
+            for token in path.split("/")[1:]
+        ]
+
+    @classmethod
+    def _filter_shape_paths(
+        cls,
+        paths: dict[str, Any],
+        *,
+        path_prefix: str,
+        max_depth: int,
+        max_array_items: int,
+    ) -> list[tuple[str, Any]]:
+        prefix_tokens = cls._pointer_tokens(path_prefix)
+        selected: list[tuple[str, Any]] = []
+        for path, descriptor in paths.items():
+            if not isinstance(path, str):
+                continue
+            tokens = cls._pointer_tokens(path)
+            if tokens[: len(prefix_tokens)] != prefix_tokens:
+                continue
+            relative = tokens[len(prefix_tokens) :]
+            if len(relative) > max_depth:
+                continue
+            if any(
+                token.isdigit() and int(token) >= max_array_items
+                for token in relative
+            ):
+                continue
+            selected.append((path, descriptor))
+        return sorted(selected, key=lambda item: item[0])
+
+    @classmethod
+    def _bounded_redacted_subtree(
+        cls,
+        value: Any,
+        *,
+        path_prefix: str,
+        max_depth: int,
+        max_array_items: int,
+    ) -> Any:
+        current = value
+        for token in cls._pointer_tokens(path_prefix):
+            if isinstance(current, dict) and token in current:
+                current = current[token]
+            elif isinstance(current, list) and token.isdigit():
+                index = int(token)
+                if index >= len(current):
+                    return None
+                current = current[index]
+            else:
+                return None
+
+        def prune(item: Any, depth: int) -> Any:
+            if depth >= max_depth:
+                if isinstance(item, dict):
+                    return {"$truncated": "object"}
+                if isinstance(item, list):
+                    return {"$truncated": "array", "length": len(item)}
+                return item
+            if isinstance(item, dict):
+                keys = sorted(item)[:100]
+                result = {key: prune(item[key], depth + 1) for key in keys}
+                if len(item) > len(keys):
+                    result["$truncated_key_count"] = len(item) - len(keys)
+                return result
+            if isinstance(item, list):
+                result = [
+                    prune(child, depth + 1)
+                    for child in item[:max_array_items]
+                ]
+                if len(item) > max_array_items:
+                    result.append(
+                        {"$truncated_array_items": len(item) - max_array_items}
+                    )
+                return result
+            return item
+
+        return prune(current, 0)
+
     def _validate_and_store_series(
         self,
         *,
         session_id: str,
         manifest: dict[str, Any],
-        payload: CaptureFlowPayload | ReplayRequestPayload,
+        payload: CaptureFlowPayload,
     ) -> None:
         series = payload.series.model_dump(mode="json", exclude_none=True)
         predecessor_id = series.get("predecessor_experiment_id")
@@ -730,42 +823,85 @@ class BrowserActionService:
         manifest["series"] = series
 
     @staticmethod
-    def _generate_volatile_binding_values(payload: ReplayRequestPayload) -> dict[str, Any]:
+    def _generate_binding_value(binding: VolatileBinding) -> Any:
+        if binding.generator == "uuid4":
+            return str(uuid.uuid4())
+        if binding.generator == "timestamp_ms":
+            return int(time.time() * 1000)
+        if binding.generator == "timestamp_iso":
+            return datetime.now(UTC).isoformat()
+        return secrets.token_hex(16)
+
+    @classmethod
+    def _generate_volatile_binding_values(
+        cls,
+        bindings: list[VolatileBinding],
+    ) -> dict[str, Any]:
         values: dict[str, Any] = {}
-        for binding in payload.volatile_bindings:
-            if binding.generator == "uuid4":
-                value: Any = str(uuid.uuid4())
-            elif binding.generator == "timestamp_ms":
-                value = int(time.time() * 1000)
-            elif binding.generator == "timestamp_iso":
-                value = datetime.now(UTC).isoformat()
-            else:
-                value = secrets.token_hex(8)
-            values[binding.binding_id] = value
+        for binding in bindings:
+            values[binding.binding_id] = cls._generate_binding_value(binding)
         return values
+
+    @staticmethod
+    def _pair_protocol(control: ReplayControlPayload) -> dict[str, Any]:
+        return {
+            "session_id": control.session_id,
+            "source_experiment_id": control.source_experiment_id,
+            "source_evidence_id": control.source_evidence_id,
+            "mode": control.mode,
+            "target": control.target.model_dump(mode="json", exclude_none=True),
+            "wait_for": (
+                control.wait_for.model_dump(mode="json", exclude_none=True)
+                if control.wait_for
+                else None
+            ),
+            "verification_flow": [
+                step.model_dump(mode="json", exclude_none=True)
+                for step in control.verification_flow
+            ],
+            "execution_mode": control.execution_mode,
+            "deadline_ms": control.deadline_ms,
+            "job_timeout_ms": control.job_timeout_ms,
+            "max_response_bytes": control.max_response_bytes,
+            "stream_idle_timeout_ms": control.stream_idle_timeout_ms,
+            "default_done_marker": control.default_done_marker,
+            "capture": control.capture.model_dump(mode="json"),
+            "requirements": control.requirements.model_dump(mode="json"),
+            "network_evidence": [
+                item.model_dump(mode="json", exclude_none=True)
+                for item in control.network_evidence
+            ],
+            "volatile_bindings": [
+                item.model_dump(mode="json", exclude_none=True)
+                for item in control.volatile_bindings
+            ],
+        }
 
     def _resolve_replay_pair(
         self,
         payload: ReplayRequestPayload,
-    ) -> tuple[list[Any], dict[str, Any], dict[str, Any] | None]:
-        if payload.replay_mode == "control":
-            return (
-                list(payload.volatile_bindings),
-                self._generate_volatile_binding_values(payload),
-                None,
-            )
-        control_id = str(payload.control_experiment_id)
+    ) -> tuple[
+        ReplayControlPayload,
+        list[VolatileBinding],
+        dict[str, Any],
+        dict[str, Any],
+        dict[str, Any] | None,
+        Any | None,
+    ]:
+        if isinstance(payload, ReplayControlPayload):
+            bindings = list(payload.volatile_bindings)
+            values = self._generate_volatile_binding_values(bindings)
+            protocol = self._pair_protocol(payload)
+            return payload, bindings, values, protocol, None, None
+        control_id = payload.control_experiment_id
         control = self.experiments.load_manifest(control_id)
-        if control.get("session_id") != payload.session_id:
-            raise BrowserServiceError(
-                "control_session_mismatch",
-                "The control replay belongs to a different browser session.",
-                409,
-            )
-        if control.get("status") != "completed" or control.get("objective_integrity") == "failed":
+        if (
+            control.get("status") != "completed"
+            or control.get("objective_integrity") != "complete"
+        ):
             raise BrowserServiceError(
                 "control_replay_not_usable",
-                "Treatment replay requires a completed, non-failed control replay.",
+                "Treatment replay requires a completed control with complete objective integrity.",
                 409,
             )
         control_http_status = control.get("replay_http_status")
@@ -779,6 +915,18 @@ class BrowserActionService:
                 "Treatment replay requires a control replay with a successful HTTP status.",
                 409,
             )
+        control_response_classification = control.get(
+            "replay_response_classification"
+        )
+        if (
+            not isinstance(control_response_classification, dict)
+            or control_response_classification.get("classification") != "success"
+        ):
+            raise BrowserServiceError(
+                "control_replay_response_contract_failed",
+                "Treatment replay requires a control with a successful response contract.",
+                409,
+            )
         replay = control.get("replay")
         replay = replay if isinstance(replay, dict) else {}
         if replay.get("replay_mode") != "control":
@@ -787,18 +935,41 @@ class BrowserActionService:
                 "control_experiment_id does not reference a control replay.",
                 409,
             )
-        if (
-            replay.get("source_experiment_id") != payload.source_experiment_id
-            or replay.get("source_evidence_id") != payload.source_evidence_id
+        pair_protocol = replay.get("pair_protocol")
+        pair_protocol_hash = replay.get("pair_protocol_hash")
+        if not isinstance(pair_protocol, dict) or not isinstance(
+            pair_protocol_hash, str
         ):
             raise BrowserServiceError(
-                "control_replay_source_mismatch",
-                "Control and treatment must use the same source evidence.",
+                "control_pair_protocol_missing",
+                "Control replay has no immutable pair protocol.",
                 409,
             )
+        if canonical_json_sha256(pair_protocol) != pair_protocol_hash:
+            raise BrowserServiceError(
+                "control_pair_protocol_invalid",
+                "Control replay pair protocol hash does not match its manifest.",
+                409,
+            )
+        try:
+            effective_control = ReplayControlPayload.model_validate(
+                {
+                    **pair_protocol,
+                    "objective": str(control.get("objective") or "paired replay"),
+                    "replay_mode": "control",
+                    "mutations": [],
+                    "series": control.get("series") or {},
+                }
+            )
+        except Exception as exc:
+            raise BrowserServiceError(
+                "control_pair_protocol_invalid",
+                "Control replay pair protocol cannot be reconstructed.",
+                409,
+            ) from exc
         binding_specs = replay.get("volatile_bindings")
-        binding_values = replay.get("volatile_binding_values")
-        if not isinstance(binding_specs, list) or not isinstance(binding_values, dict):
+        control_values = replay.get("control_volatile_binding_values")
+        if not isinstance(binding_specs, list) or not isinstance(control_values, dict):
             raise BrowserServiceError(
                 "control_replay_bindings_missing",
                 "Control replay does not contain reusable volatile bindings.",
@@ -812,7 +983,22 @@ class BrowserActionService:
                 "Control replay contains invalid volatile binding metadata.",
                 409,
             ) from exc
-        return parsed_specs, dict(binding_values), control
+        treatment_values = {
+            binding.binding_id: (
+                control_values[binding.binding_id]
+                if binding.reuse_policy == "same_value"
+                else self._generate_binding_value(binding)
+            )
+            for binding in parsed_specs
+        }
+        return (
+            effective_control,
+            parsed_specs,
+            treatment_values,
+            pair_protocol,
+            control,
+            payload.mutation,
+        )
 
     async def _all_network_requests(self, deadline: Deadline) -> list[dict[str, Any]]:
         payload = await self.js_reverse.list_network_requests(
@@ -880,10 +1066,22 @@ class BrowserActionService:
                         kind=f"network_{part}",
                         sensitivity=(
                             "credential"
-                            if part in {"all", "responseHeaders"}
+                            if part
+                            in {
+                                "all",
+                                "requestBody",
+                                "responseBody",
+                                "responseHeaders",
+                            }
                             else "private"
                         ),
-                        contains_credentials=part in {"all", "responseHeaders"},
+                        contains_credentials=part
+                        in {
+                            "all",
+                            "requestBody",
+                            "responseBody",
+                            "responseHeaders",
+                        },
                     )
                     if descriptor:
                         artifacts.append(descriptor)
@@ -1004,8 +1202,40 @@ class BrowserActionService:
                         "selector_id": selector.selector_id,
                         "request_ids": {
                             "reqid": reqid,
-                            "collector_generation": self._transport_generation(),
+                            "collector_generation": (
+                                snapshot.get("collectorGeneration")
+                                if isinstance(snapshot, dict)
+                                and snapshot.get("collectorGeneration") is not None
+                                else request.get("collectorGeneration")
+                                if request.get("collectorGeneration") is not None
+                                else self._transport_generation()
+                            ),
+                            "network_request_id": (
+                                snapshot.get("networkRequestId")
+                                if isinstance(snapshot, dict)
+                                else request.get("networkRequestId")
+                            ),
+                            "cdp_request_id": (
+                                snapshot.get("cdpRequestId")
+                                if isinstance(snapshot, dict)
+                                else request.get("cdpRequestId")
+                            ),
+                            "persistent_request_id": (
+                                snapshot.get("persistentRequestId")
+                                if isinstance(snapshot, dict)
+                                else request.get("persistentRequestId")
+                            ),
                         },
+                        "request_body_canonical_sha256": (
+                            request_body_canonical_sha256_from_snapshot(snapshot)
+                            if isinstance(snapshot, dict)
+                            else None
+                        ),
+                        "observed_at": (
+                            snapshot.get("observedAt")
+                            if isinstance(snapshot, dict)
+                            else request.get("observedAt")
+                        ),
                         "artifact_ids": artifact_ids,
                         "artifact_paths": artifact_paths,
                         "cookie_artifact_ids": cookie_artifacts,
@@ -1129,6 +1359,179 @@ class BrowserActionService:
         except (ValueError, OSError, json.JSONDecodeError):
             return None
 
+    @staticmethod
+    def _select_replay_network_evidence(
+        entries: list[dict[str, Any]],
+        replay_plan: dict[str, Any],
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        expected_hash = replay_plan.get("expected_request_body_canonical_sha256")
+        dispatch_wall_time_ms = replay_plan.get("dispatch_wall_time_ms")
+        candidates = [
+            item
+            for item in entries
+            if item.get("kind") == "network_request"
+            and item.get("selector_id") == "replay_request"
+            and (
+                expected_hash is None
+                or item.get("request_body_canonical_sha256") == expected_hash
+            )
+            and (
+                not isinstance(dispatch_wall_time_ms, int)
+                or not isinstance(item.get("observed_at"), (int, float))
+                or int(item["observed_at"]) >= dispatch_wall_time_ms - 1_000
+            )
+        ]
+        if len(candidates) == 1:
+            return candidates[0], None
+        if not candidates:
+            return None, "No replay request matched the expected canonical body fingerprint."
+        return (
+            None,
+            "Multiple replay requests matched the dispatch window and canonical body "
+            "fingerprint; the replay request is ambiguous.",
+        )
+
+    @staticmethod
+    def _associate_stream_network_evidence(
+        request: dict[str, Any],
+        network_entries: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        def request_ids(item: dict[str, Any]) -> dict[str, Any]:
+            value = item.get("request_ids")
+            return value if isinstance(value, dict) else {}
+
+        tiers: list[tuple[str, list[dict[str, Any]]]] = []
+        network_request_id = request.get("networkRequestId")
+        collector_generation = request.get("collectorGeneration")
+        if network_request_id is not None:
+            tiers.append(
+                (
+                    "network_request_id_and_generation",
+                    [
+                        item
+                        for item in network_entries
+                        if request_ids(item).get("network_request_id")
+                        == network_request_id
+                        and (
+                            collector_generation is None
+                            or request_ids(item).get("collector_generation")
+                            == collector_generation
+                        )
+                    ],
+                )
+            )
+        cdp_request_id = request.get("cdpRequestId")
+        if cdp_request_id is not None:
+            tiers.append(
+                (
+                    "cdp_request_id",
+                    [
+                        item
+                        for item in network_entries
+                        if request_ids(item).get("cdp_request_id") == cdp_request_id
+                    ],
+                )
+            )
+        persistent_request_id = request.get("persistentRequestId")
+        if persistent_request_id is not None:
+            tiers.append(
+                (
+                    "persistent_request_id",
+                    [
+                        item
+                        for item in network_entries
+                        if request_ids(item).get("persistent_request_id")
+                        == persistent_request_id
+                    ],
+                )
+            )
+        tiers.append(
+            (
+                "url_method_fallback",
+                [
+                    item
+                    for item in network_entries
+                    if isinstance(item.get("summary"), dict)
+                    and item["summary"].get("url") == request.get("url")
+                    and item["summary"].get("method") == request.get("method")
+                ],
+            )
+        )
+        for tier, candidates in tiers:
+            if len(candidates) == 1:
+                return candidates[0], {
+                    "status": "matched",
+                    "method": tier,
+                    "candidate_count": 1,
+                }
+            if len(candidates) > 1:
+                return None, {
+                    "status": "ambiguous",
+                    "method": tier,
+                    "candidate_count": len(candidates),
+                }
+        return None, {
+            "status": "not_found",
+            "method": None,
+            "candidate_count": 0,
+        }
+
+    @staticmethod
+    def _augment_network_request_with_evidence(
+        request: dict[str, Any],
+        evidence_entries: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        reqid = request.get("reqid")
+        candidates = [
+            item
+            for item in evidence_entries
+            if item.get("kind") == "network_request"
+            and isinstance(item.get("request_ids"), dict)
+            and item["request_ids"].get("reqid") == reqid
+        ]
+        if len(candidates) != 1:
+            return {
+                **request,
+                "networkEvidenceAssociation": {
+                    "status": "ambiguous" if candidates else "not_found",
+                    "candidate_count": len(candidates),
+                },
+            }
+        evidence = candidates[0]
+        summary = evidence.get("summary")
+        summary = summary if isinstance(summary, dict) else {}
+        integrity = summary.get("snapshot_integrity")
+        integrity = integrity if isinstance(integrity, dict) else {}
+        network_snapshot_integrity = str(
+            integrity.get("network_snapshot_integrity") or "partial"
+        )
+        network_artifact_integrity = (
+            "complete"
+            if isinstance(evidence.get("artifact_paths"), dict)
+            and evidence["artifact_paths"].get("all")
+            else "partial"
+        )
+        return {
+            **request,
+            "networkEvidenceId": evidence.get("evidence_id"),
+            "networkEvidenceAssociation": {
+                "status": "matched",
+                "method": "reqid",
+                "candidate_count": 1,
+            },
+            "networkSnapshotIntegrity": network_snapshot_integrity,
+            "requestBodyCompleteness": integrity.get("request_body_completeness"),
+            "requestHeadersCompleteness": integrity.get(
+                "request_headers_completeness"
+            ),
+            "networkArtifactIntegrity": network_artifact_integrity,
+            "artifactIntegrity": network_artifact_integrity,
+            "integrityStatus": max(
+                (network_snapshot_integrity, network_artifact_integrity),
+                key=BrowserActionService._integrity_severity,
+            ),
+        }
+
     @classmethod
     def _extract_http_status(cls, value: Any) -> int | None:
         if isinstance(value, dict):
@@ -1189,6 +1592,111 @@ class BrowserActionService:
                 return None
         return None
 
+    @classmethod
+    def _extract_response_field(cls, value: Any, field: str) -> Any:
+        if isinstance(value, dict):
+            if field in value:
+                return value[field]
+            for child in value.values():
+                found = cls._extract_response_field(child, field)
+                if found is not None:
+                    return found
+        elif isinstance(value, list):
+            for child in value:
+                found = cls._extract_response_field(child, field)
+                if found is not None:
+                    return found
+        elif isinstance(value, str):
+            try:
+                return cls._extract_response_field(json.loads(value), field)
+            except json.JSONDecodeError:
+                return None
+        return None
+
+    @staticmethod
+    def _cookie_name_set_sha256(snapshot: dict[str, Any] | None) -> str | None:
+        if not isinstance(snapshot, dict):
+            return None
+        headers = snapshot.get("requestHeadersArray")
+        if not isinstance(headers, list):
+            return None
+        names: set[str] = set()
+        for item in headers:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("name", "")).lower() != "cookie":
+                continue
+            for segment in str(item.get("value", "")).split(";"):
+                name = segment.split("=", 1)[0].strip()
+                if name:
+                    names.add(name)
+        return hashlib.sha256("\n".join(sorted(names)).encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _pair_environment_fingerprint(
+        cls,
+        initial_alignment: AlignmentResult,
+        post_alignment: AlignmentResult,
+        wire_snapshot: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        page_id = post_alignment.js_reverse_page_id or initial_alignment.js_reverse_page_id
+        page_url = (
+            post_alignment.js_reverse_page_url
+            or post_alignment.playwright_page.url
+            or initial_alignment.js_reverse_page_url
+            or initial_alignment.playwright_page.url
+        )
+        page_split = urlsplit(page_url or "")
+        request_url = (
+            str(wire_snapshot.get("url", ""))
+            if isinstance(wire_snapshot, dict)
+            else ""
+        )
+        request_split = urlsplit(request_url)
+        return {
+            "page_id": page_id,
+            "page_url": page_url,
+            "page_origin": (
+                f"{page_split.scheme}://{page_split.netloc}"
+                if page_split.scheme and page_split.netloc
+                else None
+            ),
+            "request_origin": (
+                f"{request_split.scheme}://{request_split.netloc}"
+                if request_split.scheme and request_split.netloc
+                else None
+            ),
+            "request_path": request_split.path or None,
+            "cookie_name_set_sha256": cls._cookie_name_set_sha256(wire_snapshot),
+            "unavailable_dimensions": [
+                "conversation_current_node",
+                "critical_bundle_sha256",
+            ],
+        }
+
+    @staticmethod
+    def _compare_pair_environments(
+        control: dict[str, Any] | None,
+        treatment: dict[str, Any],
+    ) -> dict[str, Any]:
+        keys = [
+            "page_id",
+            "page_url",
+            "page_origin",
+            "request_origin",
+            "request_path",
+            "cookie_name_set_sha256",
+        ]
+        if not isinstance(control, dict):
+            return {
+                "equivalent": False,
+                "differences": ["control_environment_fingerprint_missing"],
+            }
+        differences = [
+            key for key in keys if control.get(key) != treatment.get(key)
+        ]
+        return {"equivalent": not differences, "differences": differences}
+
     @staticmethod
     def _stream_evidence_entries(
         experiment_id: str,
@@ -1217,17 +1725,27 @@ class BrowserActionService:
                 for item in core_artifacts
                 if item.get("relativePath")
             }
-            linked_network_id = None
-            for network in network_entries:
-                summary = network.get("summary")
-                if not isinstance(summary, dict):
-                    continue
-                if (
-                    summary.get("url") == request.get("url")
-                    and summary.get("method") == request.get("method")
-                ):
-                    linked_network_id = network.get("evidence_id")
-                    break
+            linked_network, association = (
+                BrowserActionService._associate_stream_network_evidence(
+                    request,
+                    network_entries,
+                )
+            )
+            linked_network_id = (
+                linked_network.get("evidence_id")
+                if isinstance(linked_network, dict)
+                else None
+            )
+            linked_summary = (
+                linked_network.get("summary")
+                if isinstance(linked_network, dict)
+                and isinstance(linked_network.get("summary"), dict)
+                else {}
+            )
+            snapshot_integrity = linked_summary.get("snapshot_integrity")
+            snapshot_integrity = (
+                snapshot_integrity if isinstance(snapshot_integrity, dict) else {}
+            )
             stream_id = evidence_id(
                 experiment_id,
                 "stream_request",
@@ -1240,6 +1758,8 @@ class BrowserActionService:
                     "request_ids": {
                         "persistent": persistent_id,
                         "cdp": cdp_id,
+                        "network": request.get("networkRequestId"),
+                        "collector_generation": request.get("collectorGeneration"),
                         "network_evidence_id": linked_network_id,
                     },
                     "artifact_ids": artifact_ids,
@@ -1259,32 +1779,54 @@ class BrowserActionService:
                         "request_snapshot_integrity": request.get(
                             "requestSnapshotIntegrity"
                         ),
-                        "artifact_integrity": request.get("artifactIntegrity"),
+                        "stream_artifact_integrity": request.get(
+                            "artifactIntegrity"
+                        ),
+                        "network_snapshot_integrity": snapshot_integrity.get(
+                            "network_snapshot_integrity"
+                        ),
+                        "request_body_completeness": snapshot_integrity.get(
+                            "request_body_completeness"
+                        ),
+                        "request_headers_completeness": snapshot_integrity.get(
+                            "request_headers_completeness"
+                        ),
+                        "network_evidence_association": association,
                     },
                 }
             )
-            event_count = max(
-                int(request.get("rawEventCount") or 0),
-                int(request.get("semanticEventCount") or 0),
-            )
-            event_artifacts = [
-                str(item.get("artifactId"))
-                for item in core_artifacts
-                if str(item.get("kind", ""))
-                in {"events", "eventsource_events", "decoded_sse", "chunks"}
-                and item.get("artifactId")
+            ranges = [
+                (
+                    "raw-stream",
+                    int(request.get("rawEventCount") or 0),
+                    {"events", "decoded_sse", "chunks"},
+                ),
+                (
+                    "eventsource",
+                    int(request.get("semanticEventCount") or 0),
+                    {"eventsource_events"},
+                ),
             ]
-            if event_count > 0 and event_artifacts:
+            for event_source, event_count, artifact_kinds in ranges:
+                event_artifacts = [
+                    str(item.get("artifactId"))
+                    for item in core_artifacts
+                    if str(item.get("kind", "")) in artifact_kinds
+                    and item.get("artifactId")
+                ]
+                if event_count <= 0 or not event_artifacts:
+                    continue
                 entries.append(
                     {
                         "evidence_id": evidence_id(
                             experiment_id,
                             "stream_event_range",
+                            selector_id=event_source,
                             stable_id=persistent_id or cdp_id or ordinal,
                         ),
                         "kind": "stream_event_range",
                         "stream_request_evidence_id": stream_id,
-                        "event_source": request.get("primaryEventSource"),
+                        "event_source": event_source,
                         "start_event_index": 0,
                         "end_event_index": event_count - 1,
                         "artifact_ids": event_artifacts,
@@ -1296,9 +1838,30 @@ class BrowserActionService:
         self,
         request: ReplayRequestRequest,
     ) -> tuple[CaptureFlowPayload, dict[str, Any]]:
-        payload = request.payload
-        source_manifest = self.experiments.load_manifest(payload.source_experiment_id)
-        if source_manifest.get("session_id") != payload.session_id:
+        request_payload = request.payload
+        (
+            control_payload,
+            binding_specs,
+            current_binding_values,
+            pair_protocol,
+            control_manifest,
+            mutation,
+        ) = self._resolve_replay_pair(request_payload)
+        replay_mode = request_payload.replay_mode
+        pair_protocol_hash = canonical_json_sha256(pair_protocol)
+        control_values = (
+            dict(
+                (control_manifest.get("replay") or {}).get(
+                    "control_volatile_binding_values", {}
+                )
+            )
+            if isinstance(control_manifest, dict)
+            else dict(current_binding_values)
+        )
+        source_manifest = self.experiments.load_manifest(
+            control_payload.source_experiment_id
+        )
+        if source_manifest.get("session_id") != control_payload.session_id:
             raise BrowserServiceError(
                 "source_experiment_session_mismatch",
                 "Replay source evidence belongs to a different browser session.",
@@ -1306,7 +1869,7 @@ class BrowserActionService:
             )
         source_evidence = self._find_evidence(
             source_manifest,
-            payload.source_evidence_id,
+            control_payload.source_evidence_id,
         )
         if source_evidence.get("kind") != "network_request":
             raise BrowserServiceError(
@@ -1340,14 +1903,11 @@ class BrowserActionService:
             )
         try:
             snapshot = load_snapshot(snapshot_path)
-            binding_specs, binding_values, control_manifest = self._resolve_replay_pair(
-                payload
-            )
             spec, diff = build_replay_spec(
                 snapshot,
-                payload.mutations,
+                [mutation] if mutation is not None else [],
                 volatile_bindings=binding_specs,
-                binding_values=binding_values,
+                binding_values=current_binding_values,
             )
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             raise BrowserServiceError(
@@ -1375,42 +1935,67 @@ class BrowserActionService:
             allow_supporting_failures=True,
             include_in_flight=False,
         )
-        selectors: list[Any] = list(payload.network_evidence)
+        selectors: list[Any] = list(control_payload.network_evidence)
         if not selectors:
             selectors = [
                 {
                     "selector_id": "replay_request",
                     "matcher": matcher.model_dump(mode="json", exclude_none=True),
-                    "max_matches": 5,
+                    "max_matches": 20,
                     "export_parts": ["all"],
                     "include_initiator": True,
                 }
             ]
-        capture = payload.capture.model_dump(mode="json")
-        requirements = payload.requirements.model_dump(mode="json")
-        wait_for = payload.wait_for
+        capture = control_payload.capture.model_dump(mode="json")
+        requirements = control_payload.requirements.model_dump(mode="json")
+        wait_for = control_payload.wait_for
         if source_is_stream:
             capture["stream"] = True
             requirements["require_raw_capture"] = True
             requirements["require_artifacts"] = True
+        spec["responseControl"] = {
+            "maxResponseBytes": control_payload.max_response_bytes,
+            "idleTimeoutMs": control_payload.stream_idle_timeout_ms,
+            "doneMarker": (
+                control_payload.default_done_marker if source_is_stream else None
+            ),
+        }
+        if isinstance(control_manifest, dict):
+            control_series = control_manifest.get("series")
+            control_series = control_series if isinstance(control_series, dict) else {}
+            series = {
+                **control_series,
+                "scenario_type": f"treatment_{mutation.type}",
+                "predecessor_experiment_id": request_payload.control_experiment_id,
+                "sequence_index": int(control_series.get("sequence_index") or 0) + 1,
+            }
+            objective = (
+                f"Treatment for {request_payload.control_experiment_id}: "
+                f"{mutation.type}"
+            )
+        else:
+            series = control_payload.series.model_dump(mode="json", exclude_none=True)
+            objective = control_payload.objective
         normalized = CaptureFlowPayload.model_validate(
             {
-                "session_id": payload.session_id,
-                "objective": payload.objective,
-                "target": payload.target.model_dump(mode="json", exclude_none=True),
+                "session_id": control_payload.session_id,
+                "objective": objective,
+                "target": control_payload.target.model_dump(
+                    mode="json", exclude_none=True
+                ),
                 "primary_request": primary.model_dump(mode="json"),
                 "flow": [
                     item.model_dump(mode="json", exclude_none=True)
-                    for item in payload.verification_flow
+                    for item in control_payload.verification_flow
                 ],
                 "wait_for": (
                     wait_for.model_dump(mode="json", exclude_none=True)
                     if wait_for
                     else None
                 ),
-                "execution_mode": payload.execution_mode,
-                "deadline_ms": payload.deadline_ms,
-                "job_timeout_ms": payload.job_timeout_ms,
+                "execution_mode": control_payload.execution_mode,
+                "deadline_ms": control_payload.deadline_ms,
+                "job_timeout_ms": control_payload.job_timeout_ms,
                 "capture": capture,
                 "requirements": requirements,
                 "network_evidence": [
@@ -1419,18 +2004,23 @@ class BrowserActionService:
                     else item
                     for item in selectors
                 ],
-                "series": payload.series.model_dump(mode="json", exclude_none=True),
+                "series": series,
             }
         )
+        replay_attempt_id = f"replay_{uuid.uuid4().hex}"
         return normalized, {
-            "source_experiment_id": payload.source_experiment_id,
-            "source_evidence_id": payload.source_evidence_id,
+            "source_experiment_id": control_payload.source_experiment_id,
+            "source_evidence_id": control_payload.source_evidence_id,
             "source_snapshot_path": snapshot_path,
             "source_evidence": source_evidence,
             "source_content_type": source_content_type,
             "source_is_stream": source_is_stream,
-            "replay_mode": payload.replay_mode,
-            "control_experiment_id": payload.control_experiment_id,
+            "replay_mode": replay_mode,
+            "control_experiment_id": (
+                request_payload.control_experiment_id
+                if isinstance(request_payload, ReplayTreatmentPayload)
+                else None
+            ),
             "control_objective_integrity": (
                 control_manifest.get("objective_integrity")
                 if isinstance(control_manifest, dict)
@@ -1444,8 +2034,15 @@ class BrowserActionService:
             "volatile_bindings": [
                 item.model_dump(mode="json", exclude_none=True) for item in binding_specs
             ],
-            "volatile_binding_values": binding_values,
-            "mutation": payload.mutations[0] if payload.mutations else None,
+            "control_volatile_binding_values": control_values,
+            "current_volatile_binding_values": current_binding_values,
+            "pair_protocol": pair_protocol,
+            "pair_protocol_hash": pair_protocol_hash,
+            "mutation": mutation,
+            "replay_attempt_id": replay_attempt_id,
+            "expected_request_body_canonical_sha256": (
+                request_body_canonical_sha256_from_spec(spec)
+            ),
             "spec": spec,
             "diff": diff,
         }
@@ -1616,8 +2213,17 @@ class BrowserActionService:
                         "source_content_type": replay_plan["source_content_type"],
                         "source_is_stream": replay_plan["source_is_stream"],
                         "volatile_bindings": replay_plan["volatile_bindings"],
-                        "volatile_binding_values": replay_plan[
-                            "volatile_binding_values"
+                        "control_volatile_binding_values": replay_plan[
+                            "control_volatile_binding_values"
+                        ],
+                        "current_volatile_binding_values": replay_plan[
+                            "current_volatile_binding_values"
+                        ],
+                        "pair_protocol": replay_plan["pair_protocol"],
+                        "pair_protocol_hash": replay_plan["pair_protocol_hash"],
+                        "replay_attempt_id": replay_plan["replay_attempt_id"],
+                        "expected_request_body_canonical_sha256": replay_plan[
+                            "expected_request_body_canonical_sha256"
                         ],
                     }
                 self.experiments.write_manifest(experiment_id, manifest)
@@ -1764,16 +2370,34 @@ class BrowserActionService:
                 shape_path.relative_to(self.experiments.root)
                 shape = json.loads(shape_path.read_text(encoding="utf-8"))
                 redacted = None
-                if isinstance(redacted_relative, str):
+                if (
+                    request.payload.include_redacted_body
+                    and isinstance(redacted_relative, str)
+                ):
                     redacted_path = (self.experiments.root / redacted_relative).resolve()
                     redacted_path.relative_to(self.experiments.root)
-                    redacted = json.loads(redacted_path.read_text(encoding="utf-8"))
+                    redacted = self._bounded_redacted_subtree(
+                        json.loads(redacted_path.read_text(encoding="utf-8")),
+                        path_prefix=request.payload.path_prefix,
+                        max_depth=request.payload.max_depth,
+                        max_array_items=request.payload.max_array_items,
+                    )
             except (ValueError, OSError, json.JSONDecodeError) as exc:
                 raise BrowserServiceError(
                     "request_shape_invalid",
                     "The saved request shape artifact is unavailable or invalid.",
                     409,
                 ) from exc
+            all_paths = shape.get("paths")
+            all_paths = all_paths if isinstance(all_paths, dict) else {}
+            filtered = self._filter_shape_paths(
+                all_paths,
+                path_prefix=request.payload.path_prefix,
+                max_depth=request.payload.max_depth,
+                max_array_items=request.payload.max_array_items,
+            )
+            start = request.payload.page_idx * request.payload.page_size
+            page = filtered[start : start + request.payload.page_size]
             return BrowserActionResponse(
                 operation=request.operation,
                 status="completed",
@@ -1781,8 +2405,25 @@ class BrowserActionService:
                 experiment_id=request.payload.experiment_id,
                 result={
                     "evidence_id": request.payload.evidence_id,
-                    "request_shape": shape,
+                    "request_shape": {
+                        "format": shape.get("format", "json-pointer-v1"),
+                        "path_prefix": request.payload.path_prefix,
+                        "paths": dict(page),
+                    },
                     "request_body_redacted": redacted,
+                    "pagination": {
+                        "page_idx": request.payload.page_idx,
+                        "page_size": request.payload.page_size,
+                        "total_paths": len(filtered),
+                        "has_next_page": start + len(page) < len(filtered),
+                    },
+                    "limits": {
+                        "max_depth": request.payload.max_depth,
+                        "max_array_items": request.payload.max_array_items,
+                        "include_redacted_body": (
+                            request.payload.include_redacted_body
+                        ),
+                    },
                 },
             )
         if isinstance(request, GetRequestInitiatorRequest):
@@ -2247,7 +2888,15 @@ class BrowserActionService:
 
     @staticmethod
     def _integrity_severity(value: str) -> int:
-        return {"complete": 0, "semantic-only": 1, "partial": 2, "failed": 3}.get(value, 2)
+        return {
+            "complete": 0,
+            "not_required": 0,
+            "not_applicable_protocol_rejection": 0,
+            "not_applicable_non_stream_response": 0,
+            "semantic-only": 1,
+            "partial": 2,
+            "failed": 3,
+        }.get(value, 2)
 
     def _primary_result(
         self,
@@ -2293,23 +2942,59 @@ class BrowserActionService:
                 "request_snapshot": "failed" if payload.capture.stream else "partial",
                 "artifacts": "failed" if payload.capture.stream else "partial",
             }
-        integrity = max(
-            (str(item.get("integrityStatus", "partial")) for item in requests),
-            key=self._integrity_severity,
-        )
-        fields = {
-            "raw_capture": "rawCaptureIntegrity",
-            "semantic_parse": "semanticParseIntegrity",
-            "request_snapshot": "requestSnapshotIntegrity",
-            "artifacts": "artifactIntegrity",
-        }
         dimensions = {
-            name: max(
-                (str(item.get(field, "partial")) for item in requests),
+            "raw_capture": (
+                max(
+                    (
+                        str(item.get("rawCaptureIntegrity", "partial"))
+                        for item in requests
+                    ),
+                    key=self._integrity_severity,
+                )
+                if payload.capture.stream
+                else "not_required"
+            ),
+            "semantic_parse": (
+                max(
+                    (
+                        str(item.get("semanticParseIntegrity", "partial"))
+                        for item in requests
+                    ),
+                    key=self._integrity_severity,
+                )
+                if payload.capture.stream
+                else "not_required"
+            ),
+            "request_snapshot": max(
+                (
+                    str(
+                        item.get("networkSnapshotIntegrity")
+                        or item.get("requestSnapshotIntegrity", "partial")
+                    )
+                    for item in requests
+                ),
                 key=self._integrity_severity,
-            )
-            for name, field in fields.items()
+            ),
+            "artifacts": max(
+                (str(item.get("artifactIntegrity", "partial")) for item in requests),
+                key=self._integrity_severity,
+            ),
         }
+        applicable_values = [
+            value
+            for value in dimensions.values()
+            if value
+            not in {
+                "not_required",
+                "not_applicable_protocol_rejection",
+                "not_applicable_non_stream_response",
+            }
+        ]
+        integrity = (
+            max(applicable_values, key=self._integrity_severity)
+            if applicable_values
+            else "complete"
+        )
         return requests, integrity, count_ok, dimensions
 
     @staticmethod
@@ -2493,7 +3178,18 @@ class BrowserActionService:
                 "source_content_type": replay_plan["source_content_type"],
                 "source_is_stream": replay_plan["source_is_stream"],
                 "volatile_bindings": replay_plan["volatile_bindings"],
-                "volatile_binding_values": replay_plan["volatile_binding_values"],
+                "control_volatile_binding_values": replay_plan[
+                    "control_volatile_binding_values"
+                ],
+                "current_volatile_binding_values": replay_plan[
+                    "current_volatile_binding_values"
+                ],
+                "pair_protocol": replay_plan["pair_protocol"],
+                "pair_protocol_hash": replay_plan["pair_protocol_hash"],
+                "replay_attempt_id": replay_plan["replay_attempt_id"],
+                "expected_request_body_canonical_sha256": replay_plan[
+                    "expected_request_body_canonical_sha256"
+                ],
             }
         self.experiments.write_manifest(experiment_id, manifest)
         task = asyncio.create_task(
@@ -2831,6 +3527,7 @@ class BrowserActionService:
             network_checkpoint_value: dict[str, Any] = {}
             console_checkpoint_value: dict[str, Any] = {}
             replay_result: dict[str, Any] = {}
+            replay_response: Any = None
             replay_http_status: int | None = None
             replay_response_content_type: str | None = None
             replay_artifacts: list[dict[str, Any]] = []
@@ -3100,6 +3797,13 @@ class BrowserActionService:
                     )
                     started = utc_now()
                     try:
+                        replay_plan["dispatch_wall_time_ms"] = int(time.time() * 1000)
+                        replay_manifest = manifest.get("replay")
+                        if isinstance(replay_manifest, dict):
+                            replay_manifest["dispatch_wall_time_ms"] = replay_plan[
+                                "dispatch_wall_time_ms"
+                            ]
+                            self.experiments.write_manifest(experiment_id, manifest)
                         replay_result = await self.js_reverse.evaluate_browser_replay(
                             spec_file,
                             result_file,
@@ -3500,17 +4204,21 @@ class BrowserActionService:
                 evidence_artifacts.extend(console_artifacts)
                 warnings.extend(console_warnings)
             mutation_assessment: dict[str, Any] | None = None
+            response_classification: dict[str, Any] | None = None
             replay_network_evidence_id: str | None = None
+            replay_inconclusive = False
+            wire_snapshot: dict[str, Any] | None = None
+            environment_fingerprint: dict[str, Any] | None = None
+            environment_comparison: dict[str, Any] | None = None
             if replay_plan is not None:
-                replay_network_entry = next(
-                    (
-                        item
-                        for item in evidence_entries
-                        if item.get("kind") == "network_request"
-                        and item.get("selector_id") == "replay_request"
-                    ),
-                    None,
+                replay_network_entry, replay_selection_error = (
+                    self._select_replay_network_evidence(
+                        evidence_entries,
+                        replay_plan,
+                    )
                 )
+                if replay_selection_error:
+                    errors.append(replay_selection_error)
                 replay_network_evidence_id = (
                     str(replay_network_entry.get("evidence_id"))
                     if isinstance(replay_network_entry, dict)
@@ -3521,9 +4229,91 @@ class BrowserActionService:
                     self.experiments.root,
                     replay_network_entry,
                 )
-                mutation_assessment = assess_mutation_effectiveness(
-                    replay_plan.get("mutation"),
-                    wire_snapshot,
+                replay_plan["network_evidence_id"] = replay_network_evidence_id
+                replay_manifest = manifest.get("replay")
+                if isinstance(replay_manifest, dict):
+                    replay_manifest["network_evidence_id"] = (
+                        replay_network_evidence_id
+                    )
+                mutation = replay_plan.get("mutation")
+                if replay_plan.get("replay_mode") == "treatment" and mutation is not None:
+                    control_manifest = self.experiments.load_manifest(
+                        str(replay_plan["control_experiment_id"])
+                    )
+                    control_replay = control_manifest.get("replay")
+                    control_replay = (
+                        control_replay if isinstance(control_replay, dict) else {}
+                    )
+                    control_network_evidence_id = control_replay.get(
+                        "network_evidence_id"
+                    )
+                    control_entry = next(
+                        (
+                            item
+                            for item in self._evidence_index(control_manifest)
+                            if item.get("evidence_id")
+                            == control_network_evidence_id
+                        ),
+                        None,
+                    )
+                    control_snapshot = self._network_evidence_snapshot(
+                        self.experiments.root,
+                        control_entry,
+                    )
+                    mutation_assessment = assess_paired_mutation_effectiveness(
+                        mutation,
+                        control_snapshot,
+                        wire_snapshot,
+                        volatile_bindings=[
+                            VolatileBinding.model_validate(item)
+                            for item in replay_plan["volatile_bindings"]
+                        ],
+                        control_binding_values=replay_plan[
+                            "control_volatile_binding_values"
+                        ],
+                        treatment_binding_values=replay_plan[
+                            "current_volatile_binding_values"
+                        ],
+                    )
+                else:
+                    mutation_assessment = assess_control_wire_baseline(
+                        wire_snapshot,
+                        volatile_bindings=[
+                            VolatileBinding.model_validate(item)
+                            for item in replay_plan["volatile_bindings"]
+                        ],
+                        binding_values=replay_plan[
+                            "current_volatile_binding_values"
+                        ],
+                    )
+                    if (
+                        mutation_assessment.get("volatile_bindings_effective")
+                        is not True
+                    ):
+                        errors.append(
+                            "Control replay volatile bindings were not observed on the "
+                            "outbound wire request."
+                        )
+                response_classification = classify_replay_response(
+                    status=replay_http_status,
+                    content_type=replay_response_content_type,
+                    response_value=replay_response,
+                    mutation=mutation,
+                    redirected=bool(
+                        self._extract_response_field(replay_response, "redirected")
+                    ),
+                    final_url=(
+                        str(value)
+                        if (
+                            value := self._extract_response_field(
+                                replay_response,
+                                "url",
+                            )
+                        )
+                        else None
+                    ),
+                    source_url=str(replay_plan["spec"].get("url", "")),
+                    source_content_type=replay_plan.get("source_content_type"),
                 )
                 if (
                     replay_plan.get("replay_mode") == "treatment"
@@ -3533,26 +4323,47 @@ class BrowserActionService:
                         "Requested treatment mutation was not observed on the "
                         "outbound wire request."
                     )
-            exported_reqids = {
-                int(request_ids["reqid"])
-                for item in evidence_entries
-                if item.get("kind") == "network_request"
-                and isinstance((request_ids := item.get("request_ids")), dict)
-                and isinstance(request_ids.get("reqid"), int)
-            }
+                classification = response_classification.get("classification")
+                if replay_plan.get("replay_mode") == "control":
+                    if classification != "success":
+                        errors.append(
+                            "Control replay response contract was not successful: "
+                            f"{classification}."
+                        )
+                elif classification not in {"success", "validation_rejection"}:
+                    replay_inconclusive = True
+                    warnings.append(
+                        "Treatment response is inconclusive for field classification: "
+                        f"{classification}."
+                    )
+                environment_fingerprint = self._pair_environment_fingerprint(
+                    alignment,
+                    post_alignment,
+                    wire_snapshot,
+                )
+                if replay_plan.get("replay_mode") == "treatment":
+                    control_manifest_for_environment = self.experiments.load_manifest(
+                        str(replay_plan["control_experiment_id"])
+                    )
+                    environment_comparison = self._compare_pair_environments(
+                        control_manifest_for_environment.get(
+                            "pair_environment_fingerprint"
+                        ),
+                        environment_fingerprint,
+                    )
+                    if environment_comparison.get("equivalent") is not True:
+                        replay_inconclusive = True
+                        warnings.append(
+                            "Control and treatment environment fingerprints differ: "
+                            + ", ".join(
+                                str(item)
+                                for item in environment_comparison.get(
+                                    "differences", []
+                                )
+                            )
+                        )
             primary_network_payload["requests"] = [
-                {
-                    **item,
-                    **(
-                        {
-                            "integrityStatus": "complete",
-                            "requestSnapshotIntegrity": "complete",
-                            "artifactIntegrity": "complete",
-                        }
-                        if item.get("reqid") in exported_reqids
-                        else {}
-                    ),
-                }
+                self._augment_network_request_with_evidence(item, evidence_entries)
                 for item in primary_network_payload["requests"]
             ]
             stream_requests = final_status_payload.get("requests")
@@ -3560,42 +4371,41 @@ class BrowserActionService:
                 for stream_request in stream_requests:
                     if not isinstance(stream_request, dict):
                         continue
-                    exact_evidence = next(
-                        (
-                            item
-                            for item in evidence_entries
-                            if item.get("kind") == "network_request"
-                            and isinstance(item.get("summary"), dict)
-                            and item["summary"].get("url")
-                            == stream_request.get("url")
-                            and item["summary"].get("method")
-                            == stream_request.get("method")
-                            and isinstance(item.get("artifact_paths"), dict)
-                            and item["artifact_paths"].get("all")
-                        ),
-                        None,
+                    exact_evidence, association = (
+                        self._associate_stream_network_evidence(
+                            stream_request,
+                            [
+                                item
+                                for item in evidence_entries
+                                if item.get("kind") == "network_request"
+                            ],
+                        )
                     )
                     if exact_evidence is None:
+                        stream_request["networkEvidenceAssociation"] = association
                         continue
-                    stream_request["requestSnapshotIntegrity"] = "complete"
-                    stream_request["artifactIntegrity"] = "complete"
-                    integrity_values = [
-                        str(stream_request.get("rawCaptureIntegrity", "partial")),
-                        str(stream_request.get("semanticParseIntegrity", "partial")),
-                        str(stream_request.get("requestSnapshotIntegrity", "partial")),
-                        str(stream_request.get("artifactIntegrity", "partial")),
-                    ]
-                    stream_request["integrityStatus"] = (
-                        "failed"
-                        if "failed" in integrity_values
-                        else "partial"
-                        if any(value != "complete" for value in integrity_values)
-                        else "complete"
+                    summary = exact_evidence.get("summary")
+                    summary = summary if isinstance(summary, dict) else {}
+                    snapshot_integrity = summary.get("snapshot_integrity")
+                    snapshot_integrity = (
+                        snapshot_integrity
+                        if isinstance(snapshot_integrity, dict)
+                        else {}
                     )
                     stream_request["networkEvidenceId"] = exact_evidence.get(
                         "evidence_id"
                     )
-            protocol_rejection_observed = bool(
+                    stream_request["networkEvidenceAssociation"] = association
+                    stream_request["networkSnapshotIntegrity"] = (
+                        snapshot_integrity.get("network_snapshot_integrity")
+                    )
+                    stream_request["requestBodyCompleteness"] = (
+                        snapshot_integrity.get("request_body_completeness")
+                    )
+                    stream_request["requestHeadersCompleteness"] = (
+                        snapshot_integrity.get("request_headers_completeness")
+                    )
+            non_stream_error_response_observed = bool(
                 replay_plan is not None
                 and replay_plan.get("replay_mode") == "treatment"
                 and replay_plan.get("source_is_stream") is True
@@ -3605,6 +4415,12 @@ class BrowserActionService:
                 and replay_network_evidence_id
                 and mutation_assessment is not None
                 and mutation_assessment.get("mutation_effective") is True
+            )
+            protocol_rejection_observed = bool(
+                non_stream_error_response_observed
+                and response_classification is not None
+                and response_classification.get("classification")
+                == "validation_rejection"
             )
 
             (
@@ -3617,7 +4433,7 @@ class BrowserActionService:
                 final_status_payload,
                 primary_network_payload,
             )
-            if protocol_rejection_observed:
+            if non_stream_error_response_observed:
                 primary_requests = list(primary_network_payload["requests"])
                 count_ok = (
                     payload.primary_request.expected_min_matches
@@ -3626,8 +4442,8 @@ class BrowserActionService:
                 )
                 primary_integrity = "complete" if count_ok else "failed"
                 primary_dimensions = {
-                    "raw_capture": "not_applicable_protocol_rejection",
-                    "semantic_parse": "not_applicable_protocol_rejection",
+                    "raw_capture": "not_applicable_non_stream_response",
+                    "semantic_parse": "not_applicable_non_stream_response",
                     "request_snapshot": "complete" if primary_requests else "failed",
                     "artifacts": "complete" if primary_requests else "failed",
                 }
@@ -3684,11 +4500,11 @@ class BrowserActionService:
             required_dimensions = {
                 "raw_capture": (
                     payload.requirements.require_raw_capture
-                    and not protocol_rejection_observed
+                    and not non_stream_error_response_observed
                 ),
                 "semantic_parse": (
                     payload.requirements.require_semantic_parse
-                    and not protocol_rejection_observed
+                    and not non_stream_error_response_observed
                 ),
                 "request_snapshot": payload.requirements.require_request_snapshot,
                 "artifacts": payload.requirements.require_artifacts,
@@ -3703,6 +4519,8 @@ class BrowserActionService:
             objective_partial = (
                 not objective_failed
                 and (
+                    replay_inconclusive
+                    or
                     primary_integrity != "complete"
                     or any(value != "complete" for value in required_values)
                     or (
@@ -3848,6 +4666,21 @@ class BrowserActionService:
                 if (relative := self.experiments.relative_path(path)) is not None
             ]
             if replay_plan is not None:
+                replay_manifest = manifest.get("replay")
+                if isinstance(replay_manifest, dict):
+                    replay_manifest.update(
+                        {
+                            "network_evidence_id": replay_network_evidence_id,
+                            "dispatch_wall_time_ms": replay_plan.get(
+                                "dispatch_wall_time_ms"
+                            ),
+                            "replay_http_status": replay_http_status,
+                            "response_classification": response_classification,
+                            "mutation_assessment": mutation_assessment,
+                            "environment_fingerprint": environment_fingerprint,
+                            "environment_comparison": environment_comparison,
+                        }
+                    )
                 replay_artifact_ids = [
                     str(item.get("artifactId"))
                     for item in replay_artifacts
@@ -3858,9 +4691,11 @@ class BrowserActionService:
                         "evidence_id": evidence_id(
                             experiment_id,
                             "replay_attempt",
-                            stable_id=1,
+                            stable_id=replay_plan["replay_attempt_id"],
                         ),
                         "kind": "replay_attempt",
+                        "replay_attempt_id": replay_plan["replay_attempt_id"],
+                        "pair_protocol_hash": replay_plan["pair_protocol_hash"],
                         "source_experiment_id": replay_plan["source_experiment_id"],
                         "source_evidence_id": replay_plan["source_evidence_id"],
                         "replay_mode": replay_plan["replay_mode"],
@@ -3869,6 +4704,9 @@ class BrowserActionService:
                         ],
                         "network_evidence_id": replay_network_evidence_id,
                         "mutation_assessment": mutation_assessment,
+                        "response_classification": response_classification,
+                        "environment_fingerprint": environment_fingerprint,
+                        "environment_comparison": environment_comparison,
                         "artifact_ids": replay_artifact_ids,
                         "step_ids": ["replay_request"],
                         "summary": {
@@ -3876,6 +4714,14 @@ class BrowserActionService:
                             "response_content_type": replay_response_content_type,
                             "protocol_rejection_observed": (
                                 protocol_rejection_observed
+                            ),
+                            "non_stream_error_response_observed": (
+                                non_stream_error_response_observed
+                            ),
+                            "response_classification": (
+                                response_classification.get("classification")
+                                if isinstance(response_classification, dict)
+                                else None
                             ),
                             "control_http_status": replay_plan.get(
                                 "control_http_status"
@@ -3938,7 +4784,23 @@ class BrowserActionService:
                     "replay_result": replay_result,
                     "replay_http_status": replay_http_status,
                     "replay_response_content_type": replay_response_content_type,
+                    "replay_response_classification": response_classification,
+                    "replay_attempt_id": (
+                        replay_plan["replay_attempt_id"]
+                        if replay_plan is not None
+                        else None
+                    ),
+                    "pair_protocol_hash": (
+                        replay_plan["pair_protocol_hash"]
+                        if replay_plan is not None
+                        else None
+                    ),
+                    "pair_environment_fingerprint": environment_fingerprint,
+                    "pair_environment_comparison": environment_comparison,
                     "protocol_rejection_observed": protocol_rejection_observed,
+                    "non_stream_error_response_observed": (
+                        non_stream_error_response_observed
+                    ),
                     "replay_comparison": (
                         {
                             "replay_mode": replay_plan["replay_mode"],
@@ -3955,6 +4817,15 @@ class BrowserActionService:
                                 if replay_plan["replay_mode"] == "treatment"
                                 else None
                             ),
+                            "response_classification": (
+                                response_classification.get("classification")
+                                if isinstance(response_classification, dict)
+                                else None
+                            ),
+                            "pair_protocol_hash": replay_plan[
+                                "pair_protocol_hash"
+                            ],
+                            "environment_comparison": environment_comparison,
                         }
                         if replay_plan is not None
                         else None

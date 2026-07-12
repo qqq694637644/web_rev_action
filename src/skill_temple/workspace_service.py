@@ -734,7 +734,10 @@ class AnalysisWorkspaceService:
             raw_path = ((data.get("path") or {}).get("text") or "").replace("\\", "/")
             if self._path_is_excluded(raw_path):
                 continue
-            if not request.include_credentials and raw_path in credential_paths:
+            if not request.include_credentials and self._path_is_credential_artifact(
+                raw_path,
+                credential_paths,
+            ):
                 continue
             line_number = int(data.get("line_number") or 0)
             line_text = str((data.get("lines") or {}).get("text") or "").rstrip("\r\n")
@@ -869,7 +872,10 @@ class AnalysisWorkspaceService:
     ) -> WorkspaceFileContent:
         try:
             normalized = normalize_workspace_path(path)
-            if not include_credentials and normalized in credential_paths:
+            if not include_credentials and self._path_is_credential_artifact(
+                normalized,
+                credential_paths,
+            ):
                 return WorkspaceFileContent(
                     path=normalized,
                     start_line=start_line,
@@ -1229,6 +1235,34 @@ class AnalysisWorkspaceService:
                     except WorkspaceToolError:
                         continue
         return paths
+
+    @staticmethod
+    def _path_is_credential_artifact(
+        path: str,
+        manifest_paths: set[str],
+    ) -> bool:
+        normalized = path.replace("\\", "/").strip("/")
+        if normalized in manifest_paths:
+            return True
+        lowered = normalized.lower()
+        filename = lowered.rsplit("/", 1)[-1]
+        if not lowered.startswith("experiments/"):
+            return False
+        if "/replay/" in lowered and filename == "request-spec.json":
+            return True
+        raw_names = {
+            "all.json",
+            "requestbody.bin",
+            "responsebody.bin",
+            "responseheaders.json",
+            "request-headers.json",
+            "request-headers-extra.json",
+            "response-headers.json",
+            "response-headers-extra.json",
+        }
+        if filename in raw_names:
+            return True
+        return filename.startswith("cookie-") and filename.endswith(".json")
 
     def _relative_path(self, path: Path) -> str:
         return path.resolve().relative_to(self.root).as_posix()

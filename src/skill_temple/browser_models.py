@@ -520,6 +520,7 @@ class VolatileBinding(StrictModel):
     path: str | None = Field(default=None, max_length=512)
     name: str | None = Field(default=None, max_length=256)
     generator: Literal["uuid4", "timestamp_ms", "timestamp_iso", "random_hex_16"]
+    reuse_policy: Literal["fresh_equivalent", "same_value"] = "fresh_equivalent"
 
     @model_validator(mode="after")
     def validate_target(self) -> VolatileBinding:
@@ -535,7 +536,7 @@ class VolatileBinding(StrictModel):
         return self
 
 
-class ReplayRequestPayload(StrictModel):
+class ReplayControlPayload(StrictModel):
     session_id: str = Field(pattern=r"^[a-zA-Z0-9_.-]+$", max_length=128)
     objective: str = Field(min_length=1, max_length=2048)
     source_experiment_id: str = Field(
@@ -545,11 +546,8 @@ class ReplayRequestPayload(StrictModel):
         pattern=r"^[a-zA-Z0-9_.-]+$", max_length=256
     )
     mode: Literal["browser_context"] = "browser_context"
-    replay_mode: Literal["control", "treatment"]
-    control_experiment_id: str | None = Field(
-        default=None, pattern=r"^[a-zA-Z0-9_.-]+$", max_length=128
-    )
-    mutations: list[ReplayMutation] = Field(default_factory=list, max_length=1)
+    replay_mode: Literal["control"]
+    mutations: list[ReplayMutation] = Field(default_factory=list, max_length=0)
     volatile_bindings: list[VolatileBinding] = Field(default_factory=list, max_length=32)
     target: BrowserTarget = Field(default_factory=BrowserTarget)
     wait_for: WaitCondition | None = None
@@ -557,6 +555,13 @@ class ReplayRequestPayload(StrictModel):
     execution_mode: Literal["job", "sync"] = "job"
     deadline_ms: int = Field(default=42_000, ge=1_000, le=42_000)
     job_timeout_ms: int = Field(default=300_000, ge=10_000, le=1_800_000)
+    max_response_bytes: int = Field(
+        default=8 * 1024 * 1024,
+        ge=8_192,
+        le=64 * 1024 * 1024,
+    )
+    stream_idle_timeout_ms: int = Field(default=15_000, ge=1_000, le=120_000)
+    default_done_marker: str | None = Field(default="[DONE]", max_length=512)
     capture: CaptureOptions = Field(
         default_factory=lambda: CaptureOptions(stream=False)
     )
@@ -573,24 +578,26 @@ class ReplayRequestPayload(StrictModel):
     series: ExperimentSeries = Field(default_factory=ExperimentSeries)
 
     @model_validator(mode="after")
-    def validate_replay(self) -> ReplayRequestPayload:
+    def validate_replay(self) -> ReplayControlPayload:
         if self.target.start_url is not None:
             raise ValueError("replay_request does not allow target.start_url")
-        if self.replay_mode == "control":
-            if self.mutations:
-                raise ValueError("control replay requires mutations=[]")
-            if self.control_experiment_id is not None:
-                raise ValueError("control replay cannot reference control_experiment_id")
-        else:
-            if len(self.mutations) != 1:
-                raise ValueError("treatment replay requires exactly one mutation")
-            if self.control_experiment_id is None:
-                raise ValueError("treatment replay requires control_experiment_id")
-            if self.volatile_bindings:
-                raise ValueError(
-                    "treatment replay reuses volatile bindings from the control experiment"
-                )
+        if self.mutations:
+            raise ValueError("control replay requires mutations=[]")
         return self
+
+
+class ReplayTreatmentPayload(StrictModel):
+    replay_mode: Literal["treatment"]
+    control_experiment_id: str = Field(
+        pattern=r"^[a-zA-Z0-9_.-]+$", max_length=128
+    )
+    mutation: ReplayMutation
+
+
+ReplayRequestPayload = Annotated[
+    ReplayControlPayload | ReplayTreatmentPayload,
+    Field(discriminator="replay_mode"),
+]
 
 
 class CaptureBaselinePayload(CaptureFlowPayload):
@@ -683,7 +690,18 @@ class GetNetworkEvidencePayload(StrictModel):
 
 
 class GetRequestShapePayload(GetNetworkEvidencePayload):
-    pass
+    path_prefix: str = Field(default="/", min_length=1, max_length=512)
+    page_idx: int = Field(default=0, ge=0, le=100_000)
+    page_size: int = Field(default=100, ge=1, le=500)
+    max_depth: int = Field(default=6, ge=0, le=32)
+    max_array_items: int = Field(default=20, ge=1, le=200)
+    include_redacted_body: bool = False
+
+    @model_validator(mode="after")
+    def validate_prefix(self) -> GetRequestShapePayload:
+        if self.path_prefix != "/":
+            _validate_json_pointer(self.path_prefix)
+        return self
 
 
 class GetRequestInitiatorPayload(GetNetworkEvidencePayload):

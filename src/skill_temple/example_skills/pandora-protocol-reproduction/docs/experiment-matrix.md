@@ -32,7 +32,16 @@ Use `export_parts=["all"]` for requests that may become replay sources. Use boun
 
 ## Field mutation matrix
 
-Create one control replay followed by one treatment replay per row. The treatment must reuse the control's volatile bindings and contain exactly one mutation.
+Create one Control replay followed by one Treatment replay per row. Treatment submits only `control_experiment_id` and exactly one `mutation`; all other execution settings are inherited from the Control pair protocol.
+
+Declare volatile bindings on the Control:
+
+| Value class | Default policy | Reason |
+|---|---|---|
+| message/request ID, nonce, timestamp | `fresh_equivalent` | Avoid duplicate or expired values |
+| conversation ID, fixed parent/context | explicit `same_value` when required | Preserve shared test context |
+
+`fresh_equivalent` values differ physically but are normalized before non-target request comparison.
 
 Use JSON Pointer rather than dotted JSONPath:
 
@@ -55,6 +64,20 @@ Use JSON Pointer rather than dotted JSONPath:
 | query feature flag | remove/replace query parameter | Feature behavior and response schema |
 
 Classify each result as `required`, `conditionally_required`, `optional`, `tracking_only`, or `unknown`.
+
+Before classification require:
+
+```text
+pair_protocol_hash equal
+Control target baseline present
+target_delta_observed true
+non_target_fields_equivalent true
+volatile_bindings_effective true
+mutation_effective true
+pair_environment_comparison equivalent
+```
+
+Only a `validation_rejection` that explicitly references the mutation target supports `required`. Authentication, rate-limit, server, generic 4xx, redirect, and response-contract failures remain inconclusive.
 
 Do not test browser-managed Cookie, Origin, Referer, Host, Content-Length, or `Sec-*` through header mutation. Use a dedicated browser-context credential experiment when needed.
 

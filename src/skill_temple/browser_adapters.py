@@ -1523,8 +1523,100 @@ class JsReverseMcpAdapter:
             credentials: 'include',
             redirect: 'follow',
           });
-          const bytes = new Uint8Array(await response.arrayBuffer());
-          const previewBytes = bytes.subarray(0, 8192);
+          const responseControl = spec.responseControl || {};
+          const maxResponseBytes = Math.max(
+            8192,
+            Number(responseControl.maxResponseBytes || 8 * 1024 * 1024),
+          );
+          const idleTimeoutMs = Math.max(
+            1000,
+            Number(responseControl.idleTimeoutMs || 15000),
+          );
+          const doneMarker = responseControl.doneMarker == null
+            ? null
+            : String(responseControl.doneMarker);
+          const reader = response.body ? response.body.getReader() : null;
+          const decoder = new TextDecoder('utf-8', {fatal: false});
+          const previewChunks = [];
+          let previewByteLength = 0;
+          let bodyByteLength = 0;
+          let doneMarkerObserved = false;
+          let truncated = false;
+          let terminationReason = reader ? 'network_close' : 'no_response_body';
+          let markerTail = '';
+          const readWithIdleTimeout = async () => {
+            let timer;
+            try {
+              return await Promise.race([
+                reader.read(),
+                new Promise((_, reject) => {
+                  timer = setTimeout(
+                    () => reject(new Error('__REPLAY_IDLE_TIMEOUT__')),
+                    idleTimeoutMs,
+                  );
+                }),
+              ]);
+            } finally {
+              if (timer) clearTimeout(timer);
+            }
+          };
+          if (reader) {
+            while (true) {
+              let readResult;
+              try {
+                readResult = await readWithIdleTimeout();
+              } catch (error) {
+                if (String(error && error.message) !== '__REPLAY_IDLE_TIMEOUT__') throw error;
+                terminationReason = 'idle_timeout';
+                await reader.cancel('idle_timeout').catch(() => {});
+                break;
+              }
+              if (readResult.done) {
+                terminationReason = 'network_close';
+                break;
+              }
+              const chunk = readResult.value || new Uint8Array();
+              const remaining = maxResponseBytes - bodyByteLength;
+              if (remaining <= 0) {
+                truncated = true;
+                terminationReason = 'max_response_bytes';
+                await reader.cancel('max_response_bytes').catch(() => {});
+                break;
+              }
+              const accepted = chunk.subarray(0, Math.min(chunk.byteLength, remaining));
+              bodyByteLength += accepted.byteLength;
+              if (previewByteLength < 8192) {
+                const previewPart = accepted.subarray(
+                  0,
+                  Math.min(accepted.byteLength, 8192 - previewByteLength),
+                );
+                previewChunks.push(previewPart);
+                previewByteLength += previewPart.byteLength;
+              }
+              if (doneMarker) {
+                const combined = markerTail + decoder.decode(accepted, {stream: true});
+                if (combined.includes(doneMarker)) {
+                  doneMarkerObserved = true;
+                  terminationReason = 'done_marker';
+                  await reader.cancel('done_marker').catch(() => {});
+                  break;
+                }
+                markerTail = combined.slice(-Math.max(doneMarker.length - 1, 1024));
+              }
+              if (accepted.byteLength < chunk.byteLength || bodyByteLength >= maxResponseBytes) {
+                truncated = true;
+                terminationReason = 'max_response_bytes';
+                await reader.cancel('max_response_bytes').catch(() => {});
+                break;
+              }
+            }
+          }
+          const previewBytes = new Uint8Array(previewByteLength);
+          let previewOffset = 0;
+          for (const chunk of previewChunks) {
+            previewBytes.set(chunk, previewOffset);
+            previewOffset += chunk.byteLength;
+          }
           let preview = '';
           try { preview = new TextDecoder('utf-8', {fatal: false}).decode(previewBytes); }
           catch { preview = ''; }
@@ -1535,8 +1627,13 @@ class JsReverseMcpAdapter:
             redirected: response.redirected,
             ok: response.ok,
             headers: Array.from(response.headers.entries()),
-            bodyByteLength: bytes.byteLength,
+            bodyByteLength,
             bodyPreview: preview,
+            doneMarkerObserved,
+            terminationReason,
+            truncated,
+            maxResponseBytes,
+            idleTimeoutMs,
           };
         }"""
         return await self._call(

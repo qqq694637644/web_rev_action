@@ -63,7 +63,9 @@ After completion:
 1. Call `list_evidence`.
 2. Select the primary `network_request` evidence.
 3. Call `get_network_evidence` for its redacted summary.
-4. Call `get_request_shape` before choosing a JSON mutation path.
+4. Call `get_request_shape` before choosing a JSON mutation path. Use
+   `path_prefix`, pagination, depth, and array-item limits; request a bounded
+   redacted subtree only when necessary.
 5. Call `get_request_initiator`.
 6. Use `search_scripts` and `get_script_source` for the identified request builder.
 7. Persist the bounded source region with `save_script_source`, linked to the network evidence ID.
@@ -76,14 +78,25 @@ Replay classification is always a pair:
 control replay
   replay_mode = control
   mutations = []
-  volatile_bindings generate fresh IDs/timestamps/nonces
+  volatile_bindings declare generator and reuse_policy
 
 treatment replay
   replay_mode = treatment
   control_experiment_id = <control>
-  mutations = exactly one
-  reuses the control volatile values
+  mutation = exactly one
+  no target/capture/wait/deadline/source overrides
 ```
+
+The backend inherits an immutable `pair_protocol` from the Control. Each volatile
+binding uses one of these policies:
+
+```text
+fresh_equivalent  default for message IDs, request IDs, nonce, timestamp
+same_value        explicit for conversation ID, parent node, fixed context
+```
+
+Fresh values may differ on wire. The backend normalizes both values to the same
+logical placeholder before comparing non-target fields.
 
 Use RFC 6901 JSON Pointer paths, including array indices:
 
@@ -105,7 +118,18 @@ remove_query_parameter
 replace_query_parameter
 ```
 
-Browser-managed headers such as Cookie, Origin, Referer, Host, Content-Length, and `Sec-*` cannot be mutated through browser-context fetch and must be rejected rather than classified. Classify a field only when `mutation_effective=true`, after comparing:
+Browser-managed headers such as Cookie, Origin, Referer, Host, Content-Length, and `Sec-*` cannot be mutated through browser-context fetch and must be rejected rather than classified. Classify a field only when the paired assessment proves:
+
+```text
+Control contains the target baseline
+Treatment contains the requested target delta
+volatile bindings are effective on wire
+non-target fields are equivalent after normalization
+mutation_effective = true
+pair environment is equivalent
+```
+
+Then compare:
 
 - replay HTTP status and response evidence;
 - stream or network terminal behavior;
@@ -113,7 +137,21 @@ Browser-managed headers such as Cookie, Origin, Referer, Host, Content-Length, a
 - conversation persistence or subsequent retrieval;
 - console errors.
 
-If the source response is `text/event-stream`, replay automatically enables stream capture and raw artifact requirements. A treatment that produces an exact non-stream 4xx response is recorded as a protocol rejection, not a collector failure.
+If the source response is `text/event-stream`, replay automatically enables stream capture and raw artifact requirements. The replay response reader is incremental and terminates on the configured done marker, byte limit, idle timeout, or network close.
+
+An exact non-stream error response terminates the stream requirement without being treated as a collector failure. Interpret it by classification:
+
+```text
+validation_rejection      only when 400/409/422 evidence names the target
+authentication_failure    401/403
+rate_limited              429
+server_failure            5xx
+unknown_rejection
+unexpected_redirect
+response_contract_mismatch
+```
+
+Only `validation_rejection` can support a required-field conclusion. All other error classes are inconclusive.
 
 Use `verification_flow` for reload, conversation detail retrieval, or reopening the conversation after fetch. Without persistent-state verification, do not classify a 2xx result beyond `partial` or `unknown`.
 
@@ -176,6 +214,9 @@ The generated HTTP replay script must use placeholders or environment variables 
 - If a source match is minified, use bounded source offsets and persist it with `save_script_source`; document the loaded script URL/hash and initiator evidence ID.
 - If a treatment reports `mutation_effective=false`, discard it as inconclusive and fix the matcher or mutation path.
 - If a source request is stateful, require a successful control replay before running a treatment.
+- Use `fresh_equivalent` for one-time IDs, timestamps, and nonce values. Use `same_value` only when the server contract requires the same fixed context.
+- If replay request correlation is ambiguous, do not choose a candidate manually; recapture with a narrower source request.
+- If the Control and Treatment environment fingerprints differ, classify the result as partial/inconclusive.
 - If an experiment is submitted incorrectly, call `cancel_experiment`; do not close the session or restart the service.
 - If `changed_during_read=true`, do not cite the file hash as stable. Re-read after the experiment reaches a terminal state.
 - If an evidence or replay result is partial, preserve the uncertainty in reports and `notes/open-questions.md`.
@@ -189,7 +230,9 @@ The protocol reproduction is complete only when:
 - request shapes and redacted request bodies expose mutation paths without exposing values;
 - request construction has initiator and source evidence;
 - important fields have successful control plus one-variable treatment results;
-- every treatment verifies the mutation on the actual outbound request;
+- every treatment verifies Control baseline, target delta, normalized non-target equivalence, and mutation effectiveness on exact outbound requests;
+- Control and Treatment use the same immutable pair protocol hash;
+- environment fingerprints are equivalent or the conclusion is explicitly partial;
 - streaming requests have `stream_request` and `stream_event_range` evidence;
 - stream events and conversation state transitions are documented;
 - Stop behavior is observed rather than assumed;

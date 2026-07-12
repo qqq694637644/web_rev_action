@@ -86,6 +86,27 @@ def find_numeric_status(value: Any) -> int | None:
     return None
 
 
+def find_field(value: Any, field: str) -> Any:
+    if isinstance(value, dict):
+        if field in value:
+            return value[field]
+        for child in value.values():
+            found = find_field(child, field)
+            if found is not None:
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = find_field(child, field)
+            if found is not None:
+                return found
+    elif isinstance(value, str):
+        try:
+            return find_field(json.loads(value), field)
+        except json.JSONDecodeError:
+            return None
+    return None
+
+
 def process_matches(patterns: list[str], excluded_pid: int) -> list[str]:
     escaped = [item.replace("'", "''") for item in patterns]
     pattern_array = ",".join(f"'{item}'" for item in escaped)
@@ -529,41 +550,31 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
         )
         if not control_stream:
             raise AssertionError("Control replay produced no stream_request evidence")
+        control_response_artifact = artifact_by_kind(
+            control_manifest,
+            "replay_response",
+        )
+        control_response_value = json.loads(
+            (evidence_root / relative_path(control_response_artifact)).read_text(
+                encoding="utf-8"
+            )
+        )
+        if find_field(control_response_value, "doneMarkerObserved") is not True:
+            raise AssertionError(control_response_value)
+        if find_field(control_response_value, "terminationReason") != "done_marker":
+            raise AssertionError(control_response_value)
 
         async def run_replay(
             *,
-            scenario_type: str,
-            sequence_index: int,
             mutation: dict[str, Any],
-        ) -> tuple[dict[str, Any], int]:
+        ) -> tuple[dict[str, Any], int, dict[str, Any]]:
             replay = await service.run(
                 ReplayRequestRequest(
                     operation="replay_request",
                     payload={
-                        "session_id": SESSION_ID,
-                        "objective": f"Pandora-like replay: {scenario_type}",
-                        "source_experiment_id": pandora_capture.experiment_id,
-                        "source_evidence_id": source_evidence["evidence_id"],
                         "replay_mode": "treatment",
                         "control_experiment_id": control.experiment_id,
-                        "mutations": [mutation],
-                        "execution_mode": "sync",
-                        "deadline_ms": 30_000,
-                        "capture": {
-                            "network": True,
-                            "stream": False,
-                            "trace": False,
-                            "screenshots": False,
-                            "page_snapshots": True,
-                            "console_errors": True,
-                        },
-                        "series": {
-                            "analysis_series_id": "pandora-fixture-series",
-                            "scenario_type": scenario_type,
-                            "predecessor_experiment_id": control.experiment_id,
-                            "sequence_index": sequence_index,
-                            "conversation_key": "conversation-fixture",
-                        },
+                        "mutation": mutation,
                     },
                 )
             )
@@ -589,11 +600,9 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
             response_status = find_numeric_status(response_value)
             if response_status is None:
                 raise AssertionError(response_value)
-            return replay_manifest, response_status
+            return replay_manifest, response_status, response_value
 
-        tracking_manifest, tracking_status = await run_replay(
-            scenario_type="remove_tracking_field",
-            sequence_index=3,
+        tracking_manifest, tracking_status, tracking_response = await run_replay(
             mutation={
                 "type": "remove_json_path",
                 "path": "/tracking_id",
@@ -601,9 +610,7 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
         )
         if tracking_status != 200:
             raise AssertionError(tracking_manifest)
-        required_manifest, required_status = await run_replay(
-            scenario_type="remove_required_message_id",
-            sequence_index=4,
+        required_manifest, required_status, required_response = await run_replay(
             mutation={
                 "type": "remove_json_path",
                 "path": "/messages/0/id",
@@ -611,6 +618,15 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
         )
         if required_status != 422:
             raise AssertionError(required_manifest)
+        if find_field(tracking_response, "doneMarkerObserved") is not True:
+            raise AssertionError(tracking_response)
+        if find_field(tracking_response, "terminationReason") != "done_marker":
+            raise AssertionError(tracking_response)
+        if find_field(required_response, "terminationReason") not in {
+            "network_close",
+            "no_response_body",
+        }:
+            raise AssertionError(required_response)
         for replay_manifest in [tracking_manifest, required_manifest]:
             replay_attempt = next(
                 item
@@ -626,6 +642,11 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
             mutation_assessment = replay_manifest.get("mutation_assessment") or {}
             if mutation_assessment.get("mutation_effective") is not True:
                 raise AssertionError(mutation_assessment)
+            if mutation_assessment.get("non_target_fields_equivalent") is not True:
+                raise AssertionError(mutation_assessment)
+            environment = replay_manifest.get("pair_environment_comparison") or {}
+            if environment.get("equivalent") is not True:
+                raise AssertionError(environment)
             diff_artifact = artifact_by_kind(
                 replay_manifest,
                 "replay_request_diff",
@@ -647,6 +668,115 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
             raise AssertionError("Tracking treatment produced no stream evidence")
         if not required_manifest.get("protocol_rejection_observed"):
             raise AssertionError(required_manifest)
+        if (
+            required_manifest.get("replay_response_classification", {}).get(
+                "classification"
+            )
+            != "validation_rejection"
+        ):
+            raise AssertionError(required_manifest)
+        control_spec = json.loads(
+            (
+                evidence_root
+                / "experiments"
+                / str(control.experiment_id)
+                / "replay"
+                / "request-spec.json"
+            ).read_text(encoding="utf-8")
+        )
+        tracking_spec = json.loads(
+            (
+                evidence_root
+                / "experiments"
+                / str(tracking_manifest["experiment_id"])
+                / "replay"
+                / "request-spec.json"
+            ).read_text(encoding="utf-8")
+        )
+        control_message_id = json.loads(control_spec["body"]["text"])["messages"][0][
+            "id"
+        ]
+        tracking_message_id = json.loads(tracking_spec["body"]["text"])["messages"][0][
+            "id"
+        ]
+        if control_message_id == tracking_message_id:
+            raise AssertionError("fresh_equivalent message IDs were reused")
+
+        same_value_control = await service.run(
+            ReplayRequestRequest(
+                operation="replay_request",
+                payload={
+                    "session_id": SESSION_ID,
+                    "objective": "prove duplicate message IDs invalidate a pair",
+                    "source_experiment_id": pandora_capture.experiment_id,
+                    "source_evidence_id": source_evidence["evidence_id"],
+                    "replay_mode": "control",
+                    "mutations": [],
+                    "volatile_bindings": [
+                        {
+                            "binding_id": "message_id",
+                            "target": "json_pointer",
+                            "path": "/messages/0/id",
+                            "generator": "uuid4",
+                            "reuse_policy": "same_value",
+                        }
+                    ],
+                    "execution_mode": "sync",
+                    "deadline_ms": 30_000,
+                    "capture": {
+                        "network": True,
+                        "stream": False,
+                        "trace": False,
+                        "screenshots": False,
+                        "page_snapshots": False,
+                        "console_errors": False,
+                    },
+                },
+            )
+        )
+        if same_value_control.status != "completed":
+            raise AssertionError(same_value_control.model_dump())
+        same_value_treatment = await service.run(
+            ReplayRequestRequest(
+                operation="replay_request",
+                payload={
+                    "replay_mode": "treatment",
+                    "control_experiment_id": same_value_control.experiment_id,
+                    "mutation": {
+                        "type": "remove_json_path",
+                        "path": "/tracking_id",
+                    },
+                },
+            )
+        )
+        if same_value_treatment.status != "partial":
+            raise AssertionError(same_value_treatment.model_dump())
+        same_value_manifest = json.loads(
+            (
+                evidence_root
+                / "experiments"
+                / str(same_value_treatment.experiment_id)
+                / "manifest.json"
+            ).read_text(encoding="utf-8")
+        )
+        if same_value_manifest.get("replay_http_status") != 409:
+            raise AssertionError(same_value_manifest)
+        if (
+            same_value_manifest.get("replay_response_classification", {}).get(
+                "classification"
+            )
+            != "unknown_rejection"
+        ):
+            raise AssertionError(same_value_manifest)
+        if same_value_manifest.get("protocol_rejection_observed"):
+            raise AssertionError(same_value_manifest)
+        if (
+            same_value_manifest.get("mutation_assessment", {}).get(
+                "mutation_effective"
+            )
+            is not True
+        ):
+            raise AssertionError(same_value_manifest)
 
         cancellation_started = await service.run(
             CaptureFlowRequest(
@@ -767,16 +897,49 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
             "pandora_source_evidence_id": source_evidence["evidence_id"],
             "pandora_control_experiment_id": control.experiment_id,
             "pandora_control_status": control_manifest.get("replay_http_status"),
+            "pandora_control_done_marker_observed": find_field(
+                control_response_value,
+                "doneMarkerObserved",
+            ),
+            "pandora_control_termination_reason": find_field(
+                control_response_value,
+                "terminationReason",
+            ),
             "pandora_tracking_replay_status": tracking_status,
             "pandora_tracking_mutation_effective": tracking_manifest.get(
                 "mutation_assessment", {}
             ).get("mutation_effective"),
+            "pandora_tracking_non_target_equivalent": tracking_manifest.get(
+                "mutation_assessment", {}
+            ).get("non_target_fields_equivalent"),
+            "pandora_tracking_environment_equivalent": tracking_manifest.get(
+                "pair_environment_comparison", {}
+            ).get("equivalent"),
+            "pandora_tracking_done_marker_observed": find_field(
+                tracking_response,
+                "doneMarkerObserved",
+            ),
+            "pandora_fresh_message_ids_differ": (
+                control_message_id != tracking_message_id
+            ),
             "pandora_required_replay_status": required_status,
             "pandora_required_mutation_effective": required_manifest.get(
                 "mutation_assessment", {}
             ).get("mutation_effective"),
             "pandora_required_protocol_rejection": required_manifest.get(
                 "protocol_rejection_observed"
+            ),
+            "pandora_required_response_classification": required_manifest.get(
+                "replay_response_classification", {}
+            ).get("classification"),
+            "pandora_same_value_duplicate_status": same_value_manifest.get(
+                "replay_http_status"
+            ),
+            "pandora_same_value_duplicate_classification": same_value_manifest.get(
+                "replay_response_classification", {}
+            ).get("classification"),
+            "pandora_same_value_duplicate_objective": same_value_manifest.get(
+                "objective_integrity"
             ),
             "cancellation_status": cancellation_manifest.get("status"),
             "cancellation_step_status": cancellation_steps[0].get("status"),

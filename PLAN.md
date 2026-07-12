@@ -108,9 +108,18 @@ create running manifest
 
 GPT 看不到内部 stream primitive，也不能在多个 HTTP 请求之间手工协调 start、click、wait 和 stop。
 
-`replay_request` 同样由后端原子执行：从 source experiment 的 exact network evidence 读取请求，先执行无 mutation 的 control，再让 treatment 复用同一组 volatile binding 值并应用唯一一个结构化 mutation，通过当前页面上下文发起 fetch，并捕获新 network/stream/page/console evidence。Cookie、Authorization 和 CSRF 不进入 Action JSON。
+`replay_request` 同样由后端原子执行：从 source experiment 的 exact network evidence 读取请求，先执行无 mutation 的 Control，再让 Treatment 只提交 `control_experiment_id + mutation`。Target、capture、wait、verification、deadline、source 和 selector 全部从 Control 的 immutable `pair_protocol_hash` 继承。
 
-JSON body mutation 使用无 wildcard 的 RFC 6901 JSON Pointer，支持对象属性和数组索引。Browser-managed Cookie、Origin、Referer、Host、Content-Length 和 `Sec-*` header mutation 在 schema 层直接拒绝。Treatment 只有在 exact outbound request 中观察到 mutation 时才有效。
+每个 volatile binding 声明：
+
+```text
+fresh_equivalent  默认；Control/Treatment 分别生成新值，比较时规范化
+same_value        显式；仅用于 conversation ID、固定 parent/context 等
+```
+
+Treatment 通过当前页面上下文发起 fetch，并捕获新 network/stream/page/console evidence。Cookie、Authorization 和 CSRF 不进入 Action JSON。
+
+JSON body mutation 使用无 wildcard 的 RFC 6901 JSON Pointer，支持对象属性和数组索引。Browser-managed Cookie、Origin、Referer、Host、Content-Length 和 `Sec-*` header mutation 在 schema 层直接拒绝。Treatment 必须由 Control/Treatment 两份 exact outbound snapshot 同时证明：Control baseline存在、目标 delta正确、volatile binding有效、规范化后的非目标字段等价。
 
 ### 2.4 证据以文件为主，Action 返回摘要
 
@@ -219,6 +228,9 @@ private runtime
 - 普通 network high-water checkpoint、精确导出和 evidence index。
 - browser-context replay 与 source evidence 绑定。
 - control/treatment replay、volatile binding 复用和 wire mutation effectiveness。
+- immutable pair protocol hash、fresh/same binding policy 和 pair environment fingerprint。
+- replay attempt dispatch time + canonical request body fingerprint 唯一关联。
+- validation/auth/rate/server/redirect/response-contract 分类。
 - JSON request shape/redacted body、stream request/event-range evidence。
 - bounded source region 持久化及 SHA-256。
 - experiment series/predecessor 校验。
@@ -615,6 +627,9 @@ rawCaptureIntegrity
 semanticParseIntegrity
 requestSnapshotIntegrity
 artifactIntegrity
+networkSnapshotIntegrity
+requestBodyCompleteness
+requestHeadersCompleteness
 ```
 
 Experiment requirements 声明哪些维度必须 complete：
@@ -637,6 +652,7 @@ failed
 规则：
 
 - stream=true 时，普通 network summary 只能作为诊断，不能替代 stream evidence。
+- ordinary exact snapshot 只能补充 network snapshot/body/header 完整性，不能升级 raw stream artifact integrity。
 - supporting request 失败是否影响 objective 由 `allow_supporting_failures` 控制。
 - `expected_min_matches=0` 且没有 primary request 是有效 baseline。
 - partial、semantic-only 或 artifact error 不得被压成 complete。
@@ -824,22 +840,57 @@ source_experiment_id / source_evidence_id（replay）
 
 每个 JSON network evidence 自动生成 public `request-shape.json` 和 `request-body.redacted.json`。Shape 使用 JSON Pointer 显示对象、数组长度、scalar 类型和安全 placeholder，不返回原始字符串值。
 
+公开 `get_request_shape` 默认只返回路径页：
+
+```text
+path_prefix
+page_idx / page_size
+max_depth
+max_array_items
+include_redacted_body = false
+```
+
+只有显式请求时才返回受深度和数组上限裁剪的 redacted subtree。
+
 每个 replay classification 使用：
 
 ```text
 control replay
   mutations = []
-  generates volatile bindings
+  generates volatile bindings according to reuse_policy
   must complete with HTTP 2xx/3xx
+  exact wire snapshot confirms bindings
 
 treatment replay
   control_experiment_id = control
-  reuses the exact generated values
-  mutations = exactly one
-  requires mutation_effective = true on wire evidence
+  mutation = exactly one
+  accepts no other execution parameters
+  fresh_equivalent values are regenerated; same_value is reused
+  requires target_delta + non_target equivalence + mutation_effective
 ```
 
-若 source response 为 `text/event-stream`，后端自动启用 stream collector 和 raw/artifact requirements。成功 treatment 保存 stream evidence；若有效 treatment 得到明确非流 4xx，记录 `protocol_rejection_observed`，raw/semantic 维度为 `not_applicable_protocol_rejection`，而不是误报 collector 故障。
+Replay 保存：
+
+```text
+replay_attempt_id
+dispatch_wall_time_ms
+expected_request_body_canonical_sha256
+control/treatment network evidence IDs
+pair_protocol_hash
+pair_environment_fingerprint/comparison
+```
+
+候选必须同时满足 dispatch window、URL/method selector 和 canonical body fingerprint；零个或多个候选都 fail closed。
+
+若 source response 为 `text/event-stream`，后端自动启用 stream collector 和 raw/artifact requirements。Evaluate 使用 `response.body.getReader()` 增量读取，只保留 bounded preview，并在 done marker、max bytes、idle timeout 或 network close 时终止。
+
+有效 Treatment 得到明确非流错误响应时，raw/semantic 维度为 `not_applicable_non_stream_response`，由 ordinary exact response终结实验。仅以下分类可支持 required：
+
+```text
+validation_rejection = 400/409/422 且结构化错误明确引用 mutation target
+```
+
+`authentication_failure`、`rate_limited`、`server_failure`、`unknown_rejection`、`unexpected_redirect` 和 `response_contract_mismatch` 都是 partial/inconclusive。
 
 ## 14. Workspace 服务
 
@@ -856,7 +907,7 @@ truncation metadata
 
 `max_depth` 相对于每个 requested base path 计算。
 
-默认 `include_credentials=false`。Tree 可以显示 credential artifact 路径和大小，但 search/related snippet 不返回正文。
+默认 `include_credentials=false`。Tree 可以显示 credential artifact 路径和大小，但 search/related snippet 不返回正文。即使 running manifest尚未写入 descriptor，固定 raw 路径如 `all.json`、`requestBody.bin`、`responseBody.bin`、完整 headers、cookie provenance 和 replay `request-spec.json` 也按路径规则隐藏。
 
 ### 14.2 workspaceSearch
 
@@ -968,7 +1019,10 @@ start Chrome remote debugging
 → control replay with fresh volatile message ID (SSE 200)
 → treatment removing tracking field (SSE 200)
 → treatment removing required message ID (JSON 422)
-→ verify mutation_effective on exact outbound snapshots
+→ verify fresh IDs differ but normalized non-target fields are equivalent
+→ verify mutation_effective on paired exact outbound snapshots
+→ explicit same_value message ID pair produces duplicate 409 and inconclusive result
+→ incremental reader terminates successful SSE at done marker
 → verify stream_request / stream_event_range evidence IDs
 → workspace PowerShell SHA verification
 → close_session
@@ -1071,3 +1125,12 @@ Worker / Service Worker target coverage
 34. JSON request 自动生成 request shape/redacted body public artifacts。
 35. SSE source replay 自动启用 raw stream capture，并生成 stream evidence IDs。
 36. 保存的源码片段包含 URL/script ID、范围、SHA-256 和 initiator evidence 关联。
+37. Treatment payload 只能包含 control_experiment_id 和 mutation；其余参数继承 pair protocol hash。
+38. Volatile binding 默认 fresh_equivalent，same_value 必须显式声明。
+39. Mutation 结论同时要求 Control baseline、target delta、volatile effectiveness 和 non-target equivalence。
+40. Replay request 使用 dispatch time + canonical body fingerprint 唯一关联，候选歧义时失败。
+41. Stream 与 ordinary evidence 优先按 network ID/generation、CDP ID、persistent ID关联；URL/method仅作唯一 fallback。
+42. Ordinary snapshot 不升级 stream raw/event/metadata artifact integrity。
+43. 只有明确引用 target 的 validation rejection 可支持 required；其他错误分类为 inconclusive。
+44. Replay response 通过增量 reader有界消费，支持 done marker、byte limit 和 idle timeout。
+45. Request shape Action分页有界，完整 redacted body不默认返回。

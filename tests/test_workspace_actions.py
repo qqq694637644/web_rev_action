@@ -559,6 +559,76 @@ class WorkspaceActionTests(unittest.TestCase):
                 explicit_inspect.searches[0].matches[0].line,
             )
 
+    def test_running_raw_body_paths_are_hidden_before_manifest_indexing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            experiment = root / "experiments" / "exp_running"
+            network = experiment / "js-reverse" / "network" / "ev_one"
+            replay = experiment / "replay"
+            network.mkdir(parents=True)
+            replay.mkdir(parents=True)
+            raw_body = network / "requestBody.bin"
+            all_snapshot = network / "all.json"
+            request_spec = replay / "request-spec.json"
+            for path in [raw_body, all_snapshot, request_spec]:
+                path.write_text("running-path-secret\n", encoding="utf-8")
+            (experiment / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "experiment_id": "exp_running",
+                        "status": "running",
+                        "artifacts": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            service = AnalysisWorkspaceService(root)
+
+            for path in [raw_body, all_snapshot, request_spec]:
+                relative = path.relative_to(root).as_posix()
+                with self.subTest(path=relative):
+                    hidden = asyncio.run(
+                        service.read_files(
+                            WorkspaceReadFilesRequest(paths=[relative])
+                        )
+                    )
+                    explicit = asyncio.run(
+                        service.read_files(
+                            WorkspaceReadFilesRequest(
+                                paths=[relative],
+                                include_credentials=True,
+                            )
+                        )
+                    )
+                    self.assertIn(
+                        "hidden by default",
+                        hidden.files[0].error or "",
+                    )
+                    self.assertIn(
+                        "running-path-secret",
+                        explicit.files[0].content,
+                    )
+
+            hidden_search = asyncio.run(
+                service.search(
+                    WorkspaceSearchRequest(
+                        query="running-path-secret",
+                        paths=["experiments/exp_running"],
+                    )
+                )
+            )
+            explicit_search = asyncio.run(
+                service.search(
+                    WorkspaceSearchRequest(
+                        query="running-path-secret",
+                        paths=["experiments/exp_running"],
+                        include_credentials=True,
+                    )
+                )
+            )
+            self.assertEqual(hidden_search.match_count, 0)
+            self.assertEqual(explicit_search.match_count, 3)
+
     def test_search_stops_at_match_limit_without_buffering_all_results(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

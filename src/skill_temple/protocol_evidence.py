@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -178,6 +179,35 @@ def public_network_summary(snapshot: dict[str, Any]) -> dict[str, Any]:
         "response_body": _public_body_summary(snapshot.get("responseBody")),
         "observed_at": snapshot.get("observedAt"),
         "timing": snapshot.get("timing"),
+        "snapshot_integrity": network_snapshot_dimensions(snapshot),
+    }
+
+
+def network_snapshot_dimensions(snapshot: dict[str, Any]) -> dict[str, str]:
+    method = str(snapshot.get("method", "GET")).upper()
+    headers_complete = isinstance(snapshot.get("requestHeadersArray"), list)
+    request_body = snapshot.get("requestBody")
+    if method in {"GET", "HEAD"} and not (
+        isinstance(request_body, dict) and request_body.get("available")
+    ):
+        body_completeness = "not_required"
+    elif isinstance(request_body, dict) and request_body.get("available"):
+        body_completeness = "complete"
+    elif isinstance(request_body, dict) and request_body.get("reason"):
+        body_completeness = "partial"
+    else:
+        body_completeness = "unknown"
+    request_headers_completeness = "complete" if headers_complete else "partial"
+    network_snapshot_integrity = (
+        "complete"
+        if request_headers_completeness == "complete"
+        and body_completeness in {"complete", "not_required"}
+        else "partial"
+    )
+    return {
+        "network_snapshot_integrity": network_snapshot_integrity,
+        "request_body_completeness": body_completeness,
+        "request_headers_completeness": request_headers_completeness,
     }
 
 
@@ -411,6 +441,40 @@ def build_replay_spec(
     return spec, diff
 
 
+def canonical_json_sha256(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def request_body_canonical_sha256_from_spec(spec: dict[str, Any]) -> str | None:
+    return _body_canonical_sha256(spec.get("body"))
+
+
+def request_body_canonical_sha256_from_snapshot(
+    snapshot: dict[str, Any],
+) -> str | None:
+    return _body_canonical_sha256(snapshot.get("requestBody"))
+
+
+def _body_canonical_sha256(body: Any) -> str | None:
+    if not isinstance(body, dict) or not body.get("available"):
+        return None
+    if body.get("encoding") == "utf8":
+        text = str(body.get("text", ""))
+        try:
+            return canonical_json_sha256(json.loads(text))
+        except json.JSONDecodeError:
+            return hashlib.sha256(text.encode("utf-8")).hexdigest()
+    if body.get("encoding") == "base64":
+        return str(body.get("sha256") or body.get("encodedSha256") or "") or None
+    return None
+
+
 def assess_mutation_effectiveness(
     mutation: ReplayMutation | None,
     wire_snapshot: dict[str, Any] | None,
@@ -488,6 +552,440 @@ def assess_mutation_effectiveness(
             "mutation_effective": False,
             "reason": str(exc),
         }
+
+
+def assess_paired_mutation_effectiveness(
+    mutation: ReplayMutation,
+    control_snapshot: dict[str, Any] | None,
+    treatment_snapshot: dict[str, Any] | None,
+    *,
+    volatile_bindings: list[VolatileBinding],
+    control_binding_values: dict[str, Any],
+    treatment_binding_values: dict[str, Any],
+) -> dict[str, Any]:
+    requested = _redacted_mutation(mutation)
+    if control_snapshot is None or treatment_snapshot is None:
+        return {
+            "mutation_requested": requested,
+            "control_wire_value": None,
+            "treatment_wire_value": None,
+            "target_delta_observed": False,
+            "non_target_fields_equivalent": False,
+            "volatile_bindings_effective": False,
+            "mutation_effective": False,
+            "reason": "control and treatment exact wire snapshots are required",
+        }
+    try:
+        control_exists, control_value = _observe_mutation_target(
+            control_snapshot,
+            mutation,
+        )
+        treatment_exists, treatment_value = _observe_mutation_target(
+            treatment_snapshot,
+            mutation,
+        )
+        if mutation.type.startswith("remove_"):
+            target_delta = control_exists and not treatment_exists
+        else:
+            target_delta = (
+                control_exists
+                and treatment_exists
+                and control_value != treatment_value
+                and treatment_value == mutation.value
+            )
+        control_bindings_ok = _bindings_match_snapshot(
+            control_snapshot,
+            volatile_bindings,
+            control_binding_values,
+        )
+        treatment_bindings_ok = _bindings_match_snapshot(
+            treatment_snapshot,
+            volatile_bindings,
+            treatment_binding_values,
+            mutation_target=mutation,
+        )
+        control_view = _canonical_pair_view(
+            control_snapshot,
+            volatile_bindings,
+            mutation,
+            role="control",
+        )
+        treatment_view = _canonical_pair_view(
+            treatment_snapshot,
+            volatile_bindings,
+            mutation,
+            role="treatment",
+        )
+        control_hash = canonical_json_sha256(control_view)
+        treatment_hash = canonical_json_sha256(treatment_view)
+        non_target_equivalent = control_hash == treatment_hash
+        effective = bool(
+            target_delta
+            and control_bindings_ok
+            and treatment_bindings_ok
+            and non_target_equivalent
+        )
+        reasons: list[str] = []
+        if not control_exists:
+            reasons.append("control request did not contain the mutation target")
+        if not target_delta:
+            reasons.append("control/treatment target delta does not match the mutation")
+        if not control_bindings_ok or not treatment_bindings_ok:
+            reasons.append("one or more volatile bindings were not observed on wire")
+        if not non_target_equivalent:
+            reasons.append("non-target request fields differ after volatile normalization")
+        return {
+            "mutation_requested": requested,
+            "control_wire_value": _public_target_value(
+                control_exists,
+                control_value,
+                mutation,
+            ),
+            "treatment_wire_value": _public_target_value(
+                treatment_exists,
+                treatment_value,
+                mutation,
+            ),
+            "target_delta_observed": target_delta,
+            "non_target_fields_equivalent": non_target_equivalent,
+            "volatile_bindings_effective": (
+                control_bindings_ok and treatment_bindings_ok
+            ),
+            "control_non_target_sha256": control_hash,
+            "treatment_non_target_sha256": treatment_hash,
+            "mutation_effective": effective,
+            "reason": (
+                "paired wire snapshots differ only by the requested mutation"
+                if effective
+                else "; ".join(reasons)
+            ),
+        }
+    except ValueError as exc:
+        return {
+            "mutation_requested": requested,
+            "control_wire_value": None,
+            "treatment_wire_value": None,
+            "target_delta_observed": False,
+            "non_target_fields_equivalent": False,
+            "volatile_bindings_effective": False,
+            "mutation_effective": False,
+            "reason": str(exc),
+        }
+
+
+def assess_control_wire_baseline(
+    wire_snapshot: dict[str, Any] | None,
+    *,
+    volatile_bindings: list[VolatileBinding],
+    binding_values: dict[str, Any],
+) -> dict[str, Any]:
+    if wire_snapshot is None:
+        return {
+            "mutation_requested": None,
+            "control_wire_value": None,
+            "treatment_wire_value": None,
+            "target_delta_observed": None,
+            "non_target_fields_equivalent": None,
+            "volatile_bindings_effective": False,
+            "mutation_effective": None,
+            "reason": "control exact wire snapshot is required",
+        }
+    bindings_effective = _bindings_match_snapshot(
+        wire_snapshot,
+        volatile_bindings,
+        binding_values,
+    )
+    return {
+        "mutation_requested": None,
+        "control_wire_value": None,
+        "treatment_wire_value": None,
+        "target_delta_observed": None,
+        "non_target_fields_equivalent": None,
+        "volatile_bindings_effective": bindings_effective,
+        "mutation_effective": None,
+        "reason": (
+            "control replay wire baseline and volatile bindings are confirmed"
+            if bindings_effective
+            else "one or more control volatile bindings were not observed on wire"
+        ),
+    }
+
+
+def classify_replay_response(
+    *,
+    status: int | None,
+    content_type: str | None,
+    response_value: Any,
+    mutation: ReplayMutation | None,
+    redirected: bool = False,
+    final_url: str | None = None,
+    source_url: str | None = None,
+    source_content_type: str | None = None,
+) -> dict[str, Any]:
+    if redirected and source_url and final_url:
+        source = urlsplit(source_url)
+        final = urlsplit(final_url)
+        if (source.scheme, source.netloc, source.path) != (
+            final.scheme,
+            final.netloc,
+            final.path,
+        ):
+            return {
+                "classification": "unexpected_redirect",
+                "usable_for_required_classification": False,
+                "status": status,
+                "content_type": content_type,
+                "final_url": final_url,
+            }
+    if (
+        status is not None
+        and 200 <= status < 400
+        and source_content_type
+        and content_type
+        and source_content_type != content_type
+    ):
+        return {
+            "classification": "response_contract_mismatch",
+            "usable_for_required_classification": False,
+            "status": status,
+            "content_type": content_type,
+            "source_content_type": source_content_type,
+            "final_url": final_url,
+        }
+    if status is None:
+        classification = "unknown_response"
+    elif status in {401, 403}:
+        classification = "authentication_failure"
+    elif status == 429:
+        classification = "rate_limited"
+    elif status >= 500:
+        classification = "server_failure"
+    elif status in {400, 409, 422}:
+        classification = (
+            "validation_rejection"
+            if mutation is not None
+            and _response_references_mutation(response_value, mutation)
+            else "unknown_rejection"
+        )
+    elif status >= 400:
+        classification = "unknown_rejection"
+    else:
+        classification = "success"
+    return {
+        "classification": classification,
+        "usable_for_required_classification": (
+            classification == "validation_rejection"
+        ),
+        "status": status,
+        "content_type": content_type,
+        "source_content_type": source_content_type,
+        "final_url": final_url,
+    }
+
+
+def _observe_mutation_target(
+    snapshot: dict[str, Any],
+    mutation: ReplayMutation,
+) -> tuple[bool, Any]:
+    if mutation.type in {"remove_json_path", "replace_json_path"}:
+        body = _decode_json_request_body(snapshot.get("requestBody"))
+        if body is None:
+            raise ValueError("wire request has no JSON body")
+        return _read_pointer(body, mutation.path)
+    if mutation.type in {"remove_header", "replace_header"}:
+        values = [
+            item["value"]
+            for item in _normalized_headers(snapshot.get("requestHeadersArray"))
+            if item["name"].lower() == mutation.name.lower()
+        ]
+        return bool(values), values[0] if values else None
+    values = [
+        value
+        for name, value in parse_qsl(
+            urlsplit(str(snapshot.get("url", ""))).query,
+            keep_blank_values=True,
+        )
+        if name == mutation.name
+    ]
+    return bool(values), values[0] if values else None
+
+
+def _public_target_value(
+    exists: bool,
+    value: Any,
+    mutation: ReplayMutation,
+) -> Any:
+    if not exists:
+        return "<absent>"
+    hint = getattr(mutation, "name", None) or _last_pointer_token(
+        str(getattr(mutation, "path", ""))
+    )
+    return _redact_json_value(value, key_hint=hint)
+
+
+def _bindings_match_snapshot(
+    snapshot: dict[str, Any],
+    bindings: list[VolatileBinding],
+    expected_values: dict[str, Any],
+    *,
+    mutation_target: ReplayMutation | None = None,
+) -> bool:
+    for binding in bindings:
+        if mutation_target is not None and _binding_targets_mutation(
+            binding,
+            mutation_target,
+        ):
+            continue
+        if binding.binding_id not in expected_values:
+            return False
+        expected = expected_values[binding.binding_id]
+        if binding.target == "json_pointer":
+            body = _decode_json_request_body(snapshot.get("requestBody"))
+            if body is None:
+                return False
+            exists, observed = _read_pointer(body, str(binding.path))
+        elif binding.target == "header":
+            values = [
+                item["value"]
+                for item in _normalized_headers(snapshot.get("requestHeadersArray"))
+                if item["name"].lower() == str(binding.name).lower()
+            ]
+            exists, observed = bool(values), values[0] if values else None
+            expected = str(expected)
+        else:
+            values = [
+                value
+                for name, value in parse_qsl(
+                    urlsplit(str(snapshot.get("url", ""))).query,
+                    keep_blank_values=True,
+                )
+                if name == binding.name
+            ]
+            exists, observed = bool(values), values[0] if values else None
+            expected = str(expected)
+        if not exists or observed != expected:
+            return False
+    return True
+
+
+def _binding_targets_mutation(
+    binding: VolatileBinding,
+    mutation: ReplayMutation,
+) -> bool:
+    if mutation.type in {"remove_json_path", "replace_json_path"}:
+        return binding.target == "json_pointer" and binding.path == mutation.path
+    if mutation.type in {"remove_header", "replace_header"}:
+        return (
+            binding.target == "header"
+            and str(binding.name).lower() == mutation.name.lower()
+        )
+    return (
+        binding.target == "query_parameter"
+        and binding.name == mutation.name
+    )
+
+
+def _canonical_pair_view(
+    snapshot: dict[str, Any],
+    bindings: list[VolatileBinding],
+    mutation: ReplayMutation,
+    *,
+    role: str,
+) -> dict[str, Any]:
+    split = urlsplit(str(snapshot.get("url", "")))
+    query = list(parse_qsl(split.query, keep_blank_values=True))
+    headers = [
+        {"name": item["name"].lower(), "value": item["value"]}
+        for item in _normalized_headers(snapshot.get("requestHeadersArray"))
+        if item["name"].lower() not in _BROWSER_MANAGED_HEADERS
+        and not item["name"].lower().startswith("sec-")
+    ]
+    body = _decode_json_request_body(snapshot.get("requestBody"))
+    for binding in bindings:
+        placeholder = f"<volatile:{binding.binding_id}>"
+        if binding.target == "json_pointer" and body is not None:
+            exists, _ = _read_pointer(body, str(binding.path))
+            if exists:
+                _replace_pointer(body, str(binding.path), placeholder)
+        elif binding.target == "header":
+            for item in headers:
+                if item["name"] == str(binding.name).lower():
+                    item["value"] = placeholder
+        else:
+            query = [
+                (name, placeholder if name == binding.name else value)
+                for name, value in query
+            ]
+    if mutation.type in {"remove_json_path", "replace_json_path"} and body is not None:
+        should_remove_target = mutation.type == "replace_json_path" or role == "control"
+        if should_remove_target:
+            exists, _ = _read_pointer(body, mutation.path)
+            if exists:
+                _remove_pointer(body, mutation.path)
+    elif mutation.type in {"remove_header", "replace_header"}:
+        headers = [
+            item for item in headers if item["name"] != mutation.name.lower()
+        ]
+    else:
+        query = [(name, value) for name, value in query if name != mutation.name]
+    return {
+        "method": str(snapshot.get("method", "GET")).upper(),
+        "url": urlunsplit((split.scheme, split.netloc, split.path, "", "")),
+        "query": sorted(query),
+        "headers": sorted(headers, key=lambda item: (item["name"], item["value"])),
+        "body": body,
+    }
+
+
+def _response_references_mutation(
+    response_value: Any,
+    mutation: ReplayMutation,
+) -> bool:
+    strings = [item.lower() for item in _validation_strings(response_value)]
+    if mutation.type in {"remove_json_path", "replace_json_path"}:
+        pointer = mutation.path.lower()
+        tokens = _decode_pointer(mutation.path)
+        bracket = ""
+        for token in tokens:
+            bracket += f"[{token}]" if token.isdigit() else ("." if bracket else "") + token
+        candidates = {pointer, bracket.lower(), ".".join(tokens).lower()}
+    else:
+        candidates = {mutation.name.lower()}
+    return any(
+        candidate and candidate in text
+        for text in strings
+        for candidate in candidates
+    )
+
+
+def _validation_strings(value: Any, *, key: str | None = None) -> list[str]:
+    result: list[str] = []
+    if isinstance(value, dict):
+        for child_key, child in value.items():
+            result.extend(_validation_strings(child, key=str(child_key)))
+    elif isinstance(value, list):
+        for child in value:
+            result.extend(_validation_strings(child, key=key))
+    elif isinstance(value, str):
+        if (key or "").lower() in {
+            "bodypreview",
+            "detail",
+            "error",
+            "errors",
+            "field",
+            "fields",
+            "message",
+            "missing",
+            "path",
+        }:
+            result.append(value)
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError:
+            decoded = None
+        if decoded is not None:
+            result.extend(_validation_strings(decoded, key=key))
+    return result
 
 
 def _redacted_mutation(mutation: ReplayMutation) -> dict[str, Any]:

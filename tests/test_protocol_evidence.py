@@ -3,16 +3,20 @@ from __future__ import annotations
 import json
 import unittest
 
+from pydantic import TypeAdapter, ValidationError
+
 from skill_temple.browser_models import (
     RemoveHeaderMutation,
     RemoveJsonPathMutation,
     ReplaceJsonPathMutation,
     ReplayRequestPayload,
     RequestMatcher,
+    VolatileBinding,
 )
 from skill_temple.protocol_evidence import (
-    assess_mutation_effectiveness,
+    assess_paired_mutation_effectiveness,
     build_replay_spec,
+    classify_replay_response,
     network_checkpoint,
     network_request_matches,
     public_network_summary,
@@ -187,20 +191,113 @@ class ProtocolEvidenceTests(unittest.TestCase):
             ):
                 RemoveHeaderMutation(type="remove_header", name=name)
 
-    def test_mutation_effectiveness_uses_actual_wire_snapshot(self) -> None:
+    def test_paired_mutation_effectiveness_requires_control_delta_and_equivalence(
+        self,
+    ) -> None:
         mutation = RemoveJsonPathMutation(
             type="remove_json_path",
             path="/messages/0/id",
         )
-        replay_spec, _ = build_replay_spec(self.snapshot(), [mutation])
-        wire = self.snapshot()
-        wire["requestBody"] = replay_spec["body"]
-        effective = assess_mutation_effectiveness(mutation, wire)
-        ineffective = assess_mutation_effectiveness(mutation, self.snapshot())
+        binding = VolatileBinding(
+            binding_id="parent",
+            target="json_pointer",
+            path="/parent_message_id",
+            generator="uuid4",
+            reuse_policy="fresh_equivalent",
+        )
+        control_spec, _ = build_replay_spec(
+            self.snapshot(),
+            [],
+            volatile_bindings=[binding],
+            binding_values={"parent": "control-parent"},
+        )
+        treatment_spec, _ = build_replay_spec(
+            self.snapshot(),
+            [mutation],
+            volatile_bindings=[binding],
+            binding_values={"parent": "treatment-parent"},
+        )
+        control_wire = self.snapshot()
+        treatment_wire = self.snapshot()
+        control_wire["requestBody"] = control_spec["body"]
+        treatment_wire["requestBody"] = treatment_spec["body"]
 
+        effective = assess_paired_mutation_effectiveness(
+            mutation,
+            control_wire,
+            treatment_wire,
+            volatile_bindings=[binding],
+            control_binding_values={"parent": "control-parent"},
+            treatment_binding_values={"parent": "treatment-parent"},
+        )
+        self.assertTrue(effective["target_delta_observed"])
+        self.assertTrue(effective["non_target_fields_equivalent"])
+        self.assertTrue(effective["volatile_bindings_effective"])
         self.assertTrue(effective["mutation_effective"])
-        self.assertEqual(effective["mutation_observed_on_wire"], "<absent>")
-        self.assertFalse(ineffective["mutation_effective"])
+        self.assertEqual(effective["control_wire_value"], "<identifier>")
+        self.assertEqual(effective["treatment_wire_value"], "<absent>")
+
+        unchanged = assess_paired_mutation_effectiveness(
+            mutation,
+            control_wire,
+            control_wire,
+            volatile_bindings=[binding],
+            control_binding_values={"parent": "control-parent"},
+            treatment_binding_values={"parent": "control-parent"},
+        )
+        self.assertFalse(unchanged["target_delta_observed"])
+        self.assertFalse(unchanged["mutation_effective"])
+
+        changed_body = json.loads(treatment_spec["body"]["text"])
+        changed_body["model"] = "other-model"
+        treatment_wire["requestBody"] = {
+            **treatment_spec["body"],
+            "text": json.dumps(changed_body),
+        }
+        non_target_change = assess_paired_mutation_effectiveness(
+            mutation,
+            control_wire,
+            treatment_wire,
+            volatile_bindings=[binding],
+            control_binding_values={"parent": "control-parent"},
+            treatment_binding_values={"parent": "treatment-parent"},
+        )
+        self.assertFalse(non_target_change["non_target_fields_equivalent"])
+        self.assertFalse(non_target_change["mutation_effective"])
+
+        target_binding = VolatileBinding(
+            binding_id="message_id",
+            target="json_pointer",
+            path="/messages/0/id",
+            generator="uuid4",
+            reuse_policy="fresh_equivalent",
+        )
+        control_target_spec, _ = build_replay_spec(
+            self.snapshot(),
+            [],
+            volatile_bindings=[target_binding],
+            binding_values={"message_id": "control-id"},
+        )
+        treatment_target_spec, _ = build_replay_spec(
+            self.snapshot(),
+            [mutation],
+            volatile_bindings=[target_binding],
+            binding_values={"message_id": "treatment-id"},
+        )
+        control_target_wire = self.snapshot()
+        treatment_target_wire = self.snapshot()
+        control_target_wire["requestBody"] = control_target_spec["body"]
+        treatment_target_wire["requestBody"] = treatment_target_spec["body"]
+        target_binding_result = assess_paired_mutation_effectiveness(
+            mutation,
+            control_target_wire,
+            treatment_target_wire,
+            volatile_bindings=[target_binding],
+            control_binding_values={"message_id": "control-id"},
+            treatment_binding_values={"message_id": "treatment-id"},
+        )
+        self.assertTrue(target_binding_result["volatile_bindings_effective"])
+        self.assertTrue(target_binding_result["mutation_effective"])
 
     def test_replay_mode_enforces_control_and_single_treatment_mutation(self) -> None:
         base = {
@@ -209,13 +306,14 @@ class ProtocolEvidenceTests(unittest.TestCase):
             "source_experiment_id": "exp_source",
             "source_evidence_id": "ev_source",
         }
-        control = ReplayRequestPayload.model_validate(
+        adapter = TypeAdapter(ReplayRequestPayload)
+        control = adapter.validate_python(
             {**base, "replay_mode": "control", "mutations": []}
         )
         self.assertEqual(control.replay_mode, "control")
 
-        with self.assertRaisesRegex(ValueError, "control replay requires mutations"):
-            ReplayRequestPayload.model_validate(
+        with self.assertRaises(ValidationError):
+            adapter.validate_python(
                 {
                     **base,
                     "replay_mode": "control",
@@ -227,19 +325,96 @@ class ProtocolEvidenceTests(unittest.TestCase):
                     ],
                 }
             )
-        with self.assertRaisesRegex(ValueError, "control_experiment_id"):
-            ReplayRequestPayload.model_validate(
+        treatment = adapter.validate_python(
+            {
+                "replay_mode": "treatment",
+                "control_experiment_id": "exp_control",
+                "mutation": {
+                    "type": "remove_json_path",
+                    "path": "/tracking_id",
+                },
+            }
+        )
+        self.assertEqual(treatment.control_experiment_id, "exp_control")
+        with self.assertRaises(ValidationError):
+            adapter.validate_python(
                 {
-                    **base,
                     "replay_mode": "treatment",
-                    "mutations": [
-                        {
-                            "type": "remove_json_path",
-                            "path": "/tracking_id",
-                        }
-                    ],
+                    "control_experiment_id": "exp_control",
+                    "mutation": {
+                        "type": "remove_json_path",
+                        "path": "/tracking_id",
+                    },
+                    "capture": {"stream": False},
                 }
             )
+
+    def test_response_classification_requires_field_validation_evidence(self) -> None:
+        mutation = RemoveJsonPathMutation(
+            type="remove_json_path",
+            path="/messages/0/id",
+        )
+        validation = classify_replay_response(
+            status=422,
+            content_type="application/json",
+            response_value={"missing": ["messages[0].id"]},
+            mutation=mutation,
+        )
+        unknown = classify_replay_response(
+            status=422,
+            content_type="application/json",
+            response_value={"error": "invalid request"},
+            mutation=mutation,
+        )
+        auth = classify_replay_response(
+            status=401,
+            content_type="application/json",
+            response_value={"error": "login required"},
+            mutation=mutation,
+        )
+        rate = classify_replay_response(
+            status=429,
+            content_type="application/json",
+            response_value={"error": "rate limited"},
+            mutation=mutation,
+        )
+        server = classify_replay_response(
+            status=502,
+            content_type="text/html",
+            response_value="bad gateway",
+            mutation=mutation,
+        )
+        redirect = classify_replay_response(
+            status=200,
+            content_type="text/html",
+            response_value="login",
+            mutation=None,
+            redirected=True,
+            source_url="https://example.test/conversation",
+            final_url="https://example.test/login",
+            source_content_type="application/json",
+        )
+        content_mismatch = classify_replay_response(
+            status=200,
+            content_type="text/html",
+            response_value="login",
+            mutation=None,
+            source_url="https://example.test/conversation",
+            final_url="https://example.test/conversation",
+            source_content_type="application/json",
+        )
+
+        self.assertEqual(validation["classification"], "validation_rejection")
+        self.assertTrue(validation["usable_for_required_classification"])
+        self.assertEqual(unknown["classification"], "unknown_rejection")
+        self.assertEqual(auth["classification"], "authentication_failure")
+        self.assertEqual(rate["classification"], "rate_limited")
+        self.assertEqual(server["classification"], "server_failure")
+        self.assertEqual(redirect["classification"], "unexpected_redirect")
+        self.assertEqual(
+            content_mismatch["classification"],
+            "response_contract_mismatch",
+        )
 
     def test_network_matcher_uses_stable_reqid_url_method_and_resource_type(self) -> None:
         request = {

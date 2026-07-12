@@ -47,7 +47,7 @@ For replay, the backend reads the exact artifact locally and creates the browser
 Use the following order:
 
 1. `list_evidence` to discover stable evidence IDs.
-2. `get_network_evidence`, `get_request_shape`, `get_request_initiator`, or `list_console_errors` for bounded summaries.
+2. `get_network_evidence`, paginated `get_request_shape`, `get_request_initiator`, or `list_console_errors` for bounded summaries.
 3. `workspaceReadFiles` for non-credential text artifacts.
 4. `workspaceExecPwsh` for binary, offset, compressed, or hash analysis.
 
@@ -77,7 +77,16 @@ source_evidence_id
 mutation list
 control_experiment_id
 volatile binding metadata
-mutation_requested / mutation_observed_on_wire / mutation_effective
+pair_protocol_hash
+replay_attempt_id and dispatch time
+control/treatment exact network evidence IDs
+control_wire_value / treatment_wire_value
+target_delta_observed
+non_target_fields_equivalent
+volatile_bindings_effective
+mutation_effective
+response classification
+pair environment fingerprint/comparison
 request diff artifact
 replay response artifact
 new network evidence IDs
@@ -85,7 +94,9 @@ stream request/event-range evidence IDs
 page and console evidence IDs
 ```
 
-A replay response status alone is insufficient to determine field necessity. Compare the persisted conversation state and subsequent retrieval when relevant.
+A replay response status alone is insufficient to determine field necessity. A field-validation response must identify the target path/header/query parameter. Compare the persisted conversation state and subsequent retrieval when relevant.
+
+Ordinary network snapshot integrity and stream artifact integrity are separate. An exact request snapshot may prove request headers/body completeness, but it cannot upgrade missing `raw.bin`, event JSONL, or stream metadata.
 
 ## Evidence quality
 

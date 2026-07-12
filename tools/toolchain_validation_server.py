@@ -171,6 +171,16 @@ class ToolchainValidationHandler(BaseHTTPRequestHandler):
             )
             mapping = state["mapping"]
             assert isinstance(mapping, dict)
+            if user_message_id in mapping:
+                self._send_json(
+                    {
+                        "ok": False,
+                        "error": "duplicate-message-id",
+                        "field": "messages[0].id",
+                    },
+                    HTTPStatus.CONFLICT,
+                )
+                return
             mapping[user_message_id] = {
                 "id": user_message_id,
                 "parent": parent_message_id,
