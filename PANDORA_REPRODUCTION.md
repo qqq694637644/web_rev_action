@@ -1,67 +1,60 @@
-# Pandora 类复现方法
+# Pandora 类网页协议分析复现方法
 
 ## 1. 目标
 
-本文描述如何使用 `web_rev_action` 的工具组合，复现 Pandora 类网页协议分析流程。
+本文复现的是 Pandora 的分析思路，不是假设当前网页仍使用相同字段或接口。
 
-这里的“复现”指：
+需要独立发现：
 
-- 用正常浏览器和授权账号观察网页端行为。
-- 记录页面动作、网络请求、SSE 流式响应、调用栈和相关前端脚本。
-- 整理出业务协议状态机、请求字段含义和响应事件类型。
-- 在 workspace 中写最小重放脚本，验证字段必要性和状态变化。
+```text
+认证如何进入业务请求
+会话如何创建
+message / parent message 如何关联
+分支和 regenerate 如何表示
+流事件如何推进消息状态
+停止生成如何影响网络和消息状态
+请求由哪段前端代码构造
+哪些字段是后端必需、状态字段或埋点字段
+```
 
-本文不属于 `web_rev_action` 的功能实现计划。功能实现见 `PLAN.md`。
+所有实验只在自己的授权账号和正常登录会话中进行。浏览器负责正常登录，分析程序研究登录后的业务协议。
 
 ---
 
 ## 2. 工具分工
 
 ```text
-playwright-cli
-  负责稳定制造页面事件
-
-js-reverse-mcp
-  负责解释事件背后的网络、脚本、断点、调用栈和运行时状态
-
-web_rev_action
-  负责把一次实验组织成 GPT 可调用的 Action，并保存 evidence / artifact
-
-github-gpt-actions-gateway workspace
-  负责保存抓包、脚本、schema、diff、报告和实验笔记
+playwright-cli 负责制造和重放页面行为
+js-reverse-mcp 负责解释网络、流、脚本、调用栈和运行时证据
+web_rev_action 负责原子编排、证据索引、deadline 和实验 manifest
+Gateway workspace 工具负责实验后的读取、搜索、diff、schema 和重放脚本
 ```
 
-核心主线：
+GPT 只调用：
 
 ```text
-先确认工具能抓到一条完整消息
-  ↓
-再封装 GPT Action
-  ↓
-再建立实验和证据模型
-  ↓
-再分析消息树和 SSE
-  ↓
-再定位构造代码
-  ↓
-最后重放验证
+inspectBrowserEvidence
+runBrowserExperiment
 ```
+
+`js-reverse-mcp` 的三个 stream primitive 是后端私有工具：
+
+```text
+start_stream_capture
+get_stream_status
+stop_stream_capture
+```
+
+一次 `capture_flow` 必须在同一个后端调用中完成 start → flow → wait → stop → manifest。
 
 ---
 
-## 3. 工作目录
+## 3. 实验目录
 
-建议在 analysis workspace 中保留固定结构。
+每次实验创建独立目录：
 
 ```text
-analysis-workspace/
-  captures/
-    baseline/
-    first-message/
-    second-message/
-    regenerate/
-    edit-message/
-    stop-generation/
+data/analysis-workspace/
   experiments/
     exp_001/
       manifest.json
@@ -69,32 +62,24 @@ analysis-workspace/
       js-reverse/
       reports/
   schemas/
-    request.schema.json
-    stream-events.schema.json
-    conversation-state.md
   scripts/
-    diff-json.py
-    replay-http.py
-    extract-stream-events.py
   reports/
-    protocol-map.md
-    stream-events.md
-    state-machine.md
-    pandora-comparison.md
   notes/
-    timeline.md
-    open-questions.md
 ```
 
-workspace 只是记录目录，不需要 Git、PR、CI 或 branch 流程。
+`web_rev_action` 把 `experiment_id` 作为受限 artifact namespace 传给上游，流证据进入：
+
+```text
+experiments/exp_001/js-reverse/capture-<uuid>/
+```
+
+workspace 是普通文件目录，不需要 Git、PR、branch 或 CI。
 
 ---
 
-## 4. 阶段一：建立协议地图
+## 4. 第一轮实验范围
 
-先不要写客户端。先用 `runBrowserExperiment.capture_baseline` 和 `runBrowserExperiment.capture_flow` 记录核心对话动作。
-
-第一轮只做六组实验：
+第一轮只做六组：
 
 ```text
 01 baseline
@@ -105,29 +90,27 @@ workspace 只是记录目录，不需要 Git、PR、CI 或 branch 流程。
 06 停止生成
 ```
 
-这六组已经足以分析：
+这六组足以观察：
 
 ```text
-会话创建
 conversation ID
 message ID
 parent message ID
-消息树
-分支
-variant / regenerate
+消息树和分支
+regenerate / variant
+流事件序列
 中断状态
-SSE 事件序列
 ```
 
-第二轮再做：
+第二轮：
 
 ```text
-切换模型
+模型切换
 标题生成
 删除会话
 ```
 
-第三轮再扩展：
+第三轮：
 
 ```text
 文件上传
@@ -136,43 +119,96 @@ SSE 事件序列
 工具调用
 ```
 
-后面的现代工具协议会产生大量额外请求，太早加入会干扰对核心对话协议的判断。
-
-每个实验至少保存：
-
-```text
-页面动作
-实验前 snapshot
-实验后 snapshot
-Trace
-请求列表
-请求头
-请求体
-响应头
-响应体或 SSE 事件序列
-请求 initiator
-相关脚本 URL 和位置
-控制台错误
-manifest.json
-```
-
-每个实验都要有独立 `experiment_id`，每条关键证据都要有 `evidence_id` 或 `artifact_id`。
+现代工具功能会引入大量额外请求，不应在核心对话协议尚未分清时加入。
 
 ---
 
-## 5. 阶段二：整理请求分类
+## 5. 每组实验的输入
 
-用 `inspectBrowserEvidence.list_requests` 和 workspace 脚本把请求按用途分类。
+`capture_flow` 至少声明：
 
-核心分类：
+```text
+objective
+primary_request matcher
+expected match count
+allow supporting failures
+flow steps
+wait condition
+42 秒以内的总 deadline
+```
+
+示例：
+
+```json
+{
+  "objective": "observe the first conversation request and complete stream",
+  "primary_request": {
+    "url_contains": "/conversation",
+    "method": "POST",
+    "expected_min_matches": 1,
+    "expected_max_matches": 1,
+    "allow_supporting_failures": true,
+    "include_in_flight": false
+  },
+  "wait_for": {
+    "type": "event_predicate",
+    "predicate": {
+      "type": "exact_data",
+      "value": "[DONE]"
+    }
+  }
+}
+```
+
+`[DONE]` 只是这个实验的默认结束谓词，不是所有网页流协议的通用定义。其他页面可以使用 event name、JSON 字段、网络终态或页面状态。
+
+---
+
+## 6. 每组实验必须保存的证据
+
+```text
+页面动作和 step result
+实验前后 snapshot
+Playwright Trace
+请求列表
+primary request 选择结果
+request / response headers
+ExtraInfo headers 和 cookie 关联
+request body 文本及完整性说明
+response status
+raw stream bytes
+UTF-8 decoded stream
+SSE 事件和 raw byte range
+网络终态
+initiator
+相关脚本 URL 和位置
+控制台错误
+capture health
+manifest.json
+```
+
+每个结论都应引用：
+
+```text
+experiment_id
+evidence_id
+artifact_id
+```
+
+数字 `reqid` 只在当前 page collector generation 中有效，不能作为跨实验主键。
+
+---
+
+## 7. 请求分类
+
+使用 `inspectBrowserEvidence.list_requests` 和 workspace 脚本分类：
 
 ```text
 页面初始化
 账号 / session 状态
 配置 / feature flag
 模型列表
-会话列表
-会话详情
+会话列表和详情
 消息提交
 停止生成
 重新生成
@@ -181,14 +217,14 @@ manifest.json
 静态资源
 ```
 
-后续扩展分类：
+后续再加入：
 
 ```text
 文件上传
 网页搜索
 图片生成
 工具调用
-WebSocket 或实时通道
+WebSocket / 实时通道
 ```
 
 对每个核心请求记录：
@@ -199,126 +235,158 @@ path
 query
 status
 content-type
-request body schema
-response body schema 或 stream event schema
-是否和页面动作直接相关
-initiator evidence
+request schema
+response / stream event schema
+initiator
+responseObserved
+failurePhase
+collectorGeneration
 ```
 
-输出到：
-
-```text
-reports/protocol-map.md
-schemas/request.schema.json
-schemas/stream-events.schema.json
-```
+默认排除 capture 前已经发出的请求。只有明确研究在途请求时才启用 `includeInFlight=true`。
 
 ---
 
-## 6. 阶段三：流式响应分析
+## 8. 流式响应分析
 
-对 Pandora 类聊天协议，流式响应分析应在状态机分析之前完成。很多状态信息可能在 SSE 中间事件里逐步出现，而不是只在最终响应里出现。
+流式分析应在状态机分析之前完成，因为 conversation ID、assistant message ID、current node 和中断状态可能在中间事件逐步出现。
 
-重点观察：
-
-```text
-conversation ID 何时出现
-assistant message ID 何时出现
-current node 如何变化
-重新生成产生新节点还是覆盖节点
-停止生成后的消息状态是什么
-错误如何返回
-取消后的最终事件是什么
-```
-
-### 6.1 最低要求
-
-普通 response body 导出如果能完整保留以下事件序列，则足够做协议语义分析：
+### 8.1 必须得到的内容
 
 ```text
-data: {...}
-
-data: {...}
-
-data: [DONE]
-```
-
-必须拿到：
-
-```text
-每条 data 事件
+每个事件
 事件顺序
-结束标记
+raw byte range
+chunk 顺序和时间
+网络完成、失败或取消
 错误事件
-取消后的结果
+取消后的最后可见状态
 ```
 
-### 6.2 需要 Raw Stream Capture 的情况
-
-如果普通导出无法完整保留 SSE 事件序列，Raw CDP Stream Capture 就是核心依赖，应先补到 `js-reverse-mcp` 再继续分析。
-
-即使普通导出足够，以下行为仍需要 Raw Stream Capture：
+上游 artifact：
 
 ```text
-每个 chunk 的到达时间
-stop-generation
-网络中断
-未正常结束的流
-chunk 边界
-心跳
-工具调用增量
+raw.bin
+  精确原始字节
+
+decoded.sse
+  UTF-8 阅读副本；非法 UTF-8 可能被替换
+
+chunks.jsonl
+  chunk offset、长度和时间
+
+events.jsonl
+  事件字段、raw byte range、chunk range 和完成时间
 ```
 
-建议输出：
+精确定位必须使用 `raw.bin + rawByteStart/rawByteEnd`，不能把 decoded character offset 当成 raw byte offset。
+
+### 8.2 完整性分维度判断
 
 ```text
-schemas/stream-events.schema.json
-reports/stream-events.md
+rawCaptureIntegrity
+semanticParseIntegrity
+requestSnapshotIntegrity
+artifactIntegrity
 ```
 
-不能只看最终响应文本，要看事件序列。
+例如：
+
+```text
+rawCaptureIntegrity = complete
+semanticParseIntegrity = partial
+```
+
+仍然可以对 `raw.bin` 做 chunk 和离线 parser 分析，不应因语义 parser 降级而丢弃整个实验。
+
+### 8.3 结束条件
+
+底层只记录事件和网络终态。实验层使用受控 predicate：
+
+```text
+exact_data
+event_name
+json_path_equals
+network_terminal
+selector_state
+```
+
+`defaultDoneMarkerObserved=true` 只表示出现过文本 `[DONE]`。
 
 ---
 
-## 7. 阶段四：分析状态机
+## 9. 状态机分析
 
-基于协议地图和 SSE 事件序列整理状态关系。
-
-重点观察：
+根据 primary request 和流事件整理：
 
 ```text
-会话如何创建
-消息 ID 如何生成
+会话何时创建
+conversation ID 何时出现
+user message ID 如何生成
+assistant message ID 何时出现
 parent / child 如何关联
-分支如何产生
-重新生成如何表示
-修改旧消息如何表示
-停止生成是否发送取消请求
-继续生成如何表示
-错误如何返回
+current node 如何变化
+重新生成产生新节点还是覆盖
+修改旧消息如何产生分支
+停止生成后消息处于什么状态
+错误和恢复如何表示
 ```
 
-建议输出：
+输出：
 
 ```text
 reports/state-machine.md
 schemas/conversation-state.md
 ```
 
-状态机文档应区分四类结论：
+每条结论标记：
 
 ```text
-已观察：抓包中直接看到
-已验证：通过对照或重放验证
-推测：有证据支持但尚未验证
-未知：还没有足够证据
+已观察
+已验证
+推测
+未知
 ```
 
 ---
 
-## 8. 阶段五：定位请求构造代码
+## 10. 停止生成实验
 
-对每个核心请求执行以下顺序。
+底层 collector 只能确认：
+
+```text
+status = canceled
+terminalReason = network_canceled
+```
+
+它不能知道是否由用户点击 Stop 引起，因为导航、AbortController、页面关闭和浏览器内部行为都可能取消请求。
+
+`web_rev_action` 只有同时满足以下条件才标记 `expected_user_cancel`：
+
+```text
+flow 中实际执行了 Stop step
+取消发生在 Stop step 的限定时间窗口
+取消请求匹配 primary request
+页面和 target 对齐
+没有导航或 page close 等更合理原因
+```
+
+分析时同时保存：
+
+```text
+Stop step 时间
+目标 request ID
+最后一个流事件
+network_canceled 时间
+页面最终状态
+消息是否可继续 / regenerate
+```
+
+---
+
+## 11. 请求构造代码定位
+
+对每个核心请求执行：
 
 ```text
 1. inspectBrowserEvidence.list_requests
@@ -330,116 +398,119 @@ schemas/conversation-state.md
 7. 保存源码片段、调用栈和 paused info
 ```
 
-目标不是反混淆全部前端，而是找到：
+只有 initiator 和源码搜索无法解释请求时，才使用 XHR/fetch breakpoint。
+
+断点实验结束必须确认：
 
 ```text
-请求在哪个模块发出
-请求体在哪里组装
-动态字段来自哪里
-状态字段来自哪里
-哪些字段只是埋点或实验参数
+execution 已恢复
+breakpoint 已移除
+页面没有停在 paused 状态
 ```
 
-只有 initiator 和源码搜索无法解释请求体时，才设置 XHR/fetch 断点。
-
-断点实验结束后要确认：
+目标是区分：
 
 ```text
-paused execution 已恢复
-breakpoint 已移除
-页面没有停在暂停状态
+后端必需字段
+前端状态字段
+动态 ID
+实验 / feature flag
+追踪和埋点字段
 ```
 
 ---
 
-## 9. 可选诊断：Worker / Service Worker
+## 12. 请求快照的真实边界
 
-Worker / Service Worker 对现代复杂网页分析有价值，但不是 Pandora 核心复现的前置阶段。
+Stream request artifact 会分别保存：
 
-只有遇到以下情况才进入这一步：
+```text
+request-headers.json
+request-headers-extra.json
+request-headers.redacted.json
+request-body.txt
+request-body.meta.json
+response-headers.json
+response-headers-extra.json
+response-headers.redacted.json
+initiator.json
+redirects.json
+```
+
+检查：
+
+```text
+headersCompleteness
+bodyCompleteness
+bodyCaptureSource
+requestSnapshotIntegrity
+```
+
+`request-body.txt` 来自 CDP `postData` 的 UTF-8 表示，不是 wire bytes。对于 multipart、文件、压缩或二进制 body，不能宣称已经获得完整请求体。
+
+### 12.1 凭据
+
+完整 headers 可能包含 Cookie、Authorization、CSRF 和 Set-Cookie。
+
+默认读取、搜索、diff 和报告只使用：
+
+```text
+*.redacted.json
+```
+
+完整 credential artifact 只供明确的本地 replay 使用，不复制到 GPT summary、自然语言报告或日志。
+
+---
+
+## 13. Worker / Service Worker
+
+当前 stream collector 明确报告：
+
+```text
+captureScope = page-target-only
+workerCoverage = false
+```
+
+这足够完成 Pandora 核心页面协议分析，但不是完整 worker coverage。
+
+只有出现以下情况才进入 Worker / Service Worker 诊断：
 
 ```text
 initiator 为空
 主页面脚本中找不到请求
-请求看起来被 Service Worker 转发
-页面操作与请求时间对应，但 frame 中不存在发起栈
+response.fromServiceWorker=true
+页面动作与请求时间对应但 frame 中没有发起栈
 ```
 
-诊断时确认：
-
-```text
-targetType
-frameId
-targetId
-workerUrl
-initiator stack
-```
-
-如果 `js-reverse-mcp` 当前请求结果缺少 target 元数据，需要优先补到上游。
+后续若确实需要，再补 Target auto-attach 和 target/session metadata；不能仅靠 URL 猜测 worker 来源。
 
 ---
 
-## 10. 阶段六：独立重放验证
+## 14. 重放验证
 
-浏览器抓到请求不等于理解了协议。需要在 workspace 中做最小重放和字段对照。
+### 14.1 Browser-context replay
 
-重放分两级。
+先在当前登录页面执行受控 fetch：
 
-### 10.1 browser-context replay
+- 自动复用 Cookie。
+- 一次只删改一个字段。
+- 请求样本来自 artifact。
+- 结果写入 workspace。
 
-在当前已登录页面上下文中重放请求。
+这是第一轮字段必要性实验的首选方式。
 
-特点：
+### 14.2 External HTTP replay
 
-```text
-自动使用现有 Cookie
-最容易验证字段删除和修改
-不需要先分析登录
-适合第一轮字段实验
-```
-
-实现方式：
+后置实现。先确认：
 
 ```text
-在当前登录页面中用 fetch 发送变体请求
-请求样本来自 artifact
-每次只删改一个字段
-结果保存到 workspace
+headersCompleteness 足够
+bodyCompleteness 足够
+bodyCaptureSource 可接受
+credential mode 已明确
 ```
 
-这一级用于快速判断字段是否可能必需。
-
-### 10.2 external HTTP replay
-
-浏览器外独立脚本重放请求。
-
-需要从已登录浏览器或已捕获请求中整理当前实验需要的：
-
-```text
-Cookie
-Authorization 或同类认证头
-CSRF 或同类防护字段
-User-Agent
-content-type
-必要动态 header
-```
-
-然后生成 Python 或 Node 脚本。
-
-这一级才是真正的浏览器外复现。先做 browser-context replay，再做 external HTTP replay，成功率更高。
-
-### 10.3 字段对照
-
-建议步骤：
-
-```text
-1. 从 artifact 导出一个核心请求样本
-2. 先 browser-context replay
-3. 再 external HTTP replay
-4. 一次只删除或修改一个字段
-5. 保存响应、错误和 diff
-6. 更新 schema 和协议报告
-```
+然后再生成 Python/Node 脚本。若 body 只是 `cdp-postData-utf8`，multipart 或 binary 请求不能宣称已完整复刻。
 
 字段分类：
 
@@ -454,50 +525,68 @@ client_generated
 unknown
 ```
 
-不要一开始复现登录。浏览器负责正常登录，重放脚本只研究登录后的业务协议。
-
 ---
 
-## 11. Pandora 对照验证矩阵
+## 15. Pandora 对照矩阵
 
-复现的目标不是证明最新版网页字段名和旧 Pandora 完全一致，而是证明能独立发现同一类协议结构和状态关系。
-
-建议维护：
+维护：
 
 ```text
 reports/pandora-comparison.md
 ```
 
-矩阵：
-
-| 分析目标 | 独立观察结果 | Pandora 参考结构 | 是否确认 | 证据 |
+| 分析目标 | 独立观察结果 | Pandora 参考结构 | 状态 | 证据 |
 | --- | --- | --- | --- | --- |
-| 认证方式 | Bearer / Cookie / 其他 | access token | 待确认 | exp / evidence |
-| 消息入口 | 请求 path | conversation 类接口 | 待确认 | exp / evidence |
-| 流协议 | SSE / WS / chunked | SSE | 待确认 | exp / evidence |
-| 首次消息动作 | 实际字段 | next 类语义 | 待确认 | exp / evidence |
-| 重新生成 | 实际字段 | variant 类语义 | 待确认 | exp / evidence |
-| 继续生成 | 实际字段 | continue 类语义 | 待确认 | exp / evidence |
-| 会话关联 | 实际字段 | conversation ID | 待确认 | exp / evidence |
-| 消息关联 | 实际字段 | parent message ID | 待确认 | exp / evidence |
-| 分支结构 | 实际结构 | message mapping tree | 待确认 | exp / evidence |
-| 结束事件 | 实际事件 | `[DONE]` 类结束标记 | 待确认 | exp / evidence |
-| 停止生成 | 实际行为 | 取消 / 截断状态 | 待确认 | exp / evidence |
-| 错误事件 | 实际事件 | SSE 错误事件或 HTTP 错误 | 待确认 | exp / evidence |
+| 认证方式 | Bearer / Cookie / 其他 | access token | 待确认 | exp/evidence |
+| 消息入口 | 实际 path | conversation 类接口 | 待确认 | exp/evidence |
+| 流协议 | SSE / WS / chunked | SSE | 待确认 | exp/evidence |
+| 首次消息 | 实际 action/字段 | next 类语义 | 待确认 | exp/evidence |
+| 重新生成 | 实际字段 | variant 类语义 | 待确认 | exp/evidence |
+| 继续生成 | 实际字段 | continue 类语义 | 待确认 | exp/evidence |
+| 会话关联 | conversation ID | conversation ID | 待确认 | exp/evidence |
+| 消息关联 | parent ID | parent message ID | 待确认 | exp/evidence |
+| 分支结构 | 实际 mapping | message tree | 待确认 | exp/evidence |
+| 结束条件 | 实际 predicate | `[DONE]` 类标记 | 待确认 | exp/evidence |
+| 停止生成 | network_canceled + 页面状态 | 取消 / 截断 | 待确认 | exp/evidence |
+| 错误事件 | HTTP / stream error | 错误事件 | 待确认 | exp/evidence |
 
-每一行至少引用一个：
-
-```text
-experiment_id
-evidence_id
-artifact_id
-```
+验证的是是否能独立发现同一类协议结构，不要求新网页与旧 Pandora 字段完全相同。
 
 ---
 
-## 12. 最终输出物
+## 16. 最小闭环
 
-完成一轮 Pandora 类复现分析后，workspace 中应有：
+```text
+capture_baseline
+  ↓
+capture_flow: 第一轮消息
+  ↓
+选择 primary request
+  ↓
+检查 raw/semantic/snapshot/artifact integrity
+  ↓
+导出请求快照和完整流事件序列
+  ↓
+get_request_initiator
+  ↓
+search_scripts
+  ↓
+写 protocol-map.md 和 stream-events.md
+  ↓
+整理 state-machine.md
+  ↓
+browser-context replay 一个低风险单变量变体
+  ↓
+更新 schema、pandora-comparison.md 和 open-questions.md
+```
+
+做到这个闭环后，再扩展到第二轮、regenerate、edit、stop、标题、删除、文件和工具调用。
+
+---
+
+## 17. 完成标准
+
+一次 Pandora 类复现分析至少应产出：
 
 ```text
 reports/protocol-map.md
@@ -512,56 +601,15 @@ scripts/diff-json.py
 notes/open-questions.md
 ```
 
-报告应包括：
+并满足：
 
-```text
-接口地图
-核心请求字段说明
-SSE 事件类型
-消息状态机
-请求构造源码位置
-browser-context replay 结果
-external HTTP replay 结果
-已验证字段
-推测字段
-未解决问题
-下一组实验
-```
-
-每个结论必须能回溯到：
-
-```text
-experiment_id
-evidence_id
-artifact_id
-```
-
----
-
-## 13. 最小闭环
-
-最小可用闭环是：
-
-```text
-capture_baseline
-  ↓
-capture_flow: 首次消息
-  ↓
-list_requests
-  ↓
-导出请求 / 响应 / SSE 事件序列
-  ↓
-get_request_initiator
-  ↓
-search_scripts
-  ↓
-写 protocol-map.md 和 stream-events.md
-  ↓
-整理 state-machine.md
-  ↓
-browser-context replay 一个低风险变体
-  ↓
-更新 schema、pandora-comparison.md 和 open-questions.md
-```
-
-做到这个闭环之后，再扩展到第二轮消息、重新生成、编辑消息、停止生成、标题、删除、文件上传和工具调用。
+- start capture 早于第一条页面变更动作。
+- pre-arm 请求默认不污染实验。
+- 无 response 失败请求仍有 evidence。
+- primary request 与 supporting request 分开评价。
+- raw bytes、语义事件和请求快照完整性分开。
+- Stop cancellation 不由底层提前解释成用户行为。
+- credential 默认脱敏。
+- stop 后关闭页面不修改历史 manifest。
+- 所有 artifact 相对路径可由 workspace 工具读取。
+- 整个 capture_flow 在统一 Action deadline 内完成或写出 best-effort timeout manifest。
