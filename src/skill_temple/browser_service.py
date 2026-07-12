@@ -21,6 +21,7 @@ from .browser_adapters import (
     PlaywrightAdapter,
     PlaywrightCliAdapter,
     StdioMcpToolTransport,
+    StreamCheckpoint,
 )
 from .browser_models import (
     BrowserActionResponse,
@@ -28,7 +29,6 @@ from .browser_models import (
     CaptureFlowPayload,
     CaptureFlowRequest,
     CloseSessionRequest,
-    FlowStep,
     FlowStepResult,
     GetExperimentRequest,
     GetSessionRequest,
@@ -267,7 +267,8 @@ class ExperimentStore:
 
 
 class BrowserActionService:
-    FINALIZE_RESERVE_MS = 2_000
+    FINALIZE_RESERVE_MS = 5_000
+    FINALIZE_GRACE_MS = 8_000
     STREAM_WAIT_TYPES = {
         "request_observed",
         "response_observed",
@@ -295,17 +296,85 @@ class BrowserActionService:
         self.default_browser_endpoint = default_browser_endpoint
         self.private_mcp_browser_endpoint = private_mcp_browser_endpoint
         self.require_private_mcp_endpoint = require_private_mcp_endpoint
+        self.service_instance_id = f"svc_{uuid.uuid4().hex}"
+        self.process_started_at = utc_now()
         self.sessions: dict[str, dict[str, Any]] = {}
         self._session_locks: dict[str, asyncio.Lock] = {}
+        self._browser_lock = asyncio.Lock()
         self._jobs: dict[str, asyncio.Task[None]] = {}
 
     def _session_lock(self, session_id: str) -> asyncio.Lock:
         return self._session_locks.setdefault(session_id, asyncio.Lock())
 
+    @staticmethod
+    def _manifest_relative_path(experiment_id: str) -> str:
+        return (Path("experiments") / experiment_id / "manifest.json").as_posix()
+
+    @staticmethod
+    def _experiment_summary(manifest: dict[str, Any]) -> dict[str, Any]:
+        primary_requests = manifest.get("primary_requests")
+        request_summaries: list[dict[str, Any]] = []
+        if isinstance(primary_requests, list):
+            for request in primary_requests[:10]:
+                if not isinstance(request, dict):
+                    continue
+                request_summaries.append(
+                    {
+                        "cdp_request_id": request.get("cdpRequestId"),
+                        "persistent_request_id": request.get("persistentRequestId"),
+                        "url": str(request.get("url", ""))[:2048],
+                        "method": request.get("method"),
+                        "status": request.get("status"),
+                        "integrity_status": request.get("integrityStatus"),
+                        "raw_capture_integrity": request.get(
+                            "rawCaptureIntegrity"
+                        ),
+                        "semantic_parse_integrity": request.get(
+                            "semanticParseIntegrity"
+                        ),
+                        "request_snapshot_integrity": request.get(
+                            "requestSnapshotIntegrity"
+                        ),
+                        "artifact_integrity": request.get("artifactIntegrity"),
+                    }
+                )
+        health = manifest.get("capture_health")
+        return {
+            "experiment_id": manifest.get("experiment_id"),
+            "session_id": manifest.get("session_id"),
+            "operation": manifest.get("operation"),
+            "status": manifest.get("status"),
+            "objective_integrity": manifest.get("objective_integrity"),
+            "collector_integrity": manifest.get("collector_integrity"),
+            "primary_request_integrity": manifest.get(
+                "primary_request_integrity"
+            ),
+            "primary_integrity_dimensions": manifest.get(
+                "primary_integrity_dimensions"
+            ),
+            "primary_requests": request_summaries,
+            "primary_request_count": (
+                len(primary_requests) if isinstance(primary_requests, list) else 0
+            ),
+            "capture_health": dict(health) if isinstance(health, dict) else {},
+            "warnings": [str(item)[:1000] for item in manifest.get("warnings", [])[:10]],
+            "errors": [str(item)[:1000] for item in manifest.get("errors", [])[:10]],
+            "created_at": manifest.get("created_at"),
+            "updated_at": manifest.get("updated_at"),
+        }
+
     def _get_session(self, session_id: str) -> dict[str, Any]:
         session = self.sessions.get(session_id) or self.experiments.load_session(session_id)
         if not session:
             raise BrowserServiceError("session_not_found", "Browser session was not found", 404)
+        if (
+            session.get("status") == "open"
+            and session.get("service_instance_id") != self.service_instance_id
+        ):
+            session["status"] = "stale"
+            session["stale_reason"] = "service_instance_changed"
+            session["updated_at"] = utc_now()
+            self.experiments.save_session(session)
         self.sessions[session_id] = session
         return session
 
@@ -352,7 +421,12 @@ class BrowserActionService:
                 status=response_status,
                 session_id=manifest.get("session_id"),
                 experiment_id=request.payload.experiment_id,
-                result={"experiment": manifest},
+                result={
+                    "experiment": self._experiment_summary(manifest),
+                    "manifest_relative_path": self._manifest_relative_path(
+                        request.payload.experiment_id
+                    ),
+                },
             )
         if isinstance(request, GetStreamStatusRequest):
             self._get_session(request.payload.session_id)
@@ -393,11 +467,14 @@ class BrowserActionService:
                 "Playwright and js-reverse-mcp must use the same CDP endpoint",
                 409,
             )
-        async with self._session_lock(session_id):
+        async with self._browser_lock, self._session_lock(session_id):
             page = await self.playwright.open_session(
                 session_id, endpoint, payload.target.start_url, deadline
             )
-            if payload.target.page_index != page.page_index:
+            if (
+                payload.target.page_index is not None
+                and payload.target.page_index != page.page_index
+            ):
                 page = await self.playwright.select_page(
                     session_id,
                     payload.target.page_index,
@@ -426,6 +503,8 @@ class BrowserActionService:
                 "page_alignment_status": alignment.status,
                 "evidence_store": "local",
                 "evidence_root_ref": ".",
+                "service_instance_id": self.service_instance_id,
+                "process_started_at": self.process_started_at,
                 "created_at": now,
                 "updated_at": now,
             }
@@ -442,9 +521,10 @@ class BrowserActionService:
     async def _close_session(self, request: CloseSessionRequest) -> BrowserActionResponse:
         deadline = Deadline(request.payload.deadline_ms)
         session_id = request.payload.session_id
-        async with self._session_lock(session_id):
+        async with self._browser_lock, self._session_lock(session_id):
             session = self._get_session(session_id)
-            await self.playwright.close_session(session_id, deadline)
+            if session.get("status") == "open":
+                await self.playwright.close_session(session_id, deadline)
             session["status"] = "closed"
             session["updated_at"] = utc_now()
             self.experiments.save_session(session)
@@ -458,24 +538,16 @@ class BrowserActionService:
     async def _align_session(
         self, session: dict[str, Any], payload: CaptureFlowPayload, deadline: Deadline
     ) -> AlignmentResult:
+        selected_index = (
+            payload.target.page_index
+            if payload.target.page_index is not None
+            else int(session.get("playwright_page_index", 0))
+        )
         page = await self.playwright.select_page(
             str(session["playwright_session_ref"]),
-            payload.target.page_index,
+            selected_index,
             deadline,
         )
-        if payload.target.start_url:
-            step = FlowStep(
-                step_id="__target_navigation__",
-                action="navigate",
-                value=payload.target.start_url,
-                timeout_ms=min(5_000, deadline.remaining_ms()),
-            )
-            await self.playwright.execute_step(
-                str(session["playwright_session_ref"]),
-                step,
-                self.experiments.root,
-                deadline,
-            )
         page = await self.playwright.current_page(
             str(session["playwright_session_ref"]), deadline
         )
@@ -533,7 +605,7 @@ class BrowserActionService:
         session_ref: str,
         capture_id: int | None,
         condition: WaitCondition,
-        since_version: int,
+        checkpoint: StreamCheckpoint,
         deadline: Deadline,
     ) -> dict[str, Any]:
         condition_deadline = deadline.child(condition.timeout_ms)
@@ -567,7 +639,7 @@ class BrowserActionService:
                 capture_id=capture_id,
                 request_matcher=condition.request_matcher or RequestMatcher(),
                 condition=condition,
-                since_version=since_version,
+                checkpoint=checkpoint,
                 deadline=condition_deadline,
             )
             return asdict(result)
@@ -576,6 +648,17 @@ class BrowserActionService:
             condition,
             condition_deadline,
         )
+
+    async def _stream_checkpoint(
+        self,
+        capture_id: int | None,
+        matcher: RequestMatcher,
+        deadline: Deadline,
+    ) -> StreamCheckpoint:
+        if capture_id is None:
+            return StreamCheckpoint()
+        status = await self.js_reverse.get_stream_status(capture_id, deadline)
+        return JsReverseMcpAdapter.checkpoint_from_status(status, matcher)
 
     def _ensure_finalize_reserve(self, deadline: Deadline, operation: str) -> None:
         if deadline.remaining_ms() <= self.FINALIZE_RESERVE_MS:
@@ -610,7 +693,7 @@ class BrowserActionService:
         payload: CaptureFlowPayload,
         status_payload: dict[str, Any],
         network_payload: dict[str, Any],
-    ) -> tuple[list[dict[str, Any]], str, bool]:
+    ) -> tuple[list[dict[str, Any]], str, bool, dict[str, str]]:
         matcher = self._request_matcher(payload)
         requests = [
             item
@@ -618,7 +701,7 @@ class BrowserActionService:
             if isinstance(item, dict)
             and JsReverseMcpAdapter._request_matches(item, matcher)
         ]
-        if not requests:
+        if not requests and not payload.capture.stream:
             requests = [
                 {
                     **item,
@@ -635,22 +718,46 @@ class BrowserActionService:
             <= payload.primary_request.expected_max_matches
         )
         if not requests:
-            integrity = (
-                "failed" if payload.primary_request.expected_min_matches else "partial"
-            )
-            return requests, integrity, count_ok
+            if payload.primary_request.expected_min_matches == 0:
+                return requests, "complete", count_ok, {
+                    "raw_capture": "complete",
+                    "semantic_parse": "complete",
+                    "request_snapshot": "complete",
+                    "artifacts": "complete",
+                }
+            integrity = "failed"
+            return requests, integrity, count_ok, {
+                "raw_capture": "failed" if payload.capture.stream else "partial",
+                "semantic_parse": "failed" if payload.capture.stream else "partial",
+                "request_snapshot": "failed" if payload.capture.stream else "partial",
+                "artifacts": "failed" if payload.capture.stream else "partial",
+            }
         integrity = max(
             (str(item.get("integrityStatus", "partial")) for item in requests),
             key=self._integrity_severity,
         )
-        return requests, integrity, count_ok
+        fields = {
+            "raw_capture": "rawCaptureIntegrity",
+            "semantic_parse": "semanticParseIntegrity",
+            "request_snapshot": "requestSnapshotIntegrity",
+            "artifacts": "artifactIntegrity",
+        }
+        dimensions = {
+            name: max(
+                (str(item.get(field, "partial")) for item in requests),
+                key=self._integrity_severity,
+            )
+            for name, field in fields.items()
+        }
+        return requests, integrity, count_ok, dimensions
 
     @staticmethod
     def _classify_cancellations(
         payload: CaptureFlowPayload,
         step_results: list[FlowStepResult],
         primary_requests: list[dict[str, Any]],
-        alignment: AlignmentResult,
+        initial_alignment: AlignmentResult,
+        post_alignment: AlignmentResult,
         wait_observations: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
         completed_by_id = {
@@ -658,14 +765,13 @@ class BrowserActionService:
             for result in step_results
             if result.status == "completed"
         }
-        classifications: list[dict[str, Any]] = []
+        stop_candidates: list[dict[str, Any]] = []
         for index, step in enumerate(payload.flow):
-            if step.intent != "stop_generation" or step.step_id not in completed_by_id:
+            if (
+                getattr(step, "intent", None) != "stop_generation"
+                or step.step_id not in completed_by_id
+            ):
                 continue
-            later_navigation = any(
-                later.action in {"navigate", "reload"}
-                for later in payload.flow[index + 1 :]
-            )
             result = completed_by_id[step.step_id]
             before_observation = next(
                 (
@@ -692,48 +798,72 @@ class BrowserActionService:
                 )
             except ValueError:
                 continue
-            for request in primary_requests:
-                if request.get("status") != "canceled":
-                    continue
-                if request.get("terminalReason") != "network_canceled":
-                    continue
-                ended_wall_ms = request.get("endedWallTimeMs")
-                within_window = isinstance(ended_wall_ms, (int, float)) and (
-                    -500 <= ended_wall_ms - stop_wall_ms <= 5_000
-                )
-                expected = (
-                    alignment.status == "aligned"
-                    and within_window
-                    and not later_navigation
-                )
-                classification = {
-                    "request_id": request.get("cdpRequestId"),
-                    "persistent_request_id": request.get("persistentRequestId"),
-                    "source_terminal_reason": "network_canceled",
-                    "classification": (
-                        "expected_user_cancel"
-                        if expected
-                        else "unclassified_network_cancel"
-                    ),
-                    "stop_step_id": step.step_id,
-                    "within_stop_window": within_window,
-                    "page_aligned": alignment.status == "aligned",
-                    "later_navigation": later_navigation,
-                    "stream_before_stop": (
-                        before_observation.get("matched_event")
-                        if before_observation
-                        else None
-                    ),
-                    "stream_after_stop": (
-                        after_observation.get("matched_event")
-                        if after_observation
-                        else None
-                    ),
+            stop_candidates.append(
+                {
+                    "step_id": step.step_id,
+                    "stop_wall_ms": stop_wall_ms,
+                    "before": before_observation,
+                    "after": after_observation,
                 }
-                request["experimentCancellationClassification"] = classification[
-                    "classification"
-                ]
-                classifications.append(classification)
+            )
+        page_remained_aligned = (
+            initial_alignment.status == "aligned"
+            and post_alignment.status == "aligned"
+            and initial_alignment.js_reverse_page_id
+            == post_alignment.js_reverse_page_id
+            and initial_alignment.playwright_page.url
+            == post_alignment.playwright_page.url
+        )
+        classifications: list[dict[str, Any]] = []
+        for request in primary_requests:
+            if request.get("status") != "canceled":
+                continue
+            if request.get("terminalReason") != "network_canceled":
+                continue
+            ended_wall_ms = request.get("endedWallTimeMs")
+            if not isinstance(ended_wall_ms, (int, float)) or not stop_candidates:
+                continue
+            nearest = min(
+                stop_candidates,
+                key=lambda item: abs(ended_wall_ms - int(item["stop_wall_ms"])),
+            )
+            delta_ms = ended_wall_ms - int(nearest["stop_wall_ms"])
+            within_window = -500 <= delta_ms <= 5_000
+            request_ids = {
+                str(request.get("cdpRequestId") or ""),
+                str(request.get("persistentRequestId") or ""),
+            }
+            before_ids = set((nearest.get("before") or {}).get("matched_request_ids", []))
+            after_ids = set((nearest.get("after") or {}).get("matched_request_ids", []))
+            same_request_observed = bool(request_ids & before_ids) and bool(
+                request_ids & after_ids
+            )
+            expected = within_window and page_remained_aligned and same_request_observed
+            classification = {
+                "request_id": request.get("cdpRequestId"),
+                "persistent_request_id": request.get("persistentRequestId"),
+                "source_terminal_reason": "network_canceled",
+                "classification": (
+                    "expected_user_cancel"
+                    if expected
+                    else "unclassified_network_cancel"
+                ),
+                "stop_step_id": nearest["step_id"],
+                "stop_delta_ms": delta_ms,
+                "within_stop_window": within_window,
+                "page_remained_aligned": page_remained_aligned,
+                "same_request_observed": same_request_observed,
+                "stream_before_stop": (
+                    (nearest.get("before") or {}).get("matched_event")
+                ),
+                "stream_after_stop": (
+                    (nearest.get("after") or {}).get("matched_event")
+                ),
+            }
+            request["experimentCancellationClassification"] = classification[
+                "classification"
+            ]
+            classifications.append(classification)
         return classifications
 
     @staticmethod
@@ -796,10 +926,8 @@ class BrowserActionService:
             session_id=payload.session_id,
             experiment_id=experiment_id,
             result={
-                "experiment": manifest,
-                "manifest_relative_path": (
-                    Path("experiments") / experiment_id / "manifest.json"
-                ).as_posix(),
+                "experiment": self._experiment_summary(manifest),
+                "manifest_relative_path": self._manifest_relative_path(experiment_id),
                 "poll_with": "inspectBrowserEvidence.get_experiment",
             },
         )
@@ -849,6 +977,90 @@ class BrowserActionService:
         if task is not None:
             await task
 
+    async def _finalize_experiment_runtime(
+        self,
+        *,
+        session_id: str,
+        experiment_dir: Path,
+        payload: CaptureFlowPayload,
+        capture_id: int | None,
+        trace_started: bool,
+        execution_deadline: Deadline,
+    ) -> dict[str, Any]:
+        cleanup_deadline = Deadline(self.FINALIZE_GRACE_MS)
+        entered_reserve = execution_deadline.remaining_ms() <= self.FINALIZE_RESERVE_MS
+        result: dict[str, Any] = {
+            "stop_payload": {},
+            "final_status_payload": {},
+            "trace_paths": [],
+            "screenshot_paths": [],
+            "network_payload": {},
+            "collector_stopped": capture_id is None,
+            "orphan_capture_id": None,
+            "warnings": [],
+            "errors": [],
+            "entered_finalize_reserve": entered_reserve,
+        }
+        if capture_id is not None:
+            try:
+                result["stop_payload"] = await self.js_reverse.stop_stream_capture(
+                    capture_id,
+                    cleanup_deadline.child(6_000),
+                )
+                result["collector_stopped"] = True
+                if cleanup_deadline.remaining_ms() > 500:
+                    result["final_status_payload"] = (
+                        await self.js_reverse.get_stream_status(
+                            capture_id,
+                            cleanup_deadline.child(1_500),
+                        )
+                    )
+            except Exception as exc:
+                result["errors"].append(f"stream finalize: {str(exc)[:3500]}")
+                result["orphan_capture_id"] = capture_id
+        if trace_started:
+            try:
+                result["trace_paths"] = await self.playwright.stop_trace(
+                    session_id,
+                    experiment_dir,
+                    cleanup_deadline.child(1_500),
+                    collect_files=not entered_reserve,
+                )
+            except Exception as exc:
+                result["warnings"].append(f"trace finalize: {str(exc)[:3500]}")
+        if not entered_reserve and execution_deadline.remaining_ms() > 1_000:
+            if payload.capture.network:
+                try:
+                    result["network_payload"] = (
+                        await self.js_reverse.list_network_requests(
+                            self._request_matcher(payload),
+                            execution_deadline.child(
+                                min(2_000, execution_deadline.remaining_ms())
+                            ),
+                        )
+                    )
+                except Exception as exc:
+                    result["warnings"].append(
+                        f"network summary: {str(exc)[:3500]}"
+                    )
+            if payload.capture.screenshots and execution_deadline.remaining_ms() > 500:
+                try:
+                    result["screenshot_paths"].append(
+                        await self.playwright.capture_screenshot(
+                            session_id,
+                            experiment_dir,
+                            "after-flow",
+                            execution_deadline.child(
+                                min(2_000, execution_deadline.remaining_ms())
+                            ),
+                        )
+                    )
+                except Exception as exc:
+                    result["warnings"].append(
+                        f"final screenshot: {str(exc)[:3500]}"
+                    )
+        return result
+
     async def _capture_flow(
         self,
         request: CaptureFlowRequest | CaptureBaselineRequest,
@@ -873,7 +1085,7 @@ class BrowserActionService:
             self.experiments.write_manifest(experiment_id, manifest)
         else:
             experiment_id, experiment_dir, manifest = prepared
-        async with self._session_lock(session_id):
+        async with self._browser_lock, self._session_lock(session_id):
             session = self._get_session(session_id)
             if session.get("status") != "open":
                 manifest["status"] = "failed"
@@ -884,7 +1096,12 @@ class BrowserActionService:
                     status="failed",
                     session_id=session_id,
                     experiment_id=experiment_id,
-                    result={"experiment": manifest},
+                    result={
+                        "experiment": self._experiment_summary(manifest),
+                        "manifest_relative_path": self._manifest_relative_path(
+                            experiment_id
+                        ),
+                    },
                     errors=manifest["errors"],
                 )
             try:
@@ -898,7 +1115,12 @@ class BrowserActionService:
                     status="failed",
                     session_id=session_id,
                     experiment_id=experiment_id,
-                    result={"experiment": manifest},
+                    result={
+                        "experiment": self._experiment_summary(manifest),
+                        "manifest_relative_path": self._manifest_relative_path(
+                            experiment_id
+                        ),
+                    },
                     errors=manifest["errors"],
                 )
             manifest["page_alignment"] = asdict(alignment)
@@ -920,7 +1142,12 @@ class BrowserActionService:
             trace_started = False
             collector_started = False
             collector_stopped = False
-            last_stream_version = 0
+            stream_checkpoint = StreamCheckpoint()
+            request_matcher = self._request_matcher(payload)
+            collector_start_wall_time_ms: int | None = None
+            first_mutation_wall_time_ms: int | None = None
+            cancelled_error: asyncio.CancelledError | None = None
+            cleanup_result: dict[str, Any] = {}
             try:
                 if payload.capture.trace:
                     await self.playwright.start_trace(
@@ -931,7 +1158,7 @@ class BrowserActionService:
                 if payload.capture.stream:
                     start_payload = await self.js_reverse.start_stream_capture(
                         experiment_id=experiment_id,
-                        matcher=self._request_matcher(payload),
+                        matcher=request_matcher,
                         include_in_flight=payload.primary_request.include_in_flight,
                         deadline=self._operation_deadline(
                             deadline,
@@ -946,6 +1173,18 @@ class BrowserActionService:
                         )
                     capture_id = int(capture["captureId"])
                     collector_started = True
+                    collector_start_wall_time_ms = int(
+                        capture.get("captureArmedWallTimeMs") or time.time() * 1000
+                    )
+                    stream_checkpoint = await self._stream_checkpoint(
+                        capture_id,
+                        request_matcher,
+                        self._operation_deadline(
+                            deadline,
+                            1_500,
+                            "initial stream checkpoint",
+                        ),
+                    )
                 if payload.capture.screenshots:
                     try:
                         screenshot_paths.append(
@@ -966,6 +1205,19 @@ class BrowserActionService:
                     self._ensure_finalize_reserve(deadline, f"step {step.step_id}")
                     started = utc_now()
                     try:
+                        if step.action not in {"wait", "assert", "snapshot"}:
+                            if capture_id is not None:
+                                stream_checkpoint = await self._stream_checkpoint(
+                                    capture_id,
+                                    request_matcher,
+                                    self._operation_deadline(
+                                        deadline,
+                                        1_500,
+                                        f"checkpoint before {step.step_id}",
+                                    ),
+                                )
+                            if first_mutation_wall_time_ms is None:
+                                first_mutation_wall_time_ms = int(time.time() * 1000)
                         step_deadline = self._operation_deadline(
                             deadline,
                             step.timeout_ms,
@@ -975,13 +1227,21 @@ class BrowserActionService:
                             result = await self._wait_condition(
                                 session_ref=session_id,
                                 capture_id=capture_id,
-                                condition=step.condition or WaitCondition(type="timeout"),
-                                since_version=last_stream_version,
+                                condition=step.condition,
+                                checkpoint=stream_checkpoint,
                                 deadline=step_deadline,
                             )
-                            last_stream_version = max(
-                                last_stream_version,
-                                int(result.get("capture_version", 0) or 0),
+                            stream_checkpoint = StreamCheckpoint(
+                                version=max(
+                                    stream_checkpoint.version,
+                                    int(result.get("capture_version", 0) or 0),
+                                ),
+                                event_indices={
+                                    str(key): int(value)
+                                    for key, value in (
+                                        result.get("event_indices") or {}
+                                    ).items()
+                                },
                             )
                             wait_observations.append(
                                 {
@@ -1057,12 +1317,20 @@ class BrowserActionService:
                         session_ref=session_id,
                         capture_id=capture_id,
                         condition=payload.wait_for,
-                        since_version=last_stream_version,
+                        checkpoint=stream_checkpoint,
                         deadline=wait_deadline,
                     )
-                    last_stream_version = max(
-                        last_stream_version,
-                        int(wait_result.get("capture_version", 0) or 0),
+                    stream_checkpoint = StreamCheckpoint(
+                        version=max(
+                            stream_checkpoint.version,
+                            int(wait_result.get("capture_version", 0) or 0),
+                        ),
+                        event_indices={
+                            str(key): int(value)
+                            for key, value in (
+                                wait_result.get("event_indices") or {}
+                            ).items()
+                        },
                     )
                     wait_observations.append(
                         {
@@ -1078,50 +1346,71 @@ class BrowserActionService:
                         }
                     )
                     final_status_payload = dict(wait_result.get("status_payload") or {})
+            except asyncio.CancelledError as exc:
+                cancelled_error = exc
+                errors.append("Experiment task was canceled; finalization was attempted.")
             except Exception as exc:
                 errors.append(str(exc)[:4000])
             finally:
-                if capture_id is not None:
-                    try:
-                        stop_payload = await self.js_reverse.stop_stream_capture(
-                            capture_id, deadline
-                        )
-                        collector_stopped = True
-                        if deadline.remaining_seconds() > 0.1:
-                            final_status_payload = await self.js_reverse.get_stream_status(
-                                capture_id, deadline
-                            )
-                    except Exception as exc:
-                        errors.append(f"stream finalize: {str(exc)[:3500]}")
-                if trace_started:
-                    try:
-                        trace_paths = await self.playwright.stop_trace(
-                            session_id, experiment_dir, deadline
-                        )
-                    except Exception as exc:
-                        warnings.append(f"trace finalize: {str(exc)[:3500]}")
-                if payload.capture.network and deadline.remaining_seconds() > 0.1:
-                    try:
-                        network_payload = await self.js_reverse.list_network_requests(
-                            self._request_matcher(payload),
-                            deadline,
-                        )
-                    except Exception as exc:
-                        warnings.append(f"network summary: {str(exc)[:3500]}")
-                if payload.capture.screenshots and deadline.remaining_seconds() > 0.1:
-                    try:
-                        screenshot_paths.append(
-                            await self.playwright.capture_screenshot(
-                                session_id,
-                                experiment_dir,
-                                "after-flow",
-                                deadline.child(min(3_000, deadline.remaining_ms())),
-                            )
-                        )
-                    except Exception as exc:
-                        warnings.append(f"final screenshot: {str(exc)[:3500]}")
+                cleanup_task = asyncio.create_task(
+                    self._finalize_experiment_runtime(
+                        session_id=session_id,
+                        experiment_dir=experiment_dir,
+                        payload=payload,
+                        capture_id=capture_id,
+                        trace_started=trace_started,
+                        execution_deadline=deadline,
+                    ),
+                    name=f"finalize-{experiment_id}",
+                )
+                try:
+                    cleanup_result = await asyncio.shield(cleanup_task)
+                except asyncio.CancelledError:
+                    cleanup_result = await cleanup_task
+                stop_payload = dict(cleanup_result.get("stop_payload") or {})
+                cleanup_status = dict(
+                    cleanup_result.get("final_status_payload") or {}
+                )
+                if cleanup_status:
+                    final_status_payload = cleanup_status
+                trace_paths = list(cleanup_result.get("trace_paths") or [])
+                screenshot_paths.extend(
+                    str(item)
+                    for item in cleanup_result.get("screenshot_paths", [])
+                )
+                network_payload = dict(
+                    cleanup_result.get("network_payload") or {}
+                )
+                collector_stopped = bool(cleanup_result.get("collector_stopped"))
+                warnings.extend(str(item) for item in cleanup_result.get("warnings", []))
+                errors.extend(str(item) for item in cleanup_result.get("errors", []))
 
-            primary_requests, primary_integrity, count_ok = self._primary_result(
+            post_alignment = AlignmentResult(
+                status="not_checked",
+                playwright_page=alignment.playwright_page,
+                warnings=["Post-flow page alignment was not checked."],
+            )
+            try:
+                post_deadline = Deadline(2_500)
+                post_page = await self.playwright.current_page(session_id, post_deadline)
+                post_alignment = await self.js_reverse.align_page(
+                    post_page,
+                    post_deadline,
+                    page_id=(
+                        str(session["js_reverse_page_id"])
+                        if session.get("js_reverse_page_id")
+                        else None
+                    ),
+                )
+            except Exception as exc:
+                warnings.append(f"post-flow alignment: {str(exc)[:3500]}")
+
+            (
+                primary_requests,
+                primary_integrity,
+                count_ok,
+                primary_dimensions,
+            ) = self._primary_result(
                 payload,
                 final_status_payload,
                 network_payload,
@@ -1131,6 +1420,7 @@ class BrowserActionService:
                 step_results,
                 primary_requests,
                 alignment,
+                post_alignment,
                 wait_observations,
             )
             capture_summary = (
@@ -1145,40 +1435,86 @@ class BrowserActionService:
             )
             wait_met = wait_result is None or bool(wait_result.get("condition_met"))
             steps_ok = all(item.status == "completed" for item in step_results)
-            objective_ok = (
-                not errors
-                and steps_ok
-                and count_ok
-                and wait_met
-                and (not payload.capture.stream or collector_stopped)
-                and primary_integrity != "failed"
-                and (
-                    payload.primary_request.allow_supporting_failures
-                    or collector_integrity != "failed"
+            objective_failed = (
+                cancelled_error is not None
+                or bool(errors)
+                or not steps_ok
+                or not count_ok
+                or not wait_met
+                or (payload.capture.stream and not collector_stopped)
+                or primary_integrity == "failed"
+                or (
+                    not payload.primary_request.allow_supporting_failures
+                    and collector_integrity == "failed"
                 )
             )
-            objective_integrity = "complete" if objective_ok else "failed"
+            required_dimensions = {
+                "raw_capture": payload.requirements.require_raw_capture,
+                "semantic_parse": payload.requirements.require_semantic_parse,
+                "request_snapshot": payload.requirements.require_request_snapshot,
+                "artifacts": payload.requirements.require_artifacts,
+            }
+            required_values = [
+                primary_dimensions[name]
+                for name, required in required_dimensions.items()
+                if required and payload.primary_request.expected_min_matches > 0
+            ]
+            if any(value == "failed" for value in required_values):
+                objective_failed = True
+            objective_partial = (
+                not objective_failed
+                and (
+                    primary_integrity != "complete"
+                    or any(value != "complete" for value in required_values)
+                    or (
+                        not payload.primary_request.allow_supporting_failures
+                        and collector_integrity != "complete"
+                    )
+                )
+            )
+            objective_integrity = (
+                "failed"
+                if objective_failed
+                else "partial"
+                if objective_partial
+                else "complete"
+            )
+            response_status = (
+                "interrupted"
+                if cancelled_error is not None
+                else "failed"
+                if objective_integrity == "failed"
+                else "partial"
+                if objective_integrity == "partial"
+                else "completed"
+            )
+            pre_arm_request_count = sum(
+                1
+                for item in primary_requests
+                if bool(item.get("requestStartedBeforeCapture"))
+            )
+            collector_before_mutation = (
+                None
+                if first_mutation_wall_time_ms is None
+                else collector_start_wall_time_ms is not None
+                and collector_start_wall_time_ms <= first_mutation_wall_time_ms
+            )
             capture_health = {
-                "page_aligned": alignment.status == "aligned",
-                "stream_collector_started_before_flow": collector_started
-                or not payload.capture.stream,
-                "pre_arm_requests_excluded": not payload.primary_request.include_in_flight,
+                "page_aligned_before_flow": alignment.status == "aligned",
+                "page_aligned_after_flow": post_alignment.status == "aligned",
+                "collector_start_wall_time_ms": collector_start_wall_time_ms,
+                "first_mutation_wall_time_ms": first_mutation_wall_time_ms,
+                "collector_started_before_first_mutation": collector_before_mutation,
+                "include_in_flight_requested": payload.primary_request.include_in_flight,
+                "pre_arm_request_count": pre_arm_request_count,
                 "primary_request_match_count_ok": count_ok,
-                "raw_capture_integrity": [
-                    item.get("rawCaptureIntegrity") for item in primary_requests
-                ],
-                "semantic_parse_integrity": [
-                    item.get("semanticParseIntegrity") for item in primary_requests
-                ],
-                "request_snapshot_integrity": [
-                    item.get("requestSnapshotIntegrity") for item in primary_requests
-                ],
-                "artifact_integrity": [
-                    item.get("artifactIntegrity") for item in primary_requests
-                ],
+                "primary_integrity_dimensions": primary_dimensions,
                 "wait_condition_met": wait_met,
                 "collector_stopped": collector_stopped or not payload.capture.stream,
-                "manifest_written": True,
+                "orphan_capture_id": cleanup_result.get("orphan_capture_id"),
+                "entered_finalize_reserve": cleanup_result.get(
+                    "entered_finalize_reserve", False
+                ),
                 "capture_scope": capture_summary.get("captureScope", "page-target-only"),
                 "worker_coverage": capture_summary.get("workerCoverage", False),
             }
@@ -1218,7 +1554,7 @@ class BrowserActionService:
             ]
             manifest.update(
                 {
-                    "status": "completed" if objective_ok else "failed",
+                    "status": response_status,
                     "deadline": deadline.to_dict(),
                     "steps": [item.model_dump(mode="json") for item in step_results],
                     "stream_capture_id": capture_id,
@@ -1227,8 +1563,11 @@ class BrowserActionService:
                     "collector_integrity": collector_integrity,
                     "primary_request_integrity": primary_integrity,
                     "objective_integrity": objective_integrity,
+                    "objective_requirements": payload.requirements.model_dump(mode="json"),
+                    "primary_integrity_dimensions": primary_dimensions,
                     "primary_requests": primary_requests,
                     "cancellation_classifications": cancellation_classifications,
+                    "post_flow_alignment": asdict(post_alignment),
                     "capture_health": capture_health,
                     "network_summary": network_payload,
                     "screenshot_paths": relative_screenshot_paths,
@@ -1238,17 +1577,28 @@ class BrowserActionService:
                     "errors": errors,
                 }
             )
+            if cancelled_error is not None:
+                manifest["interrupted_at"] = utc_now()
+                write_task = asyncio.create_task(
+                    asyncio.to_thread(
+                        self.experiments.write_manifest,
+                        experiment_id,
+                        manifest,
+                    )
+                )
+                await asyncio.shield(write_task)
+                raise cancelled_error
             self.experiments.write_manifest(experiment_id, manifest)
             return BrowserActionResponse(
                 operation=request.operation,
-                status="completed" if objective_ok else "failed",
+                status=response_status,
                 session_id=session_id,
                 experiment_id=experiment_id,
                 result={
-                    "experiment": manifest,
-                    "manifest_relative_path": (
-                        Path("experiments") / experiment_id / "manifest.json"
-                    ).as_posix(),
+                    "experiment": self._experiment_summary(manifest),
+                    "manifest_relative_path": self._manifest_relative_path(
+                        experiment_id
+                    ),
                 },
                 warnings=warnings,
                 errors=errors,
@@ -1281,23 +1631,41 @@ def build_browser_service_from_environment() -> BrowserActionService:
         env_value_from_environment_or_dotenv("WEB_REV_JS_REVERSE_COMMAND")
         or "js-reverse-mcp"
     )
-    raw_args = env_value_from_environment_or_dotenv("WEB_REV_JS_REVERSE_ARGS")
+    critical_args = [
+        "--allowedRoots",
+        str(experiments.root),
+        "--streamArtifactRoot",
+        "0",
+    ]
+    if browser_endpoint:
+        critical_args[0:0] = ["--browserUrl", browser_endpoint]
+    raw_args = env_value_from_environment_or_dotenv(
+        "WEB_REV_JS_REVERSE_EXTRA_ARGS"
+    )
+    extra_args: list[str] = []
     if raw_args:
         try:
-            args = json.loads(raw_args)
+            parsed_args = json.loads(raw_args)
         except json.JSONDecodeError as exc:
-            raise RuntimeError("WEB_REV_JS_REVERSE_ARGS must be a JSON array") from exc
-        if not isinstance(args, list) or not all(isinstance(item, str) for item in args):
-            raise RuntimeError("WEB_REV_JS_REVERSE_ARGS must be a JSON string array")
-    else:
-        args = [
-            "--allowedRoots",
-            str(experiments.root),
-            "--streamArtifactRoot",
-            "0",
-        ]
-        if browser_endpoint:
-            args[0:0] = ["--browserUrl", browser_endpoint]
+            raise RuntimeError(
+                "WEB_REV_JS_REVERSE_EXTRA_ARGS must be a JSON array"
+            ) from exc
+        if not isinstance(parsed_args, list) or not all(
+            isinstance(item, str) for item in parsed_args
+        ):
+            raise RuntimeError(
+                "WEB_REV_JS_REVERSE_EXTRA_ARGS must be a JSON string array"
+            )
+        forbidden = {"--browserUrl", "--allowedRoots", "--streamArtifactRoot"}
+        for item in parsed_args:
+            option = item.split("=", 1)[0]
+            if option in forbidden:
+                raise RuntimeError(
+                    f"{option} is managed by web_rev_action and cannot appear in "
+                    "WEB_REV_JS_REVERSE_EXTRA_ARGS"
+                )
+        extra_args = list(parsed_args)
+    args = [*critical_args, *extra_args]
     transport: McpToolTransport = StdioMcpToolTransport(
         command=command,
         args=args,

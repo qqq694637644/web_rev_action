@@ -241,7 +241,7 @@ interrupted
 
 job 解决的是 HTTP Action 调用时限和长流问题，不是文件访问问题。即使 workspace 工具已经完整，长时间 SSE、工具调用或网络异常仍可能超过同步调用时间。
 
-两种模式都使用一个 absolute deadline，adapter 不各自重新获得完整 timeout。接近 deadline 时优先 stop/finalize 和 best-effort manifest。
+执行阶段使用一个 absolute deadline，adapter 不各自重新获得完整 timeout。后端至少保留 5 秒 finalize reserve，并为 stop、pending write、Trace stop 和 interrupted manifest 提供独立的 8 秒 cleanup grace。进入 reserve 后不再执行截图、network summary 或 Trace 文件扫描；stop 失败必须记录 orphan capture ID。
 
 ---
 
@@ -254,9 +254,8 @@ job 解决的是 HTTP Action 调用时限和长流问题，不是文件访问问
     "session_id": "sess_001",
     "objective": "observe the primary conversation request and stream",
     "target": {
-      "start_url": "https://example.com/app",
       "expected_url_contains": "/app",
-      "page_index": 0
+      "page_index": null
     },
     "primary_request": {
       "url_contains": "/conversation",
@@ -268,7 +267,13 @@ job 解决的是 HTTP Action 调用时限和长流问题，不是文件访问问
       "allow_supporting_failures": true,
       "include_in_flight": false
     },
-    "flow": [],
+    "flow": [
+      {
+        "step_id": "navigate_app",
+        "action": "navigate",
+        "value": "https://example.com/app"
+      }
+    ],
     "wait_for": {
       "type": "event_predicate",
       "request_matcher": {
@@ -282,6 +287,12 @@ job 解决的是 HTTP Action 调用时限和长流问题，不是文件访问问
     },
     "execution_mode": "job",
     "job_timeout_ms": 300000,
+    "requirements": {
+      "require_raw_capture": true,
+      "require_semantic_parse": false,
+      "require_request_snapshot": false,
+      "require_artifacts": true
+    },
     "capture": {
       "network": true,
       "stream": true,
@@ -292,6 +303,8 @@ job 解决的是 HTTP Action 调用时限和长流问题，不是文件访问问
   }
 }
 ```
+
+Capture 阶段禁止 `target.start_url`。初始化导航必须是 flow 的第一个显式 `navigate` step，确保 running manifest、Trace 和 stream collector 都先于页面初始化请求创建。`page_index=null` 表示复用 session 当前 tab；显式传值才切换页面。
 
 ### 6.1 primary request
 
@@ -324,7 +337,7 @@ primary_request_integrity
 objective_integrity
 ```
 
-遥测或 supporting request 失败不能自动覆盖主消息实验结果。
+`objective_integrity` 取值为 `complete | partial | failed`。requirements 决定 raw、semantic、request snapshot 和 artifact 哪些维度必须 complete。遥测或 supporting request 失败不能自动覆盖主消息实验结果；stream=true 时普通 network summary 不能替代 primary stream evidence。
 
 ---
 
@@ -400,7 +413,7 @@ selector_visible
 selector_hidden
 request_observed
 response_observed
-network_idle
+request_log_stable
 first_event
 event_predicate
 default_done_marker
@@ -432,6 +445,8 @@ matchedSource
 ```
 
 不把事件正文返回 MCP，也不依赖 recent-event 小窗口。
+
+每个页面变更动作前记录 capture version 和每个 request 的最后 event index。后续 predicate 只允许匹配 checkpoint 之后的事件；新 request 从 `afterEventIndex=-1` 开始。`first_event` 同时检查 rawEventCount 和 semanticEventCount，因此 semantic-only EventSource 仍可满足等待。
 
 ---
 
@@ -482,6 +497,8 @@ start_stream_capture(filter, artifactNamespace=experiment_id)
 
 上游 MCP 是长生命周期进程。对 click、fill、upload、replay 等有副作用操作不做自动重试。
 
+MCP 队列项保存 absolute deadline 和 transport generation。worker 执行前丢弃已取消、已过期或旧 generation 调用；有副作用调用在已经发送后超时会终止并重建私有 MCP session，避免 start/stop/breakpoint 稍后无人知晓地执行。
+
 ---
 
 ## 10. 页面对齐
@@ -502,9 +519,13 @@ page_alignment_status
 evidence_root_ref
 created_at
 updated_at
+service_instance_id
+process_started_at
 ```
 
-初次对齐保存稳定 `js_reverse_page_id`。后续实验按 pageId 选择并重新验证 URL；page index 只用于首次发现和显示。
+初次对齐保存稳定 `js_reverse_page_id`。后续实验按 pageId 选择并重新验证 URL；page index 只用于首次发现和显示。服务重启后，旧 generation 中持久化的 open session 标记为 `stale`，必须重新 open/attach。
+
+当前一个 `web_rev_action` 实例共享一个 Playwright CLI 运行环境和一个全局选页的 `js-reverse-mcp`，因此 open/capture/close 使用进程级 browser lock 串行化。长期若需要并行，再改为每个 session 独立 MCP 实例。
 
 每次实验前必须确认：
 
@@ -558,6 +579,8 @@ stream_wait_result
 collector_integrity
 primary_request_integrity
 objective_integrity
+objective_requirements
+primary_integrity_dimensions
 capture_health
 artifacts
 warnings
@@ -565,6 +588,8 @@ errors
 ```
 
 目录和 `status=running` manifest 必须在第一条浏览器动作之前写入。服务重启时遗留 running manifest 变成 interrupted，已有文件保留。
+
+执行 endpoint 和 `get_experiment` 只返回有界摘要、primary request 前十项和 `manifest_relative_path`。完整 manifest、network summary、requests 与 artifact 索引通过 `workspaceReadFiles` 读取。
 
 ---
 
@@ -695,7 +720,9 @@ Experiment 只有在以下条件同时成立时标记 `expected_user_cancel`：
 - cancellation 位于 Stop 时间窗口。
 - request 匹配 primary request。
 - pageId 和 session 对齐。
-- 没有导航、页面关闭等更合理原因。
+- Stop 后重新获取实际 Playwright page，并再次按稳定 pageId 对齐。
+- canceled request 只关联最近的已完成 Stop step。
+- 没有导航、新 tab、刷新或页面关闭等更合理原因。
 
 Manifest 保存 Stop 前后的 event index、raw byte offset 和目标 request ID。
 
@@ -749,6 +776,8 @@ start_stream_capture
 - AnalysisWorkspaceService。
 - open_session / baseline / capture_flow / close_session。
 - 原子 start → flow → wait → stop → manifest。
+- 全局 browser lock、stale session generation、checkpoint wait 和 shielded cleanup。
+- 真实 Windows BrowserAction smoke。
 
 ### 阶段 3：Pandora 最小闭环
 
@@ -817,4 +846,5 @@ Worker / Service Worker 深入诊断
 17. workspaceExecPwsh 能读取 raw.bin、计算 SHA/Base64、处理 UTF-8 和终止超时进程树。
 18. 产品没有 Git、branch、commit、PR、CI 或 ZIP 导出功能。
 19. 真实阶段 0 fixture 达到 8/8。
-20. Windows 全量测试通过。
+20. 真实 BrowserAction Windows smoke 覆盖 attach、tab/select、navigate、click、Trace、screenshot、SSE predicate、workspace 读取、close 和残留进程检查。
+21. Windows 全量测试通过。

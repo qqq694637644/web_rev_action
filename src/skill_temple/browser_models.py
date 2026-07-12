@@ -54,31 +54,41 @@ class RequestMatcher(StrictModel):
     request_id: str | None = Field(default=None, max_length=512)
 
 
-class EventPredicate(StrictModel):
-    type: Literal[
-        "exact_data",
-        "event_name",
-        "json_path_equals",
-        "network_terminal",
-        "selector_state",
-    ]
-    value: Any | None = None
-    path: str | None = Field(default=None, max_length=512)
-    event_name: str | None = Field(default=None, max_length=256)
-    locator: Locator | None = None
+class ExactDataPredicate(StrictModel):
+    type: Literal["exact_data"]
+    value: str = Field(max_length=64_000)
 
-    @model_validator(mode="after")
-    def validate_predicate(self) -> EventPredicate:
-        if self.type == "json_path_equals" and not self.path:
-            raise ValueError("json_path_equals requires path")
-        if self.type == "event_name" and not self.event_name:
-            raise ValueError("event_name requires event_name")
-        if self.type == "selector_state":
-            if not self.locator:
-                raise ValueError("selector_state requires locator")
-            if self.value not in {"visible", "hidden"}:
-                raise ValueError("selector_state value must be visible or hidden")
-        return self
+
+class EventNamePredicate(StrictModel):
+    type: Literal["event_name"]
+    event_name: str = Field(min_length=1, max_length=256)
+
+
+class JsonPathEqualsPredicate(StrictModel):
+    type: Literal["json_path_equals"]
+    path: str = Field(pattern=r"^\$\.[A-Za-z0-9_.-]+$", max_length=512)
+    value: Any
+
+
+class NetworkTerminalPredicate(StrictModel):
+    type: Literal["network_terminal"]
+    value: Literal["finished", "canceled", "failed", "stopped"] | None = None
+
+
+class SelectorStatePredicate(StrictModel):
+    type: Literal["selector_state"]
+    locator: Locator
+    value: Literal["visible", "hidden"]
+
+
+EventPredicate = Annotated[
+    ExactDataPredicate
+    | EventNamePredicate
+    | JsonPathEqualsPredicate
+    | NetworkTerminalPredicate
+    | SelectorStatePredicate,
+    Field(discriminator="type"),
+]
 
 
 class WaitCondition(StrictModel):
@@ -88,7 +98,7 @@ class WaitCondition(StrictModel):
         "selector_hidden",
         "request_observed",
         "response_observed",
-        "network_idle",
+        "request_log_stable",
         "first_event",
         "event_predicate",
         "default_done_marker",
@@ -125,52 +135,106 @@ class WaitCondition(StrictModel):
         return self
 
 
-FlowAction = Literal[
-    "navigate",
-    "reload",
-    "click",
-    "fill",
-    "type",
-    "press",
-    "select",
-    "check",
-    "uncheck",
-    "hover",
-    "upload",
-    "wait",
-    "assert",
-    "snapshot",
-]
-
-
-class FlowStep(StrictModel):
+class FlowStepBase(StrictModel):
     step_id: str = Field(pattern=r"^[a-zA-Z0-9_.-]+$", min_length=1, max_length=128)
-    action: FlowAction
-    locator: Locator | None = None
-    value: str | None = Field(default=None, max_length=32_000)
-    values: list[str] = Field(default_factory=list, max_length=32)
-    condition: WaitCondition | None = None
     timeout_ms: int = Field(default=5_000, ge=1, le=1_800_000)
+
+
+class NavigateStep(FlowStepBase):
+    action: Literal["navigate"]
+    value: str = Field(min_length=1, max_length=8192)
+
+
+class ReloadStep(FlowStepBase):
+    action: Literal["reload"]
+
+
+class ClickStep(FlowStepBase):
+    action: Literal["click"]
+    locator: Locator
     intent: Literal["stop_generation"] | None = None
 
-    @model_validator(mode="after")
-    def validate_step(self) -> FlowStep:
-        locator_actions = {"click", "fill", "select", "check", "uncheck", "hover"}
-        if self.action in locator_actions and not self.locator:
-            raise ValueError(f"{self.action} requires locator")
-        if self.action in {"navigate", "fill", "type", "press", "select"} and self.value is None:
-            raise ValueError(f"{self.action} requires value")
-        if self.action == "upload" and not self.values:
-            raise ValueError("upload requires values")
-        if self.action in {"wait", "assert"} and not self.condition:
-            raise ValueError(f"{self.action} requires condition")
-        return self
+
+class FillStep(FlowStepBase):
+    action: Literal["fill"]
+    locator: Locator
+    value: str = Field(max_length=32_000)
+
+
+class TypeStep(FlowStepBase):
+    action: Literal["type"]
+    value: str = Field(max_length=32_000)
+
+
+class PressStep(FlowStepBase):
+    action: Literal["press"]
+    value: str = Field(min_length=1, max_length=256)
+
+
+class SelectStep(FlowStepBase):
+    action: Literal["select"]
+    locator: Locator
+    value: str = Field(max_length=32_000)
+
+
+class CheckStep(FlowStepBase):
+    action: Literal["check"]
+    locator: Locator
+
+
+class UncheckStep(FlowStepBase):
+    action: Literal["uncheck"]
+    locator: Locator
+
+
+class HoverStep(FlowStepBase):
+    action: Literal["hover"]
+    locator: Locator
+
+
+class UploadStep(FlowStepBase):
+    action: Literal["upload"]
+    locator: Locator | None = None
+    values: list[str] = Field(min_length=1, max_length=32)
+
+
+class WaitStep(FlowStepBase):
+    action: Literal["wait"]
+    condition: WaitCondition
+
+
+class AssertStep(FlowStepBase):
+    action: Literal["assert"]
+    condition: WaitCondition
+
+
+class SnapshotStep(FlowStepBase):
+    action: Literal["snapshot"]
+
+
+FlowStep = Annotated[
+    NavigateStep
+    | ReloadStep
+    | ClickStep
+    | FillStep
+    | TypeStep
+    | PressStep
+    | SelectStep
+    | CheckStep
+    | UncheckStep
+    | HoverStep
+    | UploadStep
+    | WaitStep
+    | AssertStep
+    | SnapshotStep,
+    Field(discriminator="action"),
+]
 
 
 class BrowserTarget(StrictModel):
     start_url: str | None = Field(default=None, max_length=8192)
     expected_url_contains: str | None = Field(default=None, max_length=4096)
-    page_index: int = Field(default=0, ge=0, le=100)
+    page_index: int | None = Field(default=None, ge=0, le=100)
 
 
 class PrimaryRequest(StrictModel):
@@ -202,6 +266,13 @@ class CaptureOptions(StrictModel):
     scripts: bool = False
 
 
+class ObjectiveRequirements(StrictModel):
+    require_raw_capture: bool = True
+    require_semantic_parse: bool = False
+    require_request_snapshot: bool = False
+    require_artifacts: bool = True
+
+
 class OpenSessionPayload(StrictModel):
     session_id: str | None = Field(default=None, pattern=r"^[a-zA-Z0-9_.-]+$", max_length=128)
     browser_endpoint: str | None = Field(default=None, max_length=8192)
@@ -225,13 +296,19 @@ class CaptureFlowPayload(StrictModel):
     deadline_ms: int = Field(default=42_000, ge=1_000, le=42_000)
     job_timeout_ms: int = Field(default=300_000, ge=10_000, le=1_800_000)
     capture: CaptureOptions = Field(default_factory=CaptureOptions)
+    requirements: ObjectiveRequirements = Field(default_factory=ObjectiveRequirements)
 
     @model_validator(mode="after")
     def validate_stop_sequence(self) -> CaptureFlowPayload:
+        if self.target.start_url is not None:
+            raise ValueError(
+                "capture target.start_url is not allowed; add an explicit navigate flow step "
+                "so Trace and stream capture start before navigation"
+            )
         stop_indexes = [
             index
             for index, step in enumerate(self.flow)
-            if step.intent == "stop_generation"
+            if getattr(step, "intent", None) == "stop_generation"
         ]
         for stop_index in stop_indexes:
             before = self.flow[:stop_index]

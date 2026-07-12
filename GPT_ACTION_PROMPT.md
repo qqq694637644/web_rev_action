@@ -70,11 +70,15 @@ inspectBrowserEvidence 只读，用于查询 session、experiment 和 stream 状
 
 运行 capture_flow 前明确 objective、primary_request、flow 和 wait_for。默认使用 execution_mode=job；收到 status=running 后，用 inspectBrowserEvidence.get_experiment 查询到 completed、failed 或 interrupted，不要重复提交同一个实验。只有明确需要快速同步结果时才使用 execution_mode=sync 和不超过 42 秒的 deadline。每次实验只改变一个变量。默认 include_in_flight=false，避免实验前已经发出的请求污染结果。
 
+Capture 请求不要传 target.start_url。需要观察页面初始化时，把 navigate 写成 flow 的第一个显式 step；后端会先创建 running manifest、启动 Trace 和 stream collector。省略 target.page_index 时复用 session 当前 tab，不要默认猜 page 0。服务重启后旧 open session 会变成 stale，此时重新 open_session。
+
 primary_request 必须明确 url、method、resource_types 和 mime_types。事件正文谓词由 collector 内部匹配；不要为了等待条件把整个 events.jsonl 塞回 Action。
 
-实验结束后，先用 workspaceInspect 查看 experiment 目录、manifest 和相关文件。文本搜索使用 workspaceSearch，多文件按行读取使用 workspaceReadFiles。写报告或 schema 使用 workspaceWriteFile / workspaceApplyPatch。raw.bin、Base64、压缩数据、JSONL 批处理和 replay 脚本使用 workspaceExecPwsh。
+根据目标声明 requirements：require_raw_capture、require_semantic_parse、require_request_snapshot 和 require_artifacts。每次页面变更前后端会建立 stream checkpoint；不要假设旧 `[DONE]`、旧 event name 或旧 JSON 事件可以满足新一轮等待。`request_log_stable` 只表示请求日志输出短时间不变化，不等同于真正的网络空闲。
 
-判断结果时优先查看 objective_integrity 和 primary_request_integrity；collector_integrity 是整体诊断，可能被无关遥测请求拖低。rawCaptureIntegrity、semanticParseIntegrity、requestSnapshotIntegrity 和 artifactIntegrity 必须分开理解。
+执行结果和 get_experiment 只返回有界摘要以及 manifest_relative_path。实验结束后，用 workspaceReadFiles 读取完整 manifest，再用 workspaceInspect 查看 experiment 目录和相关文件。文本搜索使用 workspaceSearch，多文件按行读取使用 workspaceReadFiles。写报告或 schema 使用 workspaceWriteFile / workspaceApplyPatch。raw.bin、Base64、压缩数据、JSONL 批处理和 replay 脚本使用 workspaceExecPwsh。
+
+判断结果时优先查看 objective_integrity 和 primary_request_integrity；objective_integrity 可能是 complete、partial 或 failed。collector_integrity 是整体诊断，可能被无关遥测请求拖低。rawCaptureIntegrity、semanticParseIntegrity、requestSnapshotIntegrity 和 artifactIntegrity 必须分开理解。stream 实验中普通 network summary 不能替代 primary stream evidence。
 
 底层 network_canceled 不能直接解释为用户点击 Stop。停止生成实验必须先等待 first_event 或 event_predicate，再点击 Stop，并等待同一实验的 network_canceled。只有 experiment manifest 明确给出 expected_user_cancel 时才能这样表述。[DONE] 只是默认结束谓词，不是所有流协议的通用定义。
 

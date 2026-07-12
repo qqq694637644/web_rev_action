@@ -23,6 +23,8 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from toolchain_validation_server import SSE_EVENTS, start_server
 
+from skill_temple.browser_adapters import build_playwright_attach_args
+
 PLAYWRIGHT_PACKAGE = "@playwright/cli@0.1.17"
 JS_REVERSE_PACKAGE = "js-reverse-mcp@4.0.1"
 SESSION_NAME = "stage0-toolchain-validation"
@@ -92,13 +94,7 @@ class PlaywrightCli:
 
     def attach(self, endpoint: str) -> None:
         self.run(
-            [
-                "attach",
-                "--cdp",
-                endpoint,
-                "--session",
-                SESSION_NAME,
-            ],
+            build_playwright_attach_args(endpoint, SESSION_NAME),
             timeout=45.0,
         ).require_success()
 

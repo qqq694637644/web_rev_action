@@ -148,6 +148,7 @@ flow steps
 wait condition
 execution_mode=job
 适合目标流长度的 job timeout
+raw / semantic / snapshot / artifact requirements
 ```
 
 示例：
@@ -155,6 +156,13 @@ execution_mode=job
 ```json
 {
   "objective": "observe the first conversation request and complete stream",
+  "flow": [
+    {
+      "step_id": "navigate_app",
+      "action": "navigate",
+      "value": "https://example.com/app"
+    }
+  ],
   "primary_request": {
     "url_contains": "/conversation",
     "method": "POST",
@@ -169,11 +177,21 @@ execution_mode=job
       "type": "exact_data",
       "value": "[DONE]"
     }
+  },
+  "requirements": {
+    "require_raw_capture": true,
+    "require_semantic_parse": false,
+    "require_request_snapshot": false,
+    "require_artifacts": true
   }
 }
 ```
 
 `[DONE]` 只是这个实验的默认结束谓词，不是所有网页流协议的通用定义。其他页面可以使用 event name、JSON 字段、网络终态或页面状态。
+
+Capture 阶段不使用 `target.start_url`。若需要记录页面初始化请求，显式 `navigate` 必须是 flow 的第一条页面变更动作。`target.page_index` 省略时复用 session 当前 tab。
+
+每条会改变页面或请求状态的 flow step 之前，后端记录 capture version 和每个 request 的最后 event index。后续 wait 只匹配 checkpoint 之后的事件，因此第二轮消息不能被第一轮的 `[DONE]` 或旧 semantic event 立即满足。
 
 ---
 
@@ -381,7 +399,9 @@ flow 中实际执行了 Stop step
 Stop 前已经观察同一 primary request 的 first_event 或受控 event predicate
 取消发生在 Stop step 的限定时间窗口
 取消请求匹配 primary request
-页面和 target 对齐
+Stop 后重新获取的实际页面仍与同一稳定 pageId 对齐
+同一 canceled request 在 Stop 前后都被观察到
+该 request 关联最近的已完成 Stop step
 没有导航或 page close 等更合理原因
 ```
 
@@ -619,8 +639,11 @@ notes/open-questions.md
 - pre-arm 请求默认不污染实验。
 - 无 response 失败请求仍有 evidence。
 - primary request 与 supporting request 分开评价。
-- raw bytes、语义事件和请求快照完整性分开。
+- raw bytes、语义事件、请求快照和 artifact 完整性分开，并按 requirements 计算 complete/partial/failed。
 - Stop cancellation 不由底层提前解释成用户行为。
+- 执行和 get_experiment 只返回有界摘要；完整 manifest 使用 workspaceReadFiles。
+- 服务重启后的 open session 必须标记 stale 并重新 attach。
+- 一个共享 MCP 实例下的 open/capture/close 必须全局串行化。
 - credential 默认脱敏。
 - stop 后关闭页面不修改历史 manifest。
 - 所有文本 artifact 相对路径可由 workspaceInspect/Search/ReadFiles 处理。

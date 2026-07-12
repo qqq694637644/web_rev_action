@@ -100,6 +100,10 @@ close_session
 
 GPT 不直接协调 start、click、wait、stop。
 
+Capture 阶段禁止 `target.start_url`。需要观察页面初始化请求、重定向、首屏脚本或初始 SSE 时，必须把导航写成 flow 的第一个显式 `navigate` step。这样 running manifest、Trace 和 stream collector 都会在导航前创建。
+
+`target.page_index` 默认是 `null`，表示复用 session 已选择的 tab；只有显式传值时才切换。所有 open/capture/close 操作通过进程级 browser lock 串行化，因为当前私有 `js-reverse-mcp` 只有一个全局选中页面。
+
 ### `inspectBrowserEvidence`
 
 只查询浏览器运行状态：
@@ -112,6 +116,8 @@ get_stream_status
 ```
 
 需要查看 `manifest.json`、`events.jsonl`、源码、schema、脚本或报告时，使用 workspace Actions。
+
+执行 endpoint 和 `get_experiment` 只返回有界实验摘要及 `manifest_relative_path`。完整 manifest、network summary、requests 和 artifact 索引通过 `workspaceReadFiles` 读取。
 
 ## Background job
 
@@ -196,7 +202,7 @@ selector_visible
 selector_hidden
 request_observed
 response_observed
-network_idle
+request_log_stable
 first_event
 event_predicate
 default_done_marker
@@ -217,6 +223,19 @@ selector_state
 ```
 
 正文谓词由 `js-reverse-mcp` collector 在完整事件文件中匹配。MCP 只返回匹配索引和 request ID，不把事件正文塞回 Action。
+
+每个会改变页面或请求状态的动作前，后端记录 capture version 和每个 request 的最后 event index。后续 wait 只匹配 checkpoint 之后的事件，上一轮消息的 `[DONE]` 不会立即满足下一轮等待。`first_event` 同时接受 raw event 和 EventSource semantic mirror。
+
+Objective 可以分别声明：
+
+```text
+require_raw_capture
+require_semantic_parse
+require_request_snapshot
+require_artifacts
+```
+
+最终结果为 `complete | partial | failed`。stream 开启时，普通 network summary 只用于诊断，不能替代 primary stream evidence。
 
 ## Stop-generation 模板
 
@@ -389,6 +408,7 @@ WEB_REV_BROWSER_CDP_URL=http://127.0.0.1:9222
 WEB_REV_EVIDENCE_DIR=C:/path/to/web_rev_action/data/analysis-workspace
 WEB_REV_PLAYWRIGHT_CLI=playwright-cli
 WEB_REV_JS_REVERSE_COMMAND=js-reverse-mcp
+WEB_REV_JS_REVERSE_EXTRA_ARGS=["--headless","false"]
 WEB_REV_WORKSPACE_SHELL=pwsh
 WEB_REV_WORKSPACE_ALLOW_NETWORK=false
 ```
@@ -400,6 +420,8 @@ WEB_REV_WORKSPACE_ALLOW_NETWORK=false
 --allowedRoots <WEB_REV_EVIDENCE_DIR>
 --streamArtifactRoot 0
 ```
+
+这三个关键参数始终由服务生成。`WEB_REV_JS_REVERSE_EXTRA_ARGS` 只能追加非冲突参数；尝试覆盖 browser URL、allowed roots 或 stream artifact root 会在启动时被拒绝。
 
 ## Install and run
 
@@ -437,6 +459,9 @@ python -m skill_temple.evals evals/skill_queries.jsonl
 
 ```powershell
 python tools/toolchain_validation.py `
+  --js-reverse-entry <js-reverse-mcp>/build/src/main.js
+
+python tools/browser_action_smoke.py `
   --js-reverse-entry <js-reverse-mcp>/build/src/main.js
 ```
 

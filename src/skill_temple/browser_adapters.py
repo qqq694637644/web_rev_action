@@ -14,7 +14,14 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any, Protocol
 
-from .browser_models import EventPredicate, FlowStep, Locator, RequestMatcher, WaitCondition
+from .browser_models import (
+    EventPredicate,
+    ExactDataPredicate,
+    FlowStep,
+    Locator,
+    RequestMatcher,
+    WaitCondition,
+)
 
 
 class AdapterError(RuntimeError):
@@ -61,7 +68,14 @@ class StreamWaitResult:
     matched_request_ids: list[str]
     terminal_status: str | None = None
     matched_event: dict[str, Any] | None = None
+    event_indices: dict[str, int] = field(default_factory=dict)
     status_payload: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class StreamCheckpoint:
+    version: int = 0
+    event_indices: dict[str, int] = field(default_factory=dict)
 
 
 class CommandRunner(Protocol):
@@ -170,7 +184,12 @@ class PlaywrightAdapter(Protocol):
     async def start_trace(self, session_ref: str, deadline: DeadlineLike) -> None: ...
 
     async def stop_trace(
-        self, session_ref: str, experiment_dir: Path, deadline: DeadlineLike
+        self,
+        session_ref: str,
+        experiment_dir: Path,
+        deadline: DeadlineLike,
+        *,
+        collect_files: bool = True,
     ) -> list[str]: ...
 
     async def capture_screenshot(
@@ -189,6 +208,10 @@ _PAGE_TITLE_RE = re.compile(r"^- Page Title:\s*(.+)$", re.MULTILINE)
 _SNAPSHOT_RE = re.compile(r"\[Snapshot\]\(([^)]+)\)")
 
 
+def build_playwright_attach_args(endpoint: str, session_ref: str) -> list[str]:
+    return ["attach", "--cdp", endpoint, "--session", session_ref]
+
+
 class PlaywrightCliAdapter:
     """Fixed-argv wrapper around the existing playwright-cli."""
 
@@ -196,17 +219,19 @@ class PlaywrightCliAdapter:
         self,
         *,
         executable: str = "playwright-cli",
+        command_prefix: list[str] | None = None,
         runner: CommandRunner | None = None,
         cwd: Path | None = None,
     ) -> None:
         self.executable = executable
+        self.command_prefix = command_prefix or [executable]
         self.runner = runner or SubprocessCommandRunner()
         self.cwd = cwd
         self._trace_files_before: dict[str, set[Path]] = {}
         self._selected_page_index: dict[str, int] = {}
 
     def _argv(self, session_ref: str, *parts: str, raw: bool = False) -> list[str]:
-        argv = [self.executable, f"-s={session_ref}"]
+        argv = [*self.command_prefix, f"-s={session_ref}"]
         if raw:
             argv.append("--raw")
         argv.extend(parts)
@@ -234,11 +259,13 @@ class PlaywrightCliAdapter:
         start_url: str | None,
         deadline: DeadlineLike,
     ) -> PageState:
-        await self._run(
-            session_ref,
-            "attach",
-            f"--cdp={browser_endpoint}",
+        await self.runner.run(
+            [
+                *self.command_prefix,
+                *build_playwright_attach_args(browser_endpoint, session_ref),
+            ],
             deadline=deadline,
+            cwd=self.cwd,
         )
         self._selected_page_index[session_ref] = 0
         if start_url:
@@ -323,19 +350,20 @@ class PlaywrightCliAdapter:
         experiment_dir: Path,
         deadline: DeadlineLike,
     ) -> dict[str, Any]:
-        target = self.render_locator(step.locator) if step.locator else None
+        locator = getattr(step, "locator", None)
+        target = self.render_locator(locator) if locator else None
         if step.action == "navigate":
-            result = await self._run(session_ref, "goto", step.value or "", deadline=deadline)
+            result = await self._run(session_ref, "goto", step.value, deadline=deadline)
         elif step.action == "reload":
             result = await self._run(session_ref, "reload", deadline=deadline)
         elif step.action in {"click", "hover", "check", "uncheck"}:
             result = await self._run(session_ref, step.action, target or "", deadline=deadline)
         elif step.action in {"fill", "select"}:
             result = await self._run(
-                session_ref, step.action, target or "", step.value or "", deadline=deadline
+                session_ref, step.action, target or "", step.value, deadline=deadline
             )
         elif step.action in {"type", "press"}:
-            result = await self._run(session_ref, step.action, step.value or "", deadline=deadline)
+            result = await self._run(session_ref, step.action, step.value, deadline=deadline)
         elif step.action == "upload":
             if target:
                 await self._run(session_ref, "click", target, deadline=deadline)
@@ -389,7 +417,7 @@ class PlaywrightCliAdapter:
                 visible = result.returncode == 0 and bool(result.stdout.strip())
                 if visible == (condition.type == "selector_visible"):
                     return {"condition_met": True, "type": condition.type}
-            elif condition.type == "network_idle":
+            elif condition.type == "request_log_stable":
                 result = await self._run(
                     session_ref,
                     "requests",
@@ -413,9 +441,17 @@ class PlaywrightCliAdapter:
         await self._run(session_ref, "tracing-start", deadline=deadline)
 
     async def stop_trace(
-        self, session_ref: str, experiment_dir: Path, deadline: DeadlineLike
+        self,
+        session_ref: str,
+        experiment_dir: Path,
+        deadline: DeadlineLike,
+        *,
+        collect_files: bool = True,
     ) -> list[str]:
         result = await self._run(session_ref, "tracing-stop", deadline=deadline)
+        if not collect_files:
+            self._trace_files_before.pop(session_ref, None)
+            return []
         base = self.cwd or Path.cwd()
         candidates: set[Path] = set()
         for raw in re.findall(
@@ -488,11 +524,24 @@ class _McpCall:
     name: str
     arguments: dict[str, Any]
     timeout_seconds: float
+    absolute_deadline: float
+    generation: int
     future: asyncio.Future[dict[str, Any]]
 
 
 class StdioMcpToolTransport:
     """Persistent MCP stdio client owned by one dedicated asyncio task."""
+
+    SIDE_EFFECTING_TOOLS = frozenset(
+        {
+            "select_page",
+            "select_frame",
+            "break_on_xhr",
+            "pause_or_resume",
+            "start_stream_capture",
+            "stop_stream_capture",
+        }
+    )
 
     def __init__(
         self,
@@ -511,11 +560,13 @@ class StdioMcpToolTransport:
         self._worker_task: asyncio.Task[None] | None = None
         self._ready: asyncio.Future[None] | None = None
         self._worker_error: BaseException | None = None
+        self._generation = 0
 
     async def _ensure_started(self) -> None:
         async with self._start_lock:
             if self._worker_task is None:
                 loop = asyncio.get_running_loop()
+                self._generation += 1
                 self._queue = asyncio.Queue()
                 self._ready = loop.create_future()
                 self._worker_error = None
@@ -561,17 +612,34 @@ class StdioMcpToolTransport:
                     call = await queue.get()
                     if call is None:
                         break
+                    if (
+                        call.future.cancelled()
+                        or call.generation != self._generation
+                        or asyncio.get_running_loop().time() >= call.absolute_deadline
+                    ):
+                        if not call.future.done():
+                            call.future.cancel()
+                        continue
                     try:
+                        remaining = max(
+                            0.1,
+                            call.absolute_deadline
+                            - asyncio.get_running_loop().time(),
+                        )
                         result = await session.call_tool(
                             call.name,
                             call.arguments,
                             read_timeout_seconds=timedelta(
-                                seconds=max(0.1, call.timeout_seconds)
+                                seconds=min(call.timeout_seconds, remaining)
                             ),
                         )
                         parsed = self._normalize_result(call.name, result)
                     except BaseException as exc:
-                        if not call.future.cancelled():
+                        if isinstance(exc, asyncio.CancelledError):
+                            if not call.future.done():
+                                call.future.cancel()
+                            raise
+                        if not call.future.done():
                             call.future.set_exception(exc)
                         if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                             raise
@@ -581,10 +649,17 @@ class StdioMcpToolTransport:
         except BaseException as exc:
             self._worker_error = exc
             if not ready.done():
-                ready.set_exception(exc)
+                if isinstance(exc, asyncio.CancelledError):
+                    ready.cancel()
+                else:
+                    ready.set_exception(exc)
             while not queue.empty():
                 pending = queue.get_nowait()
-                if pending is not None and not pending.future.cancelled():
+                if pending is None or pending.future.done():
+                    continue
+                if isinstance(exc, asyncio.CancelledError):
+                    pending.future.cancel()
+                else:
                     pending.future.set_exception(exc)
 
     @staticmethod
@@ -627,25 +702,46 @@ class StdioMcpToolTransport:
         loop = asyncio.get_running_loop()
         future: asyncio.Future[dict[str, Any]] = loop.create_future()
         timeout_seconds = max(0.1, deadline.remaining_seconds())
+        absolute_deadline = loop.time() + timeout_seconds
         await queue.put(
             _McpCall(
                 name=name,
                 arguments=arguments,
                 timeout_seconds=timeout_seconds,
+                absolute_deadline=absolute_deadline,
+                generation=self._generation,
                 future=future,
             )
         )
         try:
             return await asyncio.wait_for(future, timeout=timeout_seconds)
         except TimeoutError as exc:
+            future.cancel()
+            if name in self.SIDE_EFFECTING_TOOLS:
+                await self._abort_worker()
             raise AdapterError(f"MCP tool timed out: {name}") from exc
+
+    async def _abort_worker(self) -> None:
+        async with self._start_lock:
+            task = self._worker_task
+            self._generation += 1
+            if task is not None and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            self._queue = None
+            self._worker_task = None
+            self._ready = None
+            self._worker_error = None
 
     async def close(self) -> None:
         queue = self._queue
         task = self._worker_task
         if queue is not None and task is not None and not task.done():
             await queue.put(None)
-            await task
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=5)
+            except TimeoutError:
+                await self._abort_worker()
         elif task is not None:
             await task
         self._queue = None
@@ -693,7 +789,7 @@ class JsReverseAdapter(Protocol):
         capture_id: int,
         request_matcher: RequestMatcher,
         condition: WaitCondition,
-        since_version: int,
+        checkpoint: StreamCheckpoint,
         deadline: DeadlineLike,
     ) -> StreamWaitResult: ...
 
@@ -898,32 +994,54 @@ class JsReverseMcpAdapter:
             return False
         return True
 
+    @staticmethod
+    def _request_id(request: dict[str, Any]) -> str:
+        return str(
+            request.get("cdpRequestId")
+            or request.get("persistentRequestId")
+            or ""
+        )
+
+    @staticmethod
+    def _last_event_index(request: dict[str, Any]) -> int:
+        raw_count = int(request.get("rawEventCount", 0) or 0)
+        semantic_count = int(request.get("semanticEventCount", 0) or 0)
+        return max(raw_count, semantic_count) - 1
+
+    @classmethod
+    def checkpoint_from_status(
+        cls,
+        payload: dict[str, Any],
+        matcher: RequestMatcher,
+    ) -> StreamCheckpoint:
+        capture = payload.get("capture") if isinstance(payload.get("capture"), dict) else {}
+        indices: dict[str, int] = {}
+        for request in payload.get("requests", []):
+            if not isinstance(request, dict) or not cls._request_matches(request, matcher):
+                continue
+            request_id = cls._request_id(request)
+            if request_id:
+                indices[request_id] = cls._last_event_index(request)
+        return StreamCheckpoint(
+            version=int(capture.get("version", 0) or 0),
+            event_indices=indices,
+        )
+
     async def wait_for_stream_condition(
         self,
         *,
         capture_id: int,
         request_matcher: RequestMatcher,
         condition: WaitCondition,
-        since_version: int,
+        checkpoint: StreamCheckpoint,
         deadline: DeadlineLike,
     ) -> StreamWaitResult:
         last_payload: dict[str, Any] = {}
-        after_event_index = -1
         while deadline.remaining_seconds() > 0:
-            predicate = (
-                condition.predicate
-                if condition.type == "event_predicate"
-                and condition.predicate
-                and condition.predicate.type
-                in {"exact_data", "event_name", "json_path_equals"}
-                else None
-            )
             payload = await self.get_stream_status(
                 capture_id,
                 deadline,
                 request_id=request_matcher.request_id,
-                event_predicate=predicate,
-                after_event_index=after_event_index,
             )
             last_payload = payload
             capture = payload.get("capture") if isinstance(payload.get("capture"), dict) else {}
@@ -933,7 +1051,12 @@ class JsReverseMcpAdapter:
                 for item in payload.get("requests", [])
                 if isinstance(item, dict) and self._request_matches(item, request_matcher)
             ]
-            request_ids = [str(item.get("cdpRequestId", "")) for item in requests]
+            request_ids = [self._request_id(item) for item in requests if self._request_id(item)]
+            event_indices = {
+                request_id: self._last_event_index(item)
+                for item in requests
+                if (request_id := self._request_id(item))
+            }
             terminal = next(
                 (
                     str(item.get("status"))
@@ -945,14 +1068,32 @@ class JsReverseMcpAdapter:
             met = False
             matched_event: dict[str, Any] | None = None
             if condition.type == "first_event":
-                met = any(int(item.get("rawEventCount", 0)) > 0 for item in requests)
-                for item in requests:
-                    recent = item.get("recentRawEvents")
-                    if isinstance(recent, list) and recent:
-                        matched_event = recent[-1] if isinstance(recent[-1], dict) else None
-                        break
+                met = any(
+                    event_indices.get(request_id, -1)
+                    > checkpoint.event_indices.get(request_id, -1)
+                    for request_id in request_ids
+                )
             elif condition.type == "default_done_marker":
-                met = any(bool(item.get("defaultDoneMarkerObserved")) for item in requests)
+                for request_id in request_ids:
+                    prior_index = checkpoint.event_indices.get(request_id, -1)
+                    if event_indices.get(request_id, -1) <= prior_index:
+                        continue
+                    candidate_payload = await self.get_stream_status(
+                        capture_id,
+                        deadline,
+                        request_id=request_id,
+                        event_predicate=ExactDataPredicate(
+                            type="exact_data",
+                            value="[DONE]",
+                        ),
+                        after_event_index=prior_index,
+                    )
+                    candidate = candidate_payload.get("eventMatch")
+                    if isinstance(candidate, dict) and candidate.get("matched"):
+                        matched_event = candidate
+                        met = True
+                        last_payload = candidate_payload
+                        break
             elif condition.type == "network_finished":
                 met = any(item.get("status") == "finished" for item in requests)
             elif condition.type == "network_canceled":
@@ -971,14 +1112,24 @@ class JsReverseMcpAdapter:
                         desired is None or str(desired) == terminal
                     )
                 else:
-                    candidate = payload.get("eventMatch")
-                    matched_event = candidate if isinstance(candidate, dict) else None
-                    met = bool(matched_event and matched_event.get("matched"))
-                    if matched_event and isinstance(
-                        matched_event.get("matchedEventIndex"), int
-                    ):
-                        after_event_index = int(matched_event["matchedEventIndex"])
-            if met and version > since_version:
+                    for request_id in request_ids:
+                        prior_index = checkpoint.event_indices.get(request_id, -1)
+                        if event_indices.get(request_id, -1) <= prior_index:
+                            continue
+                        candidate_payload = await self.get_stream_status(
+                            capture_id,
+                            deadline,
+                            request_id=request_id,
+                            event_predicate=condition.predicate,
+                            after_event_index=prior_index,
+                        )
+                        candidate = candidate_payload.get("eventMatch")
+                        if isinstance(candidate, dict) and candidate.get("matched"):
+                            matched_event = candidate
+                            met = True
+                            last_payload = candidate_payload
+                            break
+            if met and version > checkpoint.version:
                 return StreamWaitResult(
                     condition_met=True,
                     capture_id=capture_id,
@@ -986,6 +1137,7 @@ class JsReverseMcpAdapter:
                     matched_request_ids=request_ids,
                     terminal_status=terminal,
                     matched_event=matched_event,
+                    event_indices=event_indices,
                     status_payload=payload,
                 )
             await asyncio.sleep(min(0.2, max(0.01, deadline.remaining_seconds())))
@@ -994,6 +1146,7 @@ class JsReverseMcpAdapter:
             capture_id=capture_id,
             capture_version=int((last_payload.get("capture") or {}).get("version", 0) or 0),
             matched_request_ids=[],
+            event_indices={},
             status_payload=last_payload,
         )
 
