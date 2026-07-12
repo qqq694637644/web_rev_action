@@ -49,6 +49,7 @@ class WorkspaceFileContent(WorkspaceModel):
     total_lines: int | None = None
     bytes: int | None = None
     sha256: str | None = None
+    changed_during_read: bool = False
     content: str = ""
     truncated: bool = False
     error: str | None = None
@@ -60,6 +61,7 @@ class WorkspaceReadFilesRequest(WorkspaceModel):
     max_lines: int = Field(default=200, ge=1, le=5_000)
     max_bytes_per_file: int | None = Field(default=None, ge=1, le=4_000_000)
     max_bytes: int | None = Field(default=None, ge=1_024, le=8_000_000)
+    include_sha256: bool = True
 
 
 class WorkspaceReadFilesResponse(WorkspaceModel):
@@ -106,6 +108,7 @@ class WorkspaceInspectRequest(WorkspaceModel):
     max_file_lines: int = Field(default=120, ge=1, le=5_000)
     max_bytes_per_file: int | None = Field(default=None, ge=1, le=4_000_000)
     max_bytes: int | None = Field(default=None, ge=1_024, le=8_000_000)
+    include_sha256: bool = False
 
 
 class WorkspaceInspectSearchResult(WorkspaceModel):

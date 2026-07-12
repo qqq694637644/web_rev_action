@@ -10,9 +10,11 @@ import re
 import shutil
 import subprocess
 import time
+import uuid
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from .runtime_coordinator import RuntimeCoordinator, RuntimeOwner, RuntimeReservationError
 from .workspace_models import (
     WorkspaceApplyPatchRequest,
     WorkspaceApplyPatchResponse,
@@ -136,6 +138,7 @@ class AnalysisWorkspaceService:
         max_timeout_seconds: int = 1_800,
         max_output_bytes: int = 1_000_000,
         allow_network: bool = False,
+        coordinator: RuntimeCoordinator | None = None,
     ) -> None:
         self.root = root.expanduser().resolve()
         self.root.mkdir(parents=True, exist_ok=True)
@@ -144,7 +147,25 @@ class AnalysisWorkspaceService:
         self.max_timeout_seconds = max_timeout_seconds
         self.max_output_bytes = max_output_bytes
         self.allow_network = allow_network
+        self.coordinator = coordinator or RuntimeCoordinator()
         self._lock = asyncio.Lock()
+
+    async def _run_protected_mutation(self, operation: str, callback: Any) -> Any:
+        owner_id = f"workspace_{uuid.uuid4().hex}"
+        try:
+            await self.coordinator.reserve_workspace(
+                RuntimeOwner(
+                    kind="workspace",
+                    owner_id=owner_id,
+                    operation=operation,
+                )
+            )
+        except RuntimeReservationError as exc:
+            raise WorkspaceToolError(exc.code, str(exc), 409) from exc
+        try:
+            return await callback()
+        finally:
+            await self.coordinator.release_workspace(owner_id)
 
     def _experiment_status(self, experiment_id: str) -> str | None:
         manifest = self.root / "experiments" / experiment_id / "manifest.json"
@@ -265,6 +286,7 @@ class AnalysisWorkspaceService:
                     start_line=max(1, first_line - request.context_lines),
                     max_lines=request.max_file_lines,
                     max_bytes=max_file_bytes,
+                    include_sha256=request.include_sha256,
                 )
                 for path, first_line in list(related.items())[: request.max_read_files]
             ]
@@ -299,6 +321,7 @@ class AnalysisWorkspaceService:
                     start_line=request.start_line,
                     max_lines=request.max_lines,
                     max_bytes=max_file_bytes,
+                    include_sha256=request.include_sha256,
                 )
                 for path in request.paths
             ]
@@ -309,6 +332,14 @@ class AnalysisWorkspaceService:
         return self._fit_read_files_response(response, max_response_bytes)
 
     async def write_file(
+        self, request: WorkspaceWriteFileRequest
+    ) -> WorkspaceWriteFileResponse:
+        return await self._run_protected_mutation(
+            "workspaceWriteFile",
+            lambda: self._write_file(request),
+        )
+
+    async def _write_file(
         self, request: WorkspaceWriteFileRequest
     ) -> WorkspaceWriteFileResponse:
         max_bytes = min(request.max_bytes or self.max_output_bytes, self.max_output_bytes)
@@ -395,6 +426,14 @@ class AnalysisWorkspaceService:
     async def apply_patch(
         self, request: WorkspaceApplyPatchRequest
     ) -> WorkspaceApplyPatchResponse:
+        return await self._run_protected_mutation(
+            "workspaceApplyPatch",
+            lambda: self._apply_patch(request),
+        )
+
+    async def _apply_patch(
+        self, request: WorkspaceApplyPatchRequest
+    ) -> WorkspaceApplyPatchResponse:
         patch_bytes = request.patch.encode("utf-8")
         max_patch_bytes = min(
             request.max_patch_bytes or 1_000_000,
@@ -446,6 +485,14 @@ class AnalysisWorkspaceService:
         )
 
     async def exec_pwsh(
+        self, request: WorkspaceExecPwshRequest
+    ) -> WorkspaceExecPwshResponse:
+        return await self._run_protected_mutation(
+            "workspaceExecPwsh",
+            lambda: self._exec_pwsh(request),
+        )
+
+    async def _exec_pwsh(
         self, request: WorkspaceExecPwshRequest
     ) -> WorkspaceExecPwshResponse:
         timeout = min(
@@ -691,6 +738,7 @@ class AnalysisWorkspaceService:
                 start_line=max(1, line_number - request.context_lines),
                 max_lines=(request.context_lines * 2) + 1,
                 max_bytes=min(max_bytes, _SEARCH_SNIPPET_MAX_BYTES),
+                include_sha256=False,
             )
             truncated = truncated or line_truncated or snippet.truncated
             matches.append(
@@ -796,40 +844,14 @@ class AnalysisWorkspaceService:
                         return entries, True
         return entries, False
 
-    @staticmethod
-    def _validate_text_and_hash(
-        resolved: Path,
-        normalized: str,
-    ) -> tuple[int, str]:
-        digest = hashlib.sha256()
-        decoder = codecs.getincrementaldecoder("utf-8")("strict")
-        total_bytes = 0
-        try:
-            with resolved.open("rb") as handle:
-                while True:
-                    chunk = handle.read(_STREAM_CHUNK_BYTES)
-                    if not chunk:
-                        break
-                    if b"\x00" in chunk:
-                        raise WorkspaceToolError(
-                            "workspace_binary_not_allowed",
-                            "NUL bytes are not allowed in workspace text operations.",
-                            403,
-                        )
-                    total_bytes += len(chunk)
-                    digest.update(chunk)
-                    decoder.decode(chunk)
-            decoder.decode(b"", final=True)
-        except UnicodeDecodeError as exc:
-            raise WorkspaceToolError(
-                "workspace_binary_not_allowed",
-                f"Only UTF-8 text files are allowed: {normalized}.",
-                403,
-            ) from exc
-        return total_bytes, digest.hexdigest()
-
     def _read_file_content(
-        self, path: str, *, start_line: int, max_lines: int, max_bytes: int
+        self,
+        path: str,
+        *,
+        start_line: int,
+        max_lines: int,
+        max_bytes: int,
+        include_sha256: bool,
     ) -> WorkspaceFileContent:
         try:
             normalized = normalize_workspace_path(path)
@@ -844,18 +866,27 @@ class AnalysisWorkspaceService:
                     403,
                 )
             resolved = resolve_workspace_path(self.root, normalized, require_file=True)
-            total_bytes, sha256 = self._validate_text_and_hash(resolved, normalized)
+            before = resolved.stat()
+            digest = hashlib.sha256() if include_sha256 else None
+            decoder = codecs.getincrementaldecoder("utf-8")("strict")
+            total_bytes = 0
             output_lines: list[str] = []
             output_bytes = 0
             total_lines = 0
             current_parts: list[str] = []
             current_text_bytes = 0
             current_has_data = False
+            pending_cr = False
             selected_clipped = False
+            requested_end = start_line + max_lines - 1
+            stop_after_line = requested_end + 1
+            stop_requested = False
+            scan_complete = True
 
             def finish_line() -> None:
                 nonlocal total_lines, output_bytes, current_parts
                 nonlocal current_text_bytes, current_has_data, selected_clipped
+                nonlocal stop_requested
                 line_number = total_lines + 1
                 selected = start_line <= line_number < start_line + max_lines
                 if selected:
@@ -871,22 +902,29 @@ class AnalysisWorkspaceService:
                 current_parts = []
                 current_text_bytes = 0
                 current_has_data = False
+                if not include_sha256 and total_lines >= stop_after_line:
+                    stop_requested = True
 
-            with resolved.open(
-                "r",
-                encoding="utf-8",
-                errors="strict",
-                newline=None,
-            ) as handle:
-                while True:
-                    segment = handle.readline(_STREAM_CHUNK_BYTES)
-                    if segment == "":
-                        if current_has_data:
-                            finish_line()
-                        break
+            def consume_text(text: str) -> None:
+                nonlocal pending_cr, current_has_data, current_text_bytes
+                nonlocal selected_clipped
+                for char in text:
+                    if pending_cr:
+                        finish_line()
+                        pending_cr = False
+                        if stop_requested:
+                            return
+                        if char == "\n":
+                            continue
+                    if char == "\r":
+                        pending_cr = True
+                        continue
+                    if char == "\n":
+                        finish_line()
+                        if stop_requested:
+                            return
+                        continue
                     current_has_data = True
-                    line_ended = segment.endswith("\n")
-                    piece = segment[:-1] if line_ended else segment
                     line_number = total_lines + 1
                     selected = start_line <= line_number < start_line + max_lines
                     if selected and not selected_clipped:
@@ -898,17 +936,52 @@ class AnalysisWorkspaceService:
                             - prefix_bytes
                             - current_text_bytes,
                         )
-                        clipped, clipped_piece = self._clip_text(piece, available)
-                        if clipped:
-                            current_parts.append(clipped)
-                            current_text_bytes += len(clipped.encode("utf-8"))
-                        if clipped_piece:
+                        encoded = char.encode("utf-8")
+                        if len(encoded) <= available:
+                            current_parts.append(char)
+                            current_text_bytes += len(encoded)
+                        else:
                             selected_clipped = True
-                    if line_ended:
-                        finish_line()
 
-            requested_end = start_line + max_lines - 1
-            has_more_lines = total_lines > requested_end
+            try:
+                handle = resolved.open("rb")
+            except OSError:
+                raise
+            with handle:
+                while True:
+                    chunk = handle.read(_STREAM_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    if b"\x00" in chunk:
+                        raise WorkspaceToolError(
+                            "workspace_binary_not_allowed",
+                            "NUL bytes are not allowed in workspace text operations.",
+                            403,
+                        )
+                    total_bytes += len(chunk)
+                    if digest is not None:
+                        digest.update(chunk)
+                    consume_text(decoder.decode(chunk))
+                    if stop_requested:
+                        scan_complete = False
+                        break
+                if scan_complete:
+                    consume_text(decoder.decode(b"", final=True))
+            if scan_complete:
+                if pending_cr:
+                    finish_line()
+                    pending_cr = False
+                elif current_has_data:
+                    finish_line()
+
+            after = resolved.stat()
+            changed_during_read = (
+                before.st_size != after.st_size
+                or before.st_mtime_ns != after.st_mtime_ns
+                or getattr(before, "st_ino", None) != getattr(after, "st_ino", None)
+            )
+
+            has_more_lines = not scan_complete or total_lines > requested_end
             content = "\n".join(output_lines)
             return WorkspaceFileContent(
                 path=normalized,
@@ -916,11 +989,31 @@ class AnalysisWorkspaceService:
                 end_line=(
                     start_line + len(output_lines) - 1 if output_lines else None
                 ),
-                total_lines=total_lines,
-                bytes=total_bytes,
-                sha256=sha256,
+                total_lines=total_lines if scan_complete else None,
+                bytes=(
+                    None
+                    if changed_during_read
+                    else total_bytes
+                    if scan_complete
+                    else before.st_size
+                ),
+                sha256=(
+                    digest.hexdigest()
+                    if digest is not None
+                    and scan_complete
+                    and not changed_during_read
+                    else None
+                ),
+                changed_during_read=changed_during_read,
                 content=content,
                 truncated=selected_clipped or has_more_lines,
+            )
+        except UnicodeDecodeError:
+            return WorkspaceFileContent(
+                path=path,
+                start_line=start_line,
+                error=f"Only UTF-8 text files are allowed: {path}.",
+                truncated=False,
             )
         except Exception as exc:
             return WorkspaceFileContent(

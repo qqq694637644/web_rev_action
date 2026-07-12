@@ -33,30 +33,34 @@ data/analysis-workspace/
 同一个 analysis workspace 只能由一个 `web_rev_action` 进程持有：
 
 - 内置 CLI 固定 `workers=1`。
-- 服务启动时获取基于 workspace 路径的 OS 文件锁。
+- 启动顺序固定为：解析 workspace root → 获取 OS 文件锁 → 创建 `ExperimentStore` → 恢复遗留 `running` experiment → 创建 BrowserService。
 - 第二个进程或 Uvicorn worker 使用同一目录时启动失败。
 
-原因是 Playwright session、MCP transport、browser lock 和后台 job 都是进程内状态，多进程无法共享一致的浏览器生命周期。
+进程锁必须早于 experiment 恢复。第二个进程不能在发现锁冲突前把第一个进程正在运行的 experiment 改成 `interrupted`。
 
 ### 2.2 一个共享浏览器、一个活动实验
 
 当前部署共享一个 Chrome CDP endpoint、一个 Playwright CLI 环境和一个长期运行的私有 `js-reverse-mcp`。
 
-因此全局同时只允许一个活动实验：
+`RuntimeCoordinator` 原子管理两类互斥 owner：
 
 ```text
-无活动实验
-  → reserve experiment
-  → atomic capture lifecycle
-  → finalize
-  → release experiment
+browser operation owner
+  open_session | close_session | capture_baseline | capture_flow
+
+protected workspace mutation owner
+  workspaceWriteFile | workspaceApplyPatch | workspaceExecPwsh
 ```
 
-系统不排队第二个实验：
+两类 owner 互斥，普通 inspect/search/read 不受影响。Browser operation 必须先取得 reservation，再 attach、创建 experiment 目录或写 `running` manifest。
+
+全局同时只允许一个 browser operation，系统不排队：
 
 - 同一 session 已有后台实验时返回 `409 session_busy`。
 - 其他 session 或同步请求遇到活动实验时返回 `409 browser_busy`。
 - `open_session` 和 `close_session` 在活动实验期间同样被拒绝。
+- Protected workspace mutation 活跃时，browser operation 返回 `409 workspace_busy`。
+- Browser operation 活跃时，workspace mutation 返回 `409 browser_busy`。
 
 这比等待进程锁更可靠：不会生成长期 `running` manifest，也不会在排队期间耗尽 deadline。
 
@@ -147,6 +151,9 @@ GPT
 
 web_rev_action
 ├── FastAPI / OpenAPI
+├── RuntimeCoordinator
+│   ├── browser operation reservation
+│   └── protected workspace mutation reservation
 ├── BrowserActionService
 │   ├── global experiment reservation
 │   ├── session registry
@@ -184,6 +191,8 @@ private runtime
 - experiment ID 和目录分配。
 - running/terminal manifest 原子写入。
 - 服务启动时把遗留 `running` 标记为 `interrupted`。
+
+`RuntimeCoordinator` 只负责当前进程的原子 reservation，不保存业务 manifest。OS 文件锁负责跨进程单实例，Coordinator 负责进程内 browser/workspace TOCTOU。
 
 `PlaywrightCliAdapter` 负责页面动作，不解释网络语义。
 
@@ -226,6 +235,7 @@ open_session
 capture_baseline
 capture_flow
 close_session
+cancel_experiment
 ```
 
 OpenAPI 使用 discriminated union。每个 operation 和 flow action 只能接受自己的字段组合。
@@ -308,6 +318,17 @@ runBrowserExperiment
 ```
 
 GPT 使用 `inspectBrowserEvidence.get_experiment` 查询终态。
+
+错误提交的长 job 可通过 consequential operation 主动取消：
+
+```text
+cancel_experiment {
+  experiment_id
+  session_id
+}
+```
+
+它只取消对应后台 task，等待 collector/Trace cleanup 和 terminal manifest 完成后返回；不通过 `close_session` 间接取消。
 
 同步模式只用于明确能在一个 Action round trip 内完成的短实验：
 
@@ -407,6 +428,11 @@ Worker 执行前丢弃：
 
 旧 worker 只能更新自己的 generation；退出时不能污染新 worker 的 ready/error 状态。
 
+MCP 异常分为两类：
+
+- Tool 业务错误：当前调用失败，worker 可以继续。
+- stdio/session/connection closed、EOF、子进程退出：当前 generation stale，worker 退出；调用方等待清理完成后收到错误，下一次调用自动启动新 generation。
+
 ## 8. Stream checkpoint 与因果等待
 
 仅比较 capture version 不足以证明事件或终态来自本轮动作。系统为每个匹配 request 保存状态快照。
@@ -498,6 +524,14 @@ eventSource = raw-stream | eventsource
 
 它只返回匹配元数据，不返回正文。
 
+Collector 在成功写入事件 JSONL 时维护 source-specific：
+
+```text
+event index → JSONL byte offset
+```
+
+`findEventMatch()` 从第一个大于 `afterEventIndex` 的 offset 直接 seek，不从文件头反复解析旧事件，避免长流轮询退化为 O(n²)。
+
 ## 9. Request 分页与 primary 归属
 
 `get_stream_status` 和 `list_network_requests` 都必须完整遍历 pagination，不能固定读取前 100 条。
@@ -569,7 +603,26 @@ capture_relative_dir
 capture_metadata_artifact_id
 collector_cleanup
 orphan_capture_id
+transport_generation
+stream_start_status
 ```
+
+`stream_start_status`：
+
+```text
+not_attempted
+failed_before_send
+confirmed
+outcome_unknown
+```
+
+若 start 已 dispatch 但结果未知：
+
+- `collector_cleanup=unknown`
+- `collector_stopped=false`
+- 保存 artifact namespace 和 transport generation
+- 扫描 `experiments/<id>/js-reverse/capture-*/capture.json` 恢复 UUID、相对目录和 metadata artifact
+- 不把发现的旧数字 capture ID 当作新 generation 中可查询的 live handle
 
 `collector_cleanup`：
 
@@ -581,6 +634,17 @@ unknown
 ```
 
 即使 MCP worker 被重建，`capture_uuid`、相对目录和 metadata artifact ID 仍可用于 workspace 检查未完成证据。`orphan_capture_id` 只作为原进程诊断值，不是跨进程恢复主键。
+
+`stop_stream_capture` 与 post-stop status 查询是两个独立阶段。Stop 已确认成功时，后续 status 超时只产生 warning，不覆盖 `collector_cleanup=completed`，也不产生 orphan。
+
+公开 `inspectBrowserEvidence.get_stream_status` 输入为：
+
+```text
+experiment_id
+capture_uuid (optional validation)
+```
+
+只有 manifest 为 running、Coordinator owner 匹配 experiment、UUID 匹配且 transport generation 未变化时才查询 live MCP。Experiment 已结束或 MCP 已重启时直接返回持久 manifest，不接受裸数字 capture ID。
 
 ## 12. Stop-generation 语义
 
@@ -697,12 +761,17 @@ truncation metadata
 
 ### 14.3 workspaceReadFiles
 
-文本读取分为两个流式阶段：
+文本读取只打开文件一次，在同一流式遍历中完成：
 
-1. 增量 UTF-8 校验、字节计数和 SHA-256。
-2. 按行号流式提取目标范围。
+```text
+incremental UTF-8 decode
+byte count
+total line count
+requested line range
+optional incremental SHA-256
+```
 
-大型 JSONL/SSE 文件不会整体载入内存。二进制文件返回 per-file error，使用 PowerShell 定向读取。
+请求可设置 `include_sha256=false`，查看少量行时不计算全文件 hash。读取前后比较 size、mtime 和 file identity；文件增长或替换时返回 `changed_during_read=true`，不宣称稳定 SHA。二进制文件返回 per-file error，使用 PowerShell 定向读取。
 
 ### 14.4 workspaceWriteFile / workspaceApplyPatch
 
@@ -732,6 +801,8 @@ rollback
 - 本地压缩文件分析。
 
 stdout/stderr 并发流式消费，只保留 byte budget 内内容。Timeout、Action cancellation 和 shutdown 都终止 Windows 进程树。
+
+`workspaceWriteFile`、`workspaceApplyPatch` 和 `workspaceExecPwsh` 先通过共享 RuntimeCoordinator 取得 mutation reservation，避免“检查没有 running experiment 后，browser job 立即开始”的 TOCTOU。
 
 网络和危险命令检查是 best-effort 本地策略，不是安全沙箱。真正离线需要 Windows Firewall、隔离账户或 VM。
 
@@ -807,6 +878,11 @@ shutdown with open Playwright session
 - matched request ID 精确。
 - raw/semantic source 和 offset 精确。
 - terminal manifest 可读取。
+- MCP read-only call 中进程崩溃后，下一次调用启动新 generation。
+- start outcome unknown 不会报告 collector stopped。
+- stop 成功不会被 post-stop status 失败覆盖。
+- `cancel_experiment` 返回时 browser reservation 已释放。
+- growing file 返回 `changed_during_read` 或稳定单次快照。
 
 ## 17. 当前边界与演进方向
 
@@ -839,16 +915,21 @@ Worker / Service Worker target coverage
 4. Running manifest、Trace 和 collector 早于第一条页面变更动作。
 5. Playwright、MCP、PowerShell 和 ripgrep cancellation 都完成进程树 cleanup。
 6. Side-effect MCP timeout/cancel 后 generation 重建且不自动重试。
-7. 每个 wait 使用 request-state checkpoint，而非只有 capture version。
-8. Raw 与 semantic event 使用独立 cursor 和 source-specific predicate。
-9. Wait 只返回真正满足条件的 request IDs。
-10. Stream 和 network status 完整分页。
-11. Primary、supporting 和 objective integrity 分开。
-12. Capture UUID、relative directory 和 metadata artifact ID 持久化。
-13. Stop cancellation 只在完整实验上下文满足时解释为用户取消。
-14. 原始证据只读，派生内容写入指定目录。
-15. Workspace 所有大型 I/O 都是流式有界并支持 cancellation。
-16. 服务 shutdown detach 本实例的 open Playwright sessions。
-17. 同一 workspace 只能由一个进程持有。
-18. Stage 0、BrowserAction success、cancellation 和 causal multi-stream gates 全部通过。
-19. 产品不包含 Git、PR、CI、ZIP 或第二套 artifact 文件 API。
+7. MCP transport crash 结束旧 generation，下一次调用自动恢复。
+8. 每个 wait 使用 request-state checkpoint，而非只有 capture version。
+9. Raw 与 semantic event 使用独立 cursor、source-specific predicate 和 byte-offset seek。
+10. Wait 只返回真正满足条件的 request IDs。
+11. Stream 和 network status 完整分页。
+12. Primary、supporting 和 objective integrity 分开；stream=false 使用 not_required。
+13. Capture UUID、relative directory、metadata artifact、namespace 和 generation 持久化。
+14. Public stream status 以 experiment/UUID 身份查询，不接受裸 capture ID。
+15. Start outcome unknown 不声明 stopped；stop/status 结果互不覆盖。
+16. `cancel_experiment` 等待 cleanup 并释放 runtime reservation。
+17. Stop cancellation 只在完整实验上下文满足时解释为用户取消。
+18. 原始证据只读，派生内容写入指定目录。
+19. Browser operation 与 protected workspace mutation 原子互斥。
+20. Workspace 大型 I/O 流式有界；文件读取为单次快照并报告 changed_during_read。
+21. 服务 shutdown detach 本实例的 open Playwright sessions。
+22. OS 进程锁早于 ExperimentStore recovery。
+23. Stage 0、BrowserAction success、cancellation 和 causal multi-stream gates 全部通过。
+24. 产品不包含 Git、PR、CI、ZIP 或第二套 artifact 文件 API。

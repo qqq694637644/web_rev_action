@@ -28,6 +28,23 @@ class AdapterError(RuntimeError):
     """Raised when a private browser adapter cannot complete an operation."""
 
 
+class McpToolCallError(AdapterError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        outcome_unknown: bool,
+        transport_generation: int,
+    ) -> None:
+        super().__init__(message)
+        self.outcome_unknown = outcome_unknown
+        self.transport_generation = transport_generation
+
+
+class McpTransportError(AdapterError):
+    pass
+
+
 class DeadlineLike(Protocol):
     def remaining_seconds(self) -> float: ...
 
@@ -587,6 +604,9 @@ class PlaywrightCliAdapter:
 
 
 class McpToolTransport(Protocol):
+    @property
+    def generation(self) -> int: ...
+
     async def call_tool(
         self, name: str, arguments: dict[str, Any], deadline: DeadlineLike
     ) -> dict[str, Any]: ...
@@ -602,6 +622,7 @@ class _McpCall:
     absolute_deadline: float
     generation: int
     future: asyncio.Future[dict[str, Any]]
+    sent: bool = False
 
 
 class StdioMcpToolTransport:
@@ -636,6 +657,39 @@ class StdioMcpToolTransport:
         self._ready: asyncio.Future[None] | None = None
         self._worker_error: BaseException | None = None
         self._generation = 0
+
+    @property
+    def generation(self) -> int:
+        return self._generation
+
+    @staticmethod
+    def _is_transport_failure(exc: BaseException) -> bool:
+        if isinstance(exc, McpTransportError):
+            return True
+        if isinstance(exc, BaseExceptionGroup):
+            return any(
+                StdioMcpToolTransport._is_transport_failure(item)
+                for item in exc.exceptions
+            )
+        if isinstance(exc, (EOFError, BrokenPipeError, ConnectionResetError, OSError)):
+            return True
+        if exc.__class__.__name__ == "McpError":
+            message = str(exc).lower()
+            return any(
+                marker in message
+                for marker in (
+                    "connection closed",
+                    "stream closed",
+                    "end of stream",
+                    "eof",
+                    "disconnected",
+                )
+            )
+        return exc.__class__.__name__ in {
+            "EndOfStream",
+            "BrokenResourceError",
+            "ClosedResourceError",
+        }
 
     async def _ensure_started(self) -> None:
         async with self._start_lock:
@@ -717,6 +771,7 @@ class StdioMcpToolTransport:
                             call.absolute_deadline
                             - asyncio.get_running_loop().time(),
                         )
+                        call.sent = True
                         result = await session.call_tool(
                             call.name,
                             call.arguments,
@@ -730,9 +785,26 @@ class StdioMcpToolTransport:
                             if not call.future.done():
                                 call.future.cancel()
                             raise
+                        transport_failure = self._is_transport_failure(exc) or (
+                            not isinstance(exc, AdapterError)
+                            and exc.__class__.__name__ != "McpError"
+                        )
+                        delivered: BaseException = exc
+                        if transport_failure:
+                            delivered = McpTransportError(
+                                f"MCP transport failed during {call.name}: {exc}"
+                            )
+                        elif call.name in self.SIDE_EFFECTING_TOOLS:
+                            delivered = McpToolCallError(
+                                f"MCP tool failed after dispatch: {call.name}: {exc}",
+                                outcome_unknown=call.sent,
+                                transport_generation=generation,
+                            )
                         if not call.future.done():
-                            call.future.set_exception(exc)
+                            call.future.set_exception(delivered)
                         if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                            raise
+                        if transport_failure:
                             raise
                     else:
                         if not call.future.cancelled():
@@ -795,31 +867,43 @@ class StdioMcpToolTransport:
         future: asyncio.Future[dict[str, Any]] = loop.create_future()
         timeout_seconds = max(0.1, deadline.remaining_seconds())
         absolute_deadline = loop.time() + timeout_seconds
-        await queue.put(
-            _McpCall(
-                name=name,
-                arguments=arguments,
-                timeout_seconds=timeout_seconds,
-                absolute_deadline=absolute_deadline,
-                generation=self._generation,
-                future=future,
-            )
+        call = _McpCall(
+            name=name,
+            arguments=arguments,
+            timeout_seconds=timeout_seconds,
+            absolute_deadline=absolute_deadline,
+            generation=self._generation,
+            future=future,
         )
+        await queue.put(call)
         try:
             return await asyncio.wait_for(future, timeout=timeout_seconds)
         except TimeoutError as exc:
             future.cancel()
             if name in self.SIDE_EFFECTING_TOOLS:
                 await self._abort_worker()
-            raise AdapterError(f"MCP tool timed out: {name}") from exc
-        except asyncio.CancelledError:
+            raise McpToolCallError(
+                f"MCP tool timed out: {name}",
+                outcome_unknown=call.sent,
+                transport_generation=call.generation,
+            ) from exc
+        except asyncio.CancelledError as exc:
             future.cancel()
+            exc.mcp_outcome_unknown = call.sent
+            exc.mcp_transport_generation = call.generation
             if name in self.SIDE_EFFECTING_TOOLS:
                 cleanup = asyncio.create_task(self._abort_worker())
                 try:
                     await asyncio.shield(cleanup)
                 except asyncio.CancelledError:
                     await cleanup
+            raise
+        except BaseException as exc:
+            if self._is_transport_failure(exc):
+                await self._abort_worker()
+                raise AdapterError(
+                    f"MCP transport failed and was restarted: {name}: {exc}"
+                ) from exc
             raise
 
     async def _abort_worker(self) -> None:
@@ -852,6 +936,9 @@ class StdioMcpToolTransport:
 
 
 class JsReverseAdapter(Protocol):
+    @property
+    def transport_generation(self) -> int: ...
+
     async def align_page(
         self,
         page: PageState,
@@ -923,6 +1010,10 @@ class JsReverseMcpAdapter:
 
     def __init__(self, transport: McpToolTransport) -> None:
         self.transport = transport
+
+    @property
+    def transport_generation(self) -> int:
+        return int(getattr(self.transport, "generation", 0))
 
     async def _call(
         self, name: str, arguments: dict[str, Any], deadline: DeadlineLike

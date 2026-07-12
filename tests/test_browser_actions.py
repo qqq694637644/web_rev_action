@@ -19,6 +19,7 @@ from skill_temple.browser_adapters import (
     AdapterError,
     AlignmentResult,
     JsReverseMcpAdapter,
+    McpToolCallError,
     PageState,
     StdioMcpToolTransport,
     StreamCheckpoint,
@@ -28,6 +29,7 @@ from skill_temple.browser_adapters import (
     build_playwright_attach_args,
 )
 from skill_temple.browser_models import (
+    CancelExperimentRequest,
     CaptureFlowRequest,
     ExactDataPredicate,
     FlowStep,
@@ -43,6 +45,10 @@ from skill_temple.browser_service import (
     ExperimentStore,
     build_browser_service_from_environment,
 )
+from skill_temple.runtime_coordinator import RuntimeCoordinator, RuntimeOwner
+from skill_temple.workspace_models import WorkspaceWriteFileRequest
+from skill_temple.workspace_service import AnalysisWorkspaceService
+from skill_temple.workspace_text_ops import WorkspaceToolError
 
 
 class FakePlaywright:
@@ -542,6 +548,14 @@ class BrowserActionTests(unittest.TestCase):
         self.assertIn("discriminator", run_schema)
         self.assertIn("oneOf", inspect_schema)
         self.assertIn("discriminator", inspect_schema)
+        run_variants = str(run_schema)
+        inspect_variants = str(inspect_schema)
+        self.assertIn("CancelExperimentRequest", run_variants)
+        self.assertIn("GetStreamStatusRequest", inspect_variants)
+        status_payload = schema["components"]["schemas"]["GetStreamStatusPayload"]
+        self.assertIn("experiment_id", status_payload["properties"])
+        self.assertIn("capture_uuid", status_payload["properties"])
+        self.assertNotIn("capture_id", status_payload["properties"])
 
     def test_atomic_capture_order_manifest_and_primary_integrity(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2172,6 +2186,78 @@ class BrowserActionTests(unittest.TestCase):
             self.assertTrue(restarted_marker.is_file())
             self.assertEqual(result["capture"]["captureId"], 31)
 
+    def test_read_only_mcp_transport_crash_restarts_on_next_call(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            marker = root / "crashed-once.txt"
+            server = root / "crash_once_mcp_server.py"
+            server.write_text(
+                "\n".join(
+                    [
+                        "import os",
+                        "from pathlib import Path",
+                        "from mcp.server.fastmcp import FastMCP",
+                        "from pydantic import BaseModel",
+                        "server = FastMCP('crash-once-test')",
+                        "class Capture(BaseModel):",
+                        "    captureId: int",
+                        "    captureUuid: str",
+                        "class Result(BaseModel):",
+                        "    capture: Capture",
+                        "@server.tool(structured_output=True)",
+                        "async def get_stream_status(marker: str) -> Result:",
+                        "    path = Path(marker)",
+                        "    if not path.exists():",
+                        "        path.write_text('crashed', encoding='utf-8')",
+                        "        os._exit(17)",
+                        "    return Result(capture=Capture(",
+                        "        captureId=42,",
+                        "        captureUuid='44444444-4444-4444-8444-444444444444',",
+                        "    ))",
+                        "if __name__ == '__main__':",
+                        "    server.run(transport='stdio')",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            transport = StdioMcpToolTransport(
+                command=sys.executable,
+                args=[str(server)],
+                cwd=root,
+            )
+
+            async def exercise() -> tuple[int, dict[str, Any]]:
+                first_generation = 0
+                try:
+                    await transport.call_tool(
+                        "get_stream_status",
+                        {"marker": str(marker)},
+                        Deadline(5_000),
+                    )
+                except BaseException as exc:
+                    self.assertNotIsInstance(
+                        exc,
+                        (KeyboardInterrupt, SystemExit, asyncio.CancelledError),
+                    )
+                else:
+                    self.fail("The first MCP process should have exited")
+                self.assertTrue(marker.is_file())
+                self.assertEqual(marker.read_text(encoding="utf-8"), "crashed")
+                first_generation = transport.generation
+                result = await transport.call_tool(
+                    "get_stream_status",
+                    {"marker": str(marker)},
+                    Deadline(5_000),
+                )
+                second_generation = transport.generation
+                await transport.close()
+                self.assertGreater(second_generation, first_generation)
+                return second_generation, result
+
+            generation, result = asyncio.run(exercise())
+            self.assertGreaterEqual(generation, 2)
+            self.assertEqual(result["capture"]["captureId"], 42)
+
     def test_terminal_wait_requires_a_post_checkpoint_transition(self) -> None:
         class TerminalTransport:
             def __init__(self) -> None:
@@ -2391,6 +2477,582 @@ class BrowserActionTests(unittest.TestCase):
             )
             self.assertEqual(saved["status"], "closed")
             self.assertEqual(saved["close_reason"], "service_shutdown")
+
+    def test_runtime_coordinator_atomically_blocks_browser_and_workspace_operations(self) -> None:
+        class BlockingOpenPlaywright(FakePlaywright):
+            def __init__(self, events: list[str]) -> None:
+                super().__init__(events)
+                self.started = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def open_session(
+                self,
+                session_ref: str,
+                browser_endpoint: str,
+                start_url: str | None,
+                deadline: Deadline,
+            ) -> PageState:
+                self.started.set()
+                await self.release.wait()
+                return await super().open_session(
+                    session_ref,
+                    browser_endpoint,
+                    start_url,
+                    deadline,
+                )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            events: list[str] = []
+            coordinator = RuntimeCoordinator()
+            playwright = BlockingOpenPlaywright(events)
+            service = BrowserActionService(
+                playwright=playwright,
+                js_reverse=FakeJsReverse(events, root),
+                experiments=ExperimentStore(root),
+                default_browser_endpoint="http://127.0.0.1:9222",
+                coordinator=coordinator,
+            )
+            workspace = AnalysisWorkspaceService(root, coordinator=coordinator)
+
+            async def exercise() -> tuple[str, str, int]:
+                opening = asyncio.create_task(
+                    service.run(
+                        OpenSessionRequest(
+                            operation="open_session",
+                            payload={"session_id": "reserved_session"},
+                        )
+                    )
+                )
+                await playwright.started.wait()
+                with self.assertRaises(BrowserServiceError) as browser_error:
+                    await service.run(
+                        CaptureFlowRequest(
+                            operation="capture_flow",
+                            payload={
+                                "session_id": "other_session",
+                                "objective": "must not queue behind open",
+                                "primary_request": {"expected_min_matches": 0},
+                                "execution_mode": "sync",
+                                "deadline_ms": 10_000,
+                            },
+                        )
+                    )
+                with self.assertRaises(WorkspaceToolError) as workspace_error:
+                    await workspace.write_file(
+                        WorkspaceWriteFileRequest(
+                            path="reports/during-open.md",
+                            content="blocked\n",
+                        )
+                    )
+                manifest_count = len(list((root / "experiments").glob("*/manifest.json")))
+                playwright.release.set()
+                await opening
+                workspace_owner = RuntimeOwner(
+                    kind="workspace",
+                    owner_id="manual_workspace",
+                    operation="workspaceExecPwsh",
+                )
+                await coordinator.reserve_workspace(workspace_owner)
+                try:
+                    with self.assertRaises(BrowserServiceError) as reverse_error:
+                        await service.run(
+                            OpenSessionRequest(
+                                operation="open_session",
+                                payload={"session_id": "blocked_by_workspace"},
+                            )
+                        )
+                    reverse_code = reverse_error.exception.code
+                finally:
+                    await coordinator.release_workspace(workspace_owner.owner_id)
+                await service.close()
+                return (
+                    browser_error.exception.code,
+                    workspace_error.exception.code,
+                    reverse_code,
+                    manifest_count,
+                )
+
+            browser_code, workspace_code, reverse_code, manifest_count = asyncio.run(
+                exercise()
+            )
+            self.assertEqual(browser_code, "browser_busy")
+            self.assertEqual(workspace_code, "browser_busy")
+            self.assertEqual(reverse_code, "workspace_busy")
+            self.assertEqual(manifest_count, 0)
+
+    def test_terminal_stream_status_is_resolved_by_experiment_and_uuid(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client, _, _ = self.make_client(
+                Path(temp_dir), include_supporting_failure=False
+            )
+            with client:
+                self.open_session(client)
+                captured = client.post(
+                    "/v1/browser/run",
+                    json=self.capture_request(),
+                )
+                self.assertEqual(captured.status_code, 200, captured.text)
+                experiment_id = captured.json()["experiment_id"]
+                status = client.post(
+                    "/v1/browser/inspect",
+                    json={
+                        "operation": "get_stream_status",
+                        "payload": {
+                            "experiment_id": experiment_id,
+                            "capture_uuid": "11111111-1111-4111-8111-111111111111",
+                        },
+                    },
+                )
+                mismatch = client.post(
+                    "/v1/browser/inspect",
+                    json={
+                        "operation": "get_stream_status",
+                        "payload": {
+                            "experiment_id": experiment_id,
+                            "capture_uuid": "22222222-2222-4222-8222-222222222222",
+                        },
+                    },
+                )
+            self.assertEqual(status.status_code, 200, status.text)
+            self.assertEqual(status.json()["result"]["source"], "manifest")
+            self.assertEqual(
+                status.json()["result"]["stream"]["capture"]["captureUuid"],
+                "11111111-1111-4111-8111-111111111111",
+            )
+            self.assertEqual(mismatch.status_code, 409)
+
+    def test_live_stream_status_requires_matching_transport_generation(self) -> None:
+        class GenerationJs(FakeJsReverse):
+            def __init__(self, events: list[str], root: Path) -> None:
+                super().__init__(events, root, include_supporting_failure=False)
+                self.generation = 5
+                self.status_calls = 0
+
+            @property
+            def transport_generation(self) -> int:
+                return self.generation
+
+            async def get_stream_status(
+                self,
+                capture_id: int,
+                deadline: Deadline,
+                **kwargs: Any,
+            ) -> dict[str, Any]:
+                self.status_calls += 1
+                return {
+                    "capture": {
+                        "captureId": capture_id,
+                        "captureUuid": "55555555-5555-4555-8555-555555555555",
+                        "status": "capturing",
+                    },
+                    "requests": [],
+                }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            events: list[str] = []
+            coordinator = RuntimeCoordinator()
+            experiments = ExperimentStore(root)
+            js = GenerationJs(events, root)
+            service = BrowserActionService(
+                playwright=FakePlaywright(events),
+                js_reverse=js,
+                experiments=experiments,
+                default_browser_endpoint="http://127.0.0.1:9222",
+                coordinator=coordinator,
+            )
+            experiment_id, _, manifest = experiments.create_experiment(
+                session_id="live_status",
+                operation="capture_flow",
+                objective="live status identity",
+                deadline=Deadline(10_000),
+                experiment_id="exp_live_status",
+            )
+            manifest["stream_runtime"] = {
+                "start_status": "confirmed",
+                "capture_id": 9,
+                "capture_uuid": "55555555-5555-4555-8555-555555555555",
+                "transport_generation": 5,
+            }
+            manifest["stream_status"] = {
+                "capture": {
+                    "captureUuid": "55555555-5555-4555-8555-555555555555",
+                    "status": "persisted",
+                }
+            }
+            experiments.write_manifest(experiment_id, manifest)
+
+            async def reserve() -> None:
+                await coordinator.reserve_browser(
+                    RuntimeOwner(
+                        kind="browser",
+                        owner_id=experiment_id,
+                        operation="capture_flow",
+                        session_id="live_status",
+                        experiment_id=experiment_id,
+                    )
+                )
+
+            asyncio.run(reserve())
+            client = TestClient(create_app(browser_service=service))
+            with client:
+                live = client.post(
+                    "/v1/browser/inspect",
+                    json={
+                        "operation": "get_stream_status",
+                        "payload": {
+                            "experiment_id": experiment_id,
+                            "capture_uuid": "55555555-5555-4555-8555-555555555555",
+                        },
+                    },
+                )
+                js.generation = 6
+                persisted = client.post(
+                    "/v1/browser/inspect",
+                    json={
+                        "operation": "get_stream_status",
+                        "payload": {"experiment_id": experiment_id},
+                    },
+                )
+            self.assertEqual(live.status_code, 200, live.text)
+            self.assertEqual(live.json()["result"]["source"], "live-mcp")
+            self.assertEqual(persisted.status_code, 200, persisted.text)
+            self.assertEqual(persisted.json()["result"]["source"], "manifest")
+            self.assertEqual(js.status_calls, 1)
+
+    def test_unknown_stream_start_is_not_reported_as_stopped(self) -> None:
+        class UnknownStartJs(FakeJsReverse):
+            @property
+            def transport_generation(self) -> int:
+                return 7
+
+            async def start_stream_capture(
+                self,
+                *,
+                experiment_id: str,
+                matcher: RequestMatcher,
+                include_in_flight: bool,
+                deadline: Deadline,
+            ) -> dict[str, Any]:
+                capture_dir = (
+                    self.evidence_root
+                    / "experiments"
+                    / experiment_id
+                    / "js-reverse"
+                    / "capture-unknown"
+                )
+                capture_dir.mkdir(parents=True, exist_ok=True)
+                (capture_dir / "capture.json").write_text(
+                    json.dumps(
+                        {
+                            "captureId": 77,
+                            "captureUuid": "33333333-3333-4333-8333-333333333333",
+                            "status": "capturing",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                raise McpToolCallError(
+                    "start outcome unknown",
+                    outcome_unknown=True,
+                    transport_generation=7,
+                )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            events: list[str] = []
+            service = BrowserActionService(
+                playwright=FakePlaywright(events),
+                js_reverse=UnknownStartJs(events, root),
+                experiments=ExperimentStore(root),
+                default_browser_endpoint="http://127.0.0.1:9222",
+            )
+
+            async def exercise() -> dict[str, Any]:
+                await service.run(
+                    OpenSessionRequest(
+                        operation="open_session",
+                        payload={"session_id": "unknown_start"},
+                    )
+                )
+                request = CaptureFlowRequest(
+                    operation="capture_flow",
+                    payload={
+                        "session_id": "unknown_start",
+                        "objective": "unknown start",
+                        "primary_request": {"expected_min_matches": 0},
+                        "execution_mode": "sync",
+                        "deadline_ms": 10_000,
+                    },
+                )
+                response = await service.run(request)
+                manifest = service.experiments.load_manifest(response.experiment_id)
+                await service.close()
+                return manifest
+
+            manifest = asyncio.run(exercise())
+            health = manifest["capture_health"]
+            self.assertEqual(health["stream_start_status"], "outcome_unknown")
+            self.assertFalse(health["collector_stopped"])
+            self.assertEqual(health["collector_cleanup"], "unknown")
+            self.assertEqual(
+                health["capture_uuid"],
+                "33333333-3333-4333-8333-333333333333",
+            )
+            self.assertEqual(health["capture_namespace"], manifest["experiment_id"])
+
+    def test_stop_success_is_not_overwritten_by_post_stop_status_failure(self) -> None:
+        class PostStopStatusFailureJs(FakeJsReverse):
+            async def get_stream_status(
+                self,
+                capture_id: int,
+                deadline: Deadline,
+                **kwargs: Any,
+            ) -> dict[str, Any]:
+                if self.status_payload.get("capture", {}).get("status") == "stopped":
+                    raise RuntimeError("synthetic post-stop status failure")
+                return await super().get_stream_status(capture_id, deadline, **kwargs)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            events: list[str] = []
+            service = BrowserActionService(
+                playwright=FakePlaywright(events),
+                js_reverse=PostStopStatusFailureJs(
+                    events, root, include_supporting_failure=False
+                ),
+                experiments=ExperimentStore(root),
+                default_browser_endpoint="http://127.0.0.1:9222",
+            )
+
+            async def exercise() -> dict[str, Any]:
+                await service.run(
+                    OpenSessionRequest(
+                        operation="open_session",
+                        payload={"session_id": "stop_status"},
+                    )
+                )
+                request = CaptureFlowRequest(
+                    operation="capture_flow",
+                    payload={
+                        "session_id": "stop_status",
+                        "objective": "stop then status fails",
+                        "primary_request": {
+                            "url_contains": "/conversation",
+                            "expected_min_matches": 0,
+                        },
+                        "execution_mode": "sync",
+                        "deadline_ms": 10_000,
+                    },
+                )
+                response = await service.run(request)
+                manifest = service.experiments.load_manifest(response.experiment_id)
+                await service.close()
+                return manifest
+
+            manifest = asyncio.run(exercise())
+            health = manifest["capture_health"]
+            self.assertTrue(health["collector_stopped"])
+            self.assertEqual(health["collector_cleanup"], "completed")
+            self.assertIsNone(health["orphan_capture_id"])
+            self.assertTrue(
+                any("post-stop status" in item for item in manifest["warnings"])
+            )
+
+    def test_cancel_experiment_waits_for_cleanup_and_releases_browser(self) -> None:
+        class BlockingPlaywright(FakePlaywright):
+            def __init__(self, events: list[str]) -> None:
+                super().__init__(events)
+                self.started = asyncio.Event()
+
+            async def execute_step(
+                self,
+                session_ref: str,
+                step: FlowStep,
+                experiment_dir: Path,
+                deadline: Deadline,
+            ) -> dict[str, Any]:
+                self.started.set()
+                await asyncio.Event().wait()
+                raise AssertionError("unreachable")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            events: list[str] = []
+            playwright = BlockingPlaywright(events)
+            service = BrowserActionService(
+                playwright=playwright,
+                js_reverse=FakeJsReverse(
+                    events, root, include_supporting_failure=False
+                ),
+                experiments=ExperimentStore(root),
+                default_browser_endpoint="http://127.0.0.1:9222",
+            )
+
+            async def exercise() -> tuple[dict[str, Any], bool]:
+                await service.run(
+                    OpenSessionRequest(
+                        operation="open_session",
+                        payload={"session_id": "cancel_public"},
+                    )
+                )
+                started = await service.run(
+                    CaptureFlowRequest(
+                        operation="capture_flow",
+                        payload={
+                            "session_id": "cancel_public",
+                            "objective": "cancel public job",
+                            "primary_request": {"expected_min_matches": 0},
+                            "flow": [
+                                {
+                                    "step_id": "blocking_click",
+                                    "action": "click",
+                                    "locator": {"css": "#send"},
+                                }
+                            ],
+                            "execution_mode": "job",
+                            "job_timeout_ms": 30_000,
+                        },
+                    )
+                )
+                await playwright.started.wait()
+                canceled = await service.run(
+                    CancelExperimentRequest(
+                        operation="cancel_experiment",
+                        payload={
+                            "experiment_id": started.experiment_id,
+                            "session_id": "cancel_public",
+                        },
+                    )
+                )
+                manifest = service.experiments.load_manifest(started.experiment_id)
+                released = service.coordinator.browser_owner is None
+                self.assertEqual(canceled.status, "interrupted")
+                await service.close()
+                return manifest, released
+
+            manifest, released = asyncio.run(exercise())
+            self.assertTrue(released)
+            self.assertEqual(manifest["status"], "interrupted")
+            self.assertEqual(
+                manifest["capture_health"]["collector_cleanup"],
+                "completed",
+            )
+
+    def test_canceling_read_only_wait_step_records_canceled(self) -> None:
+        class BlockingWaitJs(FakeJsReverse):
+            def __init__(self, events: list[str], root: Path) -> None:
+                super().__init__(events, root, include_supporting_failure=False)
+                self.wait_started = asyncio.Event()
+
+            async def wait_for_stream_condition(
+                self,
+                *,
+                capture_id: int,
+                request_matcher: RequestMatcher,
+                condition: WaitCondition,
+                checkpoint: StreamCheckpoint,
+                deadline: Deadline,
+            ) -> StreamWaitResult:
+                self.wait_started.set()
+                await asyncio.Event().wait()
+                raise AssertionError("unreachable")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            events: list[str] = []
+            js = BlockingWaitJs(events, root)
+            service = BrowserActionService(
+                playwright=FakePlaywright(events),
+                js_reverse=js,
+                experiments=ExperimentStore(root),
+                default_browser_endpoint="http://127.0.0.1:9222",
+            )
+
+            async def exercise() -> dict[str, Any]:
+                await service.run(
+                    OpenSessionRequest(
+                        operation="open_session",
+                        payload={"session_id": "cancel_wait"},
+                    )
+                )
+                started = await service.run(
+                    CaptureFlowRequest(
+                        operation="capture_flow",
+                        payload={
+                            "session_id": "cancel_wait",
+                            "objective": "cancel read-only wait",
+                            "primary_request": {"expected_min_matches": 0},
+                            "flow": [
+                                {
+                                    "step_id": "wait_event",
+                                    "action": "wait",
+                                    "condition": {
+                                        "type": "first_event",
+                                        "request_matcher": {
+                                            "url_contains": "/conversation"
+                                        },
+                                    },
+                                }
+                            ],
+                            "execution_mode": "job",
+                            "job_timeout_ms": 30_000,
+                        },
+                    )
+                )
+                await js.wait_started.wait()
+                await service.run(
+                    CancelExperimentRequest(
+                        operation="cancel_experiment",
+                        payload={
+                            "experiment_id": started.experiment_id,
+                            "session_id": "cancel_wait",
+                        },
+                    )
+                )
+                manifest = service.experiments.load_manifest(started.experiment_id)
+                await service.close()
+                return manifest
+
+            manifest = asyncio.run(exercise())
+            self.assertEqual(manifest["steps"][0]["status"], "canceled")
+
+    def test_stream_disabled_uses_not_required_collector_integrity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client, _, _ = self.make_client(Path(temp_dir))
+            request = {
+                "operation": "capture_flow",
+                "payload": {
+                    "session_id": "session_one",
+                    "objective": "page-only baseline",
+                    "primary_request": {
+                        "expected_min_matches": 0,
+                        "expected_max_matches": 1,
+                        "allow_supporting_failures": False,
+                    },
+                    "capture": {
+                        "stream": False,
+                        "network": False,
+                        "trace": False,
+                        "screenshots": False,
+                    },
+                    "execution_mode": "sync",
+                    "deadline_ms": 10_000,
+                },
+            }
+            with client:
+                self.open_session(client)
+                response = client.post("/v1/browser/run", json=request)
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json()["status"], "completed")
+            manifest = json.loads(
+                (
+                    Path(temp_dir)
+                    / response.json()["result"]["manifest_relative_path"]
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["collector_integrity"], "not_required")
 
     def test_action_experiment_summary_is_bounded(self) -> None:
         manifest = {

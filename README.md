@@ -38,6 +38,9 @@ GPT
     └── workspaceExecPwsh
 
 web_rev_action
+├── RuntimeCoordinator
+│   ├── browser operation reservation
+│   └── protected workspace mutation reservation
 ├── Browser Orchestrator
 │   ├── PlaywrightCliAdapter
 │   └── JsReverseMcpAdapter
@@ -83,6 +86,7 @@ open_session
 capture_baseline
 capture_flow
 close_session
+cancel_experiment
 ```
 
 一次 `capture_flow` 由后端原子执行：
@@ -102,7 +106,15 @@ GPT 不直接协调 start、click、wait、stop。
 
 Capture 阶段禁止 `target.start_url`。需要观察页面初始化请求、重定向、首屏脚本或初始 SSE 时，必须把导航写成 flow 的第一个显式 `navigate` step。这样 running manifest、Trace 和 stream collector 都会在导航前创建。
 
-`target.page_index` 默认是 `null`，表示复用 session 已选择的 tab；只有显式传值时才切换。当前部署共享一个浏览器和一个私有 MCP，因此全局同时只允许一个活动实验，不排队第二个实验。
+`target.page_index` 默认是 `null`，表示复用 session 已选择的 tab；只有显式传值时才切换。当前部署共享一个浏览器和一个私有 MCP，因此全局同时只允许一个 browser operation，不排队第二个操作。Open、close、sync capture 和 background capture 都必须先原子取得 RuntimeCoordinator reservation，未取得前不会 attach 或创建 running manifest。
+
+错误提交的后台任务可以显式调用：
+
+```text
+cancel_experiment { experiment_id, session_id }
+```
+
+它会取消对应 task、等待 collector/Trace cleanup 和 terminal manifest 完成，并在 browser reservation 已释放后返回。
 
 ### `inspectBrowserEvidence`
 
@@ -115,11 +127,20 @@ get_experiment
 get_stream_status
 ```
 
+公开 `get_stream_status` 使用：
+
+```text
+experiment_id
+capture_uuid (optional)
+```
+
+数字 `captureId` 是私有 MCP generation 内短期 handle，不是公开查询主键。运行中的 experiment 只有在 UUID 和 transport generation 一致时查询 live MCP；结束后的 experiment 或 MCP 重启后的查询直接读取持久 manifest。
+
 需要查看 `manifest.json`、`events.jsonl`、源码、schema、脚本或报告时，使用 workspace Actions。
 
 执行 endpoint 和 `get_experiment` 只返回有界实验摘要及 `manifest_relative_path`。完整 manifest、network summary、requests 和 artifact 索引通过 `workspaceReadFiles` 读取。
 
-Stream 和普通 network status 都会读取全部分页，并在执行 event predicate 前锁定具体 primary request ID；`matchedRequestId` 不属于该 request 时不会满足等待。同一 session 重复提交返回 `409 session_busy`，其他 session 遇到活动实验返回 `409 browser_busy`。
+Stream 和普通 network status 都会读取全部分页，并在执行 event predicate 前锁定具体 primary request ID；`matchedRequestId` 不属于该 request 时不会满足等待。同一 session 重复提交返回 `409 session_busy`，其他 browser operation 返回 `409 browser_busy`。Protected workspace mutation 与 browser operation 通过同一 RuntimeCoordinator 双向互斥，避免 TOCTOU。
 
 ## Background job
 
@@ -226,9 +247,19 @@ selector_state
 
 正文谓词由 `js-reverse-mcp` collector 在完整事件文件中匹配。MCP 只返回匹配索引和 request ID，不把事件正文塞回 Action。
 
+Collector 同时维护 source-specific `event index → JSONL byte offset`。每次 predicate 从 `afterEventIndex` 后的记录 offset 直接 seek，不从文件头反复扫描旧事件。
+
 每个会改变页面或请求状态的动作前，后端记录每个 request 的 response 状态、terminal wall time、raw event index 和 semantic event index。后续 wait 只匹配 checkpoint 后新出现或发生状态转换的 request/event；raw 与 EventSource semantic mirror 使用独立游标和 source-specific offset。
 
-取消执行型 step 时会终止本地 Playwright 进程树并停止后续 step，但已经送达页面的 click、navigate 或 upload 无法通用回滚。该 step 在 manifest 中标记为 `canceled_outcome_unknown`，不会自动重试。
+取消执行型 step 时会终止本地 Playwright 进程树并停止后续 step，但已经送达页面的 click、navigate 或 upload 无法通用回滚。该 step 在 manifest 中标记为 `canceled_outcome_unknown`，不会自动重试。取消 `wait`、`assert` 或 `snapshot` 等只读 step 时标记为 `canceled`。
+
+Stream start 显式建模为：
+
+```text
+not_attempted | failed_before_send | confirmed | outcome_unknown
+```
+
+Start 已 dispatch 但调用超时或取消时，后端扫描 experiment namespace 中的 `capture.json` 恢复持久身份，但 `collector_stopped=false`、`collector_cleanup=unknown`，不会把旧数字 ID 当作新 MCP generation 中的 live capture。
 
 Objective 可以分别声明：
 
@@ -290,12 +321,13 @@ start_line / end_line
 total_lines
 bytes
 sha256
+changed_during_read
 content
 truncated
 error
 ```
 
-读取不会先把整个文件载入内存。实现使用增量 UTF-8 校验和 SHA-256，再按行号流式提取目标范围；大型 `events.jsonl` 和 `decoded.sse` 的内存占用由响应预算限定。
+读取不会先把整个文件载入内存，也不会用两次扫描拼出一个不一致结果。一次流式遍历同时完成 UTF-8 decode、字节数、总行数、目标行和可选 SHA-256。仅查看片段时可传 `include_sha256=false`。文件在读取期间增长或被替换时返回 `changed_during_read=true` 且不提供稳定 SHA。
 
 二进制文件不会被伪装成文本。对 `raw.bin`、压缩数据或二进制 payload 使用 PowerShell。
 
@@ -423,7 +455,7 @@ WEB_REV_WORKSPACE_SHELL=pwsh
 WEB_REV_WORKSPACE_ALLOW_NETWORK=false
 ```
 
-同一个 analysis workspace 由 OS 文件锁强制只能有一个服务进程。内置 CLI 固定 `workers=1`；多个 Uvicorn worker 或第二个服务进程会在启动时失败。
+同一个 analysis workspace 由 OS 文件锁强制只能有一个服务进程。启动顺序是 workspace root → OS lock → ExperimentStore recovery → BrowserService。内置 CLI 固定 `workers=1`；多个 Uvicorn worker 或第二个服务进程会在恢复 running experiment 之前失败。
 
 原始证据路径是只读的：
 
@@ -434,7 +466,7 @@ experiments/*/js-reverse/
 experiments/*/playwright/
 ```
 
-实验运行期间禁止 workspace 写入和 PowerShell。实验结束后，派生文件只能写到 `reports/`、`derived/`、`replay/` 或顶层分析目录中的相应工作区，避免修改原始证据。
+实验运行期间禁止 workspace 写入和 PowerShell。Browser operation 与 write/patch/PowerShell 使用同一个 RuntimeCoordinator，reservation 原子互斥。实验结束后，派生文件只能写到 `reports/`、`derived/`、`replay/` 或顶层分析目录中的相应工作区，避免修改原始证据。
 
 默认私有 MCP 参数：
 

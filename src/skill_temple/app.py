@@ -27,7 +27,11 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from .browser_routes import register_browser_actions
-from .browser_service import BrowserActionService, build_browser_service_from_environment
+from .browser_service import (
+    BrowserActionService,
+    analysis_workspace_root_from_environment,
+    build_browser_service_from_environment,
+)
 from .runtime import (
     DEFAULT_MAX_SKILLS,
     SkillNotFoundError,
@@ -35,6 +39,7 @@ from .runtime import (
     env_value_from_environment_or_dotenv,
     load_runtime,
 )
+from .runtime_coordinator import RuntimeCoordinator
 from .workspace_routes import register_workspace_actions
 from .workspace_service import AnalysisWorkspaceService
 
@@ -511,13 +516,24 @@ def create_app(
             detail = structured_error("unsafe_or_missing_path", str(exc), "check_path")
             raise HTTPException(status_code=404, detail=detail) from exc
 
-    resolved_browser_service = browser_service or build_browser_service_from_environment()
     guard_key: str | None = None
+    coordinator = (
+        browser_service.coordinator if browser_service is not None else RuntimeCoordinator()
+    )
     if browser_service is None:
-        guard_key = _acquire_single_process_guard(
-            resolved_browser_service.experiments.root
-        )
+        evidence_root = analysis_workspace_root_from_environment()
+        guard_key = _acquire_single_process_guard(evidence_root)
         app.state.single_process_guard_key = guard_key
+        try:
+            resolved_browser_service = build_browser_service_from_environment(
+                evidence_root=evidence_root,
+                coordinator=coordinator,
+            )
+        except Exception:
+            _release_single_process_guard(guard_key)
+            raise
+    else:
+        resolved_browser_service = browser_service
     register_browser_actions(app, resolved_browser_service)
     resolved_workspace_service = workspace_service or AnalysisWorkspaceService(
         resolved_browser_service.experiments.root,
@@ -529,6 +545,7 @@ def create_app(
             or "false"
         ).lower()
         in {"1", "true", "yes", "on"},
+        coordinator=coordinator,
     )
     register_workspace_actions(app, resolved_workspace_service)
 

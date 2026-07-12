@@ -18,6 +18,7 @@ from .browser_adapters import (
     AlignmentResult,
     JsReverseAdapter,
     JsReverseMcpAdapter,
+    McpToolCallError,
     McpToolTransport,
     PlaywrightAdapter,
     PlaywrightCliAdapter,
@@ -27,6 +28,7 @@ from .browser_adapters import (
 )
 from .browser_models import (
     BrowserActionResponse,
+    CancelExperimentRequest,
     CaptureBaselineRequest,
     CaptureFlowPayload,
     CaptureFlowRequest,
@@ -43,6 +45,11 @@ from .browser_models import (
     WaitCondition,
 )
 from .runtime import env_value_from_environment_or_dotenv
+from .runtime_coordinator import (
+    RuntimeCoordinator,
+    RuntimeOwner,
+    RuntimeReservationError,
+)
 
 
 class BrowserServiceError(RuntimeError):
@@ -144,6 +151,13 @@ class ExperimentStore:
             return None
         return json.loads(path.read_text(encoding="utf-8"))
 
+    @staticmethod
+    def new_experiment_id() -> str:
+        return (
+            f"exp_{datetime.now(UTC).strftime('%Y%m%dT%H%M%S')}_"
+            f"{uuid.uuid4().hex[:10]}"
+        )
+
     def create_experiment(
         self,
         *,
@@ -151,8 +165,9 @@ class ExperimentStore:
         operation: str,
         objective: str,
         deadline: Deadline,
+        experiment_id: str | None = None,
     ) -> tuple[str, Path, dict[str, Any]]:
-        experiment_id = f"exp_{datetime.now(UTC).strftime('%Y%m%dT%H%M%S')}_{uuid.uuid4().hex[:10]}"
+        experiment_id = experiment_id or self.new_experiment_id()
         directory = self.experiment_dir(experiment_id)
         for child in ["playwright", "js-reverse", "reports"]:
             (directory / child).mkdir(parents=True, exist_ok=True)
@@ -291,6 +306,7 @@ class BrowserActionService:
         default_browser_endpoint: str | None = None,
         private_mcp_browser_endpoint: str | None = None,
         require_private_mcp_endpoint: bool = False,
+        coordinator: RuntimeCoordinator | None = None,
     ) -> None:
         self.playwright = playwright
         self.js_reverse = js_reverse
@@ -298,6 +314,7 @@ class BrowserActionService:
         self.default_browser_endpoint = default_browser_endpoint
         self.private_mcp_browser_endpoint = private_mcp_browser_endpoint
         self.require_private_mcp_endpoint = require_private_mcp_endpoint
+        self.coordinator = coordinator or RuntimeCoordinator()
         self.service_instance_id = f"svc_{uuid.uuid4().hex}"
         self.process_started_at = utc_now()
         self.sessions: dict[str, dict[str, Any]] = {}
@@ -305,8 +322,6 @@ class BrowserActionService:
         self._browser_lock = asyncio.Lock()
         self._jobs: dict[str, asyncio.Task[None]] = {}
         self._active_session_jobs: dict[str, str] = {}
-        self._active_browser_experiment_id: str | None = None
-        self._active_browser_session_id: str | None = None
 
     def _session_lock(self, session_id: str) -> asyncio.Lock:
         return self._session_locks.setdefault(session_id, asyncio.Lock())
@@ -354,36 +369,107 @@ class BrowserActionService:
             return None
         return experiment_id
 
-    def _assert_browser_idle(self) -> None:
-        if self._active_browser_experiment_id is None:
-            return
-        raise BrowserServiceError(
-            "browser_busy",
-            "The shared browser already has an active experiment: "
-            f"{self._active_browser_experiment_id} "
-            f"(session {self._active_browser_session_id}).",
-            409,
-        )
-
-    def _reserve_browser_experiment(
+    async def _reserve_browser_operation(
         self,
         *,
         session_id: str,
-        experiment_id: str,
+        owner_id: str,
+        operation: str,
+        experiment_id: str | None = None,
     ) -> None:
-        self._assert_browser_idle()
-        self._active_browser_experiment_id = experiment_id
-        self._active_browser_session_id = session_id
+        try:
+            await self.coordinator.reserve_browser(
+                RuntimeOwner(
+                    kind="browser",
+                    owner_id=owner_id,
+                    operation=operation,
+                    session_id=session_id,
+                    experiment_id=experiment_id,
+                )
+            )
+        except RuntimeReservationError as exc:
+            raise BrowserServiceError(exc.code, str(exc), 409) from exc
 
-    def _release_browser_experiment(self, experiment_id: str) -> None:
-        if self._active_browser_experiment_id != experiment_id:
-            return
-        self._active_browser_experiment_id = None
-        self._active_browser_session_id = None
+    async def _release_browser_operation(self, owner_id: str) -> None:
+        await self.coordinator.release_browser(owner_id)
 
     @staticmethod
     def _manifest_relative_path(experiment_id: str) -> str:
         return (Path("experiments") / experiment_id / "manifest.json").as_posix()
+
+    def _transport_generation(self) -> int:
+        return int(getattr(self.js_reverse, "transport_generation", 0))
+
+    def _discover_capture_metadata(self, experiment_id: str) -> dict[str, Any] | None:
+        base = self.experiments.experiment_dir(experiment_id) / "js-reverse"
+        candidates = sorted(
+            base.glob("capture-*/capture.json"),
+            key=lambda path: path.stat().st_mtime_ns if path.exists() else 0,
+            reverse=True,
+        )
+        for path in candidates:
+            try:
+                value = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(value, dict):
+                continue
+            relative = self.experiments.relative_path(str(path.parent))
+            return {
+                "capture_id": value.get("captureId"),
+                "capture_uuid": value.get("captureUuid"),
+                "capture_relative_dir": relative,
+                "capture_metadata_artifact_id": (
+                    (value.get("metadataArtifact") or {}).get("artifactId")
+                    if isinstance(value.get("metadataArtifact"), dict)
+                    else None
+                ),
+                "capture_metadata_relative_path": self.experiments.relative_path(
+                    str(path)
+                ),
+            }
+        return None
+
+    @staticmethod
+    def _manifest_stream_runtime(manifest: dict[str, Any]) -> dict[str, Any]:
+        runtime = manifest.get("stream_runtime")
+        if isinstance(runtime, dict):
+            return dict(runtime)
+        health = manifest.get("capture_health")
+        health = health if isinstance(health, dict) else {}
+        return {
+            "capture_id": manifest.get("stream_capture_id"),
+            "capture_uuid": health.get("capture_uuid"),
+            "capture_relative_dir": health.get("capture_relative_dir"),
+            "capture_metadata_artifact_id": health.get(
+                "capture_metadata_artifact_id"
+            ),
+            "transport_generation": health.get("transport_generation"),
+            "start_status": health.get("stream_start_status"),
+        }
+
+    def _write_stream_runtime(
+        self,
+        *,
+        experiment_id: str,
+        manifest: dict[str, Any],
+        start_status: str,
+        capture_id: int | None,
+        capture_uuid: str | None,
+        capture_relative_dir: str | None,
+        capture_metadata_artifact_id: str | None,
+        transport_generation: int | None,
+    ) -> None:
+        manifest["stream_runtime"] = {
+            "start_status": start_status,
+            "capture_id": capture_id,
+            "capture_uuid": capture_uuid,
+            "capture_relative_dir": capture_relative_dir,
+            "capture_metadata_artifact_id": capture_metadata_artifact_id,
+            "transport_generation": transport_generation,
+            "capture_namespace": experiment_id,
+        }
+        self.experiments.write_manifest(experiment_id, manifest)
 
     @staticmethod
     def _experiment_summary(manifest: dict[str, Any]) -> dict[str, Any]:
@@ -454,52 +540,111 @@ class BrowserActionService:
         return session
 
     async def run(self, request: RunBrowserExperimentRequest) -> BrowserActionResponse:
+        if isinstance(request, CancelExperimentRequest):
+            return await self._cancel_experiment(request)
         if isinstance(request, OpenSessionRequest):
-            self._assert_browser_idle()
-            return await self._open_session(request)
-        if isinstance(request, CloseSessionRequest):
-            self._assert_browser_idle()
-            return await self._close_session(request)
-        if isinstance(request, (CaptureFlowRequest, CaptureBaselineRequest)):
-            active_session_experiment = self._active_job_for_session(
-                request.payload.session_id
-            )
-            if active_session_experiment is not None:
-                raise BrowserServiceError(
-                    "session_busy",
-                    "The browser session already has an active background experiment: "
-                    f"{active_session_experiment}",
-                    409,
-                )
-            self._assert_browser_idle()
-            if request.payload.execution_mode == "job":
-                return self._start_capture_job(request)
-            payload = request.payload
-            deadline = Deadline(payload.deadline_ms)
-            experiment_id, experiment_dir, manifest = self.experiments.create_experiment(
-                session_id=payload.session_id,
-                operation=request.operation,
-                objective=payload.objective,
-                deadline=deadline,
-            )
-            manifest["execution_mode"] = "sync"
-            manifest["primary_request_matcher"] = payload.primary_request.model_dump(
-                mode="json", exclude_none=True
-            )
-            self.experiments.write_manifest(experiment_id, manifest)
-            self._reserve_browser_experiment(
-                session_id=payload.session_id,
-                experiment_id=experiment_id,
+            session_id = request.payload.session_id or f"sess_{uuid.uuid4().hex[:12]}"
+            owner_id = f"open_{uuid.uuid4().hex}"
+            await self._reserve_browser_operation(
+                session_id=session_id,
+                owner_id=owner_id,
+                operation="open_session",
             )
             try:
+                return await self._open_session(request, session_id=session_id)
+            finally:
+                await self._release_browser_operation(owner_id)
+        if isinstance(request, CloseSessionRequest):
+            owner_id = f"close_{uuid.uuid4().hex}"
+            await self._reserve_browser_operation(
+                session_id=request.payload.session_id,
+                owner_id=owner_id,
+                operation="close_session",
+            )
+            try:
+                return await self._close_session(request)
+            finally:
+                await self._release_browser_operation(owner_id)
+        if isinstance(request, (CaptureFlowRequest, CaptureBaselineRequest)):
+            experiment_id = self.experiments.new_experiment_id()
+            await self._reserve_browser_operation(
+                session_id=request.payload.session_id,
+                owner_id=experiment_id,
+                operation=request.operation,
+                experiment_id=experiment_id,
+            )
+            if request.payload.execution_mode == "job":
+                try:
+                    return self._start_capture_job(
+                        request,
+                        experiment_id=experiment_id,
+                    )
+                except Exception:
+                    await self._release_browser_operation(experiment_id)
+                    raise
+            payload = request.payload
+            deadline = Deadline(payload.deadline_ms)
+            try:
+                experiment_id, experiment_dir, manifest = (
+                    self.experiments.create_experiment(
+                        session_id=payload.session_id,
+                        operation=request.operation,
+                        objective=payload.objective,
+                        deadline=deadline,
+                        experiment_id=experiment_id,
+                    )
+                )
+                manifest["execution_mode"] = "sync"
+                manifest["primary_request_matcher"] = (
+                    payload.primary_request.model_dump(mode="json", exclude_none=True)
+                )
+                self.experiments.write_manifest(experiment_id, manifest)
                 return await self._capture_flow(
                     request,
                     deadline=deadline,
                     prepared=(experiment_id, experiment_dir, manifest),
                 )
             finally:
-                self._release_browser_experiment(experiment_id)
+                await self._release_browser_operation(experiment_id)
         raise BrowserServiceError("unsupported_operation", "Unsupported browser operation", 400)
+
+    async def _cancel_experiment(
+        self,
+        request: CancelExperimentRequest,
+    ) -> BrowserActionResponse:
+        experiment_id = request.payload.experiment_id
+        manifest = self.experiments.load_manifest(experiment_id)
+        if manifest.get("session_id") != request.payload.session_id:
+            raise BrowserServiceError(
+                "experiment_session_mismatch",
+                "Experiment does not belong to the supplied session.",
+                409,
+            )
+        task = self._jobs.get(experiment_id)
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            manifest = self.experiments.load_manifest(experiment_id)
+        return BrowserActionResponse(
+            operation=request.operation,
+            status=(
+                str(manifest.get("status"))
+                if manifest.get("status")
+                in {"running", "completed", "failed", "partial", "interrupted"}
+                else "partial"
+            ),
+            session_id=request.payload.session_id,
+            experiment_id=experiment_id,
+            result={
+                "experiment": self._experiment_summary(manifest),
+                "manifest_relative_path": self._manifest_relative_path(experiment_id),
+                "collector_cleanup": (
+                    (manifest.get("capture_health") or {}).get("collector_cleanup")
+                    if isinstance(manifest.get("capture_health"), dict)
+                    else None
+                ),
+            },
+        )
 
     async def inspect(self, request: InspectBrowserEvidenceRequest) -> BrowserActionResponse:
         if isinstance(request, GetSessionRequest):
@@ -541,21 +686,80 @@ class BrowserActionService:
                 },
             )
         if isinstance(request, GetStreamStatusRequest):
-            self._get_session(request.payload.session_id)
-            deadline = Deadline(10_000)
-            status = await self.js_reverse.get_stream_status(request.payload.capture_id, deadline)
+            manifest = self.experiments.load_manifest(request.payload.experiment_id)
+            runtime = self._manifest_stream_runtime(manifest)
+            expected_uuid = runtime.get("capture_uuid")
+            if (
+                request.payload.capture_uuid is not None
+                and expected_uuid is not None
+                and request.payload.capture_uuid != expected_uuid
+            ):
+                raise BrowserServiceError(
+                    "capture_uuid_mismatch",
+                    "The supplied capture UUID does not match the experiment manifest.",
+                    409,
+                )
+            owner = self.coordinator.browser_owner
+            capture_id = runtime.get("capture_id")
+            recorded_generation = runtime.get("transport_generation")
+            live = (
+                manifest.get("status") == "running"
+                and owner is not None
+                and owner.experiment_id == request.payload.experiment_id
+                and isinstance(capture_id, int)
+                and recorded_generation == self._transport_generation()
+            )
+            if live:
+                status = await self.js_reverse.get_stream_status(
+                    int(capture_id), Deadline(10_000)
+                )
+                returned_capture = status.get("capture")
+                returned_uuid = (
+                    returned_capture.get("captureUuid")
+                    if isinstance(returned_capture, dict)
+                    else None
+                )
+                if expected_uuid and returned_uuid != expected_uuid:
+                    raise BrowserServiceError(
+                        "capture_identity_mismatch",
+                        "Live MCP capture identity does not match the experiment manifest.",
+                        409,
+                    )
+                source = "live-mcp"
+            else:
+                persisted = manifest.get("stream_status")
+                status = (
+                    dict(persisted)
+                    if isinstance(persisted, dict)
+                    else {
+                        "capture": {
+                            "captureUuid": expected_uuid,
+                            "relativeDir": runtime.get("capture_relative_dir"),
+                            "status": manifest.get("status"),
+                        },
+                        "requests": manifest.get("primary_requests", []),
+                    }
+                )
+                source = "manifest"
             return BrowserActionResponse(
                 operation=request.operation,
-                status="completed",
-                session_id=request.payload.session_id,
-                result={"stream": status},
+                status=(
+                    "running" if manifest.get("status") == "running" else "completed"
+                ),
+                session_id=manifest.get("session_id"),
+                experiment_id=request.payload.experiment_id,
+                result={"stream": status, "source": source},
             )
         raise BrowserServiceError("unsupported_operation", "Unsupported inspect operation", 400)
 
-    async def _open_session(self, request: OpenSessionRequest) -> BrowserActionResponse:
+    async def _open_session(
+        self,
+        request: OpenSessionRequest,
+        *,
+        session_id: str,
+    ) -> BrowserActionResponse:
         payload = request.payload
         deadline = Deadline(payload.deadline_ms)
-        session_id = payload.session_id or f"sess_{uuid.uuid4().hex[:12]}"
         _safe_identifier(session_id, "session_id")
         endpoint = payload.browser_endpoint or self.default_browser_endpoint
         if not endpoint:
@@ -1052,26 +1256,22 @@ class BrowserActionService:
         return list(artifacts.values())
 
     def _start_capture_job(
-        self, request: CaptureFlowRequest | CaptureBaselineRequest
+        self,
+        request: CaptureFlowRequest | CaptureBaselineRequest,
+        *,
+        experiment_id: str,
     ) -> BrowserActionResponse:
         payload = request.payload
         session = self._get_session(payload.session_id)
         if session.get("status") != "open":
             raise BrowserServiceError("session_closed", "Browser session is not open", 409)
-        active_experiment = self._active_job_for_session(payload.session_id)
-        if active_experiment is not None:
-            raise BrowserServiceError(
-                "session_busy",
-                "The browser session already has an active background experiment: "
-                f"{active_experiment}",
-                409,
-            )
         deadline = Deadline(payload.job_timeout_ms)
         experiment_id, experiment_dir, manifest = self.experiments.create_experiment(
             session_id=payload.session_id,
             operation=request.operation,
             objective=payload.objective,
             deadline=deadline,
+            experiment_id=experiment_id,
         )
         manifest.update(
             {
@@ -1083,10 +1283,6 @@ class BrowserActionService:
             }
         )
         self.experiments.write_manifest(experiment_id, manifest)
-        self._reserve_browser_experiment(
-            session_id=payload.session_id,
-            experiment_id=experiment_id,
-        )
         task = asyncio.create_task(
             self._run_capture_job(
                 request,
@@ -1102,7 +1298,6 @@ class BrowserActionService:
             self._jobs.pop(experiment_id, None)
             if self._active_session_jobs.get(payload.session_id) == experiment_id:
                 self._active_session_jobs.pop(payload.session_id, None)
-            self._release_browser_experiment(experiment_id)
 
         task.add_done_callback(clear_job)
         return BrowserActionResponse(
@@ -1126,36 +1321,39 @@ class BrowserActionService:
     ) -> None:
         experiment_id = prepared[0]
         try:
-            await self._capture_flow(
-                request,
-                deadline=deadline,
-                prepared=prepared,
-            )
-        except asyncio.CancelledError:
-            manifest = self.experiments.load_manifest(experiment_id)
-            manifest["status"] = "interrupted"
-            manifest["errors"] = [
-                *(
-                    manifest.get("errors")
-                    if isinstance(manifest.get("errors"), list)
-                    else []
-                ),
-                "Background experiment task was canceled during service shutdown.",
-            ]
-            self.experiments.write_manifest(experiment_id, manifest)
-            raise
-        except Exception as exc:
-            manifest = self.experiments.load_manifest(experiment_id)
-            manifest["status"] = "failed"
-            manifest["errors"] = [
-                *(
-                    manifest.get("errors")
-                    if isinstance(manifest.get("errors"), list)
-                    else []
-                ),
-                str(exc)[:4000],
-            ]
-            self.experiments.write_manifest(experiment_id, manifest)
+            try:
+                await self._capture_flow(
+                    request,
+                    deadline=deadline,
+                    prepared=prepared,
+                )
+            except asyncio.CancelledError:
+                manifest = self.experiments.load_manifest(experiment_id)
+                manifest["status"] = "interrupted"
+                manifest["errors"] = [
+                    *(
+                        manifest.get("errors")
+                        if isinstance(manifest.get("errors"), list)
+                        else []
+                    ),
+                    "Background experiment task was canceled.",
+                ]
+                self.experiments.write_manifest(experiment_id, manifest)
+                raise
+            except Exception as exc:
+                manifest = self.experiments.load_manifest(experiment_id)
+                manifest["status"] = "failed"
+                manifest["errors"] = [
+                    *(
+                        manifest.get("errors")
+                        if isinstance(manifest.get("errors"), list)
+                        else []
+                    ),
+                    str(exc)[:4000],
+                ]
+                self.experiments.write_manifest(experiment_id, manifest)
+        finally:
+            await self._release_browser_operation(experiment_id)
 
     async def wait_for_job(self, experiment_id: str) -> None:
         task = self._jobs.get(experiment_id)
@@ -1169,8 +1367,11 @@ class BrowserActionService:
         experiment_dir: Path,
         payload: CaptureFlowPayload,
         capture_id: int | None,
+        stream_start_status: str,
+        capture_transport_generation: int | None,
         trace_started: bool,
         execution_deadline: Deadline,
+        canceled: bool,
     ) -> dict[str, Any]:
         cleanup_deadline = Deadline(self.FINALIZE_GRACE_MS)
         entered_reserve = execution_deadline.remaining_ms() <= self.FINALIZE_RESERVE_MS
@@ -1180,16 +1381,27 @@ class BrowserActionService:
             "trace_paths": [],
             "screenshot_paths": [],
             "network_payload": {},
-            "collector_stopped": capture_id is None,
+            "collector_stopped": (
+                not payload.capture.stream
+                or stream_start_status in {"not_attempted", "failed_before_send"}
+            ),
             "collector_cleanup": (
-                "not_required" if capture_id is None else "unknown"
+                "not_required"
+                if not payload.capture.stream
+                or stream_start_status in {"not_attempted", "failed_before_send"}
+                else "unknown"
             ),
             "orphan_capture_id": None,
             "warnings": [],
             "errors": [],
             "entered_finalize_reserve": entered_reserve,
         }
-        if capture_id is not None:
+        can_stop_live_capture = (
+            capture_id is not None
+            and stream_start_status == "confirmed"
+            and capture_transport_generation == self._transport_generation()
+        )
+        if can_stop_live_capture:
             try:
                 result["stop_payload"] = await self.js_reverse.stop_stream_capture(
                     capture_id,
@@ -1197,15 +1409,8 @@ class BrowserActionService:
                 )
                 result["collector_stopped"] = True
                 result["collector_cleanup"] = "completed"
-                if cleanup_deadline.remaining_ms() > 500:
-                    result["final_status_payload"] = (
-                        await self.js_reverse.get_stream_status(
-                            capture_id,
-                            cleanup_deadline.child(1_500),
-                        )
-                    )
             except Exception as exc:
-                result["errors"].append(f"stream finalize: {str(exc)[:3500]}")
+                result["errors"].append(f"stream stop: {str(exc)[:3500]}")
                 result["orphan_capture_id"] = capture_id
                 message = str(exc).lower()
                 result["collector_cleanup"] = (
@@ -1213,6 +1418,31 @@ class BrowserActionService:
                     if "timed out" in message or "deadline" in message
                     else "unknown"
                 )
+            else:
+                if not canceled and cleanup_deadline.remaining_ms() > 500:
+                    try:
+                        result["final_status_payload"] = (
+                            await self.js_reverse.get_stream_status(
+                                capture_id,
+                                cleanup_deadline.child(1_500),
+                            )
+                        )
+                    except Exception as exc:
+                        result["warnings"].append(
+                            f"post-stop status: {str(exc)[:3500]}"
+                        )
+                if not result["final_status_payload"] and result["stop_payload"]:
+                    result["final_status_payload"] = (
+                        dict(result["stop_payload"])
+                    )
+        elif payload.capture.stream and stream_start_status in {
+            "confirmed",
+            "outcome_unknown",
+        }:
+            result["collector_stopped"] = False
+            result["collector_cleanup"] = "unknown"
+            if capture_id is not None:
+                result["orphan_capture_id"] = capture_id
         if trace_started:
             try:
                 result["trace_paths"] = await self.playwright.stop_trace(
@@ -1223,7 +1453,11 @@ class BrowserActionService:
                 )
             except Exception as exc:
                 result["warnings"].append(f"trace finalize: {str(exc)[:3500]}")
-        if not entered_reserve and execution_deadline.remaining_ms() > 1_000:
+        if (
+            not canceled
+            and not entered_reserve
+            and execution_deadline.remaining_ms() > 1_000
+        ):
             if payload.capture.network:
                 try:
                     result["network_payload"] = (
@@ -1342,6 +1576,8 @@ class BrowserActionService:
             capture_uuid: str | None = None
             capture_relative_dir: str | None = None
             capture_metadata_artifact_id: str | None = None
+            capture_transport_generation: int | None = None
+            stream_start_status = "not_attempted"
             start_payload: dict[str, Any] = {}
             final_status_payload: dict[str, Any] = {}
             stop_payload: dict[str, Any] = {}
@@ -1370,22 +1606,124 @@ class BrowserActionService:
                     )
                     trace_started = True
                 if payload.capture.stream:
-                    start_payload = await self.js_reverse.start_stream_capture(
-                        experiment_id=experiment_id,
-                        matcher=request_matcher,
-                        include_in_flight=payload.primary_request.include_in_flight,
-                        deadline=self._operation_deadline(
-                            deadline,
-                            5_000,
-                            "stream capture start",
-                        ),
-                    )
+                    stream_start_status = "failed_before_send"
+                    try:
+                        start_payload = await self.js_reverse.start_stream_capture(
+                            experiment_id=experiment_id,
+                            matcher=request_matcher,
+                            include_in_flight=payload.primary_request.include_in_flight,
+                            deadline=self._operation_deadline(
+                                deadline,
+                                5_000,
+                                "stream capture start",
+                            ),
+                        )
+                    except asyncio.CancelledError as exc:
+                        capture_transport_generation = int(
+                            getattr(
+                                exc,
+                                "mcp_transport_generation",
+                                self._transport_generation(),
+                            )
+                        )
+                        stream_start_status = (
+                            "outcome_unknown"
+                            if bool(getattr(exc, "mcp_outcome_unknown", False))
+                            else "failed_before_send"
+                        )
+                        discovered = (
+                            self._discover_capture_metadata(experiment_id)
+                            if stream_start_status == "outcome_unknown"
+                            else None
+                        )
+                        if discovered:
+                            capture_id = (
+                                int(discovered["capture_id"])
+                                if isinstance(discovered.get("capture_id"), int)
+                                else None
+                            )
+                            capture_uuid = discovered.get("capture_uuid")
+                            capture_relative_dir = discovered.get(
+                                "capture_relative_dir"
+                            )
+                            capture_metadata_artifact_id = discovered.get(
+                                "capture_metadata_artifact_id"
+                            )
+                        self._write_stream_runtime(
+                            experiment_id=experiment_id,
+                            manifest=manifest,
+                            start_status=stream_start_status,
+                            capture_id=capture_id,
+                            capture_uuid=(
+                                str(capture_uuid) if capture_uuid is not None else None
+                            ),
+                            capture_relative_dir=(
+                                str(capture_relative_dir)
+                                if capture_relative_dir is not None
+                                else None
+                            ),
+                            capture_metadata_artifact_id=(
+                                str(capture_metadata_artifact_id)
+                                if capture_metadata_artifact_id is not None
+                                else None
+                            ),
+                            transport_generation=capture_transport_generation,
+                        )
+                        raise
+                    except McpToolCallError as exc:
+                        capture_transport_generation = exc.transport_generation
+                        stream_start_status = (
+                            "outcome_unknown"
+                            if exc.outcome_unknown
+                            else "failed_before_send"
+                        )
+                        discovered = (
+                            self._discover_capture_metadata(experiment_id)
+                            if stream_start_status == "outcome_unknown"
+                            else None
+                        )
+                        if discovered:
+                            capture_id = (
+                                int(discovered["capture_id"])
+                                if isinstance(discovered.get("capture_id"), int)
+                                else None
+                            )
+                            capture_uuid = discovered.get("capture_uuid")
+                            capture_relative_dir = discovered.get(
+                                "capture_relative_dir"
+                            )
+                            capture_metadata_artifact_id = discovered.get(
+                                "capture_metadata_artifact_id"
+                            )
+                        self._write_stream_runtime(
+                            experiment_id=experiment_id,
+                            manifest=manifest,
+                            start_status=stream_start_status,
+                            capture_id=capture_id,
+                            capture_uuid=(
+                                str(capture_uuid) if capture_uuid is not None else None
+                            ),
+                            capture_relative_dir=(
+                                str(capture_relative_dir)
+                                if capture_relative_dir is not None
+                                else None
+                            ),
+                            capture_metadata_artifact_id=(
+                                str(capture_metadata_artifact_id)
+                                if capture_metadata_artifact_id is not None
+                                else None
+                            ),
+                            transport_generation=capture_transport_generation,
+                        )
+                        raise
                     capture = start_payload.get("capture")
                     if not isinstance(capture, dict) or not capture.get("captureId"):
                         raise BrowserServiceError(
                             "stream_start_invalid", "Stream collector returned no capture ID", 502
                         )
                     capture_id = int(capture["captureId"])
+                    capture_transport_generation = self._transport_generation()
+                    stream_start_status = "confirmed"
                     capture_uuid = (
                         str(capture["captureUuid"])
                         if capture.get("captureUuid")
@@ -1415,6 +1753,16 @@ class BrowserActionService:
                             1_500,
                             "initial stream checkpoint",
                         ),
+                    )
+                    self._write_stream_runtime(
+                        experiment_id=experiment_id,
+                        manifest=manifest,
+                        start_status=stream_start_status,
+                        capture_id=capture_id,
+                        capture_uuid=capture_uuid,
+                        capture_relative_dir=capture_relative_dir,
+                        capture_metadata_artifact_id=capture_metadata_artifact_id,
+                        transport_generation=capture_transport_generation,
                     )
                 if payload.capture.screenshots:
                     try:
@@ -1515,16 +1863,25 @@ class BrowserActionService:
                             )
                         )
                     except asyncio.CancelledError:
+                        canceled_status = (
+                            "canceled"
+                            if step.action in {"wait", "assert", "snapshot"}
+                            else "canceled_outcome_unknown"
+                        )
                         step_results.append(
                             FlowStepResult(
                                 step_id=step.step_id,
-                                status="canceled_outcome_unknown",
+                                status=canceled_status,
                                 started_at=started,
                                 ended_at=utc_now(),
                                 error=(
-                                    "The local command was canceled and its process tree was "
-                                    "terminated. A side effect already delivered to the page "
-                                    "cannot be rolled back generically."
+                                    "The read-only step was canceled."
+                                    if canceled_status == "canceled"
+                                    else (
+                                        "The local command was canceled and its process tree "
+                                        "was terminated. A side effect already delivered to "
+                                        "the page cannot be rolled back generically."
+                                    )
                                 ),
                             )
                         )
@@ -1588,8 +1945,11 @@ class BrowserActionService:
                         experiment_dir=experiment_dir,
                         payload=payload,
                         capture_id=capture_id,
+                        stream_start_status=stream_start_status,
+                        capture_transport_generation=capture_transport_generation,
                         trace_started=trace_started,
                         execution_deadline=deadline,
+                        canceled=cancelled_error is not None,
                     ),
                     name=f"finalize-{experiment_id}",
                 )
@@ -1616,24 +1976,36 @@ class BrowserActionService:
                 errors.extend(str(item) for item in cleanup_result.get("errors", []))
 
             post_alignment = AlignmentResult(
-                status="not_checked",
+                status=(
+                    "not_checked_due_to_cancel"
+                    if cancelled_error is not None
+                    else "not_checked"
+                ),
                 playwright_page=alignment.playwright_page,
-                warnings=["Post-flow page alignment was not checked."],
+                warnings=[
+                    (
+                        "Post-flow page alignment was not checked because the experiment "
+                        "was canceled."
+                        if cancelled_error is not None
+                        else "Post-flow page alignment was not checked."
+                    )
+                ],
             )
-            try:
-                post_deadline = Deadline(2_500)
-                post_page = await self.playwright.current_page(session_id, post_deadline)
-                post_alignment = await self.js_reverse.align_page(
-                    post_page,
-                    post_deadline,
-                    page_id=(
-                        str(session["js_reverse_page_id"])
-                        if session.get("js_reverse_page_id")
-                        else None
-                    ),
-                )
-            except Exception as exc:
-                warnings.append(f"post-flow alignment: {str(exc)[:3500]}")
+            if cancelled_error is None:
+                try:
+                    post_deadline = Deadline(2_500)
+                    post_page = await self.playwright.current_page(session_id, post_deadline)
+                    post_alignment = await self.js_reverse.align_page(
+                        post_page,
+                        post_deadline,
+                        page_id=(
+                            str(session["js_reverse_page_id"])
+                            if session.get("js_reverse_page_id")
+                            else None
+                        ),
+                    )
+                except Exception as exc:
+                    warnings.append(f"post-flow alignment: {str(exc)[:3500]}")
 
             (
                 primary_requests,
@@ -1659,7 +2031,9 @@ class BrowserActionService:
                 else {}
             )
             collector_integrity = str(
-                capture_summary.get("collectorIntegrity")
+                "not_required"
+                if not payload.capture.stream
+                else capture_summary.get("collectorIntegrity")
                 or capture_summary.get("integrityStatus")
                 or ("partial" if collector_started else "failed")
             )
@@ -1674,6 +2048,8 @@ class BrowserActionService:
                 or (payload.capture.stream and not collector_stopped)
                 or primary_integrity == "failed"
                 or (
+                    payload.capture.stream
+                    and
                     not payload.primary_request.allow_supporting_failures
                     and collector_integrity == "failed"
                 )
@@ -1697,6 +2073,8 @@ class BrowserActionService:
                     primary_integrity != "complete"
                     or any(value != "complete" for value in required_values)
                     or (
+                        payload.capture.stream
+                        and
                         not payload.primary_request.allow_supporting_failures
                         and collector_integrity != "complete"
                     )
@@ -1750,6 +2128,8 @@ class BrowserActionService:
                 "capture_relative_dir": capture_relative_dir,
                 "capture_metadata_artifact_id": capture_metadata_artifact_id,
                 "capture_namespace": experiment_id,
+                "stream_start_status": stream_start_status,
+                "transport_generation": capture_transport_generation,
                 "entered_finalize_reserve": cleanup_result.get(
                     "entered_finalize_reserve", False
                 ),
@@ -1796,6 +2176,18 @@ class BrowserActionService:
                     "deadline": deadline.to_dict(),
                     "steps": [item.model_dump(mode="json") for item in step_results],
                     "stream_capture_id": capture_id,
+                    "stream_status": final_status_payload,
+                    "stream_runtime": {
+                        "start_status": stream_start_status,
+                        "capture_id": capture_id,
+                        "capture_uuid": capture_uuid,
+                        "capture_relative_dir": capture_relative_dir,
+                        "capture_metadata_artifact_id": (
+                            capture_metadata_artifact_id
+                        ),
+                        "transport_generation": capture_transport_generation,
+                        "capture_namespace": experiment_id,
+                    },
                     "stream_wait_result": wait_result,
                     "wait_observations": wait_observations,
                     "collector_integrity": collector_integrity,
@@ -1849,8 +2241,9 @@ class BrowserActionService:
         if jobs:
             await asyncio.gather(*jobs, return_exceptions=True)
         self._active_session_jobs.clear()
-        self._active_browser_experiment_id = None
-        self._active_browser_session_id = None
+        owner = self.coordinator.browser_owner
+        if owner is not None:
+            await self._release_browser_operation(owner.owner_id)
         for session_id, session in list(self.sessions.items()):
             if (
                 session.get("status") != "open"
@@ -1873,11 +2266,19 @@ class BrowserActionService:
         await self.js_reverse.close()
 
 
-def build_browser_service_from_environment() -> BrowserActionService:
-    evidence_root = Path(
+def analysis_workspace_root_from_environment() -> Path:
+    return Path(
         env_value_from_environment_or_dotenv("WEB_REV_EVIDENCE_DIR")
         or "data/analysis-workspace"
-    )
+    ).expanduser().resolve()
+
+
+def build_browser_service_from_environment(
+    *,
+    evidence_root: Path | None = None,
+    coordinator: RuntimeCoordinator | None = None,
+) -> BrowserActionService:
+    evidence_root = evidence_root or analysis_workspace_root_from_environment()
     experiments = ExperimentStore(evidence_root)
     browser_endpoint = env_value_from_environment_or_dotenv("WEB_REV_BROWSER_CDP_URL")
     playwright = PlaywrightCliAdapter(
@@ -1939,4 +2340,5 @@ def build_browser_service_from_environment() -> BrowserActionService:
         default_browser_endpoint=browser_endpoint,
         private_mcp_browser_endpoint=browser_endpoint,
         require_private_mcp_endpoint=True,
+        coordinator=coordinator,
     )

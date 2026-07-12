@@ -285,6 +285,11 @@ class CloseSessionPayload(StrictModel):
     deadline_ms: int = Field(default=10_000, ge=1_000, le=42_000)
 
 
+class CancelExperimentPayload(StrictModel):
+    experiment_id: str = Field(pattern=r"^[a-zA-Z0-9_.-]+$", max_length=128)
+    session_id: str = Field(pattern=r"^[a-zA-Z0-9_.-]+$", max_length=128)
+
+
 class CaptureFlowPayload(StrictModel):
     session_id: str = Field(pattern=r"^[a-zA-Z0-9_.-]+$", max_length=128)
     objective: str = Field(min_length=1, max_length=2048)
@@ -375,6 +380,13 @@ class CloseSessionRequest(StrictModel):
     skill_binding: SkillBinding | None = None
 
 
+class CancelExperimentRequest(StrictModel):
+    contract_version: Literal["1.0"] = "1.0"
+    operation: Literal["cancel_experiment"]
+    payload: CancelExperimentPayload
+    skill_binding: SkillBinding | None = None
+
+
 class GetSessionPayload(StrictModel):
     session_id: str = Field(pattern=r"^[a-zA-Z0-9_.-]+$", max_length=128)
 
@@ -389,8 +401,8 @@ class GetExperimentPayload(StrictModel):
 
 
 class GetStreamStatusPayload(StrictModel):
-    session_id: str = Field(pattern=r"^[a-zA-Z0-9_.-]+$", max_length=128)
-    capture_id: int = Field(gt=0)
+    experiment_id: str = Field(pattern=r"^[a-zA-Z0-9_.-]+$", max_length=128)
+    capture_uuid: str | None = Field(default=None, max_length=128)
 
 
 class GetSessionRequest(StrictModel):
@@ -415,7 +427,8 @@ RunBrowserExperimentRequest = Annotated[
     OpenSessionRequest
     | CaptureBaselineRequest
     | CaptureFlowRequest
-    | CloseSessionRequest,
+    | CloseSessionRequest
+    | CancelExperimentRequest,
     Field(discriminator="operation"),
 ]
 
@@ -442,6 +455,7 @@ class FlowStepResult(StrictModel):
         "failed",
         "skipped",
         "timed_out",
+        "canceled",
         "canceled_outcome_unknown",
     ]
     started_at: str

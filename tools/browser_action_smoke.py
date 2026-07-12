@@ -28,6 +28,7 @@ from skill_temple.browser_adapters import (
     StdioMcpToolTransport,
 )
 from skill_temple.browser_models import (
+    CancelExperimentRequest,
     CaptureFlowRequest,
     CloseSessionRequest,
     OpenSessionRequest,
@@ -318,43 +319,43 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
         if f"sha256={expected_sha}" not in binary.stdout:
             raise AssertionError(binary.stdout)
 
-        cancellation_task = asyncio.create_task(
-            service.run(
-                CaptureFlowRequest(
-                    operation="capture_flow",
-                    payload={
-                        "session_id": SESSION_ID,
-                        "objective": "cancel a real slow navigation",
-                        "primary_request": {
-                            "url_contains": "/api/sse",
-                            "method": "GET",
-                            "resource_types": ["eventsource"],
-                            "mime_types": ["text/event-stream"],
-                            "expected_min_matches": 0,
-                            "allow_supporting_failures": True,
-                            "include_in_flight": False,
-                        },
-                        "flow": [
-                            {
-                                "step_id": "cancel_slow_navigation",
-                                "action": "navigate",
-                                "value": f"http://127.0.0.1:{fixture_port}/slow?seconds=10",
-                                "timeout_ms": 20_000,
-                            }
-                        ],
-                        "execution_mode": "sync",
-                        "deadline_ms": 30_000,
-                        "capture": {
-                            "network": False,
-                            "stream": True,
-                            "trace": True,
-                            "screenshots": False,
-                            "scripts": False,
-                        },
+        cancellation_started = await service.run(
+            CaptureFlowRequest(
+                operation="capture_flow",
+                payload={
+                    "session_id": SESSION_ID,
+                    "objective": "cancel a real slow navigation",
+                    "primary_request": {
+                        "url_contains": "/api/sse",
+                        "method": "GET",
+                        "resource_types": ["eventsource"],
+                        "mime_types": ["text/event-stream"],
+                        "expected_min_matches": 0,
+                        "allow_supporting_failures": True,
+                        "include_in_flight": False,
                     },
-                )
+                    "flow": [
+                        {
+                            "step_id": "cancel_slow_navigation",
+                            "action": "navigate",
+                            "value": f"http://127.0.0.1:{fixture_port}/slow?seconds=10",
+                            "timeout_ms": 20_000,
+                        }
+                    ],
+                    "execution_mode": "job",
+                    "job_timeout_ms": 30_000,
+                    "capture": {
+                        "network": False,
+                        "stream": True,
+                        "trace": True,
+                        "screenshots": False,
+                        "scripts": False,
+                    },
+                },
             )
         )
+        if cancellation_started.status != "running":
+            raise AssertionError(cancellation_started.model_dump())
         slow_started = server.RequestHandlerClass.slow_started_event
         for _ in range(200):
             if slow_started.is_set():
@@ -362,24 +363,25 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
             await asyncio.sleep(0.05)
         if not slow_started.is_set():
             raise AssertionError("Slow navigation was not observed by the fixture server")
-        cancellation_task.cancel()
-        try:
-            await cancellation_task
-        except asyncio.CancelledError:
-            pass
-        else:
-            raise AssertionError("Slow navigation experiment was not canceled")
-        cancellation_manifests = [
-            path
-            for path in (evidence_root / "experiments").glob("*/manifest.json")
-            if path != manifest_path
-        ]
-        if len(cancellation_manifests) != 1:
-            raise AssertionError(
-                f"Expected one cancellation manifest: {cancellation_manifests}"
+        canceled = await service.run(
+            CancelExperimentRequest(
+                operation="cancel_experiment",
+                payload={
+                    "experiment_id": cancellation_started.experiment_id,
+                    "session_id": SESSION_ID,
+                },
             )
+        )
+        if canceled.status != "interrupted":
+            raise AssertionError(canceled.model_dump())
+        cancellation_manifest_path = (
+            evidence_root
+            / "experiments"
+            / str(cancellation_started.experiment_id)
+            / "manifest.json"
+        )
         cancellation_manifest = json.loads(
-            cancellation_manifests[0].read_text(encoding="utf-8")
+            cancellation_manifest_path.read_text(encoding="utf-8")
         )
         if cancellation_manifest.get("status") != "interrupted":
             raise AssertionError(cancellation_manifest)

@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -386,6 +387,82 @@ class WorkspaceActionTests(unittest.TestCase):
             self.assertIn("20002:", item.content)
             self.assertTrue(item.truncated)
 
+    def test_file_growth_during_single_pass_read_is_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            path = root / "growing.jsonl"
+            path.write_text("line\n" * 2_000_000, encoding="utf-8")
+            service = AnalysisWorkspaceService(root)
+
+            def append_later() -> None:
+                time.sleep(0.01)
+                with path.open("a", encoding="utf-8") as handle:
+                    handle.write("appended\n")
+
+            thread = threading.Thread(target=append_later)
+            thread.start()
+            response = asyncio.run(
+                service.read_files(
+                    WorkspaceReadFilesRequest(
+                        paths=["growing.jsonl"],
+                        start_line=1,
+                        max_lines=2,
+                        max_bytes_per_file=1_000,
+                        max_bytes=2_000,
+                        include_sha256=True,
+                    )
+                )
+            )
+            thread.join(timeout=5)
+            item = response.files[0]
+            self.assertTrue(item.changed_during_read)
+            self.assertIsNone(item.sha256)
+            self.assertGreater(item.total_lines or 0, 1_000_000)
+
+    def test_read_can_skip_full_sha256_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "small.txt").write_text("one\ntwo\n", encoding="utf-8")
+            service = AnalysisWorkspaceService(root)
+            response = asyncio.run(
+                service.read_files(
+                    WorkspaceReadFilesRequest(
+                        paths=["small.txt"],
+                        include_sha256=False,
+                    )
+                )
+            )
+            item = response.files[0]
+            self.assertIsNone(item.sha256)
+            self.assertFalse(item.changed_during_read)
+            self.assertEqual(item.bytes, (root / "small.txt").stat().st_size)
+
+    def test_read_without_sha_stops_after_requested_range(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            payload = b"one\ntwo\n" + (b"x" * 70_000) + b"\x00binary-tail"
+            (root / "range-only.txt").write_bytes(payload)
+            service = AnalysisWorkspaceService(root)
+            response = asyncio.run(
+                service.read_files(
+                    WorkspaceReadFilesRequest(
+                        paths=["range-only.txt"],
+                        start_line=1,
+                        max_lines=1,
+                        max_bytes_per_file=1_000,
+                        max_bytes=2_000,
+                        include_sha256=False,
+                    )
+                )
+            )
+            item = response.files[0]
+            self.assertIsNone(item.error)
+            self.assertEqual(item.content, "1: one")
+            self.assertIsNone(item.total_lines)
+            self.assertIsNone(item.sha256)
+            self.assertEqual(item.bytes, len(payload))
+            self.assertTrue(item.truncated)
+
     def test_search_stops_at_match_limit_without_buffering_all_results(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -605,6 +682,53 @@ class WorkspaceActionTests(unittest.TestCase):
                 )
                 self.assertNotEqual(child.returncode, 0)
                 self.assertIn("exactly one worker", child.stderr + child.stdout)
+            finally:
+                _release_single_process_guard(key)
+
+    @unittest.skipUnless(os.name == "nt", "Windows single-process lock")
+    def test_second_process_cannot_recover_running_manifest_before_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir).resolve()
+            manifest = root / "experiments" / "exp_live" / "manifest.json"
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "experiment_id": "exp_live",
+                        "session_id": "session_live",
+                        "status": "running",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            key = _acquire_single_process_guard(root)
+            try:
+                env = {
+                    **os.environ,
+                    "WEB_REV_EVIDENCE_DIR": str(root),
+                    "WEB_REV_BROWSER_CDP_URL": "http://127.0.0.1:9222",
+                }
+                child = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        "from skill_temple.app import create_app; create_app()",
+                    ],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=30,
+                    check=False,
+                )
+                self.assertNotEqual(child.returncode, 0)
+                self.assertIn(
+                    "already owns this analysis workspace",
+                    child.stdout + child.stderr,
+                )
+                current = json.loads(manifest.read_text(encoding="utf-8"))
+                self.assertEqual(current["status"], "running")
             finally:
                 _release_single_process_guard(key)
 
