@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 import difflib
 import hashlib
 import json
@@ -53,6 +54,22 @@ _ALLOWED_ENV_READ_FILES = {".env.example", ".env.sample", ".env.template"}
 _SEARCH_LINE_MAX_BYTES = 8_192
 _SEARCH_SNIPPET_MAX_BYTES = 64_000
 _MIN_STRUCTURED_RESPONSE_BYTES = 1_024
+_STREAM_CHUNK_BYTES = 64 * 1024
+_MAX_PATCH_TARGET_BYTES = 8_000_000
+_MAX_PATCH_SNAPSHOT_BYTES = 32_000_000
+_WRITABLE_EXPERIMENT_DIRS = {"reports", "derived", "replay"}
+_PROTECTED_EXPERIMENT_DIRS = {"js-reverse", "playwright"}
+_POWERSHELL_MUTATION_RE = re.compile(
+    r"\b(?:Set-Content|Add-Content|Clear-Content|Out-File|Remove-Item|Move-Item|"
+    r"Copy-Item|Rename-Item|New-Item|Set-Location|Push-Location|WriteAllBytes|"
+    r"WriteAllText|Delete|Move|Replace|Create)\b",
+    re.IGNORECASE,
+)
+_PROTECTED_LITERAL_RE = re.compile(
+    r"(?:^|[\"'\s])(?:sessions[\\/]|experiments[\\/][^\\/\"']+[\\/]"
+    r"(?:manifest\.json|js-reverse(?:[\\/]|$)|playwright(?:[\\/]|$)))",
+    re.IGNORECASE,
+)
 
 _BLOCKED_ALWAYS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bgit\s+push\b", re.IGNORECASE), "git push is not allowed."),
@@ -70,10 +87,22 @@ _BLOCKED_ALWAYS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bscp\b", re.IGNORECASE), "scp is not allowed."),
 ]
 _NETWORK_BLOCKED: list[tuple[re.Pattern[str], str]] = [
-    (re.compile(r"\bInvoke-WebRequest\b", re.IGNORECASE), "Network downloads are disabled."),
-    (re.compile(r"\bInvoke-RestMethod\b", re.IGNORECASE), "Network requests are disabled."),
-    (re.compile(r"\bcurl\b", re.IGNORECASE), "curl is disabled when network is not allowed."),
-    (re.compile(r"\bwget\b", re.IGNORECASE), "wget is disabled when network is not allowed."),
+    (
+        re.compile(r"\bInvoke-WebRequest\b", re.IGNORECASE),
+        "Invoke-WebRequest is blocked by the best-effort local command policy.",
+    ),
+    (
+        re.compile(r"\bInvoke-RestMethod\b", re.IGNORECASE),
+        "Invoke-RestMethod is blocked by the best-effort local command policy.",
+    ),
+    (
+        re.compile(r"\bcurl\b", re.IGNORECASE),
+        "curl is blocked by the best-effort local command policy.",
+    ),
+    (
+        re.compile(r"\bwget\b", re.IGNORECASE),
+        "wget is blocked by the best-effort local command policy.",
+    ),
 ]
 _ENV_ALLOWLIST = {
     "PATH",
@@ -116,6 +145,83 @@ class AnalysisWorkspaceService:
         self.max_output_bytes = max_output_bytes
         self.allow_network = allow_network
         self._lock = asyncio.Lock()
+
+    def _experiment_status(self, experiment_id: str) -> str | None:
+        manifest = self.root / "experiments" / experiment_id / "manifest.json"
+        if not manifest.is_file():
+            return None
+        try:
+            value = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        return str(value.get("status")) if value.get("status") else None
+
+    def _assert_writable_path(self, path: str) -> None:
+        normalized = normalize_workspace_path(path)
+        parts = PurePosixPath(normalized).parts
+        if not parts:
+            return
+        if parts[0] == "sessions":
+            raise WorkspaceToolError(
+                "workspace_managed_path_read_only",
+                "Session files are managed by the browser backend and are read-only.",
+                403,
+            )
+        if parts[0] != "experiments":
+            return
+        if len(parts) < 3:
+            raise WorkspaceToolError(
+                "workspace_managed_path_read_only",
+                "Experiment roots are managed by the browser backend.",
+                403,
+            )
+        experiment_id = parts[1]
+        if self._experiment_status(experiment_id) == "running":
+            raise WorkspaceToolError(
+                "workspace_experiment_running",
+                f"Experiment {experiment_id} is still running and cannot be modified.",
+                409,
+            )
+        relative = parts[2:]
+        if relative == ("manifest.json",) or relative[0] in _PROTECTED_EXPERIMENT_DIRS:
+            raise WorkspaceToolError(
+                "workspace_raw_evidence_read_only",
+                "Original experiment manifests, Playwright evidence, and js-reverse evidence "
+                "are read-only. Write derived output under reports/, derived/, or replay/.",
+                403,
+            )
+        if relative[0] not in _WRITABLE_EXPERIMENT_DIRS:
+            raise WorkspaceToolError(
+                "workspace_experiment_path_not_writable",
+                "Experiment-derived files must be written under reports/, derived/, or replay/.",
+                403,
+            )
+
+    def _has_running_experiment(self) -> bool:
+        for manifest in (self.root / "experiments").glob("*/manifest.json"):
+            try:
+                value = json.loads(manifest.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if value.get("status") == "running":
+                return True
+        return False
+
+    def _validate_protected_script_mutations(self, script: str) -> None:
+        if self._has_running_experiment():
+            raise WorkspaceToolError(
+                "workspace_experiment_running",
+                "PowerShell execution is disabled while an experiment is running.",
+                409,
+            )
+        for line in script.splitlines():
+            if _POWERSHELL_MUTATION_RE.search(line) and _PROTECTED_LITERAL_RE.search(line):
+                raise WorkspaceToolError(
+                    "workspace_raw_evidence_read_only",
+                    "PowerShell cannot mutate sessions or original experiment evidence. "
+                    "Write derived output under reports/, derived/, replay/, or scripts/.",
+                    403,
+                )
 
     async def inspect(self, request: WorkspaceInspectRequest) -> WorkspaceInspectResponse:
         max_file_bytes = self._bounded_output_bytes(request.max_bytes_per_file)
@@ -211,12 +317,19 @@ class AnalysisWorkspaceService:
             raise WorkspaceToolError(
                 "workspace_write_invalid_path", "A file path is required.", 400
             )
+        self._assert_writable_path(path)
         async with self._lock:
             resolved = resolve_workspace_path(self.root, path)
             existed = resolved.exists()
             if existed and not resolved.is_file():
                 raise WorkspaceToolError(
                     "workspace_write_invalid_path", "Target is not a file.", 400
+                )
+            if existed and resolved.stat().st_size > max_bytes:
+                raise WorkspaceToolError(
+                    "workspace_payload_too_large",
+                    "Existing write target is larger than the configured text limit.",
+                    413,
                 )
             previous = resolved.read_bytes() if existed else None
             if previous is not None:
@@ -297,6 +410,25 @@ class AnalysisWorkspaceService:
                 max_changed_files=max_changed_files,
             )
             paths = [operation.path for operation in operations]
+            snapshot_bytes = 0
+            for path in paths:
+                self._assert_writable_path(path)
+                resolved = resolve_workspace_path(self.root, path)
+                if resolved.is_file():
+                    target_bytes = resolved.stat().st_size
+                    if target_bytes > _MAX_PATCH_TARGET_BYTES:
+                        raise WorkspaceToolError(
+                            "workspace_payload_too_large",
+                            f"Patch target is too large: {path}",
+                            413,
+                        )
+                    snapshot_bytes += target_bytes
+                    if snapshot_bytes > _MAX_PATCH_SNAPSHOT_BYTES:
+                        raise WorkspaceToolError(
+                            "workspace_payload_too_large",
+                            "Combined patch targets exceed the snapshot memory limit.",
+                            413,
+                        )
             snapshots = snapshot_files(self.root, paths)
             try:
                 apply_text_patch(self.root, operations)
@@ -325,6 +457,7 @@ class AnalysisWorkspaceService:
             self.max_output_bytes,
         )
         self._validate_script(request.script, allow_network=request.allow_network)
+        self._validate_protected_script_mutations(request.script)
         script = self._build_pwsh_script(
             request.script,
             plain_output=request.plain_output,
@@ -352,13 +485,27 @@ class AnalysisWorkspaceService:
                 f"PowerShell 7 executable was not found: {self.shell}",
                 500,
             ) from exc
+        output_state: dict[str, Any] = {
+            "remaining": max_output,
+            "truncated": False,
+            "stdout": [],
+            "stderr": [],
+        }
+        readers = [
+            asyncio.create_task(
+                self._read_process_stream(process.stdout, output_state, "stdout")
+            ),
+            asyncio.create_task(
+                self._read_process_stream(process.stderr, output_state, "stderr")
+            ),
+        ]
         try:
-            stdout_b, stderr_b = await asyncio.wait_for(
-                process.communicate(), timeout=timeout
-            )
+            await asyncio.wait_for(process.wait(), timeout=timeout)
         except TimeoutError as exc:
             await self._kill_process_tree(process)
-            stdout_b, stderr_b = await process.communicate()
+            await asyncio.gather(*readers, return_exceptions=True)
+            stdout_b = b"".join(output_state["stdout"])
+            stderr_b = b"".join(output_state["stderr"])
             stdout, stderr, truncated = self._decode_output(
                 stdout_b,
                 stderr_b,
@@ -370,12 +517,16 @@ class AnalysisWorkspaceService:
                 f"PowerShell timed out after {timeout}s. stdout={stdout!r} stderr={stderr!r}",
                 408,
             ) from exc
+        await asyncio.gather(*readers, return_exceptions=True)
+        stdout_b = b"".join(output_state["stdout"])
+        stderr_b = b"".join(output_state["stderr"])
         stdout, stderr, truncated = self._decode_output(
             stdout_b,
             stderr_b,
             max_output,
             strip_ansi=request.plain_output,
         )
+        truncated = truncated or bool(output_state["truncated"])
         return WorkspaceExecPwshResponse(
             exit_code=process.returncode or 0,
             stdout=stdout,
@@ -383,6 +534,46 @@ class AnalysisWorkspaceService:
             truncated=truncated,
             duration_ms=round((time.perf_counter() - started) * 1000),
         )
+
+    @staticmethod
+    async def _read_process_stream(
+        stream: asyncio.StreamReader | None,
+        state: dict[str, Any],
+        key: str,
+    ) -> None:
+        if stream is None:
+            return
+        parts: list[bytes] = state[key]
+        while True:
+            chunk = await stream.read(_STREAM_CHUNK_BYTES)
+            if not chunk:
+                return
+            remaining = int(state["remaining"])
+            if remaining > 0:
+                kept = chunk[:remaining]
+                parts.append(kept)
+                state["remaining"] = remaining - len(kept)
+            if len(chunk) > remaining:
+                state["truncated"] = True
+
+    @staticmethod
+    async def _read_stream_capped(
+        stream: asyncio.StreamReader | None,
+        max_bytes: int,
+    ) -> bytes:
+        if stream is None:
+            return b""
+        parts: list[bytes] = []
+        remaining = max_bytes
+        while True:
+            chunk = await stream.read(_STREAM_CHUNK_BYTES)
+            if not chunk:
+                break
+            if remaining > 0:
+                kept = chunk[:remaining]
+                parts.append(kept)
+                remaining -= len(kept)
+        return b"".join(parts)
 
     async def _search_workspace(
         self, request: WorkspaceSearchRequest
@@ -398,7 +589,17 @@ class AnalysisWorkspaceService:
                 500,
             )
         paths = self._normalize_existing_paths(request.paths)
-        args = [rg, "--json", "--line-number", "--column", "--color", "never"]
+        args = [
+            rg,
+            "--json",
+            "--line-number",
+            "--column",
+            "--color",
+            "never",
+            "--max-columns",
+            "4096",
+            "--max-columns-preview",
+        ]
         if not request.regex:
             args.append("--fixed-strings")
         if not request.case_sensitive:
@@ -410,19 +611,49 @@ class AnalysisWorkspaceService:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout_b, stderr_b = await process.communicate()
-        stdout_b, stdout_truncated = self._truncate_bytes(stdout_b, max_bytes)
-        if process.returncode == 2:
-            raise WorkspaceToolError(
-                "workspace_search_invalid",
-                f"ripgrep rejected the query: {stderr_b.decode('utf-8', errors='replace')}",
-                422,
-            )
         matches: list[WorkspaceSearchMatch] = []
-        truncated = stdout_truncated
-        for raw_line in stdout_b.decode("utf-8", errors="replace").splitlines():
+        truncated = False
+        consumed_bytes = 0
+        stopped_early = False
+        stderr_task = asyncio.create_task(
+            self._read_stream_capped(process.stderr, 64_000)
+        )
+        loop = asyncio.get_running_loop()
+        end = loop.time() + min(self.default_timeout_seconds, 60)
+        while True:
+            remaining = end - loop.time()
+            if remaining <= 0:
+                await self._kill_process_tree(process)
+                await self._read_stream_capped(process.stdout, 0)
+                await stderr_task
+                raise WorkspaceToolError(
+                    "workspace_search_timeout",
+                    "ripgrep search timed out.",
+                    408,
+                )
             try:
-                event = json.loads(raw_line)
+                raw_line = await asyncio.wait_for(
+                    process.stdout.readline() if process.stdout else asyncio.sleep(0, result=b""),
+                    timeout=remaining,
+                )
+            except (TimeoutError, ValueError) as exc:
+                await self._kill_process_tree(process)
+                await self._read_stream_capped(process.stdout, 0)
+                await stderr_task
+                raise WorkspaceToolError(
+                    "workspace_search_timeout",
+                    "ripgrep search exceeded its time or line-size limit.",
+                    408,
+                ) from exc
+            if not raw_line:
+                break
+            consumed_bytes += len(raw_line)
+            if consumed_bytes > max_bytes:
+                truncated = True
+                stopped_early = True
+                break
+            try:
+                event = json.loads(raw_line.decode("utf-8", errors="replace"))
             except json.JSONDecodeError:
                 continue
             if event.get("type") != "match":
@@ -456,7 +687,21 @@ class AnalysisWorkspaceService:
             )
             if len(matches) >= request.max_matches:
                 truncated = True
+                stopped_early = True
                 break
+        if stopped_early:
+            if process.returncode is None:
+                await self._kill_process_tree(process)
+            await self._read_stream_capped(process.stdout, 0)
+        else:
+            await process.wait()
+        stderr_b = await stderr_task
+        if process.returncode == 2:
+            raise WorkspaceToolError(
+                "workspace_search_invalid",
+                f"ripgrep rejected the query: {stderr_b.decode('utf-8', errors='replace')}",
+                422,
+            )
         response = WorkspaceSearchResponse(
             query=request.query,
             matches=matches,
@@ -486,8 +731,9 @@ class AnalysisWorkspaceService:
                 rel_current = (
                     self._relative_path(current_path) if current_path != self.root else "."
                 )
-                depth = 0 if rel_current == "." else len(PurePosixPath(rel_current).parts)
-                if depth >= max_depth:
+                relative_current = current_path.relative_to(base_path)
+                base_depth = len(relative_current.parts)
+                if base_depth >= max_depth:
                     dirs[:] = []
                     continue
                 dirs[:] = [
@@ -501,7 +747,7 @@ class AnalysisWorkspaceService:
                         WorkspaceTreeEntry(
                             path=rel,
                             type="dir",
-                            depth=len(PurePosixPath(rel).parts),
+                            depth=base_depth + 1,
                         )
                     )
                     if len(entries) >= max_entries:
@@ -515,13 +761,45 @@ class AnalysisWorkspaceService:
                         WorkspaceTreeEntry(
                             path=rel,
                             type="file",
-                            depth=len(PurePosixPath(rel).parts),
+                            depth=base_depth + 1,
                             bytes=file_path.stat().st_size,
                         )
                     )
                     if len(entries) >= max_entries:
                         return entries, True
         return entries, False
+
+    @staticmethod
+    def _validate_text_and_hash(
+        resolved: Path,
+        normalized: str,
+    ) -> tuple[int, str]:
+        digest = hashlib.sha256()
+        decoder = codecs.getincrementaldecoder("utf-8")("strict")
+        total_bytes = 0
+        try:
+            with resolved.open("rb") as handle:
+                while True:
+                    chunk = handle.read(_STREAM_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    if b"\x00" in chunk:
+                        raise WorkspaceToolError(
+                            "workspace_binary_not_allowed",
+                            "NUL bytes are not allowed in workspace text operations.",
+                            403,
+                        )
+                    total_bytes += len(chunk)
+                    digest.update(chunk)
+                    decoder.decode(chunk)
+            decoder.decode(b"", final=True)
+        except UnicodeDecodeError as exc:
+            raise WorkspaceToolError(
+                "workspace_binary_not_allowed",
+                f"Only UTF-8 text files are allowed: {normalized}.",
+                403,
+            ) from exc
+        return total_bytes, digest.hexdigest()
 
     def _read_file_content(
         self, path: str, *, start_line: int, max_lines: int, max_bytes: int
@@ -539,41 +817,83 @@ class AnalysisWorkspaceService:
                     403,
                 )
             resolved = resolve_workspace_path(self.root, normalized, require_file=True)
-            data = resolved.read_bytes()
-            assert_text_bytes(data, path=normalized)
-            text = data.decode("utf-8")
-            lines = text.splitlines()
-            start_idx = start_line - 1
-            selected = lines[start_idx : start_idx + max_lines]
+            total_bytes, sha256 = self._validate_text_and_hash(resolved, normalized)
             output_lines: list[str] = []
             output_bytes = 0
-            truncated = start_idx + len(selected) < len(lines)
-            for offset, line in enumerate(selected, start=start_line):
-                rendered = f"{offset}: {line}"
-                rendered_bytes = len((rendered + "\n").encode("utf-8"))
-                if rendered_bytes > max_bytes:
-                    clipped, _ = self._clip_text(rendered, max_bytes)
-                    if clipped:
-                        output_lines.append(clipped)
-                    truncated = True
-                    break
-                if output_bytes + rendered_bytes > max_bytes:
-                    truncated = True
-                    break
-                output_lines.append(rendered)
-                output_bytes += rendered_bytes
-            end_line = start_line + len(output_lines) - 1 if output_lines else None
+            total_lines = 0
+            current_parts: list[str] = []
+            current_text_bytes = 0
+            current_has_data = False
+            selected_clipped = False
+
+            def finish_line() -> None:
+                nonlocal total_lines, output_bytes, current_parts
+                nonlocal current_text_bytes, current_has_data, selected_clipped
+                line_number = total_lines + 1
+                selected = start_line <= line_number < start_line + max_lines
+                if selected:
+                    prefix = f"{line_number}: "
+                    rendered = prefix + "".join(current_parts)
+                    rendered_bytes = len((rendered + "\n").encode("utf-8"))
+                    if output_bytes + rendered_bytes <= max_bytes:
+                        output_lines.append(rendered)
+                        output_bytes += rendered_bytes
+                    else:
+                        selected_clipped = True
+                total_lines += 1
+                current_parts = []
+                current_text_bytes = 0
+                current_has_data = False
+
+            with resolved.open(
+                "r",
+                encoding="utf-8",
+                errors="strict",
+                newline=None,
+            ) as handle:
+                while True:
+                    segment = handle.readline(_STREAM_CHUNK_BYTES)
+                    if segment == "":
+                        if current_has_data:
+                            finish_line()
+                        break
+                    current_has_data = True
+                    line_ended = segment.endswith("\n")
+                    piece = segment[:-1] if line_ended else segment
+                    line_number = total_lines + 1
+                    selected = start_line <= line_number < start_line + max_lines
+                    if selected and not selected_clipped:
+                        prefix_bytes = len(f"{line_number}: \n".encode())
+                        available = max(
+                            0,
+                            max_bytes
+                            - output_bytes
+                            - prefix_bytes
+                            - current_text_bytes,
+                        )
+                        clipped, clipped_piece = self._clip_text(piece, available)
+                        if clipped:
+                            current_parts.append(clipped)
+                            current_text_bytes += len(clipped.encode("utf-8"))
+                        if clipped_piece:
+                            selected_clipped = True
+                    if line_ended:
+                        finish_line()
+
+            requested_end = start_line + max_lines - 1
+            has_more_lines = total_lines > requested_end
             content = "\n".join(output_lines)
-            content, content_truncated = self._clip_text(content, max_bytes)
             return WorkspaceFileContent(
                 path=normalized,
                 start_line=start_line,
-                end_line=end_line,
-                total_lines=len(lines),
-                bytes=len(data),
-                sha256=hashlib.sha256(data).hexdigest(),
+                end_line=(
+                    start_line + len(output_lines) - 1 if output_lines else None
+                ),
+                total_lines=total_lines,
+                bytes=total_bytes,
+                sha256=sha256,
                 content=content,
-                truncated=truncated or content_truncated,
+                truncated=selected_clipped or has_more_lines,
             )
         except Exception as exc:
             return WorkspaceFileContent(

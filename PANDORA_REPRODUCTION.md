@@ -649,3 +649,6 @@ notes/open-questions.md
 - 所有文本 artifact 相对路径可由 workspaceInspect/Search/ReadFiles 处理。
 - raw.bin、Base64、压缩和批量 JSONL 可由 workspaceExecPwsh 处理。
 - 长流由后台 job 完成；显式快速同步模式才受 42 秒 Action deadline 限制。
+- 原始 `manifest.json`、`js-reverse/` 和 `playwright/` 只读；报告、schema、diff 和 replay 输出写入 `reports/`、`derived/` 或 `replay/`。
+- 同一 session 同时只运行一个后台 experiment；`session_busy` 时查询已有 experiment。
+- supporting request 的事件不能满足 primary predicate；等待结果必须关联具体 primary request ID。

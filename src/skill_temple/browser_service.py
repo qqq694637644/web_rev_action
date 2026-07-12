@@ -8,6 +8,7 @@ import os
 import re
 import time
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
@@ -302,9 +303,53 @@ class BrowserActionService:
         self._session_locks: dict[str, asyncio.Lock] = {}
         self._browser_lock = asyncio.Lock()
         self._jobs: dict[str, asyncio.Task[None]] = {}
+        self._active_session_jobs: dict[str, str] = {}
 
     def _session_lock(self, session_id: str) -> asyncio.Lock:
         return self._session_locks.setdefault(session_id, asyncio.Lock())
+
+    @asynccontextmanager
+    async def _locked_browser_session(
+        self,
+        session_id: str,
+        deadline: Deadline,
+    ) -> Any:
+        browser_acquired = False
+        session_acquired = False
+        session_lock = self._session_lock(session_id)
+        try:
+            await asyncio.wait_for(
+                self._browser_lock.acquire(),
+                timeout=max(0.1, deadline.remaining_seconds()),
+            )
+            browser_acquired = True
+            await asyncio.wait_for(
+                session_lock.acquire(),
+                timeout=max(0.1, deadline.remaining_seconds()),
+            )
+            session_acquired = True
+            yield
+        except TimeoutError as exc:
+            raise BrowserServiceError(
+                "browser_busy",
+                "Timed out waiting for the shared browser experiment lock.",
+                409,
+            ) from exc
+        finally:
+            if session_acquired:
+                session_lock.release()
+            if browser_acquired:
+                self._browser_lock.release()
+
+    def _active_job_for_session(self, session_id: str) -> str | None:
+        experiment_id = self._active_session_jobs.get(session_id)
+        if experiment_id is None:
+            return None
+        task = self._jobs.get(experiment_id)
+        if task is None or task.done():
+            self._active_session_jobs.pop(session_id, None)
+            return None
+        return experiment_id
 
     @staticmethod
     def _manifest_relative_path(experiment_id: str) -> str:
@@ -384,6 +429,16 @@ class BrowserActionService:
         if isinstance(request, CloseSessionRequest):
             return await self._close_session(request)
         if isinstance(request, (CaptureFlowRequest, CaptureBaselineRequest)):
+            active_experiment = self._active_job_for_session(
+                request.payload.session_id
+            )
+            if active_experiment is not None:
+                raise BrowserServiceError(
+                    "session_busy",
+                    "The browser session already has an active background experiment: "
+                    f"{active_experiment}",
+                    409,
+                )
             if request.payload.execution_mode == "job":
                 return self._start_capture_job(request)
             return await self._capture_flow(request)
@@ -467,7 +522,7 @@ class BrowserActionService:
                 "Playwright and js-reverse-mcp must use the same CDP endpoint",
                 409,
             )
-        async with self._browser_lock, self._session_lock(session_id):
+        async with self._locked_browser_session(session_id, deadline):
             page = await self.playwright.open_session(
                 session_id, endpoint, payload.target.start_url, deadline
             )
@@ -521,7 +576,7 @@ class BrowserActionService:
     async def _close_session(self, request: CloseSessionRequest) -> BrowserActionResponse:
         deadline = Deadline(request.payload.deadline_ms)
         session_id = request.payload.session_id
-        async with self._browser_lock, self._session_lock(session_id):
+        async with self._locked_browser_session(session_id, deadline):
             session = self._get_session(session_id)
             if session.get("status") == "open":
                 await self.playwright.close_session(session_id, deadline)
@@ -893,6 +948,14 @@ class BrowserActionService:
         session = self._get_session(payload.session_id)
         if session.get("status") != "open":
             raise BrowserServiceError("session_closed", "Browser session is not open", 409)
+        active_experiment = self._active_job_for_session(payload.session_id)
+        if active_experiment is not None:
+            raise BrowserServiceError(
+                "session_busy",
+                "The browser session already has an active background experiment: "
+                f"{active_experiment}",
+                409,
+            )
         deadline = Deadline(payload.job_timeout_ms)
         experiment_id, experiment_dir, manifest = self.experiments.create_experiment(
             session_id=payload.session_id,
@@ -919,7 +982,14 @@ class BrowserActionService:
             name=f"browser-experiment-{experiment_id}",
         )
         self._jobs[experiment_id] = task
-        task.add_done_callback(lambda _task: self._jobs.pop(experiment_id, None))
+        self._active_session_jobs[payload.session_id] = experiment_id
+
+        def clear_job(_task: asyncio.Task[None]) -> None:
+            self._jobs.pop(experiment_id, None)
+            if self._active_session_jobs.get(payload.session_id) == experiment_id:
+                self._active_session_jobs.pop(payload.session_id, None)
+
+        task.add_done_callback(clear_job)
         return BrowserActionResponse(
             operation=request.operation,
             status="running",
@@ -996,6 +1066,9 @@ class BrowserActionService:
             "screenshot_paths": [],
             "network_payload": {},
             "collector_stopped": capture_id is None,
+            "collector_cleanup": (
+                "not_required" if capture_id is None else "unknown"
+            ),
             "orphan_capture_id": None,
             "warnings": [],
             "errors": [],
@@ -1008,6 +1081,7 @@ class BrowserActionService:
                     cleanup_deadline.child(6_000),
                 )
                 result["collector_stopped"] = True
+                result["collector_cleanup"] = "completed"
                 if cleanup_deadline.remaining_ms() > 500:
                     result["final_status_payload"] = (
                         await self.js_reverse.get_stream_status(
@@ -1018,6 +1092,12 @@ class BrowserActionService:
             except Exception as exc:
                 result["errors"].append(f"stream finalize: {str(exc)[:3500]}")
                 result["orphan_capture_id"] = capture_id
+                message = str(exc).lower()
+                result["collector_cleanup"] = (
+                    "timed_out"
+                    if "timed out" in message or "deadline" in message
+                    else "unknown"
+                )
         if trace_started:
             try:
                 result["trace_paths"] = await self.playwright.stop_trace(
@@ -1085,7 +1165,7 @@ class BrowserActionService:
             self.experiments.write_manifest(experiment_id, manifest)
         else:
             experiment_id, experiment_dir, manifest = prepared
-        async with self._browser_lock, self._session_lock(session_id):
+        async with self._locked_browser_session(session_id, deadline):
             session = self._get_session(session_id)
             if session.get("status") != "open":
                 manifest["status"] = "failed"
@@ -1511,6 +1591,10 @@ class BrowserActionService:
                 "primary_integrity_dimensions": primary_dimensions,
                 "wait_condition_met": wait_met,
                 "collector_stopped": collector_stopped or not payload.capture.stream,
+                "collector_cleanup": cleanup_result.get(
+                    "collector_cleanup",
+                    "not_required" if not payload.capture.stream else "unknown",
+                ),
                 "orphan_capture_id": cleanup_result.get("orphan_capture_id"),
                 "entered_finalize_reserve": cleanup_result.get(
                     "entered_finalize_reserve", False
@@ -1610,6 +1694,7 @@ class BrowserActionService:
             task.cancel()
         if jobs:
             await asyncio.gather(*jobs, return_exceptions=True)
+        self._active_session_jobs.clear()
         await self.js_reverse.close()
 
 

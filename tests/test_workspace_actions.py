@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,8 +13,21 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from skill_temple.app import create_app
+from skill_temple.app import (
+    _acquire_single_process_guard,
+    _release_single_process_guard,
+    create_app,
+)
+from skill_temple.workspace_models import (
+    WorkspaceApplyPatchRequest,
+    WorkspaceExecPwshRequest,
+    WorkspaceInspectRequest,
+    WorkspaceReadFilesRequest,
+    WorkspaceSearchRequest,
+    WorkspaceWriteFileRequest,
+)
 from skill_temple.workspace_service import AnalysisWorkspaceService
+from skill_temple.workspace_text_ops import WorkspaceToolError
 
 
 class WorkspaceActionTests(unittest.TestCase):
@@ -293,6 +310,248 @@ class WorkspaceActionTests(unittest.TestCase):
                 {".env.example"},
             )
             self.assertEqual(hidden.status_code, 422)
+
+    def test_inspect_depth_is_relative_to_each_requested_base_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            raw = (
+                root
+                / "experiments"
+                / "exp_deep"
+                / "js-reverse"
+                / "capture-one"
+                / "raw.txt"
+            )
+            raw.parent.mkdir(parents=True)
+            raw.write_text("evidence\n", encoding="utf-8")
+            service = AnalysisWorkspaceService(root)
+            response = asyncio.run(
+                service.inspect(
+                    WorkspaceInspectRequest(
+                        paths=["experiments/exp_deep/js-reverse"],
+                        max_depth=2,
+                        max_tree_entries=20,
+                    )
+                )
+            )
+            entries = {item.path: item.depth for item in response.tree}
+            self.assertEqual(
+                entries["experiments/exp_deep/js-reverse/capture-one"],
+                1,
+            )
+            self.assertEqual(
+                entries[
+                    "experiments/exp_deep/js-reverse/capture-one/raw.txt"
+                ],
+                2,
+            )
+
+    def test_large_text_read_streams_without_path_read_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            path = root / "events.jsonl"
+            content = "".join(
+                json.dumps({"index": index, "value": "中文"}, ensure_ascii=False)
+                + "\n"
+                for index in range(50_000)
+            )
+            path.write_text(content, encoding="utf-8", newline="\n")
+            expected_bytes = path.stat().st_size
+            expected_sha = hashlib.sha256(
+                content.encode("utf-8")
+            ).hexdigest()
+            service = AnalysisWorkspaceService(root)
+            with patch.object(
+                Path,
+                "read_bytes",
+                side_effect=AssertionError("read_bytes must not be used"),
+            ):
+                response = asyncio.run(
+                    service.read_files(
+                        WorkspaceReadFilesRequest(
+                            paths=["events.jsonl"],
+                            start_line=20_000,
+                            max_lines=3,
+                            max_bytes_per_file=2_000,
+                            max_bytes=4_000,
+                        )
+                    )
+                )
+            item = response.files[0]
+            self.assertIsNone(item.error)
+            self.assertEqual(item.bytes, expected_bytes)
+            self.assertEqual(item.sha256, expected_sha)
+            self.assertIn("20000:", item.content)
+            self.assertIn("20002:", item.content)
+            self.assertTrue(item.truncated)
+
+    def test_search_stops_at_match_limit_without_buffering_all_results(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "many.txt").write_text(
+                "".join(f"needle {index}\n" for index in range(20_000)),
+                encoding="utf-8",
+            )
+            service = AnalysisWorkspaceService(root)
+            response = asyncio.run(
+                service.search(
+                    WorkspaceSearchRequest(
+                        query="needle",
+                        paths=["many.txt"],
+                        max_matches=5,
+                        max_bytes=16_000,
+                    )
+                )
+            )
+            self.assertEqual(response.match_count, 5)
+            self.assertTrue(response.truncated)
+
+    def test_original_evidence_is_read_only_but_derived_directories_are_writable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            experiment = root / "experiments" / "exp_done"
+            raw = experiment / "js-reverse" / "capture-one" / "events.jsonl"
+            trace = experiment / "playwright" / "traces" / "trace.txt"
+            raw.parent.mkdir(parents=True)
+            trace.parent.mkdir(parents=True)
+            raw.write_text('{"event":"done"}\n', encoding="utf-8")
+            trace.write_text("trace\n", encoding="utf-8")
+            (experiment / "manifest.json").write_text(
+                json.dumps({"experiment_id": "exp_done", "status": "completed"}),
+                encoding="utf-8",
+            )
+            (root / "sessions").mkdir()
+            (root / "sessions" / "one.json").write_text("{}\n", encoding="utf-8")
+            service = AnalysisWorkspaceService(root)
+
+            for protected in [
+                "sessions/one.json",
+                "experiments/exp_done/manifest.json",
+                "experiments/exp_done/js-reverse/capture-one/events.jsonl",
+                "experiments/exp_done/playwright/traces/trace.txt",
+            ]:
+                with self.assertRaises(WorkspaceToolError) as raised:
+                    asyncio.run(
+                        service.write_file(
+                            WorkspaceWriteFileRequest(
+                                path=protected,
+                                content="changed\n",
+                                mode="overwrite",
+                            )
+                        )
+                    )
+                self.assertEqual(raised.exception.status_code, 403)
+
+            written = asyncio.run(
+                service.write_file(
+                    WorkspaceWriteFileRequest(
+                        path="experiments/exp_done/reports/analysis.md",
+                        content="# Analysis\n",
+                    )
+                )
+            )
+            self.assertTrue(written.written)
+
+            with self.assertRaises(WorkspaceToolError) as patch_error:
+                asyncio.run(
+                    service.apply_patch(
+                        WorkspaceApplyPatchRequest(
+                            patch=(
+                                "*** Begin Patch\n"
+                                "*** Update File: experiments/exp_done/js-reverse/"
+                                "capture-one/events.jsonl\n"
+                                "@@\n"
+                                "-{\"event\":\"done\"}\n"
+                                "+{\"event\":\"changed\"}\n"
+                                "*** End Patch"
+                            )
+                        )
+                    )
+                )
+            self.assertEqual(patch_error.exception.status_code, 403)
+
+            read_result = asyncio.run(
+                service.exec_pwsh(
+                    WorkspaceExecPwshRequest(
+                        script=(
+                            "$bytes = [IO.File]::ReadAllBytes("
+                            "'experiments/exp_done/js-reverse/capture-one/events.jsonl')\n"
+                            "Write-Output $bytes.Length"
+                        ),
+                        plain_output=True,
+                    )
+                )
+            )
+            self.assertEqual(read_result.exit_code, 0)
+
+            with self.assertRaises(WorkspaceToolError) as pwsh_error:
+                asyncio.run(
+                    service.exec_pwsh(
+                        WorkspaceExecPwshRequest(
+                            script=(
+                                "Set-Content "
+                                "'experiments/exp_done/js-reverse/capture-one/events.jsonl' "
+                                "'changed'"
+                            )
+                        )
+                    )
+                )
+            self.assertEqual(pwsh_error.exception.status_code, 403)
+
+    def test_running_experiment_blocks_workspace_mutation_and_powershell(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            experiment = root / "experiments" / "exp_running"
+            experiment.mkdir(parents=True)
+            (experiment / "manifest.json").write_text(
+                json.dumps(
+                    {"experiment_id": "exp_running", "status": "running"}
+                ),
+                encoding="utf-8",
+            )
+            service = AnalysisWorkspaceService(root)
+            with self.assertRaises(WorkspaceToolError) as write_error:
+                asyncio.run(
+                    service.write_file(
+                        WorkspaceWriteFileRequest(
+                            path="experiments/exp_running/reports/note.md",
+                            content="not yet\n",
+                        )
+                    )
+                )
+            self.assertEqual(write_error.exception.status_code, 409)
+            with self.assertRaises(WorkspaceToolError) as pwsh_error:
+                asyncio.run(
+                    service.exec_pwsh(
+                        WorkspaceExecPwshRequest(script="Write-Output 'read-only'")
+                    )
+                )
+            self.assertEqual(pwsh_error.exception.status_code, 409)
+
+    @unittest.skipUnless(os.name == "nt", "Windows single-process lock")
+    def test_single_process_guard_rejects_a_second_process_for_same_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir).resolve()
+            key = _acquire_single_process_guard(root)
+            try:
+                script = (
+                    "from pathlib import Path; "
+                    "from skill_temple.app import _acquire_single_process_guard; "
+                    f"_acquire_single_process_guard(Path({str(root)!r}))"
+                )
+                child = subprocess.run(
+                    [sys.executable, "-c", script],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=20,
+                    check=False,
+                )
+                self.assertNotEqual(child.returncode, 0)
+                self.assertIn("exactly one worker", child.stderr + child.stdout)
+            finally:
+                _release_single_process_guard(key)
 
     def test_paths_cannot_escape_analysis_root(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

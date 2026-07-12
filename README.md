@@ -119,6 +119,8 @@ get_stream_status
 
 执行 endpoint 和 `get_experiment` 只返回有界实验摘要及 `manifest_relative_path`。完整 manifest、network summary、requests 和 artifact 索引通过 `workspaceReadFiles` 读取。
 
+Stream status 会自动读取全部分页，并在执行 event predicate 前锁定具体 primary request ID；`matchedRequestId` 不属于该 request 时不会满足等待。一个 session 同时只允许一个后台 experiment，重复提交返回 `409 session_busy`。
+
 ## Background job
 
 `capture_flow` 默认使用后台 job：
@@ -291,6 +293,8 @@ truncated
 error
 ```
 
+读取不会先把整个文件载入内存。实现使用增量 UTF-8 校验和 SHA-256，再按行号流式提取目标范围；大型 `events.jsonl` 和 `decoded.sse` 的内存占用由响应预算限定。
+
 二进制文件不会被伪装成文本。对 `raw.bin`、压缩数据或二进制 payload 使用 PowerShell。
 
 ### `workspaceWriteFile`
@@ -332,7 +336,11 @@ dry_run
 - stdout/stderr 大小限制。
 - timeout。
 - Windows 进程树终止。
-- 默认禁止网络下载和 secret/认证管理命令。
+- 常见网络命令、secret/认证管理命令和远程发布命令的 best-effort 拦截。
+
+这不是安全沙箱：PowerShell alias、.NET、Python 或其他可执行文件仍可能绕过字符串规则。真正离线运行应使用 Windows 防火墙、隔离账户或单独虚拟机。
+
+PowerShell、ripgrep 和 Playwright CLI 的 stdout/stderr 都按流读取；达到输出预算后继续丢弃超限内容或终止搜索，不会先把完整输出缓冲到内存。
 
 它适合：
 
@@ -412,6 +420,19 @@ WEB_REV_JS_REVERSE_EXTRA_ARGS=["--headless","false"]
 WEB_REV_WORKSPACE_SHELL=pwsh
 WEB_REV_WORKSPACE_ALLOW_NETWORK=false
 ```
+
+同一个 analysis workspace 由 OS 文件锁强制只能有一个服务进程。内置 CLI 固定 `workers=1`；多个 Uvicorn worker 或第二个服务进程会在启动时失败。
+
+原始证据路径是只读的：
+
+```text
+sessions/
+experiments/*/manifest.json
+experiments/*/js-reverse/
+experiments/*/playwright/
+```
+
+实验运行期间禁止 workspace 写入和 PowerShell。实验结束后，派生文件只能写到 `reports/`、`derived/`、`replay/` 或顶层分析目录中的相应工作区，避免修改原始证据。
 
 默认私有 MCP 参数：
 

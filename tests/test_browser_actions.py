@@ -37,6 +37,7 @@ from skill_temple.browser_models import (
 )
 from skill_temple.browser_service import (
     BrowserActionService,
+    BrowserServiceError,
     Deadline,
     ExperimentStore,
     build_browser_service_from_environment,
@@ -909,6 +910,10 @@ class BrowserActionTests(unittest.TestCase):
                 ).read_text(encoding="utf-8")
             )
             self.assertEqual(manifest["capture_health"]["orphan_capture_id"], 1)
+            self.assertEqual(
+                manifest["capture_health"]["collector_cleanup"],
+                "unknown",
+            )
 
     def test_post_stop_alignment_failure_prevents_user_cancel_classification(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1659,6 +1664,270 @@ class BrowserActionTests(unittest.TestCase):
             0,
         )
         self.assertEqual(result.matched_event["matchedEventIndex"], 1)
+
+    def test_stream_status_paginates_until_primary_request_is_found(self) -> None:
+        class PaginatedTransport:
+            def __init__(self) -> None:
+                self.pages: list[int] = []
+
+            async def call_tool(
+                self, name: str, arguments: dict[str, Any], deadline: Deadline
+            ) -> dict[str, Any]:
+                if name != "get_stream_status":
+                    raise AssertionError(name)
+                page_idx = int(arguments["pageIdx"])
+                self.pages.append(page_idx)
+                if page_idx == 0:
+                    requests = [
+                        {
+                            "cdpRequestId": f"supporting-{index}",
+                            "url": f"https://example.test/telemetry/{index}",
+                            "method": "GET",
+                            "resourceType": "fetch",
+                            "status": "finished",
+                            "rawEventCount": 0,
+                            "semanticEventCount": 0,
+                        }
+                        for index in range(100)
+                    ]
+                    pagination = {
+                        "pageIdx": 0,
+                        "pageSize": 100,
+                        "totalItems": 101,
+                        "totalPages": 2,
+                        "hasNextPage": True,
+                        "hasPreviousPage": False,
+                    }
+                else:
+                    requests = [
+                        {
+                            "cdpRequestId": "primary-request",
+                            "url": "https://example.test/conversation",
+                            "method": "POST",
+                            "resourceType": "fetch",
+                            "status": "streaming",
+                            "rawEventCount": 1,
+                            "semanticEventCount": 0,
+                        }
+                    ]
+                    pagination = {
+                        "pageIdx": 1,
+                        "pageSize": 100,
+                        "totalItems": 101,
+                        "totalPages": 2,
+                        "hasNextPage": False,
+                        "hasPreviousPage": True,
+                    }
+                return {
+                    "capture": {"captureId": 7, "version": 2},
+                    "requests": requests,
+                    "pagination": pagination,
+                }
+
+            async def close(self) -> None:
+                return None
+
+        transport = PaginatedTransport()
+
+        async def exercise() -> dict[str, Any]:
+            adapter = JsReverseMcpAdapter(transport)
+            return await adapter.get_stream_status(7, Deadline(2_000))
+
+        payload = asyncio.run(exercise())
+        self.assertEqual(transport.pages, [0, 1])
+        self.assertEqual(len(payload["requests"]), 101)
+        self.assertEqual(payload["requests"][-1]["cdpRequestId"], "primary-request")
+        self.assertFalse(payload["pagination"]["hasNextPage"])
+
+    def test_supporting_request_event_match_cannot_satisfy_primary_wait(self) -> None:
+        class MismatchedEventTransport:
+            def __init__(self) -> None:
+                self.predicate_calls = 0
+
+            async def call_tool(
+                self, name: str, arguments: dict[str, Any], deadline: Deadline
+            ) -> dict[str, Any]:
+                if name != "get_stream_status":
+                    raise AssertionError(name)
+                if "eventPredicate" in arguments:
+                    self.predicate_calls += 1
+                    matched_request = (
+                        "supporting-request"
+                        if self.predicate_calls == 1
+                        else "primary-request"
+                    )
+                    return {
+                        "capture": {"captureId": 7, "version": 4},
+                        "request": {
+                            "cdpRequestId": "primary-request",
+                            "url": "https://example.test/conversation",
+                            "method": "POST",
+                            "resourceType": "fetch",
+                            "status": "streaming",
+                            "rawEventCount": 2,
+                            "semanticEventCount": 0,
+                        },
+                        "eventMatch": {
+                            "matched": True,
+                            "matchedEventIndex": 1,
+                            "matchedRequestId": matched_request,
+                            "matchedSource": "raw-stream",
+                        },
+                    }
+                return {
+                    "capture": {"captureId": 7, "version": 4},
+                    "requests": [
+                        {
+                            "cdpRequestId": "primary-request",
+                            "url": "https://example.test/conversation",
+                            "method": "POST",
+                            "resourceType": "fetch",
+                            "status": "streaming",
+                            "rawEventCount": 2,
+                            "semanticEventCount": 0,
+                        }
+                    ],
+                    "pagination": {
+                        "pageIdx": 0,
+                        "pageSize": 100,
+                        "totalItems": 1,
+                        "totalPages": 1,
+                        "hasNextPage": False,
+                        "hasPreviousPage": False,
+                    },
+                }
+
+            async def close(self) -> None:
+                return None
+
+        transport = MismatchedEventTransport()
+
+        async def exercise() -> StreamWaitResult:
+            adapter = JsReverseMcpAdapter(transport)
+            return await adapter.wait_for_stream_condition(
+                capture_id=7,
+                request_matcher=RequestMatcher(url_contains="/conversation"),
+                condition=WaitCondition(
+                    type="event_predicate",
+                    request_matcher=RequestMatcher(url_contains="/conversation"),
+                    predicate=ExactDataPredicate(
+                        type="exact_data",
+                        value="[DONE]",
+                    ),
+                ),
+                checkpoint=StreamCheckpoint(
+                    version=2,
+                    event_indices={"primary-request": 0},
+                ),
+                deadline=Deadline(3_000),
+            )
+
+        result = asyncio.run(exercise())
+        self.assertTrue(result.condition_met)
+        self.assertEqual(transport.predicate_calls, 2)
+        self.assertEqual(
+            result.matched_event["matchedRequestId"],
+            "primary-request",
+        )
+        self.assertEqual(result.matched_request_ids, ["primary-request"])
+
+    def test_same_session_rejects_a_second_background_job(self) -> None:
+        class BlockingPlaywright(FakePlaywright):
+            def __init__(self, events: list[str]) -> None:
+                super().__init__(events)
+                self.started = asyncio.Event()
+
+            async def execute_step(
+                self,
+                session_ref: str,
+                step: FlowStep,
+                experiment_dir: Path,
+                deadline: Deadline,
+            ) -> dict[str, Any]:
+                self.started.set()
+                await asyncio.Event().wait()
+                raise AssertionError("unreachable")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            events: list[str] = []
+            playwright = BlockingPlaywright(events)
+            service = BrowserActionService(
+                playwright=playwright,
+                js_reverse=FakeJsReverse(
+                    events,
+                    root,
+                    include_supporting_failure=False,
+                ),
+                experiments=ExperimentStore(root),
+                default_browser_endpoint="http://127.0.0.1:9222",
+            )
+
+            async def scenario() -> str:
+                await service.run(
+                    OpenSessionRequest(
+                        operation="open_session",
+                        payload={"session_id": "session_busy"},
+                    )
+                )
+                request = CaptureFlowRequest(
+                    operation="capture_flow",
+                    payload={
+                        "session_id": "session_busy",
+                        "objective": "long running job",
+                        "primary_request": {
+                            "url_contains": "/conversation",
+                            "method": "POST",
+                            "resource_types": ["fetch"],
+                        },
+                        "flow": [
+                            {
+                                "step_id": "blocking_click",
+                                "action": "click",
+                                "locator": {
+                                    "role": "button",
+                                    "name": "Send",
+                                },
+                            }
+                        ],
+                        "execution_mode": "job",
+                        "job_timeout_ms": 30_000,
+                    },
+                )
+                await service.run(request)
+                await playwright.started.wait()
+                try:
+                    with self.assertRaises(BrowserServiceError) as raised:
+                        await service.run(request)
+                    return raised.exception.code
+                finally:
+                    await service.close()
+
+            self.assertEqual(asyncio.run(scenario()), "session_busy")
+
+    def test_playwright_output_is_streamed_into_a_bounded_buffer(self) -> None:
+        async def exercise() -> Any:
+            runner = SubprocessCommandRunner(max_output_bytes=200)
+            return await runner.run(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import sys;"
+                        "sys.stdout.write('x'*10000);"
+                        "sys.stderr.write('y'*10000)"
+                    ),
+                ],
+                deadline=Deadline(5_000),
+            )
+
+        result = asyncio.run(exercise())
+        self.assertTrue(result.truncated)
+        self.assertLessEqual(
+            len(result.stdout.encode("utf-8"))
+            + len(result.stderr.encode("utf-8")),
+            200,
+        )
 
     @unittest.skipUnless(os.name == "nt", "Windows process-tree behavior")
     def test_playwright_runner_timeout_terminates_child_process_tree(self) -> None:

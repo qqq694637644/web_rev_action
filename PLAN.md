@@ -591,6 +591,10 @@ errors
 
 执行 endpoint 和 `get_experiment` 只返回有界摘要、primary request 前十项和 `manifest_relative_path`。完整 manifest、network summary、requests 与 artifact 索引通过 `workspaceReadFiles` 读取。
 
+`get_stream_status` 必须聚合全部 pagination page。Event predicate 只能按已经匹配 primary filter 的具体 request ID 查询，并校验 `eventMatch.matchedRequestId` 属于该 request，supporting stream 不能满足 primary objective。
+
+一个 session 同时只允许一个后台 experiment；第二个请求返回 `409 session_busy`。全局 browser lock 和 session lock 的获取也受实验 deadline 限制，不能在队列中无限等待。
+
 ---
 
 ## 12. Analysis Workspace Action 契约
@@ -639,7 +643,7 @@ max_bytes
 
 ### 12.3 workspaceReadFiles
 
-读取多个 UTF-8 文件并返回行号、总行数、字节数和 SHA-256。二进制文件返回 per-file error。
+读取多个 UTF-8 文件并返回行号、总行数、字节数和 SHA-256。实现使用增量 UTF-8 校验、增量 SHA-256 和按行流式范围提取，不允许先完整 `read_bytes()`；二进制文件返回 per-file error。
 
 ### 12.4 workspaceWriteFile
 
@@ -678,7 +682,23 @@ utf8_output
 - schema、diff、replay 和报告脚本。
 - 批量文件操作。
 
-默认禁止网络下载、Git push、GitHub CLI 认证/secret 管理、环境枚举、SSH/SCP。没有 Git commit、branch 或 PR 功能。
+默认对常见网络命令、Git push、GitHub CLI 认证/secret 管理、环境枚举和 SSH/SCP 做 best-effort 拦截。它不是网络安全沙箱；真正离线应由 Windows 防火墙、隔离账户或虚拟机保证。
+
+PowerShell、ripgrep 和 Playwright CLI 必须流式消费 stdout/stderr，只保存输出预算内的数据。ripgrep 达到 match/byte 限制或 timeout 后终止进程，不能使用无界 `communicate()`。
+
+Workspace 写入策略：
+
+```text
+sessions/                         后端管理，只读
+experiments/*/manifest.json       后端管理，只读
+experiments/*/js-reverse/         原始证据，只读
+experiments/*/playwright/         原始证据，只读
+experiments/*/reports|derived|replay/  派生内容可写
+```
+
+experiment 为 running 时禁止全部 workspace 写入和 PowerShell，避免与 collector 文件写入竞争。
+
+部署必须是单进程。CLI 固定 `workers=1`，服务对 analysis workspace 获取 OS 文件锁；第二个进程使用同一目录时启动失败。
 
 ---
 
@@ -839,12 +859,14 @@ Worker / Service Worker 深入诊断
 10. Stop cancellation 只在实验上下文满足时转换为 expected_user_cancel。
 11. experiment manifest 所有路径都相对分析根目录。
 12. workspaceInspect 能返回实验树、搜索和相关文件。
-13. workspaceSearch 使用 ripgrep 并支持 bounded response。
-14. workspaceReadFiles 返回 UTF-8 行号、SHA 和 per-file error。
+13. workspaceSearch 流式消费 ripgrep，并在 match、byte 或 timeout 限制到达时终止。
+14. workspaceReadFiles 使用增量 UTF-8/SHA 和流式行范围读取。
 15. workspaceWriteFile 支持 SHA guard、line endings 和 dry-run。
 16. workspaceApplyPatch 支持 update/add/delete opt-in 和 rollback。
 17. workspaceExecPwsh 能读取 raw.bin、计算 SHA/Base64、处理 UTF-8 和终止超时进程树。
 18. 产品没有 Git、branch、commit、PR、CI 或 ZIP 导出功能。
 19. 真实阶段 0 fixture 达到 8/8。
 20. 真实 BrowserAction Windows smoke 覆盖 attach、tab/select、navigate、click、Trace、screenshot、SSE predicate、workspace 读取、close 和残留进程检查。
-21. Windows 全量测试通过。
+21. 原始证据目录只读，running experiment 阻止 workspace mutation。
+22. 单 analysis workspace 只能由一个服务进程持有。
+23. Windows 全量测试通过。
