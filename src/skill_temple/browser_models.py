@@ -311,30 +311,6 @@ class GetExperimentPayload(StrictModel):
     experiment_id: str = Field(pattern=r"^[a-zA-Z0-9_.-]+$", max_length=128)
 
 
-class ListArtifactsPayload(GetExperimentPayload):
-    offset: int = Field(default=0, ge=0)
-    limit: int = Field(default=100, ge=1, le=500)
-
-
-class ReadArtifactPayload(GetExperimentPayload):
-    artifact_id: str = Field(min_length=1, max_length=512)
-    offset: int = Field(default=0, ge=0)
-    max_bytes: int = Field(default=64_000, ge=1, le=256_000)
-    credential_mode: Literal["redacted", "full"] = "redacted"
-
-
-class SearchArtifactsPayload(GetExperimentPayload):
-    query: str = Field(min_length=1, max_length=1024)
-    artifact_kinds: list[str] = Field(default_factory=list, max_length=32)
-    max_matches: int = Field(default=100, ge=1, le=500)
-    max_bytes_per_artifact: int = Field(default=1_000_000, ge=1, le=8_000_000)
-    credential_mode: Literal["redacted", "full"] = "redacted"
-
-
-class ExportExperimentPayload(GetExperimentPayload):
-    include_credentials: bool = False
-
-
 class GetStreamStatusPayload(StrictModel):
     session_id: str = Field(pattern=r"^[a-zA-Z0-9_.-]+$", max_length=128)
     capture_id: int = Field(gt=0)
@@ -358,37 +334,11 @@ class GetExperimentRequest(StrictModel):
     payload: GetExperimentPayload
 
 
-class ListArtifactsRequest(StrictModel):
-    contract_version: Literal["1.0"] = "1.0"
-    operation: Literal["list_artifacts"]
-    payload: ListArtifactsPayload
-
-
-class ReadArtifactRequest(StrictModel):
-    contract_version: Literal["1.0"] = "1.0"
-    operation: Literal["read_artifact"]
-    payload: ReadArtifactPayload
-
-
-class SearchArtifactsRequest(StrictModel):
-    contract_version: Literal["1.0"] = "1.0"
-    operation: Literal["search_artifacts"]
-    payload: SearchArtifactsPayload
-
-
-class ExportExperimentRequest(StrictModel):
-    contract_version: Literal["1.0"] = "1.0"
-    operation: Literal["export_experiment"]
-    payload: ExportExperimentPayload
-    skill_binding: SkillBinding | None = None
-
-
 RunBrowserExperimentRequest = Annotated[
     OpenSessionRequest
     | CaptureBaselineRequest
     | CaptureFlowRequest
-    | CloseSessionRequest
-    | ExportExperimentRequest,
+    | CloseSessionRequest,
     Field(discriminator="operation"),
 ]
 
@@ -403,9 +353,6 @@ InspectBrowserEvidenceRequest = Annotated[
     GetSessionRequest
     | ListExperimentsRequest
     | GetExperimentRequest
-    | ListArtifactsRequest
-    | ReadArtifactRequest
-    | SearchArtifactsRequest
     | GetStreamStatusRequest,
     Field(discriminator="operation"),
 ]

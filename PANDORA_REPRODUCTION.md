@@ -27,14 +27,26 @@ message / parent message 如何关联
 playwright-cli 负责制造和重放页面行为
 js-reverse-mcp 负责解释网络、流、脚本、调用栈和运行时证据
 web_rev_action 负责原子编排、证据索引、deadline 和实验 manifest
-LocalEvidenceStore 负责实验后的读取、搜索、分页、导出、diff、schema 和重放脚本
+workspaceInspect/Search/ReadFiles 负责实验后的浏览和文本分析
+workspaceWriteFile/ApplyPatch/ExecPwsh 负责 schema、报告、二进制、diff 和重放脚本
 ```
 
-GPT 只调用：
+浏览器实验调用：
 
 ```text
 inspectBrowserEvidence
 runBrowserExperiment
+```
+
+实验文件调用：
+
+```text
+workspaceInspect
+workspaceSearch
+workspaceReadFiles
+workspaceWriteFile
+workspaceApplyPatch
+workspaceExecPwsh
 ```
 
 `js-reverse-mcp` 的三个 stream primitive 是后端私有工具：
@@ -73,7 +85,7 @@ data/analysis-workspace/
 experiments/exp_001/js-reverse/capture-<uuid>/
 ```
 
-这是 Action 服务本机的普通 evidence 目录，不需要 Git、PR、branch 或 CI，也不假设与 GitHub Gateway workspace 共享文件系统。GPT 通过 `inspectBrowserEvidence` 读、搜、分页；需要搬运时使用 `runBrowserExperiment(export_experiment)` 创建 ZIP。
+这是 Action 服务本机的普通分析目录，不需要 Git、PR、branch、CI、ZIP 或远程同步。浏览器 Orchestrator 和六个 workspace Action 直接操作同一个目录。
 
 ---
 
@@ -202,7 +214,7 @@ artifact_id
 
 ## 7. 请求分类
 
-使用 `inspectBrowserEvidence` 的请求查询、artifact 搜索和 Action 后端本地脚本分类：
+先用 `inspectBrowserEvidence.get_experiment` 确认实验终态，再用 `workspaceInspect`、`workspaceSearch`、`workspaceReadFiles` 和 PowerShell 脚本分类：
 
 ```text
 页面初始化
@@ -391,13 +403,11 @@ network_canceled 时间
 对每个核心请求执行：
 
 ```text
-1. inspectBrowserEvidence.list_requests
-2. inspectBrowserEvidence.get_request
-3. inspectBrowserEvidence.get_request_initiator
-4. inspectBrowserEvidence.search_scripts
-5. 必要时 runBrowserExperiment.trace_request
-6. inspectBrowserEvidence.get_script_source
-7. 保存源码片段、调用栈和 paused info
+1. workspaceInspect 定位 manifest、request metadata 和 initiator artifact
+2. workspaceReadFiles 读取请求摘要、headers、initiator 和相关源码文本
+3. workspaceSearch 搜索请求 path、字段和脚本符号
+4. 必要时由后续 runBrowserExperiment.trace_request 执行断点实验
+5. workspaceWriteFile / ApplyPatch 保存源码片段、调用栈和 paused info
 ```
 
 只有 initiator 和源码搜索无法解释请求时，才使用 XHR/fetch breakpoint。
@@ -497,7 +507,7 @@ response.fromServiceWorker=true
 - 自动复用 Cookie。
 - 一次只删改一个字段。
 - 请求样本来自 artifact。
-- 结果写入 LocalEvidenceStore。
+- 结果通过 workspaceWriteFile / ApplyPatch 写入分析目录。
 
 这是第一轮字段必要性实验的首选方式。
 
@@ -613,5 +623,6 @@ notes/open-questions.md
 - Stop cancellation 不由底层提前解释成用户行为。
 - credential 默认脱敏。
 - stop 后关闭页面不修改历史 manifest。
-- 所有 artifact 相对路径可由 LocalEvidenceStore 读取、搜索、分页和导出。
+- 所有文本 artifact 相对路径可由 workspaceInspect/Search/ReadFiles 处理。
+- raw.bin、Base64、压缩和批量 JSONL 可由 workspaceExecPwsh 处理。
 - 长流由后台 job 完成；显式快速同步模式才受 42 秒 Action deadline 限制。

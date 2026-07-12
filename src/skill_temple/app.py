@@ -31,6 +31,8 @@ from .runtime import (
     env_value_from_environment_or_dotenv,
     load_runtime,
 )
+from .workspace_routes import register_workspace_actions
+from .workspace_service import AnalysisWorkspaceService
 
 BEARER_TOKEN_ENV_VAR = "SKILL_TEMPLE_BEARER_TOKEN"
 
@@ -258,6 +260,7 @@ def create_app(
     skills_dir: str | Path | None = None,
     server_url: str | None = None,
     browser_service: BrowserActionService | None = None,
+    workspace_service: AnalysisWorkspaceService | None = None,
 ) -> FastAPI:
     runtime = load_runtime(skills_dir)
     configured_server_url = _normalize_server_url(
@@ -446,6 +449,18 @@ def create_app(
 
     resolved_browser_service = browser_service or build_browser_service_from_environment()
     register_browser_actions(app, resolved_browser_service)
+    resolved_workspace_service = workspace_service or AnalysisWorkspaceService(
+        resolved_browser_service.experiments.root,
+        shell=(
+            env_value_from_environment_or_dotenv("WEB_REV_WORKSPACE_SHELL") or "pwsh"
+        ),
+        allow_network=(
+            env_value_from_environment_or_dotenv("WEB_REV_WORKSPACE_ALLOW_NETWORK")
+            or "false"
+        ).lower()
+        in {"1", "true", "yes", "on"},
+    )
+    register_workspace_actions(app, resolved_workspace_service)
 
     async def close_browser_service() -> None:
         await resolved_browser_service.close()

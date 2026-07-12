@@ -8,7 +8,6 @@ import os
 import re
 import time
 import uuid
-import zipfile
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
@@ -29,20 +28,16 @@ from .browser_models import (
     CaptureFlowPayload,
     CaptureFlowRequest,
     CloseSessionRequest,
-    ExportExperimentRequest,
     FlowStep,
     FlowStepResult,
     GetExperimentRequest,
     GetSessionRequest,
     GetStreamStatusRequest,
     InspectBrowserEvidenceRequest,
-    ListArtifactsRequest,
     ListExperimentsRequest,
     OpenSessionRequest,
-    ReadArtifactRequest,
     RequestMatcher,
     RunBrowserExperimentRequest,
-    SearchArtifactsRequest,
     WaitCondition,
 )
 from .runtime import env_value_from_environment_or_dotenv
@@ -112,8 +107,8 @@ def _safe_identifier(value: str, label: str) -> str:
     return value
 
 
-class LocalEvidenceStore:
-    """Owns Action-local evidence. It is not a Gateway or Git workspace."""
+class ExperimentStore:
+    """Minimal internal persistence for sessions and experiment manifests."""
 
     def __init__(self, root: Path) -> None:
         self.root = root.expanduser().resolve()
@@ -211,21 +206,6 @@ class LocalEvidenceStore:
                 break
         return items
 
-    @staticmethod
-    def _artifact_id(descriptor: dict[str, Any]) -> str | None:
-        value = descriptor.get("artifactId") or descriptor.get("artifact_id")
-        return str(value) if value else None
-
-    def list_artifacts(
-        self, experiment_id: str, offset: int = 0, limit: int | None = None
-    ) -> list[dict[str, Any]]:
-        manifest = self.load_manifest(experiment_id)
-        artifacts = manifest.get("artifacts")
-        if not isinstance(artifacts, list):
-            return []
-        items = [item for item in artifacts if isinstance(item, dict)]
-        return items[offset:] if limit is None else items[offset : offset + limit]
-
     def recover_interrupted_experiments(self) -> int:
         recovered = 0
         for path in self.experiments_dir.glob("*/manifest.json"):
@@ -248,197 +228,6 @@ class LocalEvidenceStore:
             self.write_manifest(str(manifest["experiment_id"]), manifest)
             recovered += 1
         return recovered
-
-    def _resolve_relative(self, relative_path: str) -> Path:
-        path = (self.root / Path(relative_path)).resolve()
-        try:
-            path.relative_to(self.root)
-        except ValueError as exc:
-            raise BrowserServiceError(
-                "unsafe_artifact_path",
-                "Artifact path escaped workspace",
-                400,
-            ) from exc
-        return path
-
-    def read_artifact(
-        self,
-        *,
-        experiment_id: str,
-        artifact_id: str,
-        offset: int,
-        max_bytes: int,
-        credential_mode: str,
-    ) -> dict[str, Any]:
-        artifacts = self.list_artifacts(experiment_id)
-        descriptor = next(
-            (item for item in artifacts if self._artifact_id(item) == artifact_id),
-            None,
-        )
-        if descriptor is None:
-            raise BrowserServiceError("artifact_not_found", "Artifact was not found", 404)
-        if descriptor.get("sensitivity") == "credential" and credential_mode != "full":
-            redacted_id = descriptor.get("redactedArtifactId") or descriptor.get(
-                "redacted_artifact_id"
-            )
-            if redacted_id:
-                return self.read_artifact(
-                    experiment_id=experiment_id,
-                    artifact_id=str(redacted_id),
-                    offset=offset,
-                    max_bytes=max_bytes,
-                    credential_mode="redacted",
-                )
-            return {
-                "artifact": descriptor,
-                "credential_redacted": True,
-                "content": None,
-                "truncated": False,
-                "next_offset": None,
-            }
-        relative_path = descriptor.get("relativePath") or descriptor.get("relative_path")
-        if not isinstance(relative_path, str):
-            raise BrowserServiceError("artifact_path_missing", "Artifact has no relative path", 409)
-        path = self._resolve_relative(relative_path)
-        if not path.is_file():
-            raise BrowserServiceError("artifact_file_missing", "Artifact file is unavailable", 404)
-        with path.open("rb") as handle:
-            handle.seek(offset)
-            payload = handle.read(max_bytes + 1)
-        truncated = len(payload) > max_bytes
-        payload = payload[:max_bytes]
-        return {
-            "artifact": descriptor,
-            "offset": offset,
-            "bytes_returned": len(payload),
-            "content": payload.decode("utf-8", errors="replace"),
-            "truncated": truncated,
-            "next_offset": offset + len(payload) if truncated else None,
-            "credential_redacted": descriptor.get("sensitivity") != "credential",
-        }
-
-    def _effective_descriptor(
-        self,
-        experiment_id: str,
-        descriptor: dict[str, Any],
-        credential_mode: str,
-    ) -> dict[str, Any] | None:
-        if descriptor.get("sensitivity") != "credential" or credential_mode == "full":
-            return descriptor
-        redacted_id = descriptor.get("redactedArtifactId") or descriptor.get(
-            "redacted_artifact_id"
-        )
-        if not redacted_id:
-            return None
-        return next(
-            (
-                item
-                for item in self.list_artifacts(experiment_id)
-                if self._artifact_id(item) == str(redacted_id)
-            ),
-            None,
-        )
-
-    def search_artifacts(
-        self,
-        *,
-        experiment_id: str,
-        query: str,
-        artifact_kinds: list[str],
-        max_matches: int,
-        max_bytes_per_artifact: int,
-        credential_mode: str,
-    ) -> list[dict[str, Any]]:
-        needle = query.casefold()
-        matches: list[dict[str, Any]] = []
-        seen: set[str] = set()
-        for original in self.list_artifacts(experiment_id):
-            descriptor = self._effective_descriptor(
-                experiment_id, original, credential_mode
-            )
-            if descriptor is None:
-                continue
-            artifact_id = self._artifact_id(descriptor)
-            if not artifact_id or artifact_id in seen:
-                continue
-            seen.add(artifact_id)
-            if artifact_kinds and str(descriptor.get("kind")) not in artifact_kinds:
-                continue
-            relative_path = descriptor.get("relativePath") or descriptor.get(
-                "relative_path"
-            )
-            if not isinstance(relative_path, str):
-                continue
-            path = self._resolve_relative(relative_path)
-            if not path.is_file():
-                continue
-            with path.open("rb") as handle:
-                payload = handle.read(max_bytes_per_artifact)
-            text = payload.decode("utf-8", errors="replace")
-            for line_number, line in enumerate(text.splitlines(), start=1):
-                position = line.casefold().find(needle)
-                if position < 0:
-                    continue
-                start = max(0, position - 120)
-                end = min(len(line), position + len(query) + 120)
-                matches.append(
-                    {
-                        "artifact_id": artifact_id,
-                        "kind": descriptor.get("kind"),
-                        "relative_path": relative_path,
-                        "line_number": line_number,
-                        "snippet": line[start:end],
-                        "credential_redacted": (
-                            original.get("sensitivity") == "credential"
-                            and credential_mode != "full"
-                        ),
-                    }
-                )
-                if len(matches) >= max_matches:
-                    return matches
-        return matches
-
-    def export_experiment(
-        self, experiment_id: str, *, include_credentials: bool
-    ) -> dict[str, Any]:
-        directory = self.experiment_dir(experiment_id)
-        manifest = self.load_manifest(experiment_id)
-        exports = directory / "exports"
-        exports.mkdir(parents=True, exist_ok=True)
-        archive = exports / f"{experiment_id}.zip"
-        credential_paths = {
-            str(item.get("relativePath") or item.get("relative_path"))
-            for item in self.list_artifacts(experiment_id)
-            if item.get("sensitivity") == "credential"
-        }
-        with zipfile.ZipFile(
-            archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6
-        ) as bundle:
-            for path in directory.rglob("*"):
-                if not path.is_file() or exports in path.parents:
-                    continue
-                relative_to_root = path.relative_to(self.root).as_posix()
-                if not include_credentials and relative_to_root in credential_paths:
-                    continue
-                bundle.write(path, path.relative_to(directory).as_posix())
-        descriptor = self.describe_local_artifact(
-            archive.as_posix(),
-            artifact_id=f"art_{experiment_id}_export",
-            kind="experiment_export",
-            sensitivity="credential" if include_credentials else "private",
-        )
-        if descriptor is None:
-            raise BrowserServiceError("export_failed", "Experiment export was not created", 500)
-        artifacts = [
-            item
-            for item in manifest.get("artifacts", [])
-            if isinstance(item, dict)
-            and self._artifact_id(item) != descriptor["artifactId"]
-        ]
-        artifacts.append(descriptor)
-        manifest["artifacts"] = artifacts
-        self.write_manifest(experiment_id, manifest)
-        return descriptor
 
     def describe_local_artifact(
         self,
@@ -495,14 +284,14 @@ class BrowserActionService:
         *,
         playwright: PlaywrightAdapter,
         js_reverse: JsReverseAdapter,
-        evidence: LocalEvidenceStore,
+        experiments: ExperimentStore,
         default_browser_endpoint: str | None = None,
         private_mcp_browser_endpoint: str | None = None,
         require_private_mcp_endpoint: bool = False,
     ) -> None:
         self.playwright = playwright
         self.js_reverse = js_reverse
-        self.evidence = evidence
+        self.experiments = experiments
         self.default_browser_endpoint = default_browser_endpoint
         self.private_mcp_browser_endpoint = private_mcp_browser_endpoint
         self.require_private_mcp_endpoint = require_private_mcp_endpoint
@@ -514,24 +303,13 @@ class BrowserActionService:
         return self._session_locks.setdefault(session_id, asyncio.Lock())
 
     def _get_session(self, session_id: str) -> dict[str, Any]:
-        session = self.sessions.get(session_id) or self.evidence.load_session(session_id)
+        session = self.sessions.get(session_id) or self.experiments.load_session(session_id)
         if not session:
             raise BrowserServiceError("session_not_found", "Browser session was not found", 404)
         self.sessions[session_id] = session
         return session
 
     async def run(self, request: RunBrowserExperimentRequest) -> BrowserActionResponse:
-        if isinstance(request, ExportExperimentRequest):
-            descriptor = self.evidence.export_experiment(
-                request.payload.experiment_id,
-                include_credentials=request.payload.include_credentials,
-            )
-            return BrowserActionResponse(
-                operation=request.operation,
-                status="completed",
-                experiment_id=request.payload.experiment_id,
-                result={"export_artifact": descriptor},
-            )
         if isinstance(request, OpenSessionRequest):
             return await self._open_session(request)
         if isinstance(request, CloseSessionRequest):
@@ -552,7 +330,7 @@ class BrowserActionService:
                 result={"session": session},
             )
         if isinstance(request, ListExperimentsRequest):
-            items = self.evidence.list_experiments(
+            items = self.experiments.list_experiments(
                 request.payload.session_id, request.payload.limit
             )
             return BrowserActionResponse(
@@ -561,7 +339,7 @@ class BrowserActionService:
                 result={"experiments": items, "count": len(items)},
             )
         if isinstance(request, GetExperimentRequest):
-            manifest = self.evidence.load_manifest(request.payload.experiment_id)
+            manifest = self.experiments.load_manifest(request.payload.experiment_id)
             manifest_status = str(manifest.get("status", "partial"))
             response_status = (
                 manifest_status
@@ -575,47 +353,6 @@ class BrowserActionService:
                 session_id=manifest.get("session_id"),
                 experiment_id=request.payload.experiment_id,
                 result={"experiment": manifest},
-            )
-        if isinstance(request, ListArtifactsRequest):
-            artifacts = self.evidence.list_artifacts(
-                request.payload.experiment_id,
-                request.payload.offset,
-                request.payload.limit,
-            )
-            return BrowserActionResponse(
-                operation=request.operation,
-                status="completed",
-                experiment_id=request.payload.experiment_id,
-                result={"artifacts": artifacts, "count": len(artifacts)},
-            )
-        if isinstance(request, ReadArtifactRequest):
-            result = self.evidence.read_artifact(
-                experiment_id=request.payload.experiment_id,
-                artifact_id=request.payload.artifact_id,
-                offset=request.payload.offset,
-                max_bytes=request.payload.max_bytes,
-                credential_mode=request.payload.credential_mode,
-            )
-            return BrowserActionResponse(
-                operation=request.operation,
-                status="completed",
-                experiment_id=request.payload.experiment_id,
-                result=result,
-            )
-        if isinstance(request, SearchArtifactsRequest):
-            matches = self.evidence.search_artifacts(
-                experiment_id=request.payload.experiment_id,
-                query=request.payload.query,
-                artifact_kinds=request.payload.artifact_kinds,
-                max_matches=request.payload.max_matches,
-                max_bytes_per_artifact=request.payload.max_bytes_per_artifact,
-                credential_mode=request.payload.credential_mode,
-            )
-            return BrowserActionResponse(
-                operation=request.operation,
-                status="completed",
-                experiment_id=request.payload.experiment_id,
-                result={"matches": matches, "count": len(matches)},
             )
         if isinstance(request, GetStreamStatusRequest):
             self._get_session(request.payload.session_id)
@@ -693,7 +430,7 @@ class BrowserActionService:
                 "updated_at": now,
             }
             self.sessions[session_id] = session
-            self.evidence.save_session(session)
+            self.experiments.save_session(session)
         return BrowserActionResponse(
             operation=request.operation,
             status="completed",
@@ -710,7 +447,7 @@ class BrowserActionService:
             await self.playwright.close_session(session_id, deadline)
             session["status"] = "closed"
             session["updated_at"] = utc_now()
-            self.evidence.save_session(session)
+            self.experiments.save_session(session)
         return BrowserActionResponse(
             operation=request.operation,
             status="completed",
@@ -736,7 +473,7 @@ class BrowserActionService:
             await self.playwright.execute_step(
                 str(session["playwright_session_ref"]),
                 step,
-                self.evidence.root,
+                self.experiments.root,
                 deadline,
             )
         page = await self.playwright.current_page(
@@ -778,7 +515,7 @@ class BrowserActionService:
                 "updated_at": utc_now(),
             }
         )
-        self.evidence.save_session(session)
+        self.experiments.save_session(session)
         return alignment
 
     @staticmethod
@@ -1027,7 +764,7 @@ class BrowserActionService:
         if session.get("status") != "open":
             raise BrowserServiceError("session_closed", "Browser session is not open", 409)
         deadline = Deadline(payload.job_timeout_ms)
-        experiment_id, experiment_dir, manifest = self.evidence.create_experiment(
+        experiment_id, experiment_dir, manifest = self.experiments.create_experiment(
             session_id=payload.session_id,
             operation=request.operation,
             objective=payload.objective,
@@ -1042,7 +779,7 @@ class BrowserActionService:
                 ),
             }
         )
-        self.evidence.write_manifest(experiment_id, manifest)
+        self.experiments.write_manifest(experiment_id, manifest)
         task = asyncio.create_task(
             self._run_capture_job(
                 request,
@@ -1082,7 +819,7 @@ class BrowserActionService:
                 prepared=prepared,
             )
         except asyncio.CancelledError:
-            manifest = self.evidence.load_manifest(experiment_id)
+            manifest = self.experiments.load_manifest(experiment_id)
             manifest["status"] = "interrupted"
             manifest["errors"] = [
                 *(
@@ -1092,10 +829,10 @@ class BrowserActionService:
                 ),
                 "Background experiment task was canceled during service shutdown.",
             ]
-            self.evidence.write_manifest(experiment_id, manifest)
+            self.experiments.write_manifest(experiment_id, manifest)
             raise
         except Exception as exc:
-            manifest = self.evidence.load_manifest(experiment_id)
+            manifest = self.experiments.load_manifest(experiment_id)
             manifest["status"] = "failed"
             manifest["errors"] = [
                 *(
@@ -1105,7 +842,7 @@ class BrowserActionService:
                 ),
                 str(exc)[:4000],
             ]
-            self.evidence.write_manifest(experiment_id, manifest)
+            self.experiments.write_manifest(experiment_id, manifest)
 
     async def wait_for_job(self, experiment_id: str) -> None:
         task = self._jobs.get(experiment_id)
@@ -1123,7 +860,7 @@ class BrowserActionService:
         deadline = deadline or Deadline(payload.deadline_ms)
         session_id = payload.session_id
         if prepared is None:
-            experiment_id, experiment_dir, manifest = self.evidence.create_experiment(
+            experiment_id, experiment_dir, manifest = self.experiments.create_experiment(
                 session_id=session_id,
                 operation=request.operation,
                 objective=payload.objective,
@@ -1133,7 +870,7 @@ class BrowserActionService:
             manifest["primary_request_matcher"] = payload.primary_request.model_dump(
                 mode="json", exclude_none=True
             )
-            self.evidence.write_manifest(experiment_id, manifest)
+            self.experiments.write_manifest(experiment_id, manifest)
         else:
             experiment_id, experiment_dir, manifest = prepared
         async with self._session_lock(session_id):
@@ -1141,7 +878,7 @@ class BrowserActionService:
             if session.get("status") != "open":
                 manifest["status"] = "failed"
                 manifest["errors"] = ["Browser session is not open."]
-                self.evidence.write_manifest(experiment_id, manifest)
+                self.experiments.write_manifest(experiment_id, manifest)
                 return BrowserActionResponse(
                     operation=request.operation,
                     status="failed",
@@ -1155,7 +892,7 @@ class BrowserActionService:
             except Exception as exc:
                 manifest["status"] = "failed"
                 manifest["errors"] = [str(exc)[:4000]]
-                self.evidence.write_manifest(experiment_id, manifest)
+                self.experiments.write_manifest(experiment_id, manifest)
                 return BrowserActionResponse(
                     operation=request.operation,
                     status="failed",
@@ -1281,7 +1018,7 @@ class BrowserActionService:
                             )
                             raw_snapshot_ref = result.get("snapshot_ref")
                             snapshot_ref = (
-                                self.evidence.relative_path(str(raw_snapshot_ref))
+                                self.experiments.relative_path(str(raw_snapshot_ref))
                                 if raw_snapshot_ref
                                 else None
                             )
@@ -1452,7 +1189,7 @@ class BrowserActionService:
                 network_payload,
             )
             for index, screenshot_path in enumerate(screenshot_paths, start=1):
-                descriptor = self.evidence.describe_local_artifact(
+                descriptor = self.experiments.describe_local_artifact(
                     screenshot_path,
                     artifact_id=f"art_{experiment_id}_screenshot_{index}",
                     kind="playwright_screenshot",
@@ -1461,7 +1198,7 @@ class BrowserActionService:
                 if descriptor:
                     artifacts.append(descriptor)
             for index, trace_path in enumerate(trace_paths, start=1):
-                descriptor = self.evidence.describe_local_artifact(
+                descriptor = self.experiments.describe_local_artifact(
                     trace_path,
                     artifact_id=f"art_{experiment_id}_trace_{index}",
                     kind="playwright_trace",
@@ -1472,12 +1209,12 @@ class BrowserActionService:
             relative_screenshot_paths = [
                 relative
                 for path in screenshot_paths
-                if (relative := self.evidence.relative_path(path)) is not None
+                if (relative := self.experiments.relative_path(path)) is not None
             ]
             relative_trace_paths = [
                 relative
                 for path in trace_paths
-                if (relative := self.evidence.relative_path(path)) is not None
+                if (relative := self.experiments.relative_path(path)) is not None
             ]
             manifest.update(
                 {
@@ -1501,7 +1238,7 @@ class BrowserActionService:
                     "errors": errors,
                 }
             )
-            self.evidence.write_manifest(experiment_id, manifest)
+            self.experiments.write_manifest(experiment_id, manifest)
             return BrowserActionResponse(
                 operation=request.operation,
                 status="completed" if objective_ok else "failed",
@@ -1531,14 +1268,14 @@ def build_browser_service_from_environment() -> BrowserActionService:
         env_value_from_environment_or_dotenv("WEB_REV_EVIDENCE_DIR")
         or "data/analysis-workspace"
     )
-    evidence = LocalEvidenceStore(evidence_root)
+    experiments = ExperimentStore(evidence_root)
     browser_endpoint = env_value_from_environment_or_dotenv("WEB_REV_BROWSER_CDP_URL")
     playwright = PlaywrightCliAdapter(
         executable=(
             env_value_from_environment_or_dotenv("WEB_REV_PLAYWRIGHT_CLI")
             or "playwright-cli"
         ),
-        cwd=evidence.root,
+        cwd=experiments.root,
     )
     command = (
         env_value_from_environment_or_dotenv("WEB_REV_JS_REVERSE_COMMAND")
@@ -1555,7 +1292,7 @@ def build_browser_service_from_environment() -> BrowserActionService:
     else:
         args = [
             "--allowedRoots",
-            str(evidence.root),
+            str(experiments.root),
             "--streamArtifactRoot",
             "0",
         ]
@@ -1564,13 +1301,13 @@ def build_browser_service_from_environment() -> BrowserActionService:
     transport: McpToolTransport = StdioMcpToolTransport(
         command=command,
         args=args,
-        cwd=evidence.root,
+        cwd=experiments.root,
     )
     js_reverse = JsReverseMcpAdapter(transport)
     return BrowserActionService(
         playwright=playwright,
         js_reverse=js_reverse,
-        evidence=evidence,
+        experiments=experiments,
         default_browser_endpoint=browser_endpoint,
         private_mcp_browser_endpoint=browser_endpoint,
         require_private_mcp_endpoint=True,

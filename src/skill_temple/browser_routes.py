@@ -22,8 +22,8 @@ def register_browser_actions(app: FastAPI, service: BrowserActionService) -> Non
         response_model_exclude_none=True,
         summary="Inspect saved browser experiment evidence.",
         description=(
-            "Read sessions, experiment manifests, stream status, and bounded artifacts. "
-            "Credential artifacts are redacted unless full local replay access is explicit."
+            "Read browser sessions, experiment manifests, and private stream status. "
+            "Use the workspace Actions to inspect or modify files under the analysis directory."
         ),
         openapi_extra={"x-openai-isConsequential": False},
     )

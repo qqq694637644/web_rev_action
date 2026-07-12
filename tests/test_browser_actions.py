@@ -7,7 +7,6 @@ import sys
 import tempfile
 import time
 import unittest
-import zipfile
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -32,7 +31,7 @@ from skill_temple.browser_models import (
 from skill_temple.browser_service import (
     BrowserActionService,
     Deadline,
-    LocalEvidenceStore,
+    ExperimentStore,
     build_browser_service_from_environment,
 )
 
@@ -382,10 +381,10 @@ class BrowserActionTests(unittest.TestCase):
         primary_status: str = "finished",
     ) -> tuple[TestClient, list[str], FakeJsReverse]:
         events: list[str] = []
-        evidence = LocalEvidenceStore(root)
+        experiments = ExperimentStore(root)
         js = FakeJsReverse(
             events,
-            evidence.root,
+            experiments.root,
             alignment_status=alignment_status,
             include_supporting_failure=include_supporting_failure,
             primary_status=primary_status,
@@ -393,7 +392,7 @@ class BrowserActionTests(unittest.TestCase):
         service = BrowserActionService(
             playwright=FakePlaywright(events, fail_step=fail_step),
             js_reverse=js,
-            evidence=evidence,
+            experiments=experiments,
             default_browser_endpoint="http://127.0.0.1:9222",
         )
         return TestClient(create_app(browser_service=service)), events, js
@@ -528,49 +527,6 @@ class BrowserActionTests(unittest.TestCase):
             self.assertEqual(response.status_code, 409)
             self.assertNotIn("js.start", events)
             self.assertIn("playwright.close", events)
-
-    def test_inspect_defaults_to_redacted_credential_artifact(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            client, _, _ = self.make_client(Path(temp_dir))
-            with client:
-                self.open_session(client)
-                capture = client.post("/v1/browser/run", json=self.capture_request()).json()
-                experiment_id = capture["experiment_id"]
-                artifacts = client.post(
-                    "/v1/browser/inspect",
-                    json={
-                        "operation": "list_artifacts",
-                        "payload": {"experiment_id": experiment_id},
-                    },
-                ).json()["result"]["artifacts"]
-                credential = next(
-                    item for item in artifacts if item.get("sensitivity") == "credential"
-                )
-                redacted = client.post(
-                    "/v1/browser/inspect",
-                    json={
-                        "operation": "read_artifact",
-                        "payload": {
-                            "experiment_id": experiment_id,
-                            "artifact_id": credential["artifactId"],
-                        },
-                    },
-                )
-                full = client.post(
-                    "/v1/browser/inspect",
-                    json={
-                        "operation": "read_artifact",
-                        "payload": {
-                            "experiment_id": experiment_id,
-                            "artifact_id": credential["artifactId"],
-                            "credential_mode": "full",
-                        },
-                    },
-                )
-            self.assertEqual(redacted.status_code, 200, redacted.text)
-            self.assertIn("[REDACTED]", redacted.json()["result"]["content"])
-            self.assertNotIn("Bearer secret", redacted.json()["result"]["content"])
-            self.assertIn("Bearer secret", full.json()["result"]["content"])
 
     def test_include_in_flight_is_forwarded_and_close_session_is_persisted(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -740,7 +696,7 @@ class BrowserActionTests(unittest.TestCase):
                 final["result"]["experiment"]["execution_mode"], "job"
             )
 
-    def test_local_evidence_recovers_running_manifest_as_interrupted(self) -> None:
+    def test_experiment_store_recovers_running_manifest_as_interrupted(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             experiment_dir = root / "experiments" / "exp_crashed"
@@ -756,68 +712,10 @@ class BrowserActionTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            evidence = LocalEvidenceStore(root)
-            recovered = evidence.load_manifest("exp_crashed")
+            experiments = ExperimentStore(root)
+            recovered = experiments.load_manifest("exp_crashed")
             self.assertEqual(recovered["status"], "interrupted")
             self.assertTrue(recovered["errors"])
-
-    def test_local_evidence_search_paging_and_export_do_not_require_gateway_mount(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir)
-            client, _, _ = self.make_client(root)
-            with client:
-                self.open_session(client)
-                captured = client.post(
-                    "/v1/browser/run", json=self.capture_request()
-                ).json()
-                experiment_id = captured["experiment_id"]
-                page = client.post(
-                    "/v1/browser/inspect",
-                    json={
-                        "operation": "list_artifacts",
-                        "payload": {
-                            "experiment_id": experiment_id,
-                            "offset": 0,
-                            "limit": 2,
-                        },
-                    },
-                )
-                searched = client.post(
-                    "/v1/browser/inspect",
-                    json={
-                        "operation": "search_artifacts",
-                        "payload": {
-                            "experiment_id": experiment_id,
-                            "query": "REDACTED",
-                        },
-                    },
-                )
-                exported = client.post(
-                    "/v1/browser/run",
-                    json={
-                        "operation": "export_experiment",
-                        "payload": {
-                            "experiment_id": experiment_id,
-                            "include_credentials": False,
-                        },
-                    },
-                )
-            self.assertEqual(page.status_code, 200, page.text)
-            self.assertLessEqual(page.json()["result"]["count"], 2)
-            self.assertEqual(searched.status_code, 200, searched.text)
-            self.assertTrue(searched.json()["result"]["matches"])
-            matches = searched.json()["result"]["matches"]
-            self.assertTrue(any(match["credential_redacted"] for match in matches))
-            self.assertTrue(all("Bearer secret" not in match["snippet"] for match in matches))
-            descriptor = exported.json()["result"]["export_artifact"]
-            archive = root / descriptor["relativePath"]
-            self.assertTrue(archive.is_file())
-            with zipfile.ZipFile(archive) as bundle:
-                names = set(bundle.namelist())
-            self.assertNotIn(
-                "js-reverse/capture-fake/request-0001/request-headers.json",
-                names,
-            )
 
     def test_session_reuses_stable_js_reverse_page_id(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -864,11 +762,11 @@ class BrowserActionTests(unittest.TestCase):
     def test_configured_private_mcp_rejects_a_different_playwright_endpoint(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             events: list[str] = []
-            evidence = LocalEvidenceStore(Path(temp_dir))
+            experiments = ExperimentStore(Path(temp_dir))
             service = BrowserActionService(
                 playwright=FakePlaywright(events),
-                js_reverse=FakeJsReverse(events, evidence.root),
-                evidence=evidence,
+                js_reverse=FakeJsReverse(events, experiments.root),
+                experiments=experiments,
                 default_browser_endpoint="http://127.0.0.1:9222",
                 private_mcp_browser_endpoint="http://127.0.0.1:9222",
                 require_private_mcp_endpoint=True,

@@ -2,206 +2,142 @@
 
 ## 1. 项目目标
 
-`web_rev_action` 是一个单用户、自用的 GPT 5.6 网页协议分析后端。
+`web_rev_action` 是一个单用户、Windows 优先的 GPT 5.6 网页协议分析后端。
 
-目标不是重新实现浏览器自动化或 CDP collector，而是复用：
+它复用：
 
-- `playwright-cli`：执行稳定、可重放的页面动作。
-- `js-reverse-mcp`：抓取网络、流、脚本、initiator、断点和运行时证据。
-- `LocalEvidenceStore`：在 Action 后端本机保存、读取、搜索、分页和导出实验文件。
-
-系统需要把一次实验变成可重复、可查询、可比较的证据包，并支持复现 Pandora 类网页协议分析方法。
+- `playwright-cli`：稳定执行页面动作。
+- `js-reverse-mcp`：网络、SSE、脚本、initiator、断点和运行时证据。
+- 从 `github-gpt-actions-gateway` 移植的 workspace 读写、搜索、补丁和 PowerShell 7 能力。
 
 不做：
 
-- 登录、验证码、风控或速率限制绕过。
-- 自研 Playwright、locator、CDP network collector 或 JavaScript debugger。
-- 让 GPT 用多个 Action 手工协调开始抓包、点击、等待和停止。
-- 在 Action 返回值中直接塞入大响应、Base64、Cookie 或 Token。
-- Git、PR、CI 或 workspace 版本控制功能；分析目录就是普通文件夹。
+- 自研浏览器自动化、locator 或 CDP collector。
+- 让 GPT 用多个 Action 手工协调 start、click、wait 和 stop。
+- Git、branch、commit、PR、CI 或远程 workspace 同步。
+- ZIP 导出层。
+- 在 Action 返回值中直接塞入大型响应、Base64、Cookie 或 Token。
+
+分析根目录是一个普通 Windows 文件夹：
+
+```text
+data/analysis-workspace/
+```
+
+浏览器实验和 workspace 工具使用同一个目录。
 
 ---
 
-## 2. 核心设计原则
-
-### 2.1 只有两个 GPT 可见浏览器 Action
+## 2. 总体架构
 
 ```text
-inspectBrowserEvidence
-runBrowserExperiment
+GPT 5.6
+├── Skill Actions
+│   ├── retrieveSkillContext
+│   ├── readSkillContent
+│   └── searchSkillDocs
+│
+├── Browser Actions
+│   ├── inspectBrowserEvidence
+│   └── runBrowserExperiment
+│
+└── Analysis Workspace Actions
+    ├── workspaceInspect
+    ├── workspaceSearch
+    ├── workspaceReadFiles
+    ├── workspaceWriteFile
+    ├── workspaceApplyPatch
+    └── workspaceExecPwsh
+
+web_rev_action
+├── API / OpenAPI
+├── Browser Orchestrator
+├── Session Registry
+├── Deadline / Job Manager
+├── Page Alignment
+├── ExperimentStore
+├── AnalysisWorkspaceService
+└── Adapters
+    ├── PlaywrightCliAdapter
+    └── JsReverseMcpAdapter
+
+private runtime
+├── playwright-cli
+├── js-reverse-mcp
+└── data/analysis-workspace/
 ```
 
-`inspectBrowserEvidence` 只读：
+### 2.1 ExperimentStore
+
+`ExperimentStore` 只负责浏览器生命周期必须的少量内部状态：
+
+- session JSON。
+- experiment ID 和目录创建。
+- running/completed/failed/interrupted manifest。
+- 服务重启后把遗留 running manifest 标记为 interrupted。
+
+它不提供通用文件读取、搜索、编辑、ZIP 或 credential API。
+
+### 2.2 AnalysisWorkspaceService
+
+直接移植 `github-gpt-actions-gateway` 的本地 workspace 能力，去掉 Git 仓库语义：
+
+```text
+workspaceInspect
+workspaceSearch
+workspaceReadFiles
+workspaceWriteFile
+workspaceApplyPatch
+workspaceExecPwsh
+```
+
+所有工具都以 `data/analysis-workspace/` 为根目录。
+
+---
+
+## 3. Browser Action 契约
+
+### 3.1 `inspectBrowserEvidence`
+
+只读、non-consequential：
 
 ```yaml
 operationId: inspectBrowserEvidence
 x-openai-isConsequential: false
 ```
 
-`runBrowserExperiment` 会导航、点击、输入、上传、清理状态、设置断点、重放请求或关闭 session：
-
-```yaml
-operationId: runBrowserExperiment
-x-openai-isConsequential: true
-```
-
-OpenAPI 无法根据 `operation` 动态改变 consequential 属性，因此整个执行 endpoint 标记为 `true`。只读查询全部放到 `inspectBrowserEvidence`。
-
-### 2.2 后端原子编排
-
-一次 `capture_flow` 必须由一个后端调用完成：
-
-```text
-GPT
-  ↓
-runBrowserExperiment(capture_flow)
-  ↓
-web_rev_action Orchestrator
-  ├── 对齐 Playwright page 与 js-reverse page/target
-  ├── 调私有 js-reverse MCP: start_stream_capture
-  ├── 调 playwright-cli 执行完整 flow
-  ├── 私有等待 stream/network/page condition
-  ├── 调私有 js-reverse MCP: stop_stream_capture
-  ├── 收集 Trace、截图、网络和源码证据
-  └── 写 experiment manifest
-```
-
-不允许：
-
-```text
-GPT 调 start
-GPT 调 click
-GPT 调 wait
-GPT 调 stop
-```
-
-Action 之间存在网络延迟、页面切换和状态漂移，这种分步方式不能形成可靠证据。
-
-### 2.3 后台 job 是默认执行模式
-
-`capture_flow` 默认只在 Action 请求内创建 experiment/job，并立即返回 `experiment_id`。后台任务继续原子执行完整生命周期：
-
-```text
-start → Playwright flow → wait → stop → manifest
-```
-
-GPT 通过 `inspectBrowserEvidence.get_experiment` 查询 `running / completed / failed / interrupted`。42 秒同步模式只用于明确选择的快速实验，不是长流的唯一执行模型。
-
-### 2.4 上游 MCP 始终使用普通模式
-
-`js-reverse-mcp` 始终注册三个 stream lifecycle primitive：
-
-```text
-start_stream_capture
-get_stream_status
-stop_stream_capture
-```
-
-`web_rev_action` 通过私有 MCP client 调用，并在 `JsReverseMcpAdapter` 中使用 allowlist。GPT 本来就看不到内部 MCP `tools/list`，不需要上游再提供“gpt-action 隐藏模式”。
-
-### 2.5 一次实验只改变一个变量
-
-每个 flow 应有明确 objective、baseline 和 primary request matcher。实验结果必须区分：
-
-```text
-直接观察
-已验证
-推测
-未知
-```
-
----
-
-## 3. 总体架构
-
-```text
-GPT 5.6
-  │
-  ├── Skill Actions
-  │   ├── retrieveSkillContext
-  │   ├── readSkillContent
-  │   └── searchSkillDocs
-  │
-  └── Browser Actions
-      ├── inspectBrowserEvidence
-      └── runBrowserExperiment
-
-web_rev_action
-  ├── API / OpenAPI
-  ├── Orchestrator
-  ├── Session Registry
-  ├── Deadline Budget
-  ├── Page Alignment
-  ├── LocalEvidenceStore
-  ├── Evidence Index
-  ├── Capture Health
-  ├── Diff / Replay
-  └── Adapters
-      ├── PlaywrightCliAdapter
-      └── JsReverseMcpAdapter
-
-private runtime
-  ├── playwright-cli
-  ├── js-reverse-mcp
-  └── data/analysis-workspace/
-```
-
-推荐一个本地 evidence root 对应一个 `web_rev_action` 实例和一个 `js-reverse-mcp` 进程。若共享进程，每个 session/experiment 必须使用独立 artifact namespace，不能只依赖全局 root。GitHub Gateway workspace 不属于产品运行时，也不假设与该目录共享挂载。
-
----
-
-## 4. Action 契约
-
-### 4.1 通用请求外壳
-
-两个 Action 都使用 operation 分支，不使用包含大量可选字段的单一大对象：
-
-```json
-{
-  "contract_version": "1.0",
-  "operation": "capture_flow",
-  "payload": {},
-  "skill_binding": {
-    "skill_id": "web-protocol-analysis",
-    "content_hash": "sha256:..."
-  }
-}
-```
-
-OpenAPI 使用 discriminated union / `oneOf`，确保每种 operation 只接受自己的 payload。
-
-### 4.2 inspectBrowserEvidence
-
-只读 operation：
+第一阶段 operation：
 
 ```text
 get_session
-get_experiment
 list_experiments
+get_experiment
+get_stream_status
+```
+
+它只查询浏览器 session、experiment/job 和 stream collector 状态。普通文件读取由 workspace Actions 完成。
+
+后续可增加的浏览器语义查询：
+
+```text
 list_requests
 get_request
-get_stream_status
-list_artifacts
-read_artifact
-search_artifacts
 get_request_initiator
 search_scripts
 get_script_source
 get_capture_diff
 ```
 
-默认读取 credential artifact 时不返回原文，而返回：
+这些查询应返回结构化摘要或路径索引，不重新实现通用文件工具。
 
-```text
-artifact metadata
-header names
-redacted artifact
-containsCredentials
+### 3.2 `runBrowserExperiment`
+
+执行型、consequential：
+
+```yaml
+operationId: runBrowserExperiment
+x-openai-isConsequential: true
 ```
-
-只有明确的本地 replay operation 可以读取完整 credential artifact；完整值不得进入自然语言报告、diff、日志或 Action summary。
-
-### 4.3 runBrowserExperiment
 
 第一阶段 operation：
 
@@ -210,7 +146,6 @@ open_session
 capture_baseline
 capture_flow
 close_session
-export_experiment
 ```
 
 后续 operation：
@@ -222,19 +157,106 @@ browser_context_replay
 external_http_replay
 ```
 
+OpenAPI 使用 discriminated union / `oneOf`，每个 operation 只接受自己的 payload。
+
 ---
 
-## 5. capture_flow 请求模型
+## 4. 后端原子编排
+
+一次 `capture_flow` 必须由后端完整执行：
+
+```text
+GPT
+  ↓
+runBrowserExperiment(capture_flow)
+  ↓
+web_rev_action Orchestrator
+  ├── 创建 experiment 目录并写 running manifest
+  ├── 对齐 Playwright page 与 js-reverse pageId
+  ├── start_stream_capture
+  ├── 执行完整 Playwright flow
+  ├── 等待 stream/network/page condition
+  ├── stop_stream_capture
+  ├── 收集 Trace、截图和网络摘要
+  └── 写 completed / failed manifest
+```
+
+不允许：
+
+```text
+GPT 调 start
+GPT 调 click
+GPT 调 wait
+GPT 调 stop
+```
+
+多个 HTTP Action 之间存在延迟、tab 切换和状态漂移，不能作为可靠抓包流程。
+
+---
+
+## 5. Background job 与 deadline
+
+### 5.1 默认 job 模式
+
+`capture_flow` 默认：
+
+```text
+创建 running manifest
+→ 创建后台 experiment task
+→ HTTP 立即返回 experiment_id
+→ 后台继续原子执行完整生命周期
+```
+
+GPT 使用：
+
+```text
+inspectBrowserEvidence.get_experiment
+```
+
+查询：
+
+```text
+running
+completed
+failed
+interrupted
+```
+
+默认 `job_timeout_ms=300000`，自用环境可配置到 30 分钟。
+
+### 5.2 快速同步模式
+
+显式使用：
+
+```json
+{
+  "execution_mode": "sync",
+  "deadline_ms": 42000
+}
+```
+
+用于明确可以在一个 GPT Action round trip 内完成的短实验。
+
+### 5.3 为什么 job 保留
+
+job 解决的是 HTTP Action 调用时限和长流问题，不是文件访问问题。即使 workspace 工具已经完整，长时间 SSE、工具调用或网络异常仍可能超过同步调用时间。
+
+两种模式都使用一个 absolute deadline，adapter 不各自重新获得完整 timeout。接近 deadline 时优先 stop/finalize 和 best-effort manifest。
+
+---
+
+## 6. capture_flow 数据契约
 
 ```json
 {
   "operation": "capture_flow",
   "payload": {
     "session_id": "sess_001",
-    "objective": "observe the primary conversation request and its stream",
+    "objective": "observe the primary conversation request and stream",
     "target": {
       "start_url": "https://example.com/app",
-      "expected_url_contains": "/app"
+      "expected_url_contains": "/app",
+      "page_index": 0
     },
     "primary_request": {
       "url_contains": "/conversation",
@@ -271,9 +293,7 @@ external_http_replay
 }
 ```
 
-### 5.1 primary request
-
-实验成功不能取所有匹配请求的最坏值。`primary_request` 决定目标请求：
+### 6.1 primary request
 
 ```text
 url_contains
@@ -286,7 +306,17 @@ allow_supporting_failures
 include_in_flight
 ```
 
-后端返回：
+它确定转换为 collector filter：
+
+```text
+urlFilter      ← url_contains
+methods        ← method
+resourceTypes  ← resource_types
+mimeTypes      ← mime_types
+includeInFlight← include_in_flight
+```
+
+实验结果分开返回：
 
 ```text
 collector_integrity
@@ -294,43 +324,11 @@ primary_request_integrity
 objective_integrity
 ```
 
-- `collector_integrity`：整个 collector 的诊断状态。
-- `primary_request_integrity`：目标请求证据状态。
-- `objective_integrity`：结合等待条件、动作结果和目标请求计算的最终实验状态。
-
-遥测流、心跳流或其他 supporting request 失败，不应自动让主消息实验失败。
-
-### 5.2 Job deadline 与快速同步 deadline
-
-默认 `execution_mode=job`。Action 请求只负责创建 running manifest 和后台任务，因此不受一次长流必须在 42 秒内结束的限制。后台 job 默认总预算 300 秒，可在自用环境中配置到 30 分钟。
-
-显式 `execution_mode=sync` 用于快速实验，其 Action round trip 使用不超过 42 秒的总预算：
-
-```text
-总预算              42s
-连接和页面对齐       4s
-启动 collector       3s
-Playwright flow      18s
-等待目标条件         10s
-stop/finalize         5s
-manifest/response     2s
-```
-
-两种模式都只使用一个 absolute deadline；未使用预算可以向后转移。每个 adapter 接收同一 deadline / AbortSignal：
-
-```text
-alignment
-Playwright command
-waitForStreamCondition
-stop_stream_capture
-local evidence write
-```
-
-接近 deadline 时优先完成 stop 和 best-effort manifest，不继续执行新动作。服务启动时扫描遗留的 `running` manifest 并标记为 `interrupted`。
+遥测或 supporting request 失败不能自动覆盖主消息实验结果。
 
 ---
 
-## 6. Flow step 数据契约
+## 7. Flow step 契约
 
 统一结构：
 
@@ -346,7 +344,7 @@ local evidence write
 }
 ```
 
-支持动作：
+支持：
 
 ```text
 navigate
@@ -365,11 +363,10 @@ assert
 snapshot
 ```
 
-不支持任意 JavaScript、Python、PowerShell 或原始 Playwright 命令作为 flow step。
-
-Locator 优先级：
+Locator：
 
 ```text
+snapshot ref
 role + accessible name
 label
 placeholder
@@ -378,9 +375,9 @@ text
 CSS
 ```
 
-XPath 默认不使用。
+Flow 不接受任意 JavaScript、Python、PowerShell 或原始 Playwright 命令。复杂文件处理在实验前后使用 workspaceExecPwsh，不能插进毫秒级抓包编排。
 
-Step 返回值：
+Step result：
 
 ```json
 {
@@ -388,16 +385,14 @@ Step 返回值：
   "status": "completed",
   "started_at": "...",
   "ended_at": "...",
-  "snapshot_ref": "art_...",
+  "snapshot_ref": "experiments/exp_001/playwright/...",
   "warnings": []
 }
 ```
 
 ---
 
-## 7. Wait condition 契约
-
-`wait` step 和 capture 结束都使用统一 condition：
+## 8. Wait condition 契约
 
 ```text
 timeout
@@ -415,19 +410,7 @@ failed
 page_url
 ```
 
-`[DONE]` 只是 `default_done_marker` 或 `exact_data` 的默认值，不是通用完成定义。
-
-受控 event predicate：
-
-```json
-{
-  "type": "json_path_equals",
-  "path": "$.type",
-  "value": "message_end"
-}
-```
-
-支持：
+Event predicate：
 
 ```text
 exact_data
@@ -437,33 +420,40 @@ network_terminal
 selector_state
 ```
 
-不接受任意代码 predicate。
+`[DONE]` 只是默认 predicate，不是通用完成定义。
+
+`exact_data`、`event_name` 和 `json_path_equals` 由 `js-reverse-mcp` collector 在完整事件 artifact 中匹配。调用方传入 `afterEventIndex`，MCP 只返回：
+
+```text
+matched
+matchedEventIndex
+matchedRequestId
+matchedSource
+```
+
+不把事件正文返回 MCP，也不依赖 recent-event 小窗口。
 
 ---
 
-## 8. Adapter 契约
+## 9. Adapter 契约
 
-### 8.1 PlaywrightCliAdapter
+### 9.1 PlaywrightCliAdapter
 
 职责：
 
-- attach/open browser session。
-- page list/select。
-- goto/reload。
-- locator action。
-- snapshot、screenshot、Trace。
-- upload approved workspace file。
-- 在 deadline 或 AbortSignal 到达时停止后续 step。
+- attach browser session。
+- tab list/select。
+- navigate/reload。
+- locator actions。
+- snapshot、screenshot 和 Trace。
+- upload 分析目录内的文件。
+- deadline 时终止 CLI 进程树。
 
-不得实现：
+Windows timeout 使用进程树终止，而不是只取消 Python coroutine。
 
-- 自研 locator 引擎。
-- 任意 shell 拼接。
-- 自行抓取 CDP stream。
+### 9.2 JsReverseMcpAdapter
 
-### 8.2 JsReverseMcpAdapter
-
-通过私有 MCP client 调普通 `js-reverse-mcp`，只允许调用明确 allowlist：
+私有 allowlist：
 
 ```text
 select_page
@@ -484,69 +474,19 @@ get_websocket_messages
 Stream sequence：
 
 ```text
-start_stream_capture(
-  artifactNamespace = experiment_id,
-  includeInFlight = false,
-  urlFilter = primary_request.url_contains,
-  methods = [primary_request.method],
-  resourceTypes = primary_request.resource_types,
-  mimeTypes = primary_request.mime_types
-)
+start_stream_capture(filter, artifactNamespace=experiment_id)
 → execute Playwright flow
 → waitForStreamCondition(...)
 → stop_stream_capture(deadline)
 ```
 
-私有等待方法：
-
-```text
-waitForStreamCondition(
-  captureId,
-  requestMatcher,
-  condition,
-  sinceVersion,
-  deadline,
-  abortSignal
-)
-```
-
-它通过有界轮询 `get_stream_status` 实现。`exact_data`、`event_name` 和 `json_path_equals` 由 collector 内部在完整事件文件中匹配，调用方传入 `afterEventIndex`，MCP 只返回：
-
-```text
-matched
-matchedEventIndex
-matchedRequestId
-matchedSource
-```
-
-事件正文不返回 MCP，也不依赖最近 20 条摘要。等待至少支持：
-
-```text
-first_event
-event_predicate
-default_done_marker
-network_finished
-network_canceled
-failed
-```
-
-返回目标 request、终态、匹配事件索引和最后 version。`capture.version` 必须在 semantic event、SSE event 完成、terminal、parser degradation、finalize 和 capture stop 等所有可见变化时递增。该方法不是 GPT Action。
-
-### 8.3 LocalEvidenceStore
-
-`web_rev_action` 自己管理：
-
-```text
-data/analysis-workspace/
-```
-
-它负责 running manifest、终态更新、artifact 分页、bounded read、全文搜索、credential redaction 和显式 ZIP 导出。GPT 通过只读 `inspectBrowserEvidence` 读取、搜索和分页；创建 ZIP 使用 consequential 的 `runBrowserExperiment(export_experiment)`。重放脚本由 Action 后端在本地生成和运行，不依赖隐式共享目录。
+上游 MCP 是长生命周期进程。对 click、fill、upload、replay 等有副作用操作不做自动重试。
 
 ---
 
-## 9. Session 与页面对齐
+## 10. 页面对齐
 
-Session 至少保存：
+Session 保存：
 
 ```text
 session_id
@@ -555,48 +495,42 @@ playwright_session_ref
 playwright_page_index
 playwright_page_url
 playwright_page_title
-js_reverse_session_ref
 js_reverse_page_id
-js_reverse_frame_id
+js_reverse_page_index
 js_reverse_page_url
 page_alignment_status
-evidence_store
 evidence_root_ref
 created_at
 updated_at
 ```
 
-每次 baseline、capture_flow、trace_request 前检查：
+初次对齐保存稳定 `js_reverse_page_id`。后续实验按 pageId 选择并重新验证 URL；page index 只用于首次发现和显示。
+
+每次实验前必须确认：
 
 ```text
 Playwright 当前 page
         ↕
-js-reverse 当前 page/target/frame
+js-reverse 当前 pageId / target / frame
 ```
 
-`page_alignment_status=aligned` 需要同时满足：
-
-- 当前 URL 一致或满足已声明的 redirect/normalization 规则。
-- 页面标题或稳定页面标识一致。
-- 初次对齐保存稳定 `js_reverse_page_id`，后续按 ID 选择并重新验证 URL；page index 只作为显示信息。
-- 选中 frame 与 flow 目标 frame 一致。
-- 页面没有在对齐检查期间关闭或跳转。
-
-否则实验不开始。
+对齐失败时实验不开始。
 
 ---
 
-## 10. Experiment 与 artifact
-
-目录：
+## 11. Experiment 目录和 manifest
 
 ```text
 data/analysis-workspace/
+  sessions/
   experiments/
     exp_001/
       manifest.json
       playwright/
+        screenshots/
+        traces/
       js-reverse/
+        capture-<uuid>/
       reports/
   schemas/
   scripts/
@@ -604,281 +538,283 @@ data/analysis-workspace/
   notes/
 ```
 
-`web_rev_action` 创建 `experiment_id`，并把它作为受限 `artifactNamespace` 传给 `js-reverse-mcp`。上游最终写入：
+`web_rev_action` 创建 `experiment_id` 并作为受限 `artifactNamespace` 传给上游。
+
+Manifest 至少包含：
 
 ```text
-experiments/exp_001/js-reverse/capture-<uuid>/
+experiment_id
+session_id
+operation
+status
+execution_mode
+objective
+deadline
+page_alignment
+steps
+primary_request_matcher
+primary_requests
+stream_wait_result
+collector_integrity
+primary_request_integrity
+objective_integrity
+capture_health
+artifacts
+warnings
+errors
 ```
 
-Manifest 最少保存：
-
-```json
-{
-  "experiment_id": "exp_001",
-  "operation": "capture_flow",
-  "status": "running",
-  "execution_mode": "job",
-  "objective": "...",
-  "deadline": {},
-  "page_alignment": {},
-  "steps": [],
-  "primary_request_matcher": {},
-  "requests": [],
-  "stream_wait_result": {},
-  "collector_integrity": "partial",
-  "primary_request_integrity": "complete",
-  "objective_integrity": "complete",
-  "capture_health": {},
-  "artifacts": [],
-  "warnings": [],
-  "errors": []
-}
-```
-
-Artifact ID 使用上游 UUID，不使用进程内数字 capture ID。`networkRequestId/reqid` 只用于当前 page collector generation 的临时关联；`web_rev_action` 生成稳定 `evidence_id`。
-
-Experiment 目录与 `status=running` manifest 必须在页面对齐和第一条动作之前原子写入。服务重启时，遗留 running manifest 更新为 `interrupted`，已有 evidence 保留。
+目录和 `status=running` manifest 必须在第一条浏览器动作之前写入。服务重启时遗留 running manifest 变成 interrupted，已有文件保留。
 
 ---
 
-## 11. Capture health
+## 12. Analysis Workspace Action 契约
 
-至少包含：
+这些接口从 `github-gpt-actions-gateway` 移植，保留主要字段、输出预算和行为语义，只删除 owner/repo/branch/Git 状态。
 
-```text
-page_aligned
-stream_collector_started_before_flow
-pre_arm_requests_excluded
-primary_request_match_count_ok
-raw_capture_integrity
-semantic_parse_integrity
-request_snapshot_integrity
-artifact_integrity
-wait_condition_met
-collector_stopped
-manifest_written
-capture_scope
-worker_coverage
-```
+### 12.1 workspaceInspect
 
-当前上游明确返回：
+一次返回：
 
 ```text
-capture_scope = page-target-only
-worker_coverage = false
+tree
+searches
+related files
+truncated
 ```
 
-这不是失败，但必须作为覆盖缺口展示。只有请求来源无法解释时才进入 Worker / Service Worker 深入诊断阶段。
+请求支持：
 
-### 11.1 取消语义
+```text
+paths
+queries
+max_depth
+max_tree_entries
+context_lines
+max_search_matches
+max_read_files
+max_file_lines
+max_bytes_per_file
+max_bytes
+```
 
-上游 collector 只返回：
+### 12.2 workspaceSearch
+
+使用 `rg --json`，不启动 PowerShell。
+
+```text
+query
+regex
+case_sensitive
+paths
+context_lines
+max_matches
+max_bytes
+```
+
+### 12.3 workspaceReadFiles
+
+读取多个 UTF-8 文件并返回行号、总行数、字节数和 SHA-256。二进制文件返回 per-file error。
+
+### 12.4 workspaceWriteFile
+
+```text
+create_only
+overwrite
+overwrite_if_sha256_matches
+expected_sha256
+preserve / lf / crlf
+dry_run
+```
+
+### 12.5 workspaceApplyPatch
+
+支持 Codex `*** Begin Patch` 格式、delete opt-in、changed-file 限制、dry-run 和失败回滚。
+
+### 12.6 workspaceExecPwsh
+
+PowerShell 7 从分析目录根运行：
+
+```text
+script
+timeout_seconds
+max_output_bytes
+allow_network
+plain_output
+utf8_output
+```
+
+用于：
+
+- `raw.bin` offset 读取和十六进制/Base64。
+- SHA-256。
+- JSONL/CSV 解析。
+- 本地压缩文件解析。
+- schema、diff、replay 和报告脚本。
+- 批量文件操作。
+
+默认禁止网络下载、Git push、GitHub CLI 认证/secret 管理、环境枚举、SSH/SCP。没有 Git commit、branch 或 PR 功能。
+
+---
+
+## 13. 凭据和大型数据
+
+上游为 headers 生成完整文件和 redacted 文件。单用户工具不再额外提供 `credential_mode` API。
+
+默认分析：
+
+```text
+request-headers.redacted.json
+response-headers.redacted.json
+```
+
+明确进行本地 replay 时才读取完整 headers。GPT 不应把 Cookie、Authorization、CSRF 或 Set-Cookie 复制到自然语言回复。
+
+大型 Base64、raw stream 和二进制 payload 不通过 Action JSON 返回。使用：
+
+```text
+workspaceInspect / Search / ReadFiles 处理文本索引
+workspaceExecPwsh 处理二进制、Base64、压缩和 offset
+```
+
+---
+
+## 14. Stop-generation 语义
+
+底层 collector 只返回中性终态：
 
 ```text
 status = canceled
 terminalReason = network_canceled
 ```
 
-`web_rev_action` 只有在以下条件同时成立时才标记：
+Experiment 只有在以下条件同时成立时标记 `expected_user_cancel`：
 
-```text
-expected_user_cancel
-```
+- flow 中实际执行 Stop step。
+- Stop 前观察到同一 primary request 的 first_event 或 event predicate。
+- cancellation 位于 Stop 时间窗口。
+- request 匹配 primary request。
+- pageId 和 session 对齐。
+- 没有导航、页面关闭等更合理原因。
 
-- flow 中存在 Stop step。
-- Stop 前已观察同一 primary request 的 `first_event` 或受控 event predicate。
-- cancellation 位于 Stop step 的限定时间窗口内。
-- page/session 对齐。
-- request ID 匹配 primary request。
-- 没有导航或页面关闭等更合理原因。
-- manifest 保存 Stop 前后的 event index、raw byte offset 和目标 request ID。
+Manifest 保存 Stop 前后的 event index、raw byte offset 和目标 request ID。
 
 ---
 
-## 12. Stream 与请求快照
+## 15. 开发阶段
 
-关键 artifact：
+### 阶段 0：工具链验证
 
-```text
-raw.bin                 精确原始字节
-decoded.sse             UTF-8 阅读副本，可能含 replacement
-chunks.jsonl            chunk offset / timing
-events.jsonl            语义事件和 raw byte range
-request-headers.json    完整请求 headers，可能含凭据
-request-headers-extra.json
-request-headers.redacted.json
-request-body.txt        CDP postData 的 UTF-8 文本，不是 wire bytes
-request-body.meta.json  encoding/source/completeness
-response-headers.json
-response-headers-extra.json
-response-headers.redacted.json
-initiator.json
-redirects.json
-metadata.json
-```
-
-完整性分开保存：
+已完成真实 fixture 8/8：
 
 ```text
-rawCaptureIntegrity
-semanticParseIntegrity
-requestSnapshotIntegrity
-artifactIntegrity
-headersCompleteness
-bodyCompleteness
-replayReadiness
+页面对齐
+网络请求
+请求/响应体导出
+Raw SSE stream
+request initiator
+脚本读取和搜索
+XHR/fetch 断点
+分析目录写入
 ```
 
-`requestSnapshotIntegrity` 取 headers/body 最低状态：headers complete + body partial 仍是 partial；无 body 的请求可以是 complete。`replayReadiness` 再综合 method、content-type、body source 和 credential 可用性。对于 multipart、文件或二进制 body，`request-body.txt` 不得描述为精确 wire bytes。
-
-### 12.1 凭据策略
-
-Artifact descriptor：
+SSE 实际验证：
 
 ```text
-sensitivity = public | private | credential
-containsCredentials
-redactedArtifactId
+start_stream_capture
+→ Playwright click
+→ collector-side [DONE] predicate
+→ stop_stream_capture
+→ 校验 raw.bin、events.jsonl 和 manifest
 ```
-
-默认读取、搜索、diff 和报告只使用 redacted artifact。完整 credential artifact 只供明确的 browser-context/external replay 使用，不进入 GPT summary。
-
----
-
-## 13. Diff 与重放
-
-### 13.1 Diff
-
-支持：
-
-- 请求集合、method/path/status。
-- Header 名称和脱敏值。
-- JSON 请求/响应字段。
-- SSE 事件类型、顺序和 raw byte range。
-- initiator 脚本位置。
-- artifact hash。
-
-动态值归一化规则必须写入 diff 报告，不静默忽略。
-
-### 13.2 Browser-context replay
-
-优先在已登录页面上下文中执行 `fetch`：
-
-- 自动复用 Cookie。
-- 一次只修改一个字段。
-- 使用明确的 credential mode，不把凭据返回 GPT。
-
-### 13.3 External HTTP replay
-
-后置实现。请求样本必须检查：
-
-```text
-headersCompleteness
-bodyCompleteness
-bodyCaptureSource
-```
-
-只有完整度足够时才宣称可独立重放；`cdp-postData-utf8` 不能当作 multipart/binary wire bytes。
-
----
-
-## 14. 开发阶段
-
-### 阶段 0：已完成的工具链验证
-
-真实本地 fixture 已达到 8/8：页面对齐、网络、request/response、initiator、脚本、断点、本地 evidence 写入，以及 Raw Stream Capture。SSE 验证实际执行 `start_stream_capture → Playwright click → collector-side [DONE] predicate → stop_stream_capture`，并核对 `raw.bin` 精确字节、`events.jsonl` 顺序、namespace 相对路径和最终 manifest。
 
 ### 阶段 1：Action schema
 
-- 两个 Action。
-- `runBrowserExperiment` consequential=true。
-- operation `oneOf`。
-- flow step/result。
-- primary request 和 wait condition。
-- job/sync 两种执行模式和统一 deadline。
-- Fake adapter 契约测试。
+已完成：
+
+- Browser operation `oneOf`。
+- flow/locator/wait schema。
+- primary request filter。
+- job/sync 模式。
+- 两个 Browser Action。
+- 六个 Workspace Action。
 
 ### 阶段 2：Adapter 与最小 Orchestrator
 
+已完成：
+
 - PlaywrightCliAdapter。
-- 私有 JsReverseMcpAdapter allowlist。
-- LocalEvidenceStore。
+- 私有 JsReverseMcpAdapter。
+- ExperimentStore。
+- AnalysisWorkspaceService。
 - open_session / baseline / capture_flow / close_session。
-- 页面自动对齐。
 - 原子 start → flow → wait → stop → manifest。
 
 ### 阶段 3：Pandora 最小闭环
 
-- baseline。
-- 第一轮消息。
-- 第二轮消息。
-- 重新生成。
-- 查询请求快照、SSE、initiator 和脚本。
+```text
+baseline
+第一轮消息
+第二轮消息
+重新生成
+请求快照
+SSE
+initiator
+脚本
+```
 
 ### 阶段 4：Evidence、health 与 diff
 
-- evidence ID。
-- artifact 查询和 credential redaction。
-- primary/objective integrity。
-- capture diff。
+使用 workspace 工具实现：
+
+- schema 和协议报告。
+- JSON/JSONL diff。
+- raw byte 定向读取。
+- primary/objective integrity 汇总。
 
 ### 阶段 5：Trace 与 replay
 
-- trace_request。
-- breakpoint/paused stack/locals/resume。
-- browser-context replay。
-- external replay 后置。
+```text
+trace_request
+breakpoint / stack / locals / resume
+browser-context replay
+external HTTP replay
+```
 
 ### 阶段 6：扩展实验
 
-- 修改旧消息。
-- 停止生成及 cancellation correlation。
-- 标题、删除。
-- 文件、搜索、图片、工具调用。
-- Worker / Service Worker 深入诊断。
+```text
+编辑旧消息
+停止生成
+标题和删除
+文件上传
+网页搜索
+图片
+工具调用
+Worker / Service Worker 深入诊断
+```
 
 ---
 
-## 15. 跨仓库验收测试
+## 16. 验收标准
 
-验收环境使用本地测试页面和真实 adapter，不只测试 collector 单元。
-
-必须覆盖：
-
-1. `web_rev_action` 私有 MCP client 能调用三个 stream primitive。
-2. GPT OpenAPI 只有两个 Browser Action，不包含内部 MCP 工具。
-3. `start_stream_capture` 的记录时间早于第一条 Playwright 变更动作。
-4. pre-arm 请求默认不进入 experiment；`includeInFlight=true` 时可进入。
-5. 没有 response 的 `loadingFailed` 仍写入 evidence 和 manifest。
-6. Stop step 与 `network_canceled` 只在 page/request/time window 匹配时转换为 `expected_user_cancel`。
-7. stop 后关闭页面不会修改历史 capture 状态或 manifest hash。
-8. MCP 重启后 UUID artifact ID 不冲突。
-9. experiment manifest 中所有相对路径都能由 LocalEvidenceStore 读取、搜索、分页并显式导出。
-10. credential artifact 默认返回 redacted artifact；summary/diff/log 不含真实值。
-11. `waitForStreamCondition` 支持 first event、predicate、network finished/canceled/failed。
-12. supporting request 失败不会覆盖 primary objective success。
-13. `rawCaptureIntegrity=complete` 且 parser partial 时仍可按 raw byte range 离线分析。
-14. job 模式可运行超过 42 秒并通过 inspect 查询；sync 模式在 42 秒总 deadline 内完成或生成 best-effort timeout manifest。
-15. Action cancellation 能传入 stop/finalize，而不是只取消外层 HTTP 等待。
-
----
-
-## 16. MVP 完成标准
-
-1. GPT 可见 Browser Action 只有两个。
-2. inspect 只读且 non-consequential；run 执行型且 consequential。
-3. `playwright-cli` 与 `js-reverse-mcp` 操作同一浏览器和同一页面。
-4. 私有 MCP 始终可调用三个 stream primitive。
-5. capture_flow 由后端原子编排。
-6. 每个 experiment 有独立 namespace、manifest、evidence ID 和 UUID artifact ID。
-7. primary request、supporting request 和 objective integrity 分开。
-8. 能保存完整 raw stream、事件顺序、错误和取消结果。
-9. `[DONE]` 只是默认 predicate，不是通用完成定义。
-10. 无 response 失败请求仍可查询。
-11. pre-arm 请求默认不污染实验。
-12. 请求快照声明 ExtraInfo、headers 和 body 的真实完整性。
-13. credential artifact 默认脱敏。
-14. stop/finalize 接收同一 Action deadline 和 AbortSignal。
-15. capture health 明确报告 page-target-only 和 workerCoverage=false。
-16. LocalEvidenceStore 能读取、搜索、分页和导出所有 manifest 相对路径；产品不依赖 Gateway Git workspace。
-17. 上述跨仓库验收测试全部通过。
+1. GPT 可见内部 MCP lifecycle 工具为零。
+2. capture_flow 由后端原子编排。
+3. job 模式支持超过 42 秒的流；sync 模式受统一 deadline。
+4. Playwright 与 js-reverse 使用同一 CDP endpoint 和稳定 pageId。
+5. start_stream_capture 早于第一条页面变更动作。
+6. pre-arm 请求默认不进入实验。
+7. 无 response 的失败请求仍有 metadata。
+8. primary、supporting 和 objective integrity 分开。
+9. raw bytes、semantic parse、request snapshot 和 artifact integrity 分开。
+10. Stop cancellation 只在实验上下文满足时转换为 expected_user_cancel。
+11. experiment manifest 所有路径都相对分析根目录。
+12. workspaceInspect 能返回实验树、搜索和相关文件。
+13. workspaceSearch 使用 ripgrep 并支持 bounded response。
+14. workspaceReadFiles 返回 UTF-8 行号、SHA 和 per-file error。
+15. workspaceWriteFile 支持 SHA guard、line endings 和 dry-run。
+16. workspaceApplyPatch 支持 update/add/delete opt-in 和 rollback。
+17. workspaceExecPwsh 能读取 raw.bin、计算 SHA/Base64、处理 UTF-8 和终止超时进程树。
+18. 产品没有 Git、branch、commit、PR、CI 或 ZIP 导出功能。
+19. 真实阶段 0 fixture 达到 8/8。
+20. Windows 全量测试通过。

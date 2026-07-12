@@ -339,7 +339,7 @@ class RuntimeTests(unittest.TestCase):
             with self.assertRaisesRegex(SkillRuntimeError, "description exceeds"):
                 SkillRuntime(root)
 
-    def test_openapi_exposes_three_skill_and_two_browser_actions(self) -> None:
+    def test_openapi_exposes_skill_browser_and_workspace_actions(self) -> None:
         schema = create_app().openapi()
         operation_ids = {
             operation["operationId"]
@@ -354,12 +354,23 @@ class RuntimeTests(unittest.TestCase):
                 "readSkillContent",
                 "inspectBrowserEvidence",
                 "runBrowserExperiment",
+                "workspaceInspect",
+                "workspaceSearch",
+                "workspaceReadFiles",
+                "workspaceWriteFile",
+                "workspaceApplyPatch",
+                "workspaceExecPwsh",
             },
         )
         for path_item in schema["paths"].values():
             for operation in path_item.values():
                 self.assertLessEqual(len(operation.get("description", "")), 300)
-                expected = operation["operationId"] == "runBrowserExperiment"
+                expected = operation["operationId"] in {
+                    "runBrowserExperiment",
+                    "workspaceWriteFile",
+                    "workspaceApplyPatch",
+                    "workspaceExecPwsh",
+                }
                 self.assertIs(operation.get("x-openai-isConsequential"), expected)
 
         request_schema = schema["components"]["schemas"]["RetrieveSkillContextRequest"]
