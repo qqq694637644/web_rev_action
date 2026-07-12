@@ -563,6 +563,13 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
             raise AssertionError(control_response_value)
         if find_field(control_response_value, "terminationReason") != "done_marker":
             raise AssertionError(control_response_value)
+        control_preview = str(find_field(control_response_value, "bodyPreview") or "")
+        if "literal [DONE] text" not in control_preview:
+            raise AssertionError(control_response_value)
+        if "conversation_state" not in control_preview:
+            raise AssertionError(
+                "Replay reader stopped at [DONE] text inside a normal SSE event"
+            )
 
         async def run_replay(
             *,
@@ -578,7 +585,7 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
                     },
                 )
             )
-            if replay.status != "completed":
+            if replay.status != "partial":
                 raise AssertionError(replay.model_dump())
             replay_manifest = json.loads(
                 (
@@ -645,7 +652,9 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
             if mutation_assessment.get("non_target_fields_equivalent") is not True:
                 raise AssertionError(mutation_assessment)
             environment = replay_manifest.get("pair_environment_comparison") or {}
-            if environment.get("equivalent") is not True:
+            if environment.get("status") != "insufficient":
+                raise AssertionError(environment)
+            if environment.get("observed_dimensions_equivalent") is not True:
                 raise AssertionError(environment)
             diff_artifact = artifact_by_kind(
                 replay_manifest,
@@ -673,6 +682,13 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
                 "classification"
             )
             != "validation_rejection"
+        ):
+            raise AssertionError(required_manifest)
+        if (
+            required_manifest.get("replay_response_classification", {}).get(
+                "conclusion"
+            )
+            != "required"
         ):
             raise AssertionError(required_manifest)
         control_spec = json.loads(
@@ -765,7 +781,7 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
             same_value_manifest.get("replay_response_classification", {}).get(
                 "classification"
             )
-            != "unknown_rejection"
+            != "conflict"
         ):
             raise AssertionError(same_value_manifest)
         if same_value_manifest.get("protocol_rejection_observed"):
@@ -912,9 +928,12 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
             "pandora_tracking_non_target_equivalent": tracking_manifest.get(
                 "mutation_assessment", {}
             ).get("non_target_fields_equivalent"),
-            "pandora_tracking_environment_equivalent": tracking_manifest.get(
+            "pandora_tracking_environment_status": tracking_manifest.get(
                 "pair_environment_comparison", {}
-            ).get("equivalent"),
+            ).get("status"),
+            "pandora_tracking_observed_environment_equivalent": tracking_manifest.get(
+                "pair_environment_comparison", {}
+            ).get("observed_dimensions_equivalent"),
             "pandora_tracking_done_marker_observed": find_field(
                 tracking_response,
                 "doneMarkerObserved",

@@ -87,16 +87,25 @@ treatment replay
   no target/capture/wait/deadline/source overrides
 ```
 
-The backend inherits an immutable `pair_protocol` from the Control. Each volatile
-binding uses one of these policies:
+The backend inherits an immutable `pair_protocol` from the Control. Value origin
+and pair reuse are separate:
 
 ```text
-fresh_equivalent  default for message IDs, request IDs, nonce, timestamp
-same_value        explicit for conversation ID, parent node, fixed context
+value_source=generated + fresh_equivalent
+  message IDs, request IDs, nonce, timestamp
+
+value_source=generated + same_value
+  one newly generated value shared by the pair
+
+value_source=preserve_source + same_value
+  existing conversation ID, parent node, or fixed source context
 ```
 
 Fresh values may differ on wire. The backend normalizes both values to the same
-logical placeholder before comparing non-target fields.
+logical placeholder before comparing non-target fields. `same_value` does not
+mean “keep the source value”; use `preserve_source` for that. A binding that is
+an ancestor of the mutation path is rejected because it would erase the field
+under test during normalization.
 
 Use RFC 6901 JSON Pointer paths, including array indices:
 
@@ -126,7 +135,7 @@ Treatment contains the requested target delta
 volatile bindings are effective on wire
 non-target fields are equivalent after normalization
 mutation_effective = true
-pair environment is equivalent
+pre-dispatch environment status is observed_equivalent
 ```
 
 Then compare:
@@ -137,12 +146,21 @@ Then compare:
 - conversation persistence or subsequent retrieval;
 - console errors.
 
-If the source response is `text/event-stream`, replay automatically enables stream capture and raw artifact requirements. The replay response reader is incremental and terminates on the configured done marker, byte limit, idle timeout, or network close.
+If the source response is `text/event-stream`, replay automatically requires raw
+capture, semantic parse, and stream artifacts. `raw_only=true` is the explicit
+exception. The reader parses complete SSE events and terminates only when an
+event's combined `data` exactly equals the configured marker and the optional
+event name matches. A literal `[DONE]` inside JSON, model text, or tool arguments
+is not terminal. Missing marker, idle timeout, byte-limit truncation, malformed
+semantic evidence, or unexpected Content-Type makes the result partial or
+failed even when HTTP status is 200.
 
 An exact non-stream error response terminates the stream requirement without being treated as a collector failure. Interpret it by classification:
 
 ```text
-validation_rejection      only when 400/409/422 evidence names the target
+validation_rejection      remove + HTTP 400/422 + structured field_required
+value_constraint          replace + invalid enum/type/format
+conflict                  HTTP 409, including duplicate ID/version conflict
 authentication_failure    401/403
 rate_limited              429
 server_failure            5xx
@@ -151,7 +169,10 @@ unexpected_redirect
 response_contract_mismatch
 ```
 
-Only `validation_rejection` can support a required-field conclusion. All other error classes are inconclusive.
+Only the strict remove-field `validation_rejection` can support a required-field
+conclusion. A replace rejection proves a value constraint, not requiredness.
+Natural-language field mentions are weak hints only. Required evidence must come
+from an exact bounded response body artifact, not an incomplete preview.
 
 Use `verification_flow` for reload, conversation detail retrieval, or reopening the conversation after fetch. Without persistent-state verification, do not classify a 2xx result beyond `partial` or `unknown`.
 
@@ -214,9 +235,22 @@ The generated HTTP replay script must use placeholders or environment variables 
 - If a source match is minified, use bounded source offsets and persist it with `save_script_source`; document the loaded script URL/hash and initiator evidence ID.
 - If a treatment reports `mutation_effective=false`, discard it as inconclusive and fix the matcher or mutation path.
 - If a source request is stateful, require a successful control replay before running a treatment.
-- Use `fresh_equivalent` for one-time IDs, timestamps, and nonce values. Use `same_value` only when the server contract requires the same fixed context.
+- Use `generated + fresh_equivalent` for one-time IDs, timestamps, and nonce
+  values. Use `preserve_source + same_value` for existing parent/conversation
+  context. Generated `same_value` shares one new value; it does not preserve the
+  source value.
 - If replay request correlation is ambiguous, do not choose a candidate manually; recapture with a narrower source request.
-- If the Control and Treatment environment fingerprints differ, classify the result as partial/inconclusive.
+- Compare only `pre_dispatch_environment`. `post_response_environment` and
+  `post_verification_environment` are outcomes, not causal prerequisites.
+- Environment comparison is `observed_equivalent`, `different`, or
+  `insufficient`. Missing current-node, bundle, page, or auth-context evidence
+  is never treated as equality.
+- Browser-managed credential values stay local. The manifest stores only
+  SHA-256 digests for Cookie name/value pairs, Authorization, CSRF, and the
+  combined request context. This is change detection, not encryption or key
+  management.
+- Replay correlation requires a numeric observed timestamp inside the bounded
+  dispatch window. Missing timestamps do not participate in automatic matching.
 - If an experiment is submitted incorrectly, call `cancel_experiment`; do not close the session or restart the service.
 - If `changed_during_read=true`, do not cite the file hash as stable. Re-read after the experiment reaches a terminal state.
 - If an evidence or replay result is partial, preserve the uncertainty in reports and `notes/open-questions.md`.
@@ -232,7 +266,7 @@ The protocol reproduction is complete only when:
 - important fields have successful control plus one-variable treatment results;
 - every treatment verifies Control baseline, target delta, normalized non-target equivalence, and mutation effectiveness on exact outbound requests;
 - Control and Treatment use the same immutable pair protocol hash;
-- environment fingerprints are equivalent or the conclusion is explicitly partial;
+- pre-dispatch environment is observed-equivalent or the conclusion is explicitly partial;
 - streaming requests have `stream_request` and `stream_event_range` evidence;
 - stream events and conversation state transitions are documented;
 - Stop behavior is observed rather than assumed;

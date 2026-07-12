@@ -208,7 +208,7 @@ class ToolchainValidationHandler(BaseHTTPRequestHandler):
             {
                 "type": "message_delta",
                 "message_id": assistant_message_id,
-                "delta": "fixture answer",
+                "delta": "fixture answer contains literal [DONE] text",
             },
             {
                 "type": "conversation_state",

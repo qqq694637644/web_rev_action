@@ -74,7 +74,11 @@ Pandora 类协议复刻优先选择 `pandora-protocol-reproduction` Skill。Skil
 
 普通请求需要复刻或字段必要性分析时，在 capture_flow 中配置 `network_evidence`，至少为 replay source 导出 `all`。完成后先调用 `list_evidence`，再分页调用 `get_request_shape` 选择 JSON Pointer，例如 `/messages/0/id`；使用 `path_prefix/page_idx/page_size/max_depth/max_array_items` 控制范围，默认不要请求 redacted body。不要从隐藏的 credential artifact 或源码猜字段结构。然后使用 `get_network_evidence` 和 `get_request_initiator`。需要长期引用源码时调用 `save_script_source`，保存 URL/script ID、范围、SHA-256 和 initiator evidence 关联。
 
-字段分类必须成对执行。先运行 `replay_mode=control`、`mutations=[]`。每个 volatile binding设置 `reuse_policy`：message/request ID、nonce、timestamp默认 `fresh_equivalent`；conversation ID、固定 parent/context只有确实需要时才使用 `same_value`。Control 必须成功，且 wire snapshot必须观察到所有 bindings。
+字段分类必须成对执行。先运行`replay_mode=control`、`mutations=[]`。一次性ID、nonce、
+timestamp使用`value_source=generated + reuse_policy=fresh_equivalent`；需要保留现有
+conversation ID或parent node时使用`value_source=preserve_source + same_value`。
+`generated + same_value`只表示共用一个新生成值，不表示保留source值。Control必须
+成功，且wire snapshot必须观察到所有bindings。
 
 Treatment payload只能包含 `replay_mode=treatment`、`control_experiment_id` 和一个 `mutation`；不要重传 session、source、target、capture、wait、verification、deadline或network selector。后端继承并校验 Control 的 `pair_protocol_hash`。只有以下全部满足时才能解释 Treatment：
 
@@ -84,15 +88,27 @@ Treatment target delta正确
 volatile bindings在wire上有效
 规范化后的非目标字段等价
 mutation_effective=true
-pair environment equivalent
+pre-dispatch environment status = observed_equivalent
 replay request候选唯一
 ```
 
 Cookie、Origin、Referer、Host、Content-Length 和 `Sec-*` 属于 browser-managed header，不能通过 browser-context header mutation测试。
 
-Source response 为 `text/event-stream` 时，后端自动启用 stream capture 和 raw artifact requirements，并用增量 reader在 done marker、max bytes、idle timeout或network close终止。成功流必须有 `stream_request` / 按source分开的 `stream_event_range` evidence。
+Source response为`text/event-stream`时，后端默认要求raw、semantic和artifacts；仅在
+明确只分析raw时设置`raw_only=true`。Reader解析完整SSE event，只有data精确等于
+marker且可选event name匹配才结束。检查`stream_response_contract`；idle timeout、
+byte limit、truncated、缺marker或semantic失败不能报告complete。
 
-不要把任意 4xx解释为字段 required。只有 400/409/422 的结构化错误明确引用 mutation target时，`validation_rejection` 才可支持 required。401/403、429、5xx、通用4xx、unexpected redirect和response content-type mismatch都必须标记 partial/inconclusive。需要验证应用状态时使用 Control 的 `verification_flow` 执行 reload、conversation retrieval 或重新打开 conversation；Treatment会继承该 flow。没有持久状态验证时，不能仅凭2xx把字段判为 optional。
+不要把任意4xx解释为required。只有remove mutation得到HTTP 400/422，且exact response
+中的结构化field/path/loc精确指向目标并表达required/missing时才可支持required。
+Replace校验失败是`constrained_value`；409一律是`conflict`。Preview-only、weak text、
+401/403、429、5xx、通用4xx、任意redirect、缺失或错误Content-Type都必须
+partial/inconclusive。
+
+环境只用`pre_dispatch_environment`做因果比较；post-response和post-verification是
+结果。比较状态是observed_equivalent、different或insufficient。缺失current node、
+bundle、page或auth context时不能声称等价。后端只保存本机Cookie名值、Authorization、
+CSRF和组合请求上下文的SHA-256摘要；不做Cookie加密或密钥管理。
 
 相关实验使用同一个 analysis_series_id，并显式设置 scenario_type、predecessor_experiment_id、sequence_index 和已知的 conversation_key。不要用创建时间猜 predecessor。
 

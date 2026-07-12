@@ -519,7 +519,13 @@ class VolatileBinding(StrictModel):
     target: Literal["json_pointer", "header", "query_parameter"]
     path: str | None = Field(default=None, max_length=512)
     name: str | None = Field(default=None, max_length=256)
-    generator: Literal["uuid4", "timestamp_ms", "timestamp_iso", "random_hex_16"]
+    value_source: Literal["generated", "preserve_source"] = "generated"
+    generator: Literal[
+        "uuid4",
+        "timestamp_ms",
+        "timestamp_iso",
+        "random_hex_16",
+    ] | None = None
     reuse_policy: Literal["fresh_equivalent", "same_value"] = "fresh_equivalent"
 
     @model_validator(mode="after")
@@ -533,6 +539,13 @@ class VolatileBinding(StrictModel):
                 raise ValueError(f"{self.target} binding requires name and forbids path")
             if self.target == "header":
                 _validate_mutable_header(self.name)
+        if self.value_source == "generated" and self.generator is None:
+            raise ValueError("generated volatile binding requires generator")
+        if self.value_source == "preserve_source":
+            if self.generator is not None:
+                raise ValueError("preserve_source binding must not declare generator")
+            if self.reuse_policy != "same_value":
+                raise ValueError("preserve_source binding requires reuse_policy=same_value")
         return self
 
 
@@ -562,6 +575,8 @@ class ReplayControlPayload(StrictModel):
     )
     stream_idle_timeout_ms: int = Field(default=15_000, ge=1_000, le=120_000)
     default_done_marker: str | None = Field(default="[DONE]", max_length=512)
+    default_done_event_name: str | None = Field(default=None, max_length=128)
+    raw_only: bool = False
     capture: CaptureOptions = Field(
         default_factory=lambda: CaptureOptions(stream=False)
     )

@@ -1501,7 +1501,7 @@ class JsReverseMcpAdapter:
         output_file: Path,
         deadline: DeadlineLike,
     ) -> dict[str, Any]:
-        function = """async ({localFile}) => {
+        function = r"""async ({localFile}) => {
           const spec = JSON.parse(localFile.text);
           const headers = new Headers();
           for (const entry of spec.headers || []) {
@@ -1535,15 +1535,48 @@ class JsReverseMcpAdapter:
           const doneMarker = responseControl.doneMarker == null
             ? null
             : String(responseControl.doneMarker);
+          const doneEventName = responseControl.doneEventName == null
+            ? null
+            : String(responseControl.doneEventName);
           const reader = response.body ? response.body.getReader() : null;
           const decoder = new TextDecoder('utf-8', {fatal: false});
           const previewChunks = [];
           let previewByteLength = 0;
           let bodyByteLength = 0;
           let doneMarkerObserved = false;
+          let doneEventNameObserved = null;
           let truncated = false;
           let terminationReason = reader ? 'network_close' : 'no_response_body';
-          let markerTail = '';
+          let sseBuffer = '';
+          const consumeSseEvents = (text) => {
+            sseBuffer += text;
+            while (true) {
+              const match = /\r?\n\r?\n/.exec(sseBuffer);
+              if (!match) return false;
+              const block = sseBuffer.slice(0, match.index);
+              sseBuffer = sseBuffer.slice(match.index + match[0].length);
+              let eventName = 'message';
+              const dataLines = [];
+              for (const line of block.split(/\r?\n/)) {
+                if (!line || line.startsWith(':')) continue;
+                const colon = line.indexOf(':');
+                const field = colon < 0 ? line : line.slice(0, colon);
+                let fieldValue = colon < 0 ? '' : line.slice(colon + 1);
+                if (fieldValue.startsWith(' ')) fieldValue = fieldValue.slice(1);
+                if (field === 'event') eventName = fieldValue;
+                if (field === 'data') dataLines.push(fieldValue);
+              }
+              const data = dataLines.join('\n');
+              if (
+                doneMarker &&
+                data === doneMarker &&
+                (!doneEventName || eventName === doneEventName)
+              ) {
+                doneEventNameObserved = eventName;
+                return true;
+              }
+            }
+          };
           const readWithIdleTimeout = async () => {
             let timer;
             try {
@@ -1572,6 +1605,7 @@ class JsReverseMcpAdapter:
                 break;
               }
               if (readResult.done) {
+                if (doneMarker) consumeSseEvents(decoder.decode());
                 terminationReason = 'network_close';
                 break;
               }
@@ -1594,14 +1628,12 @@ class JsReverseMcpAdapter:
                 previewByteLength += previewPart.byteLength;
               }
               if (doneMarker) {
-                const combined = markerTail + decoder.decode(accepted, {stream: true});
-                if (combined.includes(doneMarker)) {
+                if (consumeSseEvents(decoder.decode(accepted, {stream: true}))) {
                   doneMarkerObserved = true;
                   terminationReason = 'done_marker';
                   await reader.cancel('done_marker').catch(() => {});
                   break;
                 }
-                markerTail = combined.slice(-Math.max(doneMarker.length - 1, 1024));
               }
               if (accepted.byteLength < chunk.byteLength || bodyByteLength >= maxResponseBytes) {
                 truncated = true;
@@ -1630,6 +1662,7 @@ class JsReverseMcpAdapter:
             bodyByteLength,
             bodyPreview: preview,
             doneMarkerObserved,
+            doneEventNameObserved,
             terminationReason,
             truncated,
             maxResponseBytes,

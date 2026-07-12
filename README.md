@@ -128,7 +128,8 @@ GPT 不直接协调 start、click、wait、stop。
 → Control 保存 immutable pair_protocol_hash 和 volatile binding policy
 → 本地读取 exact network snapshot
 → Treatment 只提交 control_experiment_id + 唯一 mutation
-→ fresh_equivalent 重新生成一次性值；same_value 显式复用固定上下文
+→ generated+fresh_equivalent 重新生成一次性值
+→ preserve_source+same_value 复用真实 source 上下文
 → 启动新 experiment 和 capture/checkpoint
 → 在当前页面上下文执行 fetch(credentials=include)
 → 导出新 network/page/console evidence
@@ -143,22 +144,41 @@ GPT 不直接协调 start、click、wait、stop。
 Control 必须 `mutations=[]`、HTTP 2xx/3xx，并在 actual wire snapshot 中观察到所有 volatile bindings。每个 binding 选择：
 
 ```text
-fresh_equivalent  默认；message/request ID、nonce、timestamp 分别生成新值
-same_value        显式；conversation ID、固定 parent/context 才复用
+value_source=generated + fresh_equivalent
+  message/request ID、nonce、timestamp分别生成新值
+
+value_source=generated + same_value
+  Control/Treatment共用一个新生成值
+
+value_source=preserve_source + same_value
+  保留现有 conversation ID、parent node 或固定上下文
 ```
+
+`same_value` 本身不表示保留 source 原值；需要原值时必须使用
+`preserve_source`。Binding 路径是 mutation祖先时会被拒绝，避免规范化先
+抹掉被测试字段。
 
 Treatment 的公开 payload 只能包含 `control_experiment_id` 和一个 `mutation`；target、capture、wait、verification、deadline、source 和 network selector全部从 Control 的 `pair_protocol_hash` 继承。Fresh 值不要求物理相同，而是在成对比较时规范化为同一逻辑 placeholder。若 Control 中没有 target、Treatment 没有产生预期 delta、volatile binding未上 wire、非目标字段不等价或 replay request候选不唯一，实验直接失败。
 
-若 source response 是 `text/event-stream`，replay 自动开启 stream capture 和 raw artifact requirements。Evaluate 使用增量 `ReadableStream` reader，只保留 bounded preview，并在 done marker、最大字节数、idle timeout 或 network close 时终止。
+若 source response 是 `text/event-stream`，replay 默认要求 raw capture、
+semantic parse 和 stream artifacts；只有显式 `raw_only=true` 才跳过 semantic
+要求。Evaluate 使用增量 `ReadableStream` reader和小型 SSE parser，只在完整
+event的合并 `data` 精确等于 marker、且可选 event name匹配时终止。正文、JSON
+或工具参数中的字面量 `[DONE]` 不会提前结束。`idle_timeout`、字节上限截断、
+缺失 marker、semantic失败或Content-Type不符都会进入 partial/failed。
 
 有效 Treatment 返回非流错误响应时，ordinary exact response 可以终结本轮实验而不误报 collector 故障，但只有以下情况能支持 required：
 
 ```text
-validation_rejection = 400 / 409 / 422
-且结构化错误明确引用被测试的 JSON Pointer / header / query
+validation_rejection = remove mutation + HTTP 400 / 422
+且结构化 field_required 精确引用被测试目标
 ```
 
-`authentication_failure`、`rate_limited`、`server_failure`、`unknown_rejection`、`unexpected_redirect` 和 `response_contract_mismatch` 都是 partial/inconclusive。`verification_flow` 可在 fetch 后执行 reload、重新打开 conversation 或 retrieval 检查。
+Replace返回 enum/type/format校验错误只说明 `constrained_value`，不说明字段
+required。HTTP 409统一是 `conflict`。自然语言字段名只算 weak text hint；required
+必须来自 exact network response body，或确认未截断且长度完全匹配的 bounded
+replay response body。Preview-only、认证失败、限流、5xx、通用4xx、redirect和
+response contract mismatch都必须 partial/inconclusive。
 
 Capture 阶段禁止 `target.start_url`。需要观察页面初始化请求、重定向、首屏脚本或初始 SSE 时，必须把导航写成 flow 的第一个显式 `navigate` step。这样 running manifest、Trace 和 stream collector 都会在导航前创建。
 
@@ -215,7 +235,18 @@ experiment_id + evidence_id + artifact_id
 
 流请求生成 `stream_request` 和按 source 分开的 `stream_event_range` evidence。Stream 与 ordinary network evidence 优先按 `networkRequestId + collectorGeneration`、CDP ID、persistent ID关联；URL+method只允许作为唯一候选 fallback。Ordinary snapshot 只补充 `networkSnapshotIntegrity`、request body/header完整性，不能升级缺失的 raw/events/metadata stream artifact。源码搜索结果可通过 consequential `save_script_source` 持久化到目标 experiment，并保存 script URL/ID、范围、SHA-256 和 initiator evidence 关联。
 
-Replay 使用 `replay_attempt_id + dispatch time + canonical request body SHA-256` 锁定唯一 outbound request；自动 retry、Service Worker 重发或 verification flow产生多个相同候选时 fail closed。Manifest 同时保存 Control/Treatment page/origin/request-path/Cookie-name-set环境指纹；环境不等价时结论降为 partial。
+Replay 使用 `replay_attempt_id + 有上下界的dispatch window + canonical request
+body SHA-256` 锁定唯一 outbound request。缺少 numeric `observedAt` 的请求不参与
+自动关联；retry、Service Worker重发或多个候选时 fail closed。
+
+Manifest 分别保存 `pre_dispatch_environment`、`post_response_environment` 和
+`post_verification_environment`。因果比较只使用 pre-dispatch，并返回
+`observed_equivalent | different | insufficient`；缺失 current node、bundle、
+page或认证上下文时不能用 `None == None` 冒充相等。
+
+这是个人本机工具，不加密 Cookie，也不引入 KMS、vault 或密钥管理。后端只在
+本机对实际 outbound Cookie名值、Authorization和CSRF计算 SHA-256摘要，用于发现
+身份/session轮换；manifest不保存这些原值。该摘要是变化检测，不是加密。
 
 Stream 和普通 network status 都会读取全部分页，并在执行 event predicate 前锁定具体 primary request ID；`matchedRequestId` 不属于该 request 时不会满足等待。同一 session 重复提交返回 `409 session_busy`，其他 browser operation 返回 `409 browser_busy`。Protected workspace mutation 与 browser operation 通过同一 RuntimeCoordinator 双向互斥，避免 TOCTOU。
 

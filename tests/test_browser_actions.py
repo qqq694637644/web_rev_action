@@ -205,6 +205,14 @@ class FakeJsReverse:
         self.replay_redirected = False
         self.replay_final_url: str | None = None
         self.duplicate_next_replay_requests = 0
+        self.replay_done_marker_observed: bool | None = None
+        self.replay_termination_reason: str | None = None
+        self.replay_done_event_name_observed: str | None = "message"
+        self.replay_truncated = False
+        self.wire_cookie_value: str | None = None
+        self.omit_observed_at_reqids: set[int] = set()
+        self.response_body_available = True
+        self.response_headers_available = True
 
     @property
     def transport_generation(self) -> int:
@@ -484,6 +492,13 @@ class FakeJsReverse:
                 {"name": "cookie", "value": "session=secret"},
             ]
         )
+        request_headers = list(request_headers)
+        if replay_spec and self.wire_cookie_value is not None:
+            request_headers.append(
+                {"name": "cookie", "value": self.wire_cookie_value}
+            )
+        response_status = self.replay_response_status if replay_spec else 200
+        response_text = self.replay_body_preview if replay_spec else '{"ok":true}'
         snapshot = {
             "url": (
                 replay_spec.get("url")
@@ -492,28 +507,37 @@ class FakeJsReverse:
             ),
             "method": "POST",
             "resourceType": "fetch",
-            "status": 200,
-            "statusText": "OK",
+            "status": response_status,
+            "statusText": "OK" if response_status < 400 else "Error",
             "networkRequestId": f"network-{reqid}",
             "cdpRequestId": f"cdp-{reqid}",
             "persistentRequestId": f"persistent-{reqid}",
             "collectorGeneration": 1,
             "requestHeadersArray": request_headers,
-            "responseHeadersArray": [
-                {
-                    "name": "content-type",
-                    "value": self.network_response_content_type,
-                }
-            ],
+            "responseHeadersArray": (
+                [
+                    {
+                        "name": "content-type",
+                        "value": self.network_response_content_type,
+                    }
+                ]
+                if self.response_headers_available
+                else None
+            ),
             "requestBody": request_body,
             "responseBody": {
-                "available": True,
-                "size": 11,
+                "available": self.response_body_available,
+                "size": len(response_text.encode("utf-8")),
                 "encoding": "utf8",
-                "text": "{\"ok\":true}",
+                **(
+                    {"text": response_text}
+                    if self.response_body_available
+                    else {"reason": "response body unavailable"}
+                ),
             },
-            "observedAt": int(time.time() * 1000),
         }
+        if reqid not in self.omit_observed_at_reqids:
+            snapshot["observedAt"] = int(time.time() * 1000)
         if output_part == "all":
             output_file.write_text(json.dumps(snapshot), encoding="utf-8")
         elif output_part in {"requestBody", "responseBody"}:
@@ -618,6 +642,15 @@ class FakeJsReverse:
             primary["networkRequestId"] = f"network-{reqid}"
             primary["collectorGeneration"] = 1
         output_file.parent.mkdir(parents=True, exist_ok=True)
+        is_stream = self.network_response_content_type == "text/event-stream"
+        done_marker_observed = (
+            self.replay_done_marker_observed
+            if self.replay_done_marker_observed is not None
+            else is_stream
+        )
+        termination_reason = self.replay_termination_reason or (
+            "done_marker" if is_stream else "network_close"
+        )
         output_file.write_text(
             json.dumps(
                 {
@@ -630,6 +663,14 @@ class FakeJsReverse:
                     ],
                     "bodyByteLength": 11,
                     "bodyPreview": self.replay_body_preview,
+                    "doneMarkerObserved": done_marker_observed,
+                    "doneEventNameObserved": (
+                        self.replay_done_event_name_observed
+                        if done_marker_observed
+                        else None
+                    ),
+                    "terminationReason": termination_reason,
+                    "truncated": self.replay_truncated,
                 }
             ),
             encoding="utf-8",
@@ -928,8 +969,13 @@ class BrowserActionTests(unittest.TestCase):
             "max_response_bytes",
             "stream_idle_timeout_ms",
             "default_done_marker",
+            "default_done_event_name",
+            "raw_only",
         ]:
             self.assertIn(field, control_payload["properties"])
+        binding_payload = schema["components"]["schemas"]["VolatileBinding"]
+        self.assertIn("value_source", binding_payload["properties"])
+        self.assertIn("reuse_policy", binding_payload["properties"])
         self.assertEqual(
             set(treatment_payload["properties"]),
             {"replay_mode", "control_experiment_id", "mutation"},
@@ -3723,7 +3769,7 @@ class BrowserActionTests(unittest.TestCase):
                                     "binding_id": "parent_message_id",
                                     "target": "json_pointer",
                                     "path": "/parent_message_id",
-                                    "generator": "uuid4",
+                                    "value_source": "preserve_source",
                                     "reuse_policy": "same_value",
                                 }
                             ],
@@ -3765,7 +3811,7 @@ class BrowserActionTests(unittest.TestCase):
                     },
                 )
             self.assertEqual(replay.status_code, 200, replay.text)
-            self.assertEqual(replay.json()["status"], "completed")
+            self.assertEqual(replay.json()["status"], "partial")
             replay_experiment_id = replay.json()["experiment_id"]
             control_manifest = json.loads(
                 (
@@ -3788,7 +3834,7 @@ class BrowserActionTests(unittest.TestCase):
             self.assertEqual(control_manifest["replay_http_status"], 200)
             self.assertEqual(control_manifest["replay"]["replay_mode"], "control")
             self.assertEqual(replay_manifest["series"]["sequence_index"], 3)
-            self.assertEqual(replay_manifest["objective_integrity"], "complete")
+            self.assertEqual(replay_manifest["objective_integrity"], "partial")
             self.assertEqual(
                 [item["reqid"] for item in replay_manifest["network_summary"]["requests"]],
                 [4],
@@ -3859,8 +3905,20 @@ class BrowserActionTests(unittest.TestCase):
                 replay_manifest["pair_protocol_hash"],
                 control_manifest["pair_protocol_hash"],
             )
+            self.assertEqual(
+                replay_manifest["pair_environment_comparison"]["status"],
+                "insufficient",
+            )
             self.assertTrue(
-                replay_manifest["pair_environment_comparison"]["equivalent"]
+                replay_manifest["pair_environment_comparison"][
+                    "observed_dimensions_equivalent"
+                ]
+            )
+            self.assertIn(
+                "conversation_current_node",
+                replay_manifest["pair_environment_comparison"][
+                    "required_dimensions_missing"
+                ],
             )
             self.assertNotIn("cookie", header_names)
             self.assertIn("authorization", header_names)
@@ -3962,6 +4020,290 @@ class BrowserActionTests(unittest.TestCase):
             evidence_kinds = {item["kind"] for item in replay_manifest["evidence"]}
             self.assertIn("stream_request", evidence_kinds)
             self.assertIn("stream_event_range", evidence_kinds)
+
+    def test_request_context_hash_detects_cookie_value_change_without_storing_value(
+        self,
+    ) -> None:
+        alignment = AlignmentResult(
+            status="aligned",
+            playwright_page=PageState(url="https://example.test/app"),
+            js_reverse_page_id="page_one",
+            js_reverse_page_url="https://example.test/app",
+        )
+        first = {
+            "url": "https://example.test/conversation",
+            "requestHeadersArray": [
+                {"name": "Cookie", "value": "session=first; theme=dark"},
+                {"name": "Authorization", "value": "Bearer first"},
+            ],
+        }
+        second = {
+            "url": "https://example.test/conversation",
+            "requestHeadersArray": [
+                {"name": "Cookie", "value": "session=second; theme=dark"},
+                {"name": "Authorization", "value": "Bearer first"},
+            ],
+        }
+
+        first_fp = BrowserActionService._environment_fingerprint(
+            alignment,
+            first,
+            phase="pre_dispatch",
+        )
+        second_fp = BrowserActionService._environment_fingerprint(
+            alignment,
+            second,
+            phase="pre_dispatch",
+        )
+        comparison = BrowserActionService._compare_pair_environments(
+            first_fp,
+            second_fp,
+        )
+        incomplete_match = BrowserActionService._compare_pair_environments(
+            first_fp,
+            first_fp,
+        )
+
+        self.assertNotEqual(
+            first_fp["cookie_name_value_sha256"],
+            second_fp["cookie_name_value_sha256"],
+        )
+        self.assertNotIn("session=first", json.dumps(first_fp))
+        self.assertNotIn("Bearer first", json.dumps(first_fp))
+        self.assertEqual(comparison["status"], "different")
+        self.assertIn("request_context_sha256", comparison["differences"])
+        self.assertEqual(incomplete_match["status"], "insufficient")
+        self.assertFalse(incomplete_match["equivalent"])
+        self.assertIn(
+            "conversation_current_node",
+            incomplete_match["required_dimensions_missing"],
+        )
+
+    def test_sse_terminal_contract_and_semantic_parse_affect_objective(self) -> None:
+        cases = [
+            {
+                "name": "missing_done_marker",
+                "semantic": "complete",
+                "raw_only": False,
+                "done": False,
+                "termination": "idle_timeout",
+                "expected_status": "partial",
+                "expected_contract": "partial",
+            },
+            {
+                "name": "semantic_parse_failed",
+                "semantic": "failed",
+                "raw_only": False,
+                "done": True,
+                "termination": "done_marker",
+                "expected_status": "failed",
+                "expected_contract": "complete",
+            },
+            {
+                "name": "explicit_raw_only",
+                "semantic": "failed",
+                "raw_only": True,
+                "done": True,
+                "termination": "done_marker",
+                "expected_status": "completed",
+                "expected_contract": "complete",
+            },
+        ]
+        for case in cases:
+            with self.subTest(case=case["name"]), tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                client, _, js = self.make_client(
+                    root,
+                    include_supporting_failure=False,
+                    semantic_parse_integrity=case["semantic"],
+                )
+                js.network_response_content_type = "text/event-stream"
+                js.replay_done_marker_observed = case["done"]
+                js.replay_termination_reason = case["termination"]
+                capture = self.capture_request()
+                capture["payload"]["capture"] = {
+                    "network": True,
+                    "stream": False,
+                    "trace": False,
+                    "screenshots": False,
+                    "page_snapshots": False,
+                    "console_errors": False,
+                }
+                capture["payload"]["requirements"] = {
+                    "require_raw_capture": False,
+                    "require_semantic_parse": False,
+                    "require_request_snapshot": True,
+                    "require_artifacts": True,
+                }
+                capture["payload"]["network_evidence"] = [
+                    {
+                        "selector_id": "conversation_submit",
+                        "matcher": {
+                            "url_contains": "/conversation",
+                            "method": "POST",
+                        },
+                        "export_parts": ["all"],
+                    }
+                ]
+                with client:
+                    self.open_session(client)
+                    source = client.post("/v1/browser/run", json=capture)
+                    source_id = source.json()["experiment_id"]
+                    source_manifest = json.loads(
+                        (
+                            root / "experiments" / source_id / "manifest.json"
+                        ).read_text(encoding="utf-8")
+                    )
+                    source_evidence = next(
+                        item
+                        for item in source_manifest["evidence"]
+                        if item["kind"] == "network_request"
+                    )
+                    control = client.post(
+                        "/v1/browser/run",
+                        json={
+                            "operation": "replay_request",
+                            "payload": {
+                                "session_id": "session_one",
+                                "objective": case["name"],
+                                "source_experiment_id": source_id,
+                                "source_evidence_id": source_evidence["evidence_id"],
+                                "replay_mode": "control",
+                                "mutations": [],
+                                "raw_only": case["raw_only"],
+                                "execution_mode": "sync",
+                                "deadline_ms": 10_000,
+                            },
+                        },
+                    )
+                self.assertEqual(control.status_code, 200, control.text)
+                self.assertEqual(control.json()["status"], case["expected_status"])
+                manifest = json.loads(
+                    (
+                        root
+                        / "experiments"
+                        / control.json()["experiment_id"]
+                        / "manifest.json"
+                    ).read_text(encoding="utf-8")
+                )
+                self.assertEqual(
+                    manifest["stream_response_contract"]["status"],
+                    case["expected_contract"],
+                )
+                self.assertEqual(
+                    manifest["objective_requirements"]["require_semantic_parse"],
+                    not case["raw_only"],
+                )
+
+    def test_environment_comparison_uses_pre_dispatch_not_final_page(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            client, _, _ = self.make_client(root, include_supporting_failure=False)
+            capture = self.capture_request()
+            capture["payload"]["network_evidence"] = [
+                {
+                    "selector_id": "conversation_submit",
+                    "matcher": {
+                        "url_contains": "/conversation",
+                        "method": "POST",
+                    },
+                    "export_parts": ["all"],
+                }
+            ]
+            with client:
+                self.open_session(client)
+                source = client.post("/v1/browser/run", json=capture)
+                source_id = source.json()["experiment_id"]
+                source_manifest = json.loads(
+                    (root / "experiments" / source_id / "manifest.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                evidence = next(
+                    item
+                    for item in source_manifest["evidence"]
+                    if item["kind"] == "network_request"
+                )
+                control = client.post(
+                    "/v1/browser/run",
+                    json={
+                        "operation": "replay_request",
+                        "payload": {
+                            "session_id": "session_one",
+                            "objective": "compare pre-dispatch environment",
+                            "source_experiment_id": source_id,
+                            "source_evidence_id": evidence["evidence_id"],
+                            "replay_mode": "control",
+                            "mutations": [],
+                            "verification_flow": [
+                                {
+                                    "step_id": "return_to_final",
+                                    "action": "navigate",
+                                    "value": "https://example.test/final",
+                                }
+                            ],
+                            "execution_mode": "sync",
+                            "deadline_ms": 10_000,
+                        },
+                    },
+                )
+                self.assertEqual(control.json()["status"], "completed")
+                treatment = client.post(
+                    "/v1/browser/run",
+                    json={
+                        "operation": "replay_request",
+                        "payload": {
+                            "replay_mode": "treatment",
+                            "control_experiment_id": control.json()["experiment_id"],
+                            "mutation": {
+                                "type": "remove_json_path",
+                                "path": "/tracking_id",
+                            },
+                        },
+                    },
+                )
+            self.assertEqual(treatment.status_code, 200, treatment.text)
+            self.assertEqual(treatment.json()["status"], "partial")
+            control_manifest = json.loads(
+                (
+                    root
+                    / "experiments"
+                    / control.json()["experiment_id"]
+                    / "manifest.json"
+                ).read_text(encoding="utf-8")
+            )
+            treatment_manifest = json.loads(
+                (
+                    root
+                    / "experiments"
+                    / treatment.json()["experiment_id"]
+                    / "manifest.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                control_manifest["pre_dispatch_environment"]["page_url"],
+                "https://example.test/app",
+            )
+            self.assertEqual(
+                control_manifest["post_verification_environment"]["page_url"],
+                "https://example.test/final",
+            )
+            self.assertEqual(
+                treatment_manifest["pre_dispatch_environment"]["page_url"],
+                "https://example.test/final",
+            )
+            self.assertEqual(
+                treatment_manifest["post_verification_environment"]["page_url"],
+                "https://example.test/final",
+            )
+            self.assertEqual(
+                treatment_manifest["pair_environment_comparison"]["status"],
+                "different",
+            )
+            self.assertIn(
+                "page_url",
+                treatment_manifest["pair_environment_comparison"]["differences"],
+            )
 
     def test_treatment_fails_when_mutation_is_not_observed_on_wire(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -4112,7 +4454,7 @@ class BrowserActionTests(unittest.TestCase):
                     },
                 )
             self.assertEqual(treatment.status_code, 200, treatment.text)
-            self.assertEqual(treatment.json()["status"], "completed")
+            self.assertEqual(treatment.json()["status"], "partial")
             manifest = json.loads(
                 (
                     root
@@ -4127,7 +4469,16 @@ class BrowserActionTests(unittest.TestCase):
                 manifest["primary_integrity_dimensions"]["raw_capture"],
                 "not_applicable_non_stream_response",
             )
-            self.assertEqual(manifest["objective_integrity"], "complete")
+            self.assertEqual(manifest["objective_integrity"], "partial")
+            self.assertEqual(
+                manifest["replay_response_classification"]["conclusion"],
+                "required",
+            )
+            self.assertTrue(
+                manifest["replay_response_classification"][
+                    "usable_for_required_classification"
+                ]
+            )
 
     def test_control_fails_when_volatile_binding_is_not_observed_on_wire(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -4331,6 +4682,148 @@ class BrowserActionTests(unittest.TestCase):
             )
             self.assertIn("ambiguous", " ".join(manifest["errors"]).lower())
             self.assertIsNone(manifest["replay"]["network_evidence_id"])
+
+    def test_replay_request_without_observed_timestamp_fails_correlation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            client, _, js = self.make_client(root, include_supporting_failure=False)
+            with client:
+                self.open_session(client)
+                _, _, control_id, _ = self.capture_source_and_control(client, root)
+                js.omit_observed_at_reqids.add(4)
+                treatment = client.post(
+                    "/v1/browser/run",
+                    json={
+                        "operation": "replay_request",
+                        "payload": {
+                            "replay_mode": "treatment",
+                            "control_experiment_id": control_id,
+                            "mutation": {
+                                "type": "remove_json_path",
+                                "path": "/tracking_id",
+                            },
+                        },
+                    },
+                )
+            self.assertEqual(treatment.status_code, 200, treatment.text)
+            self.assertEqual(treatment.json()["status"], "failed")
+            manifest = json.loads(
+                (
+                    root
+                    / "experiments"
+                    / treatment.json()["experiment_id"]
+                    / "manifest.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertIn(
+                "no replay request matched",
+                " ".join(manifest["errors"]).lower(),
+            )
+            self.assertIsNone(manifest["replay"]["network_evidence_id"])
+
+    def test_preview_only_validation_error_cannot_prove_required(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            client, _, js = self.make_client(root, include_supporting_failure=False)
+            js.network_response_content_type = "text/event-stream"
+            capture = self.capture_request()
+            capture["payload"]["network_evidence"] = [
+                {
+                    "selector_id": "conversation_submit",
+                    "matcher": {
+                        "url_contains": "/conversation",
+                        "method": "POST",
+                    },
+                    "export_parts": ["all"],
+                }
+            ]
+            with client:
+                self.open_session(client)
+                source = client.post("/v1/browser/run", json=capture)
+                source_id = source.json()["experiment_id"]
+                source_manifest = json.loads(
+                    (root / "experiments" / source_id / "manifest.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                source_evidence = next(
+                    item
+                    for item in source_manifest["evidence"]
+                    if item["kind"] == "network_request"
+                )
+                control = client.post(
+                    "/v1/browser/run",
+                    json={
+                        "operation": "replay_request",
+                        "payload": {
+                            "session_id": "session_one",
+                            "objective": "SSE control for exact response test",
+                            "source_experiment_id": source_id,
+                            "source_evidence_id": source_evidence["evidence_id"],
+                            "replay_mode": "control",
+                            "mutations": [],
+                            "execution_mode": "sync",
+                            "deadline_ms": 10_000,
+                        },
+                    },
+                )
+                self.assertEqual(control.json()["status"], "completed")
+                js.replay_response_status = 422
+                js.network_response_content_type = "application/json"
+                js.replay_body_preview = json.dumps(
+                    {"missing": ["messages[0].id"]}
+                )
+                js.response_body_available = False
+                treatment = client.post(
+                    "/v1/browser/run",
+                    json={
+                        "operation": "replay_request",
+                        "payload": {
+                            "replay_mode": "treatment",
+                            "control_experiment_id": control.json()["experiment_id"],
+                            "mutation": {
+                                "type": "remove_json_path",
+                                "path": "/messages/0/id",
+                            },
+                        },
+                    },
+                )
+            self.assertEqual(treatment.status_code, 200, treatment.text)
+            self.assertEqual(treatment.json()["status"], "partial")
+            manifest = json.loads(
+                (
+                    root
+                    / "experiments"
+                    / treatment.json()["experiment_id"]
+                    / "manifest.json"
+                ).read_text(encoding="utf-8")
+            )
+            classification = manifest["replay_response_classification"]
+            self.assertEqual(classification["classification"], "validation_rejection")
+            self.assertEqual(classification["conclusion"], "inconclusive")
+            self.assertFalse(classification["usable_for_required_classification"])
+            self.assertFalse(classification["evidence_sufficient"])
+            self.assertEqual(
+                manifest["response_evidence_source"],
+                "replay_preview_fallback",
+            )
+            self.assertFalse(manifest["protocol_rejection_observed"])
+            self.assertEqual(
+                manifest["primary_integrity_dimensions"]["request_snapshot"],
+                "complete",
+            )
+            replay_network = next(
+                item
+                for item in manifest["evidence"]
+                if item.get("evidence_id")
+                == manifest["replay"]["network_evidence_id"]
+            )
+            self.assertEqual(
+                replay_network["summary"]["snapshot_integrity"][
+                    "response_body_completeness"
+                ],
+                "partial",
+            )
 
     def test_non_validation_rejections_are_inconclusive(self) -> None:
         cases = [

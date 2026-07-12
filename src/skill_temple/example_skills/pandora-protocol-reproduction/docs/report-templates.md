@@ -130,7 +130,12 @@ Generate JSON Schema from observed and replay-tested request bodies. Add custom 
 }
 ```
 
-A field should be in `required` only after a successful Control, an effective one-variable Treatment, equivalent non-target request fields/environment, and a `validation_rejection` that identifies the target. Record request-shape evidence, pair protocol hash, Control/Treatment exact network evidence IDs, response classification, and reload/retrieval verification.
+A field should be in `required` only after a successful Control, an effective
+one-variable remove Treatment, equivalent non-target request fields, an
+`observed_equivalent` pre-dispatch environment, and an exact HTTP 400/422
+structured `field_required` response at the target. Record missing environment
+dimensions explicitly. Replace failures belong under `constrained_value`; 409
+belongs under `conflict`.
 
 ## `schemas/stream-events.schema.json`
 

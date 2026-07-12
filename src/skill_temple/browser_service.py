@@ -65,6 +65,7 @@ from .browser_models import (
 from .protocol_evidence import (
     assess_control_wire_baseline,
     assess_paired_mutation_effectiveness,
+    binding_value_from_snapshot,
     build_replay_spec,
     canonical_json_sha256,
     classify_replay_response,
@@ -79,7 +80,9 @@ from .protocol_evidence import (
     request_shape_from_snapshot,
     requests_after_checkpoint,
     response_content_type,
+    response_value_from_snapshot,
     select_network_evidence,
+    validate_binding_mutation_compatibility,
 )
 from .runtime import env_value_from_environment_or_dotenv
 from .runtime_coordinator import (
@@ -824,6 +827,8 @@ class BrowserActionService:
 
     @staticmethod
     def _generate_binding_value(binding: VolatileBinding) -> Any:
+        if binding.value_source != "generated" or binding.generator is None:
+            raise ValueError("Only generated bindings can generate a new value")
         if binding.generator == "uuid4":
             return str(uuid.uuid4())
         if binding.generator == "timestamp_ms":
@@ -839,7 +844,8 @@ class BrowserActionService:
     ) -> dict[str, Any]:
         values: dict[str, Any] = {}
         for binding in bindings:
-            values[binding.binding_id] = cls._generate_binding_value(binding)
+            if binding.value_source == "generated":
+                values[binding.binding_id] = cls._generate_binding_value(binding)
         return values
 
     @staticmethod
@@ -865,6 +871,8 @@ class BrowserActionService:
             "max_response_bytes": control.max_response_bytes,
             "stream_idle_timeout_ms": control.stream_idle_timeout_ms,
             "default_done_marker": control.default_done_marker,
+            "default_done_event_name": control.default_done_event_name,
+            "raw_only": control.raw_only,
             "capture": control.capture.model_dump(mode="json"),
             "requirements": control.requirements.model_dump(mode="json"),
             "network_evidence": [
@@ -986,7 +994,8 @@ class BrowserActionService:
         treatment_values = {
             binding.binding_id: (
                 control_values[binding.binding_id]
-                if binding.reuse_policy == "same_value"
+                if binding.value_source == "preserve_source"
+                or binding.reuse_policy == "same_value"
                 else self._generate_binding_value(binding)
             )
             for binding in parsed_specs
@@ -1366,6 +1375,11 @@ class BrowserActionService:
     ) -> tuple[dict[str, Any] | None, str | None]:
         expected_hash = replay_plan.get("expected_request_body_canonical_sha256")
         dispatch_wall_time_ms = replay_plan.get("dispatch_wall_time_ms")
+        window_end_wall_time_ms = replay_plan.get("correlation_window_end_wall_time_ms")
+        if not isinstance(dispatch_wall_time_ms, int) or not isinstance(
+            window_end_wall_time_ms, int
+        ):
+            return None, "Replay correlation window is missing."
         candidates = [
             item
             for item in entries
@@ -1376,9 +1390,10 @@ class BrowserActionService:
                 or item.get("request_body_canonical_sha256") == expected_hash
             )
             and (
-                not isinstance(dispatch_wall_time_ms, int)
-                or not isinstance(item.get("observed_at"), (int, float))
-                or int(item["observed_at"]) >= dispatch_wall_time_ms - 1_000
+                isinstance(item.get("observed_at"), (int, float))
+                and dispatch_wall_time_ms - 1_000
+                <= int(item["observed_at"])
+                <= window_end_wall_time_ms
             )
         ]
         if len(candidates) == 1:
@@ -1524,6 +1539,12 @@ class BrowserActionService:
             "requestHeadersCompleteness": integrity.get(
                 "request_headers_completeness"
             ),
+            "responseBodyCompleteness": integrity.get(
+                "response_body_completeness"
+            ),
+            "responseHeadersCompleteness": integrity.get(
+                "response_headers_completeness"
+            ),
             "networkArtifactIntegrity": network_artifact_integrity,
             "artifactIntegrity": network_artifact_integrity,
             "integrityStatus": max(
@@ -1613,38 +1634,137 @@ class BrowserActionService:
                 return None
         return None
 
+    @classmethod
+    def _complete_replay_response_value(cls, value: Any) -> Any | None:
+        preview = cls._extract_response_field(value, "bodyPreview")
+        byte_length = cls._extract_response_field(value, "bodyByteLength")
+        truncated = bool(cls._extract_response_field(value, "truncated"))
+        termination = cls._extract_response_field(value, "terminationReason")
+        if (
+            not isinstance(preview, str)
+            or not isinstance(byte_length, int)
+            or truncated
+            or termination not in {"network_close", "no_response_body"}
+            or len(preview.encode("utf-8")) != byte_length
+        ):
+            return None
+        try:
+            return json.loads(preview)
+        except json.JSONDecodeError:
+            return preview
+
+    @classmethod
+    def _stream_response_contract(
+        cls,
+        replay_plan: dict[str, Any],
+        replay_response: Any,
+        *,
+        status: int | None,
+        content_type: str | None,
+    ) -> dict[str, Any] | None:
+        if replay_plan.get("source_is_stream") is not True:
+            return None
+        response_control = replay_plan.get("spec", {}).get("responseControl", {})
+        response_control = response_control if isinstance(response_control, dict) else {}
+        marker = response_control.get("doneMarker")
+        event_name = response_control.get("doneEventName")
+        termination = cls._extract_response_field(replay_response, "terminationReason")
+        marker_observed = bool(
+            cls._extract_response_field(replay_response, "doneMarkerObserved")
+        )
+        observed_event_name = cls._extract_response_field(
+            replay_response,
+            "doneEventNameObserved",
+        )
+        truncated = bool(cls._extract_response_field(replay_response, "truncated"))
+        if isinstance(status, int) and status >= 400 and content_type != "text/event-stream":
+            contract_status = "not_applicable_non_stream_response"
+        else:
+            marker_ok = not marker or marker_observed
+            event_ok = not event_name or observed_event_name == event_name
+            complete = bool(
+                isinstance(status, int)
+                and 200 <= status < 400
+                and content_type == "text/event-stream"
+                and marker_ok
+                and event_ok
+                and termination in {"done_marker", "network_close"}
+                and not truncated
+            )
+            contract_status = "complete" if complete else "partial"
+        return {
+            "status": contract_status,
+            "expected_termination": "done_marker" if marker else "network_close",
+            "observed_termination": termination,
+            "done_marker_required": bool(marker),
+            "done_marker_observed": marker_observed,
+            "done_event_name_required": event_name,
+            "done_event_name_observed": observed_event_name,
+            "truncated": truncated,
+        }
+
     @staticmethod
-    def _cookie_name_set_sha256(snapshot: dict[str, Any] | None) -> str | None:
-        if not isinstance(snapshot, dict):
-            return None
-        headers = snapshot.get("requestHeadersArray")
+    def _sha256_lines(values: list[str]) -> str:
+        return hashlib.sha256("\n".join(sorted(values)).encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _request_context_hashes(
+        cls,
+        snapshot: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        headers = snapshot.get("requestHeadersArray") if isinstance(snapshot, dict) else None
         if not isinstance(headers, list):
-            return None
-        names: set[str] = set()
+            return {
+                "status": "unavailable",
+                "cookie_name_value_sha256": None,
+                "authorization_sha256": None,
+                "csrf_header_sha256": None,
+                "request_context_sha256": None,
+            }
+        cookies: list[str] = []
+        authorization: list[str] = []
+        csrf: list[str] = []
         for item in headers:
             if not isinstance(item, dict):
                 continue
-            if str(item.get("name", "")).lower() != "cookie":
-                continue
-            for segment in str(item.get("value", "")).split(";"):
-                name = segment.split("=", 1)[0].strip()
-                if name:
-                    names.add(name)
-        return hashlib.sha256("\n".join(sorted(names)).encode("utf-8")).hexdigest()
+            name = str(item.get("name", "")).strip().lower()
+            value = str(item.get("value", ""))
+            if name == "cookie":
+                cookies.extend(
+                    segment.strip()
+                    for segment in value.split(";")
+                    if segment.strip()
+                )
+            elif name in {"authorization", "proxy-authorization"}:
+                authorization.append(f"{name}:{value}")
+            elif "csrf" in name or "xsrf" in name:
+                csrf.append(f"{name}:{value}")
+        cookie_hash = cls._sha256_lines(cookies)
+        authorization_hash = cls._sha256_lines(authorization)
+        csrf_hash = cls._sha256_lines(csrf)
+        return {
+            "status": "observed",
+            "cookie_name_value_sha256": cookie_hash,
+            "authorization_sha256": authorization_hash,
+            "csrf_header_sha256": csrf_hash,
+            "request_context_sha256": cls._sha256_lines(
+                [cookie_hash, authorization_hash, csrf_hash]
+            ),
+        }
 
     @classmethod
-    def _pair_environment_fingerprint(
+    def _environment_fingerprint(
         cls,
-        initial_alignment: AlignmentResult,
-        post_alignment: AlignmentResult,
+        alignment: AlignmentResult | None,
         wire_snapshot: dict[str, Any] | None,
+        *,
+        phase: str,
     ) -> dict[str, Any]:
-        page_id = post_alignment.js_reverse_page_id or initial_alignment.js_reverse_page_id
+        page_id = alignment.js_reverse_page_id if alignment is not None else None
         page_url = (
-            post_alignment.js_reverse_page_url
-            or post_alignment.playwright_page.url
-            or initial_alignment.js_reverse_page_url
-            or initial_alignment.playwright_page.url
+            alignment.js_reverse_page_url or alignment.playwright_page.url
+            if alignment is not None
+            else None
         )
         page_split = urlsplit(page_url or "")
         request_url = (
@@ -1653,7 +1773,17 @@ class BrowserActionService:
             else ""
         )
         request_split = urlsplit(request_url)
+        request_context = cls._request_context_hashes(wire_snapshot)
+        unavailable = [
+            "conversation_current_node",
+            "critical_bundle_sha256",
+        ]
+        if alignment is None or alignment.status != "aligned":
+            unavailable.extend(["page_id", "page_url", "page_origin"])
+        if request_context["status"] != "observed":
+            unavailable.append("request_context_sha256")
         return {
+            "phase": phase,
             "page_id": page_id,
             "page_url": page_url,
             "page_origin": (
@@ -1667,11 +1797,8 @@ class BrowserActionService:
                 else None
             ),
             "request_path": request_split.path or None,
-            "cookie_name_set_sha256": cls._cookie_name_set_sha256(wire_snapshot),
-            "unavailable_dimensions": [
-                "conversation_current_node",
-                "critical_bundle_sha256",
-            ],
+            **request_context,
+            "unavailable_dimensions": sorted(set(unavailable)),
         }
 
     @staticmethod
@@ -1679,23 +1806,55 @@ class BrowserActionService:
         control: dict[str, Any] | None,
         treatment: dict[str, Any],
     ) -> dict[str, Any]:
-        keys = [
+        required_keys = [
             "page_id",
             "page_url",
             "page_origin",
             "request_origin",
             "request_path",
-            "cookie_name_set_sha256",
+            "request_context_sha256",
+            "conversation_current_node",
+            "critical_bundle_sha256",
         ]
         if not isinstance(control, dict):
             return {
+                "status": "insufficient",
                 "equivalent": False,
                 "differences": ["control_environment_fingerprint_missing"],
+                "compared_dimensions": [],
+                "unavailable_dimensions": required_keys,
+                "required_dimensions_missing": required_keys,
             }
-        differences = [
-            key for key in keys if control.get(key) != treatment.get(key)
+        compared = [
+            key
+            for key in required_keys
+            if control.get(key) is not None and treatment.get(key) is not None
         ]
-        return {"equivalent": not differences, "differences": differences}
+        missing = [key for key in required_keys if key not in compared]
+        unavailable = sorted(
+            set(control.get("unavailable_dimensions") or [])
+            | set(treatment.get("unavailable_dimensions") or [])
+        )
+        missing = sorted(set(missing) | set(unavailable))
+        differences = [
+            key for key in compared if control.get(key) != treatment.get(key)
+        ]
+        status = (
+            "different"
+            if differences
+            else "insufficient"
+            if missing
+            else "observed_equivalent"
+        )
+        return {
+            "status": status,
+            "equivalent": status == "observed_equivalent",
+            "observed_dimensions_equivalent": not differences,
+            "differences": differences,
+            "compared_dimensions": compared,
+            "unavailable_dimensions": unavailable,
+            "required_dimensions_missing": missing,
+        }
 
     @staticmethod
     def _stream_evidence_entries(
@@ -1903,6 +2062,14 @@ class BrowserActionService:
             )
         try:
             snapshot = load_snapshot(snapshot_path)
+            validate_binding_mutation_compatibility(binding_specs, mutation)
+            if not isinstance(control_manifest, dict):
+                for binding in binding_specs:
+                    if binding.value_source == "preserve_source":
+                        current_binding_values[binding.binding_id] = (
+                            binding_value_from_snapshot(snapshot, binding)
+                        )
+                control_values = dict(current_binding_values)
             spec, diff = build_replay_spec(
                 snapshot,
                 [mutation] if mutation is not None else [],
@@ -1952,12 +2119,16 @@ class BrowserActionService:
         if source_is_stream:
             capture["stream"] = True
             requirements["require_raw_capture"] = True
+            requirements["require_semantic_parse"] = not control_payload.raw_only
             requirements["require_artifacts"] = True
         spec["responseControl"] = {
             "maxResponseBytes": control_payload.max_response_bytes,
             "idleTimeoutMs": control_payload.stream_idle_timeout_ms,
             "doneMarker": (
                 control_payload.default_done_marker if source_is_stream else None
+            ),
+            "doneEventName": (
+                control_payload.default_done_event_name if source_is_stream else None
             ),
         }
         if isinstance(control_manifest, dict):
@@ -3530,6 +3701,7 @@ class BrowserActionService:
             replay_response: Any = None
             replay_http_status: int | None = None
             replay_response_content_type: str | None = None
+            post_response_alignment: AlignmentResult | None = None
             replay_artifacts: list[dict[str, Any]] = []
             step_results: list[FlowStepResult] = []
             wait_observations: list[dict[str, Any]] = []
@@ -3798,11 +3970,18 @@ class BrowserActionService:
                     started = utc_now()
                     try:
                         replay_plan["dispatch_wall_time_ms"] = int(time.time() * 1000)
+                        replay_plan["correlation_window_end_wall_time_ms"] = (
+                            replay_plan["dispatch_wall_time_ms"]
+                            + max(1_000, deadline.remaining_ms())
+                        )
                         replay_manifest = manifest.get("replay")
                         if isinstance(replay_manifest, dict):
                             replay_manifest["dispatch_wall_time_ms"] = replay_plan[
                                 "dispatch_wall_time_ms"
                             ]
+                            replay_manifest["correlation_window_end_wall_time_ms"] = (
+                                replay_plan["correlation_window_end_wall_time_ms"]
+                            )
                             self.experiments.write_manifest(experiment_id, manifest)
                         replay_result = await self.js_reverse.evaluate_browser_replay(
                             spec_file,
@@ -3830,6 +4009,24 @@ class BrowserActionService:
                                 warnings.append(
                                     f"replay response status: {str(exc)[:1000]}"
                                 )
+                        try:
+                            response_page = await self.playwright.current_page(
+                                session_id,
+                                Deadline(1_500),
+                            )
+                            post_response_alignment = await self.js_reverse.align_page(
+                                response_page,
+                                Deadline(1_500),
+                                page_id=(
+                                    str(session["js_reverse_page_id"])
+                                    if session.get("js_reverse_page_id")
+                                    else None
+                                ),
+                            )
+                        except Exception as exc:
+                            warnings.append(
+                                f"post-response alignment: {str(exc)[:1000]}"
+                            )
                         if (
                             replay_plan.get("replay_mode") == "control"
                             and (
@@ -4205,10 +4402,14 @@ class BrowserActionService:
                 warnings.extend(console_warnings)
             mutation_assessment: dict[str, Any] | None = None
             response_classification: dict[str, Any] | None = None
+            stream_response_contract: dict[str, Any] | None = None
+            response_evidence_source: str | None = None
             replay_network_evidence_id: str | None = None
             replay_inconclusive = False
             wire_snapshot: dict[str, Any] | None = None
-            environment_fingerprint: dict[str, Any] | None = None
+            pre_dispatch_environment: dict[str, Any] | None = None
+            post_response_environment: dict[str, Any] | None = None
+            post_verification_environment: dict[str, Any] | None = None
             environment_comparison: dict[str, Any] | None = None
             if replay_plan is not None:
                 replay_network_entry, replay_selection_error = (
@@ -4229,6 +4430,13 @@ class BrowserActionService:
                     self.experiments.root,
                     replay_network_entry,
                 )
+                if isinstance(wire_snapshot, dict):
+                    exact_status = wire_snapshot.get("status")
+                    if isinstance(exact_status, int):
+                        replay_http_status = exact_status
+                    exact_content_type = response_content_type(wire_snapshot)
+                    if exact_content_type:
+                        replay_response_content_type = exact_content_type
                 replay_plan["network_evidence_id"] = replay_network_evidence_id
                 replay_manifest = manifest.get("replay")
                 if isinstance(replay_manifest, dict):
@@ -4294,10 +4502,28 @@ class BrowserActionService:
                             "Control replay volatile bindings were not observed on the "
                             "outbound wire request."
                         )
+                exact_response_value = response_value_from_snapshot(wire_snapshot)
+                exact_replay_response_value = self._complete_replay_response_value(
+                    replay_response
+                )
+                response_value = (
+                    exact_response_value
+                    if exact_response_value is not None
+                    else exact_replay_response_value
+                    if exact_replay_response_value is not None
+                    else replay_response
+                )
+                response_evidence_source = (
+                    "exact_network_response_body"
+                    if exact_response_value is not None
+                    else "complete_replay_response_body"
+                    if exact_replay_response_value is not None
+                    else "replay_preview_fallback"
+                )
                 response_classification = classify_replay_response(
                     status=replay_http_status,
                     content_type=replay_response_content_type,
-                    response_value=replay_response,
+                    response_value=response_value,
                     mutation=mutation,
                     redirected=bool(
                         self._extract_response_field(replay_response, "redirected")
@@ -4315,6 +4541,49 @@ class BrowserActionService:
                     source_url=str(replay_plan["spec"].get("url", "")),
                     source_content_type=replay_plan.get("source_content_type"),
                 )
+                response_classification["evidence_source"] = response_evidence_source
+                if (
+                    response_classification.get(
+                        "usable_for_required_classification"
+                    )
+                    and response_evidence_source
+                    not in {
+                        "exact_network_response_body",
+                        "complete_replay_response_body",
+                    }
+                ):
+                    response_classification[
+                        "usable_for_required_classification"
+                    ] = False
+                    response_classification["conclusion"] = "inconclusive"
+                    response_classification["evidence_sufficient"] = False
+                    replay_inconclusive = True
+                    warnings.append(
+                        "Required-field evidence was found only in the bounded replay "
+                        "preview; exact response body evidence is required."
+                    )
+                else:
+                    response_classification["evidence_sufficient"] = (
+                        response_evidence_source
+                        in {
+                            "exact_network_response_body",
+                            "complete_replay_response_body",
+                        }
+                    )
+                stream_response_contract = self._stream_response_contract(
+                    replay_plan,
+                    replay_response,
+                    status=replay_http_status,
+                    content_type=replay_response_content_type,
+                )
+                if (
+                    isinstance(stream_response_contract, dict)
+                    and stream_response_contract.get("status") == "partial"
+                ):
+                    replay_inconclusive = True
+                    warnings.append(
+                        "Streaming response did not satisfy the configured terminal contract."
+                    )
                 if (
                     replay_plan.get("replay_mode") == "treatment"
                     and mutation_assessment.get("mutation_effective") is not True
@@ -4330,16 +4599,30 @@ class BrowserActionService:
                             "Control replay response contract was not successful: "
                             f"{classification}."
                         )
-                elif classification not in {"success", "validation_rejection"}:
+                elif classification not in {
+                    "success",
+                    "validation_rejection",
+                    "value_constraint",
+                }:
                     replay_inconclusive = True
                     warnings.append(
                         "Treatment response is inconclusive for field classification: "
                         f"{classification}."
                     )
-                environment_fingerprint = self._pair_environment_fingerprint(
+                pre_dispatch_environment = self._environment_fingerprint(
                     alignment,
+                    wire_snapshot,
+                    phase="pre_dispatch",
+                )
+                post_response_environment = self._environment_fingerprint(
+                    post_response_alignment,
+                    wire_snapshot,
+                    phase="post_response",
+                )
+                post_verification_environment = self._environment_fingerprint(
                     post_alignment,
                     wire_snapshot,
+                    phase="post_verification",
                 )
                 if replay_plan.get("replay_mode") == "treatment":
                     control_manifest_for_environment = self.experiments.load_manifest(
@@ -4347,20 +4630,15 @@ class BrowserActionService:
                     )
                     environment_comparison = self._compare_pair_environments(
                         control_manifest_for_environment.get(
-                            "pair_environment_fingerprint"
+                            "pre_dispatch_environment"
                         ),
-                        environment_fingerprint,
+                        pre_dispatch_environment,
                     )
-                    if environment_comparison.get("equivalent") is not True:
+                    if environment_comparison.get("status") != "observed_equivalent":
                         replay_inconclusive = True
                         warnings.append(
-                            "Control and treatment environment fingerprints differ: "
-                            + ", ".join(
-                                str(item)
-                                for item in environment_comparison.get(
-                                    "differences", []
-                                )
-                            )
+                            "Control/Treatment pre-dispatch environment is not fully "
+                            f"equivalent: {environment_comparison.get('status')}."
                         )
             primary_network_payload["requests"] = [
                 self._augment_network_request_with_evidence(item, evidence_entries)
@@ -4405,6 +4683,12 @@ class BrowserActionService:
                     stream_request["requestHeadersCompleteness"] = (
                         snapshot_integrity.get("request_headers_completeness")
                     )
+                    stream_request["responseBodyCompleteness"] = (
+                        snapshot_integrity.get("response_body_completeness")
+                    )
+                    stream_request["responseHeadersCompleteness"] = (
+                        snapshot_integrity.get("response_headers_completeness")
+                    )
             non_stream_error_response_observed = bool(
                 replay_plan is not None
                 and replay_plan.get("replay_mode") == "treatment"
@@ -4421,6 +4705,10 @@ class BrowserActionService:
                 and response_classification is not None
                 and response_classification.get("classification")
                 == "validation_rejection"
+                and response_classification.get(
+                    "usable_for_required_classification"
+                )
+                is True
             )
 
             (
@@ -4440,13 +4728,63 @@ class BrowserActionService:
                     <= len(primary_requests)
                     <= payload.primary_request.expected_max_matches
                 )
-                primary_integrity = "complete" if count_ok else "failed"
+                replay_summary = (
+                    replay_network_entry.get("summary")
+                    if isinstance(replay_network_entry, dict)
+                    and isinstance(replay_network_entry.get("summary"), dict)
+                    else {}
+                )
+                snapshot_dimensions = replay_summary.get("snapshot_integrity")
+                snapshot_dimensions = (
+                    snapshot_dimensions
+                    if isinstance(snapshot_dimensions, dict)
+                    else {}
+                )
+                artifact_paths = (
+                    replay_network_entry.get("artifact_paths")
+                    if isinstance(replay_network_entry, dict)
+                    and isinstance(replay_network_entry.get("artifact_paths"), dict)
+                    else {}
+                )
+                request_snapshot_integrity = str(
+                    snapshot_dimensions.get("network_snapshot_integrity") or "partial"
+                )
+                network_artifact_integrity = (
+                    "complete" if artifact_paths.get("all") else "partial"
+                )
+                response_body_completeness = str(
+                    snapshot_dimensions.get("response_body_completeness")
+                    or "unknown"
+                )
+                if response_evidence_source == "complete_replay_response_body":
+                    response_body_completeness = "complete"
+                response_headers_completeness = str(
+                    snapshot_dimensions.get("response_headers_completeness")
+                    or "partial"
+                )
                 primary_dimensions = {
                     "raw_capture": "not_applicable_non_stream_response",
                     "semantic_parse": "not_applicable_non_stream_response",
-                    "request_snapshot": "complete" if primary_requests else "failed",
-                    "artifacts": "complete" if primary_requests else "failed",
+                    "request_snapshot": request_snapshot_integrity,
+                    "artifacts": network_artifact_integrity,
                 }
+                applicable = [
+                    request_snapshot_integrity,
+                    network_artifact_integrity,
+                    response_body_completeness,
+                    response_headers_completeness,
+                ]
+                primary_integrity = (
+                    max(applicable, key=self._integrity_severity)
+                    if count_ok
+                    else "failed"
+                )
+                if any(value != "complete" for value in applicable):
+                    replay_inconclusive = True
+                    warnings.append(
+                        "Non-stream error response evidence is incomplete; field "
+                        "classification is inconclusive."
+                    )
             if payload.capture.stream:
                 network_evidence_entries = [
                     item
@@ -4489,7 +4827,6 @@ class BrowserActionService:
                 or not count_ok
                 or not wait_met
                 or (payload.capture.stream and not collector_stopped)
-                or primary_integrity == "failed"
                 or (
                     payload.capture.stream
                     and
@@ -4521,8 +4858,7 @@ class BrowserActionService:
                 and (
                     replay_inconclusive
                     or
-                    primary_integrity != "complete"
-                    or any(value != "complete" for value in required_values)
+                    any(value != "complete" for value in required_values)
                     or (
                         payload.capture.stream
                         and
@@ -4677,7 +5013,13 @@ class BrowserActionService:
                             "replay_http_status": replay_http_status,
                             "response_classification": response_classification,
                             "mutation_assessment": mutation_assessment,
-                            "environment_fingerprint": environment_fingerprint,
+                            "stream_response_contract": stream_response_contract,
+                            "response_evidence_source": response_evidence_source,
+                            "pre_dispatch_environment": pre_dispatch_environment,
+                            "post_response_environment": post_response_environment,
+                            "post_verification_environment": (
+                                post_verification_environment
+                            ),
                             "environment_comparison": environment_comparison,
                         }
                     )
@@ -4705,7 +5047,13 @@ class BrowserActionService:
                         "network_evidence_id": replay_network_evidence_id,
                         "mutation_assessment": mutation_assessment,
                         "response_classification": response_classification,
-                        "environment_fingerprint": environment_fingerprint,
+                        "stream_response_contract": stream_response_contract,
+                        "response_evidence_source": response_evidence_source,
+                        "pre_dispatch_environment": pre_dispatch_environment,
+                        "post_response_environment": post_response_environment,
+                        "post_verification_environment": (
+                            post_verification_environment
+                        ),
                         "environment_comparison": environment_comparison,
                         "artifact_ids": replay_artifact_ids,
                         "step_ids": ["replay_request"],
@@ -4785,6 +5133,8 @@ class BrowserActionService:
                     "replay_http_status": replay_http_status,
                     "replay_response_content_type": replay_response_content_type,
                     "replay_response_classification": response_classification,
+                    "stream_response_contract": stream_response_contract,
+                    "response_evidence_source": response_evidence_source,
                     "replay_attempt_id": (
                         replay_plan["replay_attempt_id"]
                         if replay_plan is not None
@@ -4795,7 +5145,9 @@ class BrowserActionService:
                         if replay_plan is not None
                         else None
                     ),
-                    "pair_environment_fingerprint": environment_fingerprint,
+                    "pre_dispatch_environment": pre_dispatch_environment,
+                    "post_response_environment": post_response_environment,
+                    "post_verification_environment": post_verification_environment,
                     "pair_environment_comparison": environment_comparison,
                     "protocol_rejection_observed": protocol_rejection_observed,
                     "non_stream_error_response_observed": (

@@ -15,6 +15,7 @@ from skill_temple.browser_models import (
 )
 from skill_temple.protocol_evidence import (
     assess_paired_mutation_effectiveness,
+    binding_value_from_snapshot,
     build_replay_spec,
     classify_replay_response,
     network_checkpoint,
@@ -23,6 +24,7 @@ from skill_temple.protocol_evidence import (
     redacted_request_body_from_snapshot,
     request_shape_from_snapshot,
     requests_after_checkpoint,
+    validate_binding_mutation_compatibility,
 )
 
 
@@ -414,6 +416,131 @@ class ProtocolEvidenceTests(unittest.TestCase):
         self.assertEqual(
             content_mismatch["classification"],
             "response_contract_mismatch",
+        )
+
+    def test_validation_matching_avoids_substring_and_distinguishes_constraints(self) -> None:
+        id_remove = RemoveJsonPathMutation(type="remove_json_path", path="/id")
+        false_positive = classify_replay_response(
+            status=422,
+            content_type="application/json",
+            response_value={"message": "invalid request"},
+            mutation=id_remove,
+        )
+        replace_model = ReplaceJsonPathMutation(
+            type="replace_json_path",
+            path="/model",
+            value="unsupported",
+        )
+        constrained = classify_replay_response(
+            status=422,
+            content_type="application/json",
+            response_value={
+                "field": "/model",
+                "code": "invalid_enum",
+            },
+            mutation=replace_model,
+        )
+        conflict = classify_replay_response(
+            status=409,
+            content_type="application/json",
+            response_value={
+                "field": "/id",
+                "code": "duplicate_id",
+            },
+            mutation=id_remove,
+        )
+        missing_content_type = classify_replay_response(
+            status=204,
+            content_type=None,
+            response_value=None,
+            mutation=None,
+            source_content_type="text/event-stream",
+        )
+
+        self.assertEqual(false_positive["classification"], "unknown_rejection")
+        self.assertEqual(
+            false_positive["validation_evidence"]["strength"],
+            "none",
+        )
+        self.assertEqual(constrained["classification"], "value_constraint")
+        self.assertEqual(constrained["conclusion"], "constrained_value")
+        self.assertFalse(constrained["usable_for_required_classification"])
+        self.assertEqual(conflict["classification"], "conflict")
+        self.assertFalse(conflict["usable_for_required_classification"])
+        self.assertEqual(
+            missing_content_type["classification"],
+            "response_contract_mismatch",
+        )
+
+    def test_non_json_body_is_part_of_non_target_equivalence(self) -> None:
+        mutation = RemoveHeaderMutation(type="remove_header", name="X-Tracking")
+        control = self.snapshot()
+        treatment = self.snapshot()
+        control["requestBody"] = {
+            "available": True,
+            "size": 5,
+            "encoding": "utf8",
+            "text": "alpha",
+        }
+        treatment["requestBody"] = {
+            "available": True,
+            "size": 4,
+            "encoding": "utf8",
+            "text": "beta",
+        }
+        treatment["requestHeadersArray"] = [
+            item
+            for item in treatment["requestHeadersArray"]
+            if item["name"].lower() != "x-tracking"
+        ]
+        assessment = assess_paired_mutation_effectiveness(
+            mutation,
+            control,
+            treatment,
+            volatile_bindings=[],
+            control_binding_values={},
+            treatment_binding_values={},
+        )
+
+        self.assertTrue(assessment["target_delta_observed"])
+        self.assertFalse(assessment["non_target_fields_equivalent"])
+        self.assertFalse(assessment["mutation_effective"])
+
+    def test_preserve_source_binding_and_pointer_overlap_rules(self) -> None:
+        preserve = VolatileBinding(
+            binding_id="parent",
+            target="json_pointer",
+            path="/parent_message_id",
+            value_source="preserve_source",
+            reuse_policy="same_value",
+        )
+        self.assertEqual(
+            binding_value_from_snapshot(self.snapshot(), preserve),
+            "parent-secret-id",
+        )
+        ancestor = VolatileBinding(
+            binding_id="message",
+            target="json_pointer",
+            path="/messages/0",
+            generator="uuid4",
+        )
+        with self.assertRaisesRegex(ValueError, "contains the mutation target"):
+            validate_binding_mutation_compatibility(
+                [ancestor],
+                RemoveJsonPathMutation(
+                    type="remove_json_path",
+                    path="/messages/0/id",
+                ),
+            )
+        descendant = VolatileBinding(
+            binding_id="message_id",
+            target="json_pointer",
+            path="/messages/0/id",
+            generator="uuid4",
+        )
+        validate_binding_mutation_compatibility(
+            [descendant],
+            RemoveJsonPathMutation(type="remove_json_path", path="/messages/0"),
         )
 
     def test_network_matcher_uses_stable_reqid_url_method_and_resource_type(self) -> None:

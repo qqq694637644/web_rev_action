@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import copy
 import hashlib
 import json
@@ -198,6 +199,16 @@ def network_snapshot_dimensions(snapshot: dict[str, Any]) -> dict[str, str]:
     else:
         body_completeness = "unknown"
     request_headers_completeness = "complete" if headers_complete else "partial"
+    response_headers_completeness = (
+        "complete" if isinstance(snapshot.get("responseHeadersArray"), list) else "partial"
+    )
+    response_body = snapshot.get("responseBody")
+    if isinstance(response_body, dict) and response_body.get("available"):
+        response_body_completeness = "complete"
+    elif isinstance(response_body, dict) and response_body.get("reason"):
+        response_body_completeness = "partial"
+    else:
+        response_body_completeness = "unknown"
     network_snapshot_integrity = (
         "complete"
         if request_headers_completeness == "complete"
@@ -208,6 +219,8 @@ def network_snapshot_dimensions(snapshot: dict[str, Any]) -> dict[str, str]:
         "network_snapshot_integrity": network_snapshot_integrity,
         "request_body_completeness": body_completeness,
         "request_headers_completeness": request_headers_completeness,
+        "response_body_completeness": response_body_completeness,
+        "response_headers_completeness": response_headers_completeness,
     }
 
 
@@ -241,6 +254,101 @@ def response_content_type(snapshot: dict[str, Any]) -> str | None:
         if str(item.get("name", "")).lower() == "content-type":
             return str(item.get("value", "")).split(";", 1)[0].strip().lower()
     return None
+
+
+def response_value_from_snapshot(
+    snapshot: dict[str, Any] | None,
+    *,
+    max_bytes: int = 1_048_576,
+) -> Any | None:
+    if not isinstance(snapshot, dict):
+        return None
+    body = snapshot.get("responseBody")
+    if not isinstance(body, dict) or not body.get("available"):
+        return None
+    encoding = body.get("encoding")
+    if encoding == "utf8":
+        text = str(body.get("text", ""))
+        if len(text.encode("utf-8")) > max_bytes:
+            return None
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return text
+    if encoding == "base64":
+        encoded = str(body.get("base64") or body.get("text") or "")
+        if len(encoded) > max_bytes * 2:
+            return None
+        try:
+            payload = base64.b64decode(encoded, validate=True)
+        except Exception:
+            return None
+        if len(payload) > max_bytes:
+            return None
+        try:
+            text = payload.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return text
+    return None
+
+
+def binding_value_from_snapshot(
+    snapshot: dict[str, Any],
+    binding: VolatileBinding,
+) -> Any:
+    if binding.target == "json_pointer":
+        body = _decode_json_request_body(snapshot.get("requestBody"))
+        if body is None:
+            raise ValueError("preserve_source JSON binding requires an available JSON body")
+        exists, value = _read_pointer(body, str(binding.path))
+        if not exists:
+            raise ValueError(f"preserve_source binding path is missing: {binding.path}")
+        return copy.deepcopy(value)
+    if binding.target == "header":
+        values = [
+            item["value"]
+            for item in _normalized_headers(snapshot.get("requestHeadersArray"))
+            if item["name"].lower() == str(binding.name).lower()
+        ]
+        if not values:
+            raise ValueError(f"preserve_source binding header is missing: {binding.name}")
+        return values[0]
+    values = [
+        value
+        for name, value in parse_qsl(
+            urlsplit(str(snapshot.get("url", ""))).query,
+            keep_blank_values=True,
+        )
+        if name == binding.name
+    ]
+    if not values:
+        raise ValueError(f"preserve_source query parameter is missing: {binding.name}")
+    return values[0]
+
+
+def validate_binding_mutation_compatibility(
+    bindings: list[VolatileBinding],
+    mutation: ReplayMutation | None,
+) -> None:
+    if mutation is None or mutation.type not in {"remove_json_path", "replace_json_path"}:
+        return
+    mutation_tokens = _decode_pointer(mutation.path)
+    for binding in bindings:
+        if binding.target != "json_pointer":
+            continue
+        binding_tokens = _decode_pointer(str(binding.path))
+        if (
+            len(binding_tokens) < len(mutation_tokens)
+            and mutation_tokens[: len(binding_tokens)] == binding_tokens
+        ):
+            raise ValueError(
+                "volatile binding path contains the mutation target; declare a narrower "
+                "binding or remove the overlap"
+            )
 
 
 def request_shape_from_snapshot(snapshot: dict[str, Any]) -> dict[str, Any] | None:
@@ -722,60 +830,91 @@ def classify_replay_response(
     source_url: str | None = None,
     source_content_type: str | None = None,
 ) -> dict[str, Any]:
-    if redirected and source_url and final_url:
-        source = urlsplit(source_url)
-        final = urlsplit(final_url)
-        if (source.scheme, source.netloc, source.path) != (
-            final.scheme,
-            final.netloc,
-            final.path,
-        ):
-            return {
-                "classification": "unexpected_redirect",
-                "usable_for_required_classification": False,
-                "status": status,
-                "content_type": content_type,
-                "final_url": final_url,
-            }
+    if redirected:
+        return {
+            "classification": "unexpected_redirect",
+            "conclusion": "inconclusive",
+            "usable_for_required_classification": False,
+            "status": status,
+            "content_type": content_type,
+            "final_url": final_url,
+        }
     if (
         status is not None
         and 200 <= status < 400
         and source_content_type
-        and content_type
-        and source_content_type != content_type
+        and (not content_type or source_content_type != content_type)
     ):
         return {
             "classification": "response_contract_mismatch",
+            "conclusion": "inconclusive",
             "usable_for_required_classification": False,
             "status": status,
             "content_type": content_type,
             "source_content_type": source_content_type,
             "final_url": final_url,
         }
+    reference = (
+        _mutation_reference_evidence(response_value, mutation)
+        if mutation is not None
+        else {"strength": "none", "semantic": "none"}
+    )
     if status is None:
         classification = "unknown_response"
+        conclusion = "inconclusive"
     elif status in {401, 403}:
         classification = "authentication_failure"
+        conclusion = "inconclusive"
     elif status == 429:
         classification = "rate_limited"
+        conclusion = "inconclusive"
     elif status >= 500:
         classification = "server_failure"
-    elif status in {400, 409, 422}:
-        classification = (
-            "validation_rejection"
-            if mutation is not None
-            and _response_references_mutation(response_value, mutation)
-            else "unknown_rejection"
-        )
+        conclusion = "inconclusive"
+    elif status == 409:
+        classification = "conflict"
+        conclusion = "conflict"
+    elif status in {400, 422}:
+        if reference.get("strength") == "strong_structured":
+            if (
+                mutation is not None
+                and mutation.type.startswith("remove_")
+                and reference.get("semantic") == "field_required"
+            ):
+                classification = "validation_rejection"
+                conclusion = "required"
+            elif (
+                mutation is not None
+                and mutation.type.startswith("replace_")
+                and reference.get("semantic") == "value_constraint"
+            ):
+                classification = "value_constraint"
+                conclusion = "constrained_value"
+            else:
+                classification = "field_rejection"
+                conclusion = "inconclusive"
+        else:
+            classification = "unknown_rejection"
+            conclusion = "inconclusive"
     elif status >= 400:
         classification = "unknown_rejection"
+        conclusion = "inconclusive"
     else:
         classification = "success"
+        conclusion = (
+            "candidate_alternative_value"
+            if mutation is not None and mutation.type.startswith("replace_")
+            else "candidate_optional"
+            if mutation is not None and mutation.type.startswith("remove_")
+            else "success"
+        )
     return {
         "classification": classification,
+        "conclusion": conclusion,
         "usable_for_required_classification": (
-            classification == "validation_rejection"
+            classification == "validation_rejection" and conclusion == "required"
         ),
+        "validation_evidence": reference,
         "status": status,
         "content_type": content_type,
         "source_content_type": source_content_type,
@@ -873,7 +1012,14 @@ def _binding_targets_mutation(
     mutation: ReplayMutation,
 ) -> bool:
     if mutation.type in {"remove_json_path", "replace_json_path"}:
-        return binding.target == "json_pointer" and binding.path == mutation.path
+        if binding.target != "json_pointer":
+            return False
+        binding_tokens = _decode_pointer(str(binding.path))
+        mutation_tokens = _decode_pointer(mutation.path)
+        return (
+            len(mutation_tokens) <= len(binding_tokens)
+            and binding_tokens[: len(mutation_tokens)] == mutation_tokens
+        )
     if mutation.type in {"remove_header", "replace_header"}:
         return (
             binding.target == "header"
@@ -901,6 +1047,9 @@ def _canonical_pair_view(
         and not item["name"].lower().startswith("sec-")
     ]
     body = _decode_json_request_body(snapshot.get("requestBody"))
+    body_descriptor: Any = body
+    if body is None:
+        body_descriptor = _non_json_body_descriptor(snapshot.get("requestBody"))
     for binding in bindings:
         placeholder = f"<volatile:{binding.binding_id}>"
         if binding.target == "json_pointer" and body is not None:
@@ -933,29 +1082,163 @@ def _canonical_pair_view(
         "url": urlunsplit((split.scheme, split.netloc, split.path, "", "")),
         "query": sorted(query),
         "headers": sorted(headers, key=lambda item: (item["name"], item["value"])),
-        "body": body,
+        "body": body_descriptor,
     }
 
 
-def _response_references_mutation(
+def _non_json_body_descriptor(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or not value.get("available"):
+        raise ValueError("wire request body is unavailable for non-target comparison")
+    encoding = str(value.get("encoding", ""))
+    size = value.get("size")
+    if encoding == "utf8":
+        payload = str(value.get("text", "")).encode("utf-8")
+    elif encoding == "base64":
+        encoded = str(value.get("base64") or value.get("text") or "")
+        try:
+            payload = base64.b64decode(encoded, validate=True)
+        except Exception as exc:
+            raise ValueError("wire request base64 body is invalid") from exc
+    else:
+        digest = value.get("sha256") or value.get("encodedSha256")
+        if not digest:
+            raise ValueError("wire request body encoding cannot be compared")
+        return {"kind": "non_json", "encoding": encoding, "size": size, "sha256": digest}
+    return {
+        "kind": "non_json",
+        "encoding": encoding,
+        "size": len(payload) if size is None else size,
+        "sha256": hashlib.sha256(payload).hexdigest(),
+    }
+
+
+def _mutation_reference_evidence(
     response_value: Any,
     mutation: ReplayMutation,
-) -> bool:
-    strings = [item.lower() for item in _validation_strings(response_value)]
-    if mutation.type in {"remove_json_path", "replace_json_path"}:
-        pointer = mutation.path.lower()
-        tokens = _decode_pointer(mutation.path)
-        bracket = ""
-        for token in tokens:
-            bracket += f"[{token}]" if token.isdigit() else ("." if bracket else "") + token
-        candidates = {pointer, bracket.lower(), ".".join(tokens).lower()}
-    else:
-        candidates = {mutation.name.lower()}
-    return any(
-        candidate and candidate in text
-        for text in strings
-        for candidate in candidates
+) -> dict[str, Any]:
+    target_tokens = (
+        _decode_pointer(mutation.path)
+        if mutation.type in {"remove_json_path", "replace_json_path"}
+        else [mutation.name]
     )
+    structured = _structured_validation_references(response_value)
+    for item in structured:
+        path_tokens = item.get("path_tokens")
+        if isinstance(path_tokens, list) and _validation_path_matches(
+            path_tokens,
+            target_tokens,
+        ):
+            code = str(item.get("code") or "").lower()
+            source_key = str(item.get("source_key") or "").lower()
+            if source_key == "missing" or any(
+                token in code for token in ("required", "missing", "field_required")
+            ):
+                semantic = "field_required"
+            elif any(
+                token in code
+                for token in ("enum", "type", "format", "invalid", "constraint", "value")
+            ):
+                semantic = "value_constraint"
+            else:
+                semantic = "field_reference"
+            return {
+                "strength": "strong_structured",
+                "semantic": semantic,
+                "matched_path": item.get("raw_path"),
+                "validation_code": item.get("code"),
+                "source_key": item.get("source_key"),
+            }
+    strings = list(_validation_strings(response_value))
+    if mutation.type in {"remove_json_path", "replace_json_path"}:
+        pointer = mutation.path
+        token = target_tokens[-1] if target_tokens else ""
+        candidates = [pointer, token]
+    else:
+        candidates = [mutation.name]
+    for text in strings:
+        for candidate in candidates:
+            if candidate and re.search(
+                rf"(?<![A-Za-z0-9_]){re.escape(candidate)}(?![A-Za-z0-9_])",
+                text,
+                flags=re.IGNORECASE,
+            ):
+                return {
+                    "strength": "weak_text_match",
+                    "semantic": "field_reference",
+                    "matched_text": candidate,
+                }
+    return {"strength": "none", "semantic": "none"}
+
+
+def _structured_validation_references(value: Any) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+
+    def walk(item: Any, *, parent_key: str | None = None, code: str | None = None) -> None:
+        if isinstance(item, dict):
+            local_code = code
+            for code_key in ("code", "type", "error_code", "kind"):
+                candidate = item.get(code_key)
+                if isinstance(candidate, str):
+                    local_code = candidate
+                    break
+            for key, child in item.items():
+                normalized = str(key).lower()
+                if normalized in {"field", "path", "loc", "missing", "fields"}:
+                    raw_paths = (
+                        child
+                        if isinstance(child, list)
+                        and normalized in {"missing", "fields"}
+                        else [child]
+                    )
+                    for raw_path in raw_paths:
+                        tokens = _validation_path_tokens(raw_path)
+                        if tokens:
+                            result.append(
+                                {
+                                    "path_tokens": tokens,
+                                    "raw_path": raw_path,
+                                    "source_key": normalized,
+                                    "code": local_code,
+                                }
+                            )
+                walk(child, parent_key=normalized, code=local_code)
+        elif isinstance(item, list):
+            for child in item:
+                walk(child, parent_key=parent_key, code=code)
+        elif isinstance(item, str):
+            try:
+                decoded = json.loads(item)
+            except json.JSONDecodeError:
+                return
+            walk(decoded, parent_key=parent_key, code=code)
+
+    walk(value)
+    return result
+
+
+def _validation_path_tokens(value: Any) -> list[str]:
+    if isinstance(value, list):
+        tokens = [str(item) for item in value]
+    elif isinstance(value, str):
+        text = value.strip()
+        if text.startswith("/"):
+            try:
+                tokens = _decode_pointer(text)
+            except ValueError:
+                return []
+        else:
+            tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_-]*|\d+", text)
+    else:
+        return []
+    while tokens and tokens[0].lower() in {"body", "request", "payload", "json"}:
+        tokens.pop(0)
+    return tokens
+
+
+def _validation_path_matches(observed: list[str], expected: list[str]) -> bool:
+    return [str(item).lower() for item in observed] == [
+        str(item).lower() for item in expected
+    ]
 
 
 def _validation_strings(value: Any, *, key: str | None = None) -> list[str]:

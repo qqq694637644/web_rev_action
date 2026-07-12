@@ -74,10 +74,14 @@ target_delta_observed true
 non_target_fields_equivalent true
 volatile_bindings_effective true
 mutation_effective true
-pair_environment_comparison equivalent
+pair_environment_comparison status = observed_equivalent
 ```
 
-Only a `validation_rejection` that explicitly references the mutation target supports `required`. Authentication, rate-limit, server, generic 4xx, redirect, and response-contract failures remain inconclusive.
+Only `remove + HTTP 400/422 + structured field_required at the exact target`
+supports `required`. Replace rejection is `constrained_value`; HTTP 409 is
+`conflict`. Authentication, rate-limit, server, generic 4xx, redirect, missing
+Content-Type, incomplete response body, and weak text matches remain
+inconclusive.
 
 Do not test browser-managed Cookie, Origin, Referer, Host, Content-Length, or `Sec-*` through header mutation. Use a dedicated browser-context credential experiment when needed.
 
