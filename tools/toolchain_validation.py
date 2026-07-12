@@ -21,7 +21,7 @@ from urllib.request import urlopen
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-from toolchain_validation_server import start_server
+from toolchain_validation_server import SSE_EVENTS, start_server
 
 PLAYWRIGHT_PACKAGE = "@playwright/cli@0.1.17"
 JS_REVERSE_PACKAGE = "js-reverse-mcp@4.0.1"
@@ -171,8 +171,9 @@ class McpToolClient:
 
 
 class Stage0Validation:
-    def __init__(self, repo_root: Path) -> None:
+    def __init__(self, repo_root: Path, js_reverse_entry: Path | None = None) -> None:
         self.repo_root = repo_root
+        self.js_reverse_entry = js_reverse_entry.resolve() if js_reverse_entry else None
         self.fixture_root = repo_root / "tests" / "fixtures" / "toolchain_validation"
         self.report_path = (
             repo_root / "data" / "analysis-workspace" / "reports" / "toolchain-validation.md"
@@ -185,7 +186,7 @@ class Stage0Validation:
         self.report_path.parent.mkdir(parents=True, exist_ok=True)
         self.environment["python"] = sys.version.split()[0]
         self.environment["playwright-cli"] = self._package_version(PLAYWRIGHT_PACKAGE)
-        self.environment["js-reverse-mcp"] = self._package_version(JS_REVERSE_PACKAGE)
+        self.environment["js-reverse-mcp"] = self._js_reverse_version()
 
         server, server_thread = start_server(self.fixture_root)
         fixture_port = int(server.server_address[1])
@@ -205,7 +206,12 @@ class Stage0Validation:
             self.playwright.attach(endpoint)
             self.playwright.session("goto", fixture_url, timeout=30.0).require_success()
 
-            server_parameters = build_mcp_server_parameters(endpoint, self.repo_root)
+            server_parameters = build_mcp_server_parameters(
+                endpoint,
+                self.repo_root,
+                export_root,
+                self.js_reverse_entry,
+            )
             async with stdio_client(server_parameters) as (read_stream, write_stream):
                 async with ClientSession(read_stream, write_stream) as session:
                     await session.initialize()
@@ -223,6 +229,9 @@ class Stage0Validation:
                         "remove_breakpoint",
                         "search_in_sources",
                         "select_page",
+                        "start_stream_capture",
+                        "get_stream_status",
+                        "stop_stream_capture",
                     }
                     missing = sorted(required_tools - tool_names)
                     if missing:
@@ -263,7 +272,7 @@ class Stage0Validation:
             shutil.rmtree(self.repo_root / ".playwright", ignore_errors=True)
             shutil.rmtree(self.repo_root / ".playwright-cli", ignore_errors=True)
 
-        self._validate_workspace_write()
+        self._validate_local_evidence_write()
         self._ensure_required_result_rows()
         self._write_report()
         return 0 if all(result.passed for result in self.results) else 1
@@ -272,6 +281,20 @@ class Stage0Validation:
         result = run_command(build_npx_command(package, ["--version"]), self.repo_root, 45.0)
         result.require_success()
         return result.stdout.strip()
+
+    def _js_reverse_version(self) -> str:
+        if self.js_reverse_entry is None:
+            return self._package_version(JS_REVERSE_PACKAGE)
+        node = shutil.which("node")
+        if node is None:
+            raise RuntimeError("node is required for a local js-reverse-mcp entrypoint")
+        result = run_command(
+            [node, str(self.js_reverse_entry), "--version"],
+            self.repo_root,
+            45.0,
+        )
+        result.require_success()
+        return f"{result.stdout.strip()} (local entry)"
 
     async def _validate_page_alignment(
         self,
@@ -326,8 +349,49 @@ class Stage0Validation:
         await client.call("clear_network_requests", {"confirm": True})
         await client.call("list_network_requests", {"pageSize": 20})
 
+        stream_start = await client.call(
+            "start_stream_capture",
+            {
+                "artifactNamespace": "stage0-toolchain",
+                "urlFilter": "/api/sse",
+                "methods": ["GET"],
+                "resourceTypes": ["eventsource"],
+                "mimeTypes": ["text/event-stream"],
+                "includeInFlight": False,
+            },
+        )
+        capture_id = extract_integer(stream_start, "captureId")
+
         self.playwright.click_button("run-capture", "Run capture")
         self.playwright.wait_for_text("capture-complete", timeout=20.0)
+
+        stream_status: dict[str, Any] | None = None
+        event_match: dict[str, Any] | None = None
+        for _ in range(100):
+            stream_status = await client.call(
+                "get_stream_status",
+                {
+                    "captureId": capture_id,
+                    "eventPredicate": {
+                        "type": "exact_data",
+                        "value": "[DONE]",
+                    },
+                    "afterEventIndex": -1,
+                    "pageIdx": 0,
+                    "pageSize": 100,
+                },
+            )
+            event_match = find_mapping(stream_status, "matched", True)
+            if event_match is not None:
+                break
+            await asyncio.sleep(0.05)
+        if stream_status is None or event_match is None:
+            raise TimeoutError("Raw stream collector did not match the [DONE] event.")
+
+        stream_stop = await client.call(
+            "stop_stream_capture",
+            {"captureId": capture_id, "finalizeTimeoutMs": 10_000},
+        )
 
         echo_listing = await client.call(
             "list_network_requests",
@@ -361,7 +425,6 @@ class Stage0Validation:
 
         request_body_path = export_root / "echo-request.json"
         response_body_path = export_root / "echo-response.json"
-        sse_body_path = export_root / "sse-response.txt"
 
         await client.call(
             "list_network_requests",
@@ -403,58 +466,61 @@ class Stage0Validation:
             )
         )
 
-        try:
-            await client.call(
-                "list_network_requests",
-                {
-                    "reqid": sse_request_id,
-                    "outputFile": str(sse_body_path),
-                    "outputPart": "responseBody",
-                },
+        raw_descriptor = extract_artifact(stream_status, "raw_bytes")
+        events_descriptor = extract_artifact(stream_status, "events")
+        capture_descriptor = extract_artifact(stream_stop, "capture_metadata")
+        raw_path = resolve_artifact(export_root, raw_descriptor)
+        events_path = resolve_artifact(export_root, events_descriptor)
+        capture_path = resolve_artifact(export_root, capture_descriptor)
+        raw_bytes = raw_path.read_bytes()
+        expected_raw = b"".join(SSE_EVENTS)
+        if raw_bytes != expected_raw:
+            raise AssertionError(
+                "raw.bin did not preserve the fixture stream exactly: "
+                f"expected={sha256_bytes(expected_raw)} actual={sha256_bytes(raw_bytes)}"
             )
-            sse_body = sse_body_path.read_bytes()
-            expected_parts = [
-                b'data: {"sequence":1,"value":"alpha"}',
-                b'data: {"sequence":2,"value":"beta"}',
-                b"data: [DONE]",
-            ]
-            positions = [sse_body.find(part) for part in expected_parts]
-            if any(position < 0 for position in positions) or positions != sorted(positions):
-                raise AssertionError(
-                    f"SSE sequence was not preserved. positions={positions}, body={sse_body!r}"
-                )
-            self.results.append(
-                ValidationResult(
-                    name="SSE event sequence preservation",
-                    passed=True,
-                    evidence=[
-                        "Preserved both data events in order.",
-                        "Preserved the [DONE] end marker.",
-                        (
-                            f"Exported SSE body: {len(sse_body)} bytes, "
-                            f"sha256={sha256_bytes(sse_body)}"
-                        ),
-                    ],
-                )
+        event_records = [
+            json.loads(line)
+            for line in events_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        event_data = [normalize_event_data(record) for record in event_records]
+        expected_data = [
+            '{"sequence":1,"value":"alpha"}',
+            '{"sequence":2,"value":"beta"}',
+            "[DONE]",
+        ]
+        if event_data != expected_data:
+            raise AssertionError(f"Unexpected ordered SSE events: {event_data}")
+        if event_match.get("matchedEventIndex") != 2:
+            raise AssertionError(f"Unexpected [DONE] match metadata: {event_match}")
+        relative_paths = [
+            str(raw_descriptor["relativePath"]),
+            str(events_descriptor["relativePath"]),
+            str(capture_descriptor["relativePath"]),
+        ]
+        if not all(
+            path.startswith("experiments/stage0-toolchain/js-reverse/")
+            for path in relative_paths
+        ):
+            raise AssertionError(f"Unexpected stream artifact namespace: {relative_paths}")
+        capture_manifest = json.loads(capture_path.read_text(encoding="utf-8"))
+        if capture_manifest.get("status") != "stopped":
+            raise AssertionError(f"Capture did not finalize as stopped: {capture_manifest}")
+        self.results.append(
+            ValidationResult(
+                name="SSE event sequence preservation",
+                passed=True,
+                evidence=[
+                    "start_stream_capture was armed before the Playwright click.",
+                    "raw.bin exactly matched all fixture SSE bytes in order.",
+                    "events.jsonl preserved both message events and the [DONE] event.",
+                    "get_stream_status matched [DONE] internally without returning its body.",
+                    "Artifacts used the stage0-toolchain namespace and relative paths.",
+                    f"raw.bin: {len(raw_bytes)} bytes, sha256={sha256_bytes(raw_bytes)}",
+                ],
             )
-        except Exception as exc:
-            error_text = str(exc)
-            if "body evicted after navigation" in error_text:
-                error_text = (
-                    "js-reverse-mcp 4.0.1 returned INTERNAL: response body is not available "
-                    "because the EventSource body was evicted after navigation."
-                )
-            self.results.append(
-                ValidationResult(
-                    name="SSE event sequence preservation",
-                    passed=False,
-                    evidence=[
-                        "Captured the EventSource request itself as network evidence.",
-                        "The fixture page observed two ordered data events and the [DONE] marker.",
-                    ],
-                    error=error_text,
-                )
-            )
+        )
         return {"echo": echo_request_id, "sse": sse_request_id}
 
     async def _validate_initiator(
@@ -628,20 +694,23 @@ class Stage0Validation:
             )
             raise
 
-    def _validate_workspace_write(self) -> None:
-        name = "Workspace file write"
+    def _validate_local_evidence_write(self) -> None:
+        name = "Local evidence file write"
         probe_path = self.report_path.parent / ".toolchain-validation-write-probe"
         marker = "workspace-write-ok\n"
         try:
             probe_path.write_text(marker, encoding="utf-8", newline="\n")
             observed = probe_path.read_text(encoding="utf-8")
             if observed != marker:
-                raise AssertionError("Workspace write/read marker mismatch.")
+                raise AssertionError("Local evidence write/read marker mismatch.")
             self.results.append(
                 ValidationResult(
                     name=name,
                     passed=True,
-                    evidence=["Python wrote and read back a UTF-8 file in the reports directory."],
+                    evidence=[
+                        "Python wrote and read back a UTF-8 file in the "
+                        "Action-local evidence directory."
+                    ],
                 )
             )
         except Exception as exc:
@@ -658,7 +727,7 @@ class Stage0Validation:
             "Request initiator",
             "Script read and search",
             "XHR/fetch breakpoint pause and resume",
-            "Workspace file write",
+            "Local evidence file write",
         ]
         existing = {result.name for result in self.results}
         for name in required_names:
@@ -680,12 +749,18 @@ class Stage0Validation:
             "Request initiator",
             "Script read and search",
             "XHR/fetch breakpoint pause and resume",
-            "Workspace file write",
+            "Local evidence file write",
         ]
         result_by_name = {result.name: result for result in self.results}
         ordered_results = [result_by_name[name] for name in ordered_names]
         extras = [result for result in self.results if result.name not in ordered_names]
         all_required_passed = all(result.passed for result in ordered_results)
+        reproduction_command = "python tools/toolchain_validation.py"
+        if self.js_reverse_entry is not None:
+            reproduction_command += (
+                " --js-reverse-entry "
+                "<path-to-js-reverse-mcp>/build/src/main.js"
+            )
 
         lines = [
             "# Stage 0 Toolchain Validation",
@@ -701,7 +776,7 @@ class Stage0Validation:
             "## Reproduction",
             "",
             "```powershell",
-            "python tools/toolchain_validation.py",
+            reproduction_command,
             "```",
             "",
             "The fixture application is stored under",
@@ -746,27 +821,25 @@ class Stage0Validation:
                 "## Conclusion",
                 "",
                 (
-                    "All required Stage 0 checks passed. The currently available toolchain is "
-                    "sufficient for the minimum closed loop, including complete semantic SSE "
-                    "event export for the tested normal completion path. Raw CDP Stream Capture "
-                    "is therefore not required for ordinary completed SSE response semantics, "
-                    "but remains necessary for chunk timing, cancellation, network failure, "
-                    "heartbeat, and incomplete-stream analysis."
+                    "All required Stage 0 checks passed. The toolchain now validates the actual "
+                    "Raw Stream Capture lifecycle: the collector is armed before the browser "
+                    "action, exact raw bytes and ordered semantic events are written under an "
+                    "experiment namespace, the [DONE] predicate is matched inside the collector, "
+                    "and the capture finalizes with relative artifact paths."
                     if all_required_passed
                     else
-                    "Seven of eight required checks passed. The current toolchain is not yet "
-                    "sufficient for the complete Stage 0 acceptance set because it cannot "
-                    "export a completed EventSource response as ordered network evidence. "
-                    "Add EventSource message capture or raw CDP stream capture before relying "
-                    "on SSE evidence in the full Action."
+                    "At least one required Stage 0 check failed. Do not treat the browser "
+                    "toolchain as ready until the failing fixture evidence is corrected."
                 ),
                 "",
                 "## Limitations",
                 "",
                 "- The SSE check covers a normally completed local EventSource stream with two",
                 "  ordered data events and a `[DONE]` marker.",
-                "- It does not validate chunk arrival timing, cancellation, network interruption,",
-                "  heartbeats, or incomplete streams.",
+                "- It validates exact normal-completion bytes, event ordering, namespace,",
+                "  collector-side predicate matching, and finalization.",
+                "- Cancellation, network interruption, heartbeats, and incomplete streams remain",
+                "  later experiment-specific validation cases.",
                 "- The test page runs in the main page target; Worker and Service Worker metadata",
                 "  remain outside this Stage 0 acceptance set.",
                 "",
@@ -787,11 +860,27 @@ def build_npx_command(package: str, args: Sequence[str]) -> list[str]:
     return [node_path, str(npx_cli), "--yes", package, *args]
 
 
-def build_mcp_server_parameters(endpoint: str, repo_root: Path) -> StdioServerParameters:
-    command = build_npx_command(
-        JS_REVERSE_PACKAGE,
-        ["--browserUrl", endpoint, "--allowedRoots", str(repo_root)],
-    )
+def build_mcp_server_parameters(
+    endpoint: str,
+    repo_root: Path,
+    evidence_root: Path,
+    js_reverse_entry: Path | None,
+) -> StdioServerParameters:
+    arguments = [
+        "--browserUrl",
+        endpoint,
+        "--allowedRoots",
+        str(evidence_root),
+        "--streamArtifactRoot",
+        "0",
+    ]
+    if js_reverse_entry is None:
+        command = build_npx_command(JS_REVERSE_PACKAGE, arguments)
+    else:
+        node = shutil.which("node")
+        if node is None:
+            raise RuntimeError("node is required for a local js-reverse-mcp entrypoint")
+        command = [node, str(js_reverse_entry), *arguments]
     return StdioServerParameters(
         command=command[0],
         args=command[1:],
@@ -1017,6 +1106,60 @@ def extract_request_id(payload: dict[str, Any], url_fragment: str) -> int:
     raise AssertionError(f"Unable to find request ID for {url_fragment}: {payload}")
 
 
+def extract_integer(payload: dict[str, Any], key: str) -> int:
+    for item in walk(payload):
+        if not isinstance(item, dict):
+            continue
+        value = item.get(key)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+    raise AssertionError(f"Unable to find integer {key!r}: {payload}")
+
+
+def find_mapping(
+    payload: dict[str, Any], key: str, expected: object
+) -> dict[str, Any] | None:
+    for item in walk(payload):
+        if isinstance(item, dict) and item.get(key) == expected:
+            return item
+    return None
+
+
+def extract_artifact(payload: dict[str, Any], kind: str) -> dict[str, Any]:
+    for item in walk(payload):
+        if not isinstance(item, dict) or item.get("kind") != kind:
+            continue
+        if isinstance(item.get("relativePath"), str):
+            return item
+    raise AssertionError(f"Unable to find artifact kind {kind!r}: {payload}")
+
+
+def resolve_artifact(root: Path, descriptor: dict[str, Any]) -> Path:
+    relative_path = descriptor.get("relativePath")
+    if not isinstance(relative_path, str):
+        raise AssertionError(f"Artifact has no relativePath: {descriptor}")
+    candidate = (root / Path(relative_path)).resolve()
+    try:
+        candidate.relative_to(root.resolve())
+    except ValueError as exc:
+        raise AssertionError(f"Artifact escaped evidence root: {descriptor}") from exc
+    if not candidate.is_file():
+        raise AssertionError(f"Artifact file is missing: {candidate}")
+    return candidate
+
+
+def normalize_event_data(record: dict[str, Any]) -> str | None:
+    data = record.get("data")
+    if isinstance(data, str):
+        return data
+    data_json = record.get("dataJson")
+    if data_json is not None:
+        return json.dumps(data_json, separators=(",", ":"), ensure_ascii=False)
+    return None
+
+
 def first_string(payload: dict[str, Any], keys: Iterable[str]) -> str | None:
     for key in keys:
         value = payload.get(key)
@@ -1037,8 +1180,8 @@ def sanitize_markdown(value: str) -> str:
     return value.replace("`", "'").replace("\r", " ").replace("\n", " ")[:800]
 
 
-async def async_main(repo_root: Path) -> int:
-    validation = Stage0Validation(repo_root)
+async def async_main(repo_root: Path, js_reverse_entry: Path | None) -> int:
+    validation = Stage0Validation(repo_root, js_reverse_entry)
     return await validation.run()
 
 
@@ -1050,12 +1193,26 @@ def parse_args() -> argparse.Namespace:
         default=Path(__file__).resolve().parents[1],
         help="Repository root. Defaults to the parent of tools/.",
     )
+    parser.add_argument(
+        "--js-reverse-entry",
+        type=Path,
+        default=None,
+        help=(
+            "Optional local built js-reverse-mcp entrypoint. Use this to validate an "
+            "unreleased PR instead of the published npm package."
+        ),
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    return asyncio.run(async_main(args.repo_root.resolve()))
+    return asyncio.run(
+        async_main(
+            args.repo_root.resolve(),
+            args.js_reverse_entry.resolve() if args.js_reverse_entry else None,
+        )
+    )
 
 
 if __name__ == "__main__":

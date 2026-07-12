@@ -11,7 +11,7 @@ No cookie, token, browser profile path, or CDP endpoint is recorded here.
 ## Reproduction
 
 ```powershell
-python tools/toolchain_validation.py
+python tools/toolchain_validation.py --js-reverse-entry <path-to-js-reverse-mcp>/build/src/main.js
 ```
 
 The fixture application is stored under
@@ -22,7 +22,7 @@ than constructed inline by the validation runner.
 
 - Python: `3.13.0`
 - playwright-cli: `0.1.17`
-- js-reverse-mcp: `4.0.1`
+- js-reverse-mcp: `4.0.1 (local entry)`
 - Browser: system Google Chrome, isolated temporary profile, headless mode
 
 ## Results
@@ -32,11 +32,11 @@ than constructed inline by the validation runner.
 | Playwright current page aligns with js-reverse target | **PASS** |
 | Network request capture | **PASS** |
 | Request and response body export | **PASS** |
-| SSE event sequence preservation | **FAIL** |
+| SSE event sequence preservation | **PASS** |
 | Request initiator | **PASS** |
 | Script read and search | **PASS** |
 | XHR/fetch breakpoint pause and resume | **PASS** |
-| Workspace file write | **PASS** |
+| Local evidence file write | **PASS** |
 
 ## Evidence
 
@@ -55,11 +55,14 @@ than constructed inline by the validation runner.
 - Request body: 82 bytes, sha256=126f75c8ae90a5f7a57eb8d65d1ca54ea7b07df75cce43772ce2ddf632a2122b
 - Response body: 132 bytes, sha256=3f3b8dc647c422f8581c8f1e056d2b21cab85d4669e50159faa3b4d903a15b2a
 
-### SSE event sequence preservation: FAIL
+### SSE event sequence preservation: PASS
 
-- Captured the EventSource request itself as network evidence.
-- The fixture page observed two ordered data events and the [DONE] marker.
-- Error: `js-reverse-mcp 4.0.1 returned INTERNAL: response body is not available because the EventSource body was evicted after navigation.`
+- start_stream_capture was armed before the Playwright click.
+- raw.bin exactly matched all fixture SSE bytes in order.
+- events.jsonl preserved both message events and the [DONE] event.
+- get_stream_status matched [DONE] internally without returning its body.
+- Artifacts used the stage0-toolchain namespace and relative paths.
+- raw.bin: 131 bytes, sha256=86c529b54b4a660d3ddd6645a1af517578127f5183a78fab699ed8aea79b9398
 
 ### Request initiator: PASS
 
@@ -76,19 +79,21 @@ than constructed inline by the validation runner.
 - Execution resumed successfully.
 - XHR breakpoint was removed after the check.
 
-### Workspace file write: PASS
+### Local evidence file write: PASS
 
-- Python wrote and read back a UTF-8 file in the reports directory.
+- Python wrote and read back a UTF-8 file in the Action-local evidence directory.
 
 ## Conclusion
 
-Seven of eight required checks passed. The current toolchain is not yet sufficient for the complete Stage 0 acceptance set because it cannot export a completed EventSource response as ordered network evidence. Add EventSource message capture or raw CDP stream capture before relying on SSE evidence in the full Action.
+All required Stage 0 checks passed. The toolchain now validates the actual Raw Stream Capture lifecycle: the collector is armed before the browser action, exact raw bytes and ordered semantic events are written under an experiment namespace, the [DONE] predicate is matched inside the collector, and the capture finalizes with relative artifact paths.
 
 ## Limitations
 
 - The SSE check covers a normally completed local EventSource stream with two
   ordered data events and a `[DONE]` marker.
-- It does not validate chunk arrival timing, cancellation, network interruption,
-  heartbeats, or incomplete streams.
+- It validates exact normal-completion bytes, event ordering, namespace,
+  collector-side predicate matching, and finalization.
+- Cancellation, network interruption, heartbeats, and incomplete streams remain
+  later experiment-specific validation cases.
 - The test page runs in the main page target; Worker and Service Worker metadata
   remain outside this Stage 0 acceptance set.

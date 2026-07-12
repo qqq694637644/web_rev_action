@@ -50,6 +50,7 @@ class RequestMatcher(StrictModel):
     url_contains: str | None = Field(default=None, max_length=4096)
     method: str | None = Field(default=None, pattern=r"^[A-Z]+$", max_length=16)
     resource_types: list[str] = Field(default_factory=list, max_length=16)
+    mime_types: list[str] = Field(default_factory=list, max_length=16)
     request_id: str | None = Field(default=None, max_length=512)
 
 
@@ -96,7 +97,7 @@ class WaitCondition(StrictModel):
         "failed",
         "page_url",
     ]
-    timeout_ms: int = Field(default=10_000, ge=1, le=42_000)
+    timeout_ms: int = Field(default=10_000, ge=1, le=1_800_000)
     locator: Locator | None = None
     request_matcher: RequestMatcher | None = None
     predicate: EventPredicate | None = None
@@ -149,7 +150,7 @@ class FlowStep(StrictModel):
     value: str | None = Field(default=None, max_length=32_000)
     values: list[str] = Field(default_factory=list, max_length=32)
     condition: WaitCondition | None = None
-    timeout_ms: int = Field(default=5_000, ge=1, le=42_000)
+    timeout_ms: int = Field(default=5_000, ge=1, le=1_800_000)
     intent: Literal["stop_generation"] | None = None
 
     @model_validator(mode="after")
@@ -176,6 +177,11 @@ class PrimaryRequest(StrictModel):
     url_contains: str | None = Field(default=None, max_length=4096)
     method: str | None = Field(default=None, pattern=r"^[A-Z]+$", max_length=16)
     resource_types: list[str] = Field(default_factory=list, max_length=16)
+    mime_types: list[str] = Field(
+        default_factory=lambda: ["text/event-stream"],
+        min_length=1,
+        max_length=16,
+    )
     expected_min_matches: int = Field(default=1, ge=0, le=100)
     expected_max_matches: int = Field(default=1, ge=1, le=100)
     allow_supporting_failures: bool = True
@@ -215,8 +221,42 @@ class CaptureFlowPayload(StrictModel):
     primary_request: PrimaryRequest = Field(default_factory=PrimaryRequest)
     flow: list[FlowStep] = Field(default_factory=list, max_length=100)
     wait_for: WaitCondition | None = None
+    execution_mode: Literal["job", "sync"] = "job"
     deadline_ms: int = Field(default=42_000, ge=1_000, le=42_000)
+    job_timeout_ms: int = Field(default=300_000, ge=10_000, le=1_800_000)
     capture: CaptureOptions = Field(default_factory=CaptureOptions)
+
+    @model_validator(mode="after")
+    def validate_stop_sequence(self) -> CaptureFlowPayload:
+        stop_indexes = [
+            index
+            for index, step in enumerate(self.flow)
+            if step.intent == "stop_generation"
+        ]
+        for stop_index in stop_indexes:
+            before = self.flow[:stop_index]
+            after = self.flow[stop_index + 1 :]
+            has_started_stream = any(
+                step.action in {"wait", "assert"}
+                and step.condition is not None
+                and step.condition.type in {"first_event", "event_predicate"}
+                for step in before
+            )
+            has_canceled_wait = any(
+                step.action in {"wait", "assert"}
+                and step.condition is not None
+                and step.condition.type == "network_canceled"
+                for step in after
+            ) or (self.wait_for is not None and self.wait_for.type == "network_canceled")
+            if not has_started_stream:
+                raise ValueError(
+                    "stop_generation requires an earlier first_event or event_predicate wait"
+                )
+            if not has_canceled_wait:
+                raise ValueError(
+                    "stop_generation requires a later network_canceled wait for the same experiment"
+                )
+        return self
 
 
 class CaptureBaselinePayload(CaptureFlowPayload):
@@ -258,12 +298,6 @@ class CloseSessionRequest(StrictModel):
     skill_binding: SkillBinding | None = None
 
 
-RunBrowserExperimentRequest = Annotated[
-    OpenSessionRequest | CaptureBaselineRequest | CaptureFlowRequest | CloseSessionRequest,
-    Field(discriminator="operation"),
-]
-
-
 class GetSessionPayload(StrictModel):
     session_id: str = Field(pattern=r"^[a-zA-Z0-9_.-]+$", max_length=128)
 
@@ -278,7 +312,8 @@ class GetExperimentPayload(StrictModel):
 
 
 class ListArtifactsPayload(GetExperimentPayload):
-    pass
+    offset: int = Field(default=0, ge=0)
+    limit: int = Field(default=100, ge=1, le=500)
 
 
 class ReadArtifactPayload(GetExperimentPayload):
@@ -286,6 +321,18 @@ class ReadArtifactPayload(GetExperimentPayload):
     offset: int = Field(default=0, ge=0)
     max_bytes: int = Field(default=64_000, ge=1, le=256_000)
     credential_mode: Literal["redacted", "full"] = "redacted"
+
+
+class SearchArtifactsPayload(GetExperimentPayload):
+    query: str = Field(min_length=1, max_length=1024)
+    artifact_kinds: list[str] = Field(default_factory=list, max_length=32)
+    max_matches: int = Field(default=100, ge=1, le=500)
+    max_bytes_per_artifact: int = Field(default=1_000_000, ge=1, le=8_000_000)
+    credential_mode: Literal["redacted", "full"] = "redacted"
+
+
+class ExportExperimentPayload(GetExperimentPayload):
+    include_credentials: bool = False
 
 
 class GetStreamStatusPayload(StrictModel):
@@ -323,6 +370,29 @@ class ReadArtifactRequest(StrictModel):
     payload: ReadArtifactPayload
 
 
+class SearchArtifactsRequest(StrictModel):
+    contract_version: Literal["1.0"] = "1.0"
+    operation: Literal["search_artifacts"]
+    payload: SearchArtifactsPayload
+
+
+class ExportExperimentRequest(StrictModel):
+    contract_version: Literal["1.0"] = "1.0"
+    operation: Literal["export_experiment"]
+    payload: ExportExperimentPayload
+    skill_binding: SkillBinding | None = None
+
+
+RunBrowserExperimentRequest = Annotated[
+    OpenSessionRequest
+    | CaptureBaselineRequest
+    | CaptureFlowRequest
+    | CloseSessionRequest
+    | ExportExperimentRequest,
+    Field(discriminator="operation"),
+]
+
+
 class GetStreamStatusRequest(StrictModel):
     contract_version: Literal["1.0"] = "1.0"
     operation: Literal["get_stream_status"]
@@ -335,6 +405,7 @@ InspectBrowserEvidenceRequest = Annotated[
     | GetExperimentRequest
     | ListArtifactsRequest
     | ReadArtifactRequest
+    | SearchArtifactsRequest
     | GetStreamStatusRequest,
     Field(discriminator="operation"),
 ]
@@ -353,7 +424,7 @@ class FlowStepResult(StrictModel):
 class BrowserActionResponse(StrictModel):
     contract_version: Literal["1.0"] = "1.0"
     operation: str
-    status: Literal["completed", "failed", "partial"]
+    status: Literal["running", "completed", "failed", "partial", "interrupted"]
     session_id: str | None = None
     experiment_id: str | None = None
     result: dict[str, Any] = Field(default_factory=dict)

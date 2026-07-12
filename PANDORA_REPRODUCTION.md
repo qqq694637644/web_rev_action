@@ -27,7 +27,7 @@ message / parent message 如何关联
 playwright-cli 负责制造和重放页面行为
 js-reverse-mcp 负责解释网络、流、脚本、调用栈和运行时证据
 web_rev_action 负责原子编排、证据索引、deadline 和实验 manifest
-Gateway workspace 工具负责实验后的读取、搜索、diff、schema 和重放脚本
+LocalEvidenceStore 负责实验后的读取、搜索、分页、导出、diff、schema 和重放脚本
 ```
 
 GPT 只调用：
@@ -45,7 +45,7 @@ get_stream_status
 stop_stream_capture
 ```
 
-一次 `capture_flow` 必须在同一个后端调用中完成 start → flow → wait → stop → manifest。
+一次 `capture_flow` 的生命周期必须由同一个后台 job 原子完成 start → flow → wait → stop → manifest。GPT 只创建 job 并查询 experiment 状态，不分步控制 collector。
 
 ---
 
@@ -73,7 +73,7 @@ data/analysis-workspace/
 experiments/exp_001/js-reverse/capture-<uuid>/
 ```
 
-workspace 是普通文件目录，不需要 Git、PR、branch 或 CI。
+这是 Action 服务本机的普通 evidence 目录，不需要 Git、PR、branch 或 CI，也不假设与 GitHub Gateway workspace 共享文件系统。GPT 通过 `inspectBrowserEvidence` 读、搜、分页；需要搬运时使用 `runBrowserExperiment(export_experiment)` 创建 ZIP。
 
 ---
 
@@ -134,7 +134,8 @@ expected match count
 allow supporting failures
 flow steps
 wait condition
-42 秒以内的总 deadline
+execution_mode=job
+适合目标流长度的 job timeout
 ```
 
 示例：
@@ -201,7 +202,7 @@ artifact_id
 
 ## 7. 请求分类
 
-使用 `inspectBrowserEvidence.list_requests` 和 workspace 脚本分类：
+使用 `inspectBrowserEvidence` 的请求查询、artifact 搜索和 Action 后端本地脚本分类：
 
 ```text
 页面初始化
@@ -365,6 +366,7 @@ terminalReason = network_canceled
 
 ```text
 flow 中实际执行了 Stop step
+Stop 前已经观察同一 primary request 的 first_event 或受控 event predicate
 取消发生在 Stop step 的限定时间窗口
 取消请求匹配 primary request
 页面和 target 对齐
@@ -376,7 +378,7 @@ flow 中实际执行了 Stop step
 ```text
 Stop step 时间
 目标 request ID
-最后一个流事件
+Stop 前后的 event index 与 raw byte offset
 network_canceled 时间
 页面最终状态
 消息是否可继续 / regenerate
@@ -495,7 +497,7 @@ response.fromServiceWorker=true
 - 自动复用 Cookie。
 - 一次只删改一个字段。
 - 请求样本来自 artifact。
-- 结果写入 workspace。
+- 结果写入 LocalEvidenceStore。
 
 这是第一轮字段必要性实验的首选方式。
 
@@ -611,5 +613,5 @@ notes/open-questions.md
 - Stop cancellation 不由底层提前解释成用户行为。
 - credential 默认脱敏。
 - stop 后关闭页面不修改历史 manifest。
-- 所有 artifact 相对路径可由 workspace 工具读取。
-- 整个 capture_flow 在统一 Action deadline 内完成或写出 best-effort timeout manifest。
+- 所有 artifact 相对路径可由 LocalEvidenceStore 读取、搜索、分页和导出。
+- 长流由后台 job 完成；显式快速同步模式才受 42 秒 Action deadline 限制。

@@ -6,7 +6,7 @@
 
 - `playwright-cli`：页面操作、snapshot、截图和 Trace。
 - `js-reverse-mcp`：网络、SSE、initiator、脚本和断点证据。
-- 本地 analysis workspace：manifest、artifact、报告、schema 和重放脚本。
+- `LocalEvidenceStore`：Action 本机的 manifest、artifact、搜索、导出、报告和重放脚本。
 - 现有 Skill runtime：向 GPT 提供 `SKILL.md` 和渐进式文档读取。
 
 当前已实现 `PLAN.md` 的阶段 1 和阶段 2：Action schema、真实 adapter、session、页面对齐、统一 deadline、最小原子 Orchestrator、experiment store 和 fake-adapter 验收测试。
@@ -60,6 +60,7 @@ open_session
 capture_baseline
 capture_flow
 close_session
+export_experiment
 ```
 
 ### `inspectBrowserEvidence`
@@ -70,6 +71,7 @@ list_experiments
 get_experiment
 list_artifacts
 read_artifact
+search_artifacts
 get_stream_status
 ```
 
@@ -163,9 +165,17 @@ selector_state
 
 `[DONE]` 只是 `default_done_marker` 的默认语义，不是通用协议完成定义。
 
-## Deadline
+## Job 与 deadline
 
-每个 Action 使用一个不超过 42 秒的总 deadline。
+`capture_flow` 默认使用后台 job：Action 立即返回 `experiment_id` 和 `status=running`，后台仍原子执行完整 start → flow → wait → stop → manifest。使用 `inspectBrowserEvidence.get_experiment` 查询终态。
+
+需要快速同步结果时显式设置：
+
+```json
+{"execution_mode": "sync", "deadline_ms": 42000}
+```
+
+同步模式使用不超过 42 秒的总 deadline；job 模式使用独立 `job_timeout_ms`，默认 300 秒。
 
 - step 使用总 deadline 的子预算。
 - wait 使用 condition timeout 与总 deadline 的较小值。
@@ -209,7 +219,7 @@ requestSnapshotIntegrity
 artifactIntegrity
 ```
 
-## Workspace
+## Local evidence
 
 默认目录：
 
@@ -228,9 +238,9 @@ data/analysis-workspace/
       reports/
 ```
 
-`web_rev_action` 把 `experiment_id` 作为受限 `artifactNamespace` 传给 `js-reverse-mcp`，因此两个服务必须看到同一个 workspace 目录。
+`web_rev_action` 把 `experiment_id` 作为受限 `artifactNamespace` 传给 `js-reverse-mcp`，因此两个本地进程必须看到同一个 evidence 目录。
 
-Workspace 是普通文件夹，不包含 Git/PR 语义。
+该目录是 Action 服务本机的普通文件夹，不包含 Git/PR 语义，也不等于 GitHub Gateway workspace。GPT 通过 `inspectBrowserEvidence` 读取、搜索和分页；跨环境搬运使用 `runBrowserExperiment(export_experiment)` 创建 ZIP。
 
 ## Credential artifacts
 
@@ -267,7 +277,7 @@ redactedArtifactId = ...
 
 ```dotenv
 WEB_REV_BROWSER_CDP_URL=http://127.0.0.1:9222
-WEB_REV_WORKSPACE_DIR=C:/path/to/web_rev_action/data/analysis-workspace
+WEB_REV_EVIDENCE_DIR=C:/path/to/web_rev_action/data/analysis-workspace
 WEB_REV_PLAYWRIGHT_CLI=playwright-cli
 WEB_REV_JS_REVERSE_COMMAND=js-reverse-mcp
 ```
@@ -276,7 +286,7 @@ WEB_REV_JS_REVERSE_COMMAND=js-reverse-mcp
 
 ```text
 --browserUrl <WEB_REV_BROWSER_CDP_URL>
---allowedRoots <WEB_REV_WORKSPACE_DIR>
+--allowedRoots <WEB_REV_EVIDENCE_DIR>
 --streamArtifactRoot 0
 ```
 
@@ -363,6 +373,7 @@ http://127.0.0.1:8765/openapi.json
       "url_contains": "/conversation",
       "method": "POST",
       "resource_types": ["fetch"],
+      "mime_types": ["text/event-stream"],
       "expected_min_matches": 1,
       "expected_max_matches": 1,
       "allow_supporting_failures": true,
@@ -388,7 +399,8 @@ http://127.0.0.1:8765/openapi.json
         "method": "POST"
       }
     },
-    "deadline_ms": 42000
+    "execution_mode": "job",
+    "job_timeout_ms": 300000
   }
 }
 ```
@@ -416,7 +428,10 @@ python -m skill_temple.evals evals/skill_queries.jsonl
 - screenshot/Trace/manifest artifact。
 - credential 默认脱敏。
 - 私有 MCP stream primitive 调用。
-- 同一 CDP endpoint 和 workspace 启动参数。
+- 同一 CDP endpoint 和本地 evidence root 启动参数。
+- 后台 job、running→completed 查询和 restart 后 interrupted 恢复。
+- artifact 分页、搜索和不含凭据的显式 ZIP 导出。
+- collector-side event predicate 和稳定 pageId。
 
 ## Next stages
 

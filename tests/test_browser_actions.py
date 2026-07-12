@@ -7,6 +7,7 @@ import sys
 import tempfile
 import time
 import unittest
+import zipfile
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -21,11 +22,17 @@ from skill_temple.browser_adapters import (
     StdioMcpToolTransport,
     StreamWaitResult,
 )
-from skill_temple.browser_models import FlowStep, Locator, RequestMatcher, WaitCondition
+from skill_temple.browser_models import (
+    EventPredicate,
+    FlowStep,
+    Locator,
+    RequestMatcher,
+    WaitCondition,
+)
 from skill_temple.browser_service import (
     BrowserActionService,
     Deadline,
-    WorkspaceStore,
+    LocalEvidenceStore,
     build_browser_service_from_environment,
 )
 
@@ -124,14 +131,14 @@ class FakeJsReverse:
     def __init__(
         self,
         events: list[str],
-        workspace_root: Path,
+        evidence_root: Path,
         *,
         alignment_status: str = "aligned",
         include_supporting_failure: bool = True,
         primary_status: str = "finished",
     ) -> None:
         self.events = events
-        self.workspace_root = workspace_root
+        self.evidence_root = evidence_root
         self.alignment_status = alignment_status
         self.include_supporting_failure = include_supporting_failure
         self.primary_status = primary_status
@@ -139,9 +146,16 @@ class FakeJsReverse:
         self.capture_id = 1
         self.experiment_id = ""
         self.status_payload: dict[str, Any] = {}
+        self.aligned_page_ids: list[str | None] = []
 
-    async def align_page(self, page: PageState, deadline: Deadline) -> AlignmentResult:
+    async def align_page(
+        self,
+        page: PageState,
+        deadline: Deadline,
+        page_id: str | None = None,
+    ) -> AlignmentResult:
         self.events.append("js.align")
+        self.aligned_page_ids.append(page_id)
         if self.alignment_status != "aligned":
             return AlignmentResult(
                 status="not_aligned",
@@ -152,12 +166,13 @@ class FakeJsReverse:
             status="aligned",
             playwright_page=page,
             js_reverse_page_index=0,
+            js_reverse_page_id=page_id or "page_fake",
             js_reverse_page_url=page.url,
         )
 
     def _write_artifacts(self, experiment_id: str) -> dict[str, dict[str, Any]]:
         request_dir = (
-            self.workspace_root
+            self.evidence_root
             / "experiments"
             / experiment_id
             / "js-reverse"
@@ -285,7 +300,13 @@ class FakeJsReverse:
         return {"capture": self.status_payload["capture"]}
 
     async def get_stream_status(
-        self, capture_id: int, deadline: Deadline
+        self,
+        capture_id: int,
+        deadline: Deadline,
+        *,
+        request_id: str | None = None,
+        event_predicate: Any | None = None,
+        after_event_index: int = -1,
     ) -> dict[str, Any]:
         self.events.append("js.status")
         if self.primary_status == "canceled":
@@ -310,13 +331,22 @@ class FakeJsReverse:
         deadline: Deadline,
     ) -> StreamWaitResult:
         self.events.append("js.wait")
+        version = max(2, since_version + 1)
+        matched_event = {
+            "matched": True,
+            "matchedEventIndex": version - 2,
+            "matchedRequestId": "primary-cdp",
+            "matchedSource": "raw-stream",
+            "rawByteStart": (version - 2) * 16,
+            "rawByteEnd": (version - 1) * 16,
+        }
         return StreamWaitResult(
             condition_met=True,
             capture_id=capture_id,
-            capture_version=2,
+            capture_version=version,
             matched_request_ids=["primary-cdp"],
             terminal_status=self.primary_status,
-            matched_event={"data": "[DONE]"},
+            matched_event=matched_event,
             status_payload=self.status_payload,
         )
 
@@ -352,10 +382,10 @@ class BrowserActionTests(unittest.TestCase):
         primary_status: str = "finished",
     ) -> tuple[TestClient, list[str], FakeJsReverse]:
         events: list[str] = []
-        workspace = WorkspaceStore(root)
+        evidence = LocalEvidenceStore(root)
         js = FakeJsReverse(
             events,
-            workspace.root,
+            evidence.root,
             alignment_status=alignment_status,
             include_supporting_failure=include_supporting_failure,
             primary_status=primary_status,
@@ -363,7 +393,7 @@ class BrowserActionTests(unittest.TestCase):
         service = BrowserActionService(
             playwright=FakePlaywright(events, fail_step=fail_step),
             js_reverse=js,
-            workspace=workspace,
+            evidence=evidence,
             default_browser_endpoint="http://127.0.0.1:9222",
         )
         return TestClient(create_app(browser_service=service)), events, js
@@ -420,6 +450,7 @@ class BrowserActionTests(unittest.TestCase):
                     },
                 },
                 "deadline_ms": 10_000,
+                "execution_mode": "sync",
             },
         }
 
@@ -578,7 +609,10 @@ class BrowserActionTests(unittest.TestCase):
                     "/v1/browser/run",
                     json={
                         "operation": "capture_baseline",
-                        "payload": {"session_id": "session_one"},
+                        "payload": {
+                            "session_id": "session_one",
+                            "execution_mode": "sync",
+                        },
                     },
                 )
             self.assertEqual(response.status_code, 200, response.text)
@@ -612,6 +646,17 @@ class BrowserActionTests(unittest.TestCase):
             request = self.capture_request()
             request["payload"]["flow"] = [
                 {
+                    "step_id": "wait_stream_started",
+                    "action": "wait",
+                    "condition": {
+                        "type": "first_event",
+                        "request_matcher": {
+                            "url_contains": "/conversation",
+                            "method": "POST",
+                        },
+                    },
+                },
+                {
                     "step_id": "stop_generation",
                     "action": "click",
                     "locator": {"role": "button", "name": "Stop"},
@@ -639,13 +684,158 @@ class BrowserActionTests(unittest.TestCase):
                 ],
                 "expected_user_cancel",
             )
+            self.assertIsNotNone(classification["stream_before_stop"])
+
+    def test_stop_intent_requires_stream_start_observation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client, _, _ = self.make_client(Path(temp_dir))
+            request = self.capture_request()
+            request["payload"]["flow"] = [
+                {
+                    "step_id": "stop_generation",
+                    "action": "click",
+                    "locator": {"role": "button", "name": "Stop"},
+                    "intent": "stop_generation",
+                }
+            ]
+            request["payload"]["wait_for"] = {
+                "type": "network_canceled",
+                "request_matcher": {"url_contains": "/conversation"},
+            }
+            with client:
+                self.open_session(client)
+                response = client.post("/v1/browser/run", json=request)
+            self.assertEqual(response.status_code, 422)
+            self.assertIn("requires an earlier first_event", response.text)
+
+    def test_job_mode_returns_running_then_completes_via_inspect(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client, _, _ = self.make_client(Path(temp_dir))
+            request = self.capture_request()
+            request["payload"].pop("execution_mode")
+            request["payload"]["job_timeout_ms"] = 30_000
+            with client:
+                self.open_session(client)
+                started = client.post("/v1/browser/run", json=request)
+                self.assertEqual(started.status_code, 200, started.text)
+                self.assertEqual(started.json()["status"], "running")
+                experiment_id = started.json()["experiment_id"]
+                final: dict[str, Any] | None = None
+                for _ in range(100):
+                    inspected = client.post(
+                        "/v1/browser/inspect",
+                        json={
+                            "operation": "get_experiment",
+                            "payload": {"experiment_id": experiment_id},
+                        },
+                    )
+                    self.assertEqual(inspected.status_code, 200, inspected.text)
+                    if inspected.json()["status"] != "running":
+                        final = inspected.json()
+                        break
+                    time.sleep(0.02)
+            self.assertIsNotNone(final)
+            self.assertEqual(final["status"], "completed")
+            self.assertEqual(
+                final["result"]["experiment"]["execution_mode"], "job"
+            )
+
+    def test_local_evidence_recovers_running_manifest_as_interrupted(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            experiment_dir = root / "experiments" / "exp_crashed"
+            experiment_dir.mkdir(parents=True)
+            (experiment_dir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "experiment_id": "exp_crashed",
+                        "session_id": "session_one",
+                        "status": "running",
+                        "errors": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            evidence = LocalEvidenceStore(root)
+            recovered = evidence.load_manifest("exp_crashed")
+            self.assertEqual(recovered["status"], "interrupted")
+            self.assertTrue(recovered["errors"])
+
+    def test_local_evidence_search_paging_and_export_do_not_require_gateway_mount(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            client, _, _ = self.make_client(root)
+            with client:
+                self.open_session(client)
+                captured = client.post(
+                    "/v1/browser/run", json=self.capture_request()
+                ).json()
+                experiment_id = captured["experiment_id"]
+                page = client.post(
+                    "/v1/browser/inspect",
+                    json={
+                        "operation": "list_artifacts",
+                        "payload": {
+                            "experiment_id": experiment_id,
+                            "offset": 0,
+                            "limit": 2,
+                        },
+                    },
+                )
+                searched = client.post(
+                    "/v1/browser/inspect",
+                    json={
+                        "operation": "search_artifacts",
+                        "payload": {
+                            "experiment_id": experiment_id,
+                            "query": "REDACTED",
+                        },
+                    },
+                )
+                exported = client.post(
+                    "/v1/browser/run",
+                    json={
+                        "operation": "export_experiment",
+                        "payload": {
+                            "experiment_id": experiment_id,
+                            "include_credentials": False,
+                        },
+                    },
+                )
+            self.assertEqual(page.status_code, 200, page.text)
+            self.assertLessEqual(page.json()["result"]["count"], 2)
+            self.assertEqual(searched.status_code, 200, searched.text)
+            self.assertTrue(searched.json()["result"]["matches"])
+            matches = searched.json()["result"]["matches"]
+            self.assertTrue(any(match["credential_redacted"] for match in matches))
+            self.assertTrue(all("Bearer secret" not in match["snippet"] for match in matches))
+            descriptor = exported.json()["result"]["export_artifact"]
+            archive = root / descriptor["relativePath"]
+            self.assertTrue(archive.is_file())
+            with zipfile.ZipFile(archive) as bundle:
+                names = set(bundle.namelist())
+            self.assertNotIn(
+                "js-reverse/capture-fake/request-0001/request-headers.json",
+                names,
+            )
+
+    def test_session_reuses_stable_js_reverse_page_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client, _, js = self.make_client(Path(temp_dir))
+            with client:
+                self.open_session(client)
+                response = client.post(
+                    "/v1/browser/run", json=self.capture_request()
+                )
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(js.aligned_page_ids, [None, "page_fake"])
 
     def test_environment_builder_binds_mcp_to_workspace_and_same_cdp_endpoint(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             with patch.dict(
                 os.environ,
                 {
-                    "WEB_REV_WORKSPACE_DIR": temp_dir,
+                    "WEB_REV_EVIDENCE_DIR": temp_dir,
                     "WEB_REV_BROWSER_CDP_URL": "http://127.0.0.1:9222",
                     "WEB_REV_JS_REVERSE_COMMAND": "js-reverse-mcp",
                 },
@@ -674,11 +864,11 @@ class BrowserActionTests(unittest.TestCase):
     def test_configured_private_mcp_rejects_a_different_playwright_endpoint(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             events: list[str] = []
-            workspace = WorkspaceStore(Path(temp_dir))
+            evidence = LocalEvidenceStore(Path(temp_dir))
             service = BrowserActionService(
                 playwright=FakePlaywright(events),
-                js_reverse=FakeJsReverse(events, workspace.root),
-                workspace=workspace,
+                js_reverse=FakeJsReverse(events, evidence.root),
+                evidence=evidence,
                 default_browser_endpoint="http://127.0.0.1:9222",
                 private_mcp_browser_endpoint="http://127.0.0.1:9222",
                 require_private_mcp_endpoint=True,
@@ -715,6 +905,12 @@ class BrowserActionTests(unittest.TestCase):
                 if name == "get_stream_status":
                     return {
                         "capture": {"captureId": 7, "version": 2},
+                        "eventMatch": {
+                            "matched": True,
+                            "matchedEventIndex": 51,
+                            "matchedRequestId": "req-7",
+                            "matchedSource": "raw-stream",
+                        },
                         "requests": [
                             {
                                 "cdpRequestId": "req-7",
@@ -722,7 +918,6 @@ class BrowserActionTests(unittest.TestCase):
                                 "method": "POST",
                                 "resourceType": "fetch",
                                 "status": "finished",
-                                "defaultDoneMarkerObserved": True,
                             }
                         ],
                     }
@@ -733,11 +928,10 @@ class BrowserActionTests(unittest.TestCase):
             async def close(self) -> None:
                 return None
 
-        with tempfile.TemporaryDirectory() as temp_dir:
+        with tempfile.TemporaryDirectory():
             transport = FakeTransport()
             adapter = JsReverseMcpAdapter(
                 transport,
-                workspace_root=Path(temp_dir),
             )
 
             async def exercise() -> StreamWaitResult:
@@ -748,6 +942,7 @@ class BrowserActionTests(unittest.TestCase):
                         url_contains="/conversation",
                         method="POST",
                         resource_types=["fetch"],
+                        mime_types=["text/event-stream"],
                     ),
                     include_in_flight=False,
                     deadline=deadline,
@@ -759,9 +954,13 @@ class BrowserActionTests(unittest.TestCase):
                         url_contains="/conversation", method="POST"
                     ),
                     condition=WaitCondition(
-                        type="default_done_marker",
+                        type="event_predicate",
                         request_matcher=RequestMatcher(
                             url_contains="/conversation", method="POST"
+                        ),
+                        predicate=EventPredicate(
+                            type="exact_data",
+                            value="[DONE]",
                         ),
                     ),
                     since_version=1,
@@ -779,6 +978,14 @@ class BrowserActionTests(unittest.TestCase):
             start_args = transport.calls[0][1]
             self.assertEqual(start_args["artifactNamespace"], "exp_private")
             self.assertFalse(start_args["includeInFlight"])
+            self.assertEqual(start_args["mimeTypes"], ["text/event-stream"])
+            status_args = transport.calls[1][1]
+            self.assertEqual(
+                status_args["eventPredicate"],
+                {"type": "exact_data", "value": "[DONE]"},
+            )
+            self.assertEqual(status_args["afterEventIndex"], -1)
+            self.assertEqual(waited.matched_event["matchedEventIndex"], 51)
 
     def test_stdio_mcp_transport_calls_a_real_mcp_server(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

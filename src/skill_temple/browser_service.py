@@ -8,6 +8,7 @@ import os
 import re
 import time
 import uuid
+import zipfile
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
@@ -28,6 +29,7 @@ from .browser_models import (
     CaptureFlowPayload,
     CaptureFlowRequest,
     CloseSessionRequest,
+    ExportExperimentRequest,
     FlowStep,
     FlowStepResult,
     GetExperimentRequest,
@@ -40,6 +42,7 @@ from .browser_models import (
     ReadArtifactRequest,
     RequestMatcher,
     RunBrowserExperimentRequest,
+    SearchArtifactsRequest,
     WaitCondition,
 )
 from .runtime import env_value_from_environment_or_dotenv
@@ -109,8 +112,8 @@ def _safe_identifier(value: str, label: str) -> str:
     return value
 
 
-class WorkspaceStore:
-    """Owns the ordinary analysis directory; no Git semantics are involved."""
+class LocalEvidenceStore:
+    """Owns Action-local evidence. It is not a Gateway or Git workspace."""
 
     def __init__(self, root: Path) -> None:
         self.root = root.expanduser().resolve()
@@ -119,6 +122,7 @@ class WorkspaceStore:
         self.root.mkdir(parents=True, exist_ok=True)
         self.experiments_dir.mkdir(parents=True, exist_ok=True)
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
+        self.recover_interrupted_experiments()
 
     def experiment_dir(self, experiment_id: str) -> Path:
         _safe_identifier(experiment_id, "experiment_id")
@@ -212,12 +216,38 @@ class WorkspaceStore:
         value = descriptor.get("artifactId") or descriptor.get("artifact_id")
         return str(value) if value else None
 
-    def list_artifacts(self, experiment_id: str) -> list[dict[str, Any]]:
+    def list_artifacts(
+        self, experiment_id: str, offset: int = 0, limit: int | None = None
+    ) -> list[dict[str, Any]]:
         manifest = self.load_manifest(experiment_id)
         artifacts = manifest.get("artifacts")
         if not isinstance(artifacts, list):
             return []
-        return [item for item in artifacts if isinstance(item, dict)]
+        items = [item for item in artifacts if isinstance(item, dict)]
+        return items[offset:] if limit is None else items[offset : offset + limit]
+
+    def recover_interrupted_experiments(self) -> int:
+        recovered = 0
+        for path in self.experiments_dir.glob("*/manifest.json"):
+            try:
+                manifest = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if manifest.get("status") != "running":
+                continue
+            manifest["status"] = "interrupted"
+            manifest["interrupted_at"] = utc_now()
+            manifest["errors"] = [
+                *(
+                    manifest.get("errors")
+                    if isinstance(manifest.get("errors"), list)
+                    else []
+                ),
+                "The service restarted before this experiment reached a terminal manifest.",
+            ]
+            self.write_manifest(str(manifest["experiment_id"]), manifest)
+            recovered += 1
+        return recovered
 
     def _resolve_relative(self, relative_path: str) -> Path:
         path = (self.root / Path(relative_path)).resolve()
@@ -287,6 +317,129 @@ class WorkspaceStore:
             "credential_redacted": descriptor.get("sensitivity") != "credential",
         }
 
+    def _effective_descriptor(
+        self,
+        experiment_id: str,
+        descriptor: dict[str, Any],
+        credential_mode: str,
+    ) -> dict[str, Any] | None:
+        if descriptor.get("sensitivity") != "credential" or credential_mode == "full":
+            return descriptor
+        redacted_id = descriptor.get("redactedArtifactId") or descriptor.get(
+            "redacted_artifact_id"
+        )
+        if not redacted_id:
+            return None
+        return next(
+            (
+                item
+                for item in self.list_artifacts(experiment_id)
+                if self._artifact_id(item) == str(redacted_id)
+            ),
+            None,
+        )
+
+    def search_artifacts(
+        self,
+        *,
+        experiment_id: str,
+        query: str,
+        artifact_kinds: list[str],
+        max_matches: int,
+        max_bytes_per_artifact: int,
+        credential_mode: str,
+    ) -> list[dict[str, Any]]:
+        needle = query.casefold()
+        matches: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for original in self.list_artifacts(experiment_id):
+            descriptor = self._effective_descriptor(
+                experiment_id, original, credential_mode
+            )
+            if descriptor is None:
+                continue
+            artifact_id = self._artifact_id(descriptor)
+            if not artifact_id or artifact_id in seen:
+                continue
+            seen.add(artifact_id)
+            if artifact_kinds and str(descriptor.get("kind")) not in artifact_kinds:
+                continue
+            relative_path = descriptor.get("relativePath") or descriptor.get(
+                "relative_path"
+            )
+            if not isinstance(relative_path, str):
+                continue
+            path = self._resolve_relative(relative_path)
+            if not path.is_file():
+                continue
+            with path.open("rb") as handle:
+                payload = handle.read(max_bytes_per_artifact)
+            text = payload.decode("utf-8", errors="replace")
+            for line_number, line in enumerate(text.splitlines(), start=1):
+                position = line.casefold().find(needle)
+                if position < 0:
+                    continue
+                start = max(0, position - 120)
+                end = min(len(line), position + len(query) + 120)
+                matches.append(
+                    {
+                        "artifact_id": artifact_id,
+                        "kind": descriptor.get("kind"),
+                        "relative_path": relative_path,
+                        "line_number": line_number,
+                        "snippet": line[start:end],
+                        "credential_redacted": (
+                            original.get("sensitivity") == "credential"
+                            and credential_mode != "full"
+                        ),
+                    }
+                )
+                if len(matches) >= max_matches:
+                    return matches
+        return matches
+
+    def export_experiment(
+        self, experiment_id: str, *, include_credentials: bool
+    ) -> dict[str, Any]:
+        directory = self.experiment_dir(experiment_id)
+        manifest = self.load_manifest(experiment_id)
+        exports = directory / "exports"
+        exports.mkdir(parents=True, exist_ok=True)
+        archive = exports / f"{experiment_id}.zip"
+        credential_paths = {
+            str(item.get("relativePath") or item.get("relative_path"))
+            for item in self.list_artifacts(experiment_id)
+            if item.get("sensitivity") == "credential"
+        }
+        with zipfile.ZipFile(
+            archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6
+        ) as bundle:
+            for path in directory.rglob("*"):
+                if not path.is_file() or exports in path.parents:
+                    continue
+                relative_to_root = path.relative_to(self.root).as_posix()
+                if not include_credentials and relative_to_root in credential_paths:
+                    continue
+                bundle.write(path, path.relative_to(directory).as_posix())
+        descriptor = self.describe_local_artifact(
+            archive.as_posix(),
+            artifact_id=f"art_{experiment_id}_export",
+            kind="experiment_export",
+            sensitivity="credential" if include_credentials else "private",
+        )
+        if descriptor is None:
+            raise BrowserServiceError("export_failed", "Experiment export was not created", 500)
+        artifacts = [
+            item
+            for item in manifest.get("artifacts", [])
+            if isinstance(item, dict)
+            and self._artifact_id(item) != descriptor["artifactId"]
+        ]
+        artifacts.append(descriptor)
+        manifest["artifacts"] = artifacts
+        self.write_manifest(experiment_id, manifest)
+        return descriptor
+
     def describe_local_artifact(
         self,
         path_value: str,
@@ -342,36 +495,50 @@ class BrowserActionService:
         *,
         playwright: PlaywrightAdapter,
         js_reverse: JsReverseAdapter,
-        workspace: WorkspaceStore,
+        evidence: LocalEvidenceStore,
         default_browser_endpoint: str | None = None,
         private_mcp_browser_endpoint: str | None = None,
         require_private_mcp_endpoint: bool = False,
     ) -> None:
         self.playwright = playwright
         self.js_reverse = js_reverse
-        self.workspace = workspace
+        self.evidence = evidence
         self.default_browser_endpoint = default_browser_endpoint
         self.private_mcp_browser_endpoint = private_mcp_browser_endpoint
         self.require_private_mcp_endpoint = require_private_mcp_endpoint
         self.sessions: dict[str, dict[str, Any]] = {}
         self._session_locks: dict[str, asyncio.Lock] = {}
+        self._jobs: dict[str, asyncio.Task[None]] = {}
 
     def _session_lock(self, session_id: str) -> asyncio.Lock:
         return self._session_locks.setdefault(session_id, asyncio.Lock())
 
     def _get_session(self, session_id: str) -> dict[str, Any]:
-        session = self.sessions.get(session_id) or self.workspace.load_session(session_id)
+        session = self.sessions.get(session_id) or self.evidence.load_session(session_id)
         if not session:
             raise BrowserServiceError("session_not_found", "Browser session was not found", 404)
         self.sessions[session_id] = session
         return session
 
     async def run(self, request: RunBrowserExperimentRequest) -> BrowserActionResponse:
+        if isinstance(request, ExportExperimentRequest):
+            descriptor = self.evidence.export_experiment(
+                request.payload.experiment_id,
+                include_credentials=request.payload.include_credentials,
+            )
+            return BrowserActionResponse(
+                operation=request.operation,
+                status="completed",
+                experiment_id=request.payload.experiment_id,
+                result={"export_artifact": descriptor},
+            )
         if isinstance(request, OpenSessionRequest):
             return await self._open_session(request)
         if isinstance(request, CloseSessionRequest):
             return await self._close_session(request)
         if isinstance(request, (CaptureFlowRequest, CaptureBaselineRequest)):
+            if request.payload.execution_mode == "job":
+                return self._start_capture_job(request)
             return await self._capture_flow(request)
         raise BrowserServiceError("unsupported_operation", "Unsupported browser operation", 400)
 
@@ -385,7 +552,7 @@ class BrowserActionService:
                 result={"session": session},
             )
         if isinstance(request, ListExperimentsRequest):
-            items = self.workspace.list_experiments(
+            items = self.evidence.list_experiments(
                 request.payload.session_id, request.payload.limit
             )
             return BrowserActionResponse(
@@ -394,16 +561,27 @@ class BrowserActionService:
                 result={"experiments": items, "count": len(items)},
             )
         if isinstance(request, GetExperimentRequest):
-            manifest = self.workspace.load_manifest(request.payload.experiment_id)
+            manifest = self.evidence.load_manifest(request.payload.experiment_id)
+            manifest_status = str(manifest.get("status", "partial"))
+            response_status = (
+                manifest_status
+                if manifest_status
+                in {"running", "completed", "failed", "partial", "interrupted"}
+                else "partial"
+            )
             return BrowserActionResponse(
                 operation=request.operation,
-                status="completed",
+                status=response_status,
                 session_id=manifest.get("session_id"),
                 experiment_id=request.payload.experiment_id,
                 result={"experiment": manifest},
             )
         if isinstance(request, ListArtifactsRequest):
-            artifacts = self.workspace.list_artifacts(request.payload.experiment_id)
+            artifacts = self.evidence.list_artifacts(
+                request.payload.experiment_id,
+                request.payload.offset,
+                request.payload.limit,
+            )
             return BrowserActionResponse(
                 operation=request.operation,
                 status="completed",
@@ -411,7 +589,7 @@ class BrowserActionService:
                 result={"artifacts": artifacts, "count": len(artifacts)},
             )
         if isinstance(request, ReadArtifactRequest):
-            result = self.workspace.read_artifact(
+            result = self.evidence.read_artifact(
                 experiment_id=request.payload.experiment_id,
                 artifact_id=request.payload.artifact_id,
                 offset=request.payload.offset,
@@ -423,6 +601,21 @@ class BrowserActionService:
                 status="completed",
                 experiment_id=request.payload.experiment_id,
                 result=result,
+            )
+        if isinstance(request, SearchArtifactsRequest):
+            matches = self.evidence.search_artifacts(
+                experiment_id=request.payload.experiment_id,
+                query=request.payload.query,
+                artifact_kinds=request.payload.artifact_kinds,
+                max_matches=request.payload.max_matches,
+                max_bytes_per_artifact=request.payload.max_bytes_per_artifact,
+                credential_mode=request.payload.credential_mode,
+            )
+            return BrowserActionResponse(
+                operation=request.operation,
+                status="completed",
+                experiment_id=request.payload.experiment_id,
+                result={"matches": matches, "count": len(matches)},
             )
         if isinstance(request, GetStreamStatusRequest):
             self._get_session(request.payload.session_id)
@@ -491,14 +684,16 @@ class BrowserActionService:
                 "playwright_page_url": page.url,
                 "playwright_page_title": page.title,
                 "js_reverse_page_index": alignment.js_reverse_page_index,
+                "js_reverse_page_id": alignment.js_reverse_page_id,
                 "js_reverse_page_url": alignment.js_reverse_page_url,
                 "page_alignment_status": alignment.status,
-                "workspace_dir": ".",
+                "evidence_store": "local",
+                "evidence_root_ref": ".",
                 "created_at": now,
                 "updated_at": now,
             }
             self.sessions[session_id] = session
-            self.workspace.save_session(session)
+            self.evidence.save_session(session)
         return BrowserActionResponse(
             operation=request.operation,
             status="completed",
@@ -515,7 +710,7 @@ class BrowserActionService:
             await self.playwright.close_session(session_id, deadline)
             session["status"] = "closed"
             session["updated_at"] = utc_now()
-            self.workspace.save_session(session)
+            self.evidence.save_session(session)
         return BrowserActionResponse(
             operation=request.operation,
             status="completed",
@@ -541,7 +736,7 @@ class BrowserActionService:
             await self.playwright.execute_step(
                 str(session["playwright_session_ref"]),
                 step,
-                self.workspace.root,
+                self.evidence.root,
                 deadline,
             )
         page = await self.playwright.current_page(
@@ -556,7 +751,15 @@ class BrowserActionService:
                 f"Current page URL does not contain {payload.target.expected_url_contains}",
                 409,
             )
-        alignment = await self.js_reverse.align_page(page, deadline)
+        alignment = await self.js_reverse.align_page(
+            page,
+            deadline,
+            page_id=(
+                str(session["js_reverse_page_id"])
+                if session.get("js_reverse_page_id")
+                else None
+            ),
+        )
         if alignment.status != "aligned":
             raise BrowserServiceError(
                 "page_alignment_failed",
@@ -569,12 +772,13 @@ class BrowserActionService:
                 "playwright_page_title": page.title,
                 "playwright_page_index": page.page_index,
                 "js_reverse_page_index": alignment.js_reverse_page_index,
+                "js_reverse_page_id": alignment.js_reverse_page_id,
                 "js_reverse_page_url": alignment.js_reverse_page_url,
                 "page_alignment_status": alignment.status,
                 "updated_at": utc_now(),
             }
         )
-        self.workspace.save_session(session)
+        self.evidence.save_session(session)
         return alignment
 
     @staticmethod
@@ -583,6 +787,7 @@ class BrowserActionService:
             url_contains=payload.primary_request.url_contains,
             method=payload.primary_request.method,
             resource_types=payload.primary_request.resource_types,
+            mime_types=payload.primary_request.mime_types,
         )
 
     async def _wait_condition(
@@ -709,6 +914,7 @@ class BrowserActionService:
         step_results: list[FlowStepResult],
         primary_requests: list[dict[str, Any]],
         alignment: AlignmentResult,
+        wait_observations: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
         completed_by_id = {
             result.step_id: result
@@ -724,6 +930,25 @@ class BrowserActionService:
                 for later in payload.flow[index + 1 :]
             )
             result = completed_by_id[step.step_id]
+            before_observation = next(
+                (
+                    item
+                    for item in reversed(wait_observations)
+                    if int(item.get("step_index", -1)) < index
+                    and item.get("condition_type")
+                    in {"first_event", "event_predicate"}
+                ),
+                None,
+            )
+            after_observation = next(
+                (
+                    item
+                    for item in wait_observations
+                    if int(item.get("step_index", -1)) > index
+                    and item.get("condition_type") == "network_canceled"
+                ),
+                None,
+            )
             try:
                 stop_wall_ms = int(
                     datetime.fromisoformat(result.ended_at).timestamp() * 1000
@@ -757,6 +982,16 @@ class BrowserActionService:
                     "within_stop_window": within_window,
                     "page_aligned": alignment.status == "aligned",
                     "later_navigation": later_navigation,
+                    "stream_before_stop": (
+                        before_observation.get("matched_event")
+                        if before_observation
+                        else None
+                    ),
+                    "stream_after_stop": (
+                        after_observation.get("matched_event")
+                        if after_observation
+                        else None
+                    ),
                 }
                 request["experimentCancellationClassification"] = classification[
                     "classification"
@@ -784,23 +1019,151 @@ class BrowserActionService:
             visit(payload)
         return list(artifacts.values())
 
-    async def _capture_flow(
+    def _start_capture_job(
         self, request: CaptureFlowRequest | CaptureBaselineRequest
     ) -> BrowserActionResponse:
         payload = request.payload
-        deadline = Deadline(payload.deadline_ms)
+        session = self._get_session(payload.session_id)
+        if session.get("status") != "open":
+            raise BrowserServiceError("session_closed", "Browser session is not open", 409)
+        deadline = Deadline(payload.job_timeout_ms)
+        experiment_id, experiment_dir, manifest = self.evidence.create_experiment(
+            session_id=payload.session_id,
+            operation=request.operation,
+            objective=payload.objective,
+            deadline=deadline,
+        )
+        manifest.update(
+            {
+                "execution_mode": "job",
+                "job_timeout_ms": payload.job_timeout_ms,
+                "primary_request_matcher": payload.primary_request.model_dump(
+                    mode="json", exclude_none=True
+                ),
+            }
+        )
+        self.evidence.write_manifest(experiment_id, manifest)
+        task = asyncio.create_task(
+            self._run_capture_job(
+                request,
+                deadline=deadline,
+                prepared=(experiment_id, experiment_dir, manifest),
+            ),
+            name=f"browser-experiment-{experiment_id}",
+        )
+        self._jobs[experiment_id] = task
+        task.add_done_callback(lambda _task: self._jobs.pop(experiment_id, None))
+        return BrowserActionResponse(
+            operation=request.operation,
+            status="running",
+            session_id=payload.session_id,
+            experiment_id=experiment_id,
+            result={
+                "experiment": manifest,
+                "manifest_relative_path": (
+                    Path("experiments") / experiment_id / "manifest.json"
+                ).as_posix(),
+                "poll_with": "inspectBrowserEvidence.get_experiment",
+            },
+        )
+
+    async def _run_capture_job(
+        self,
+        request: CaptureFlowRequest | CaptureBaselineRequest,
+        *,
+        deadline: Deadline,
+        prepared: tuple[str, Path, dict[str, Any]],
+    ) -> None:
+        experiment_id = prepared[0]
+        try:
+            await self._capture_flow(
+                request,
+                deadline=deadline,
+                prepared=prepared,
+            )
+        except asyncio.CancelledError:
+            manifest = self.evidence.load_manifest(experiment_id)
+            manifest["status"] = "interrupted"
+            manifest["errors"] = [
+                *(
+                    manifest.get("errors")
+                    if isinstance(manifest.get("errors"), list)
+                    else []
+                ),
+                "Background experiment task was canceled during service shutdown.",
+            ]
+            self.evidence.write_manifest(experiment_id, manifest)
+            raise
+        except Exception as exc:
+            manifest = self.evidence.load_manifest(experiment_id)
+            manifest["status"] = "failed"
+            manifest["errors"] = [
+                *(
+                    manifest.get("errors")
+                    if isinstance(manifest.get("errors"), list)
+                    else []
+                ),
+                str(exc)[:4000],
+            ]
+            self.evidence.write_manifest(experiment_id, manifest)
+
+    async def wait_for_job(self, experiment_id: str) -> None:
+        task = self._jobs.get(experiment_id)
+        if task is not None:
+            await task
+
+    async def _capture_flow(
+        self,
+        request: CaptureFlowRequest | CaptureBaselineRequest,
+        *,
+        deadline: Deadline | None = None,
+        prepared: tuple[str, Path, dict[str, Any]] | None = None,
+    ) -> BrowserActionResponse:
+        payload = request.payload
+        deadline = deadline or Deadline(payload.deadline_ms)
         session_id = payload.session_id
-        async with self._session_lock(session_id):
-            session = self._get_session(session_id)
-            if session.get("status") != "open":
-                raise BrowserServiceError("session_closed", "Browser session is not open", 409)
-            alignment = await self._align_session(session, payload, deadline)
-            experiment_id, experiment_dir, manifest = self.workspace.create_experiment(
+        if prepared is None:
+            experiment_id, experiment_dir, manifest = self.evidence.create_experiment(
                 session_id=session_id,
                 operation=request.operation,
                 objective=payload.objective,
                 deadline=deadline,
             )
+            manifest["execution_mode"] = "sync"
+            manifest["primary_request_matcher"] = payload.primary_request.model_dump(
+                mode="json", exclude_none=True
+            )
+            self.evidence.write_manifest(experiment_id, manifest)
+        else:
+            experiment_id, experiment_dir, manifest = prepared
+        async with self._session_lock(session_id):
+            session = self._get_session(session_id)
+            if session.get("status") != "open":
+                manifest["status"] = "failed"
+                manifest["errors"] = ["Browser session is not open."]
+                self.evidence.write_manifest(experiment_id, manifest)
+                return BrowserActionResponse(
+                    operation=request.operation,
+                    status="failed",
+                    session_id=session_id,
+                    experiment_id=experiment_id,
+                    result={"experiment": manifest},
+                    errors=manifest["errors"],
+                )
+            try:
+                alignment = await self._align_session(session, payload, deadline)
+            except Exception as exc:
+                manifest["status"] = "failed"
+                manifest["errors"] = [str(exc)[:4000]]
+                self.evidence.write_manifest(experiment_id, manifest)
+                return BrowserActionResponse(
+                    operation=request.operation,
+                    status="failed",
+                    session_id=session_id,
+                    experiment_id=experiment_id,
+                    result={"experiment": manifest},
+                    errors=manifest["errors"],
+                )
             manifest["page_alignment"] = asdict(alignment)
             manifest["primary_request_matcher"] = payload.primary_request.model_dump(
                 mode="json", exclude_none=True
@@ -814,11 +1177,13 @@ class BrowserActionService:
             screenshot_paths: list[str] = []
             network_payload: dict[str, Any] = {}
             step_results: list[FlowStepResult] = []
+            wait_observations: list[dict[str, Any]] = []
             errors: list[str] = []
             warnings = list(alignment.warnings)
             trace_started = False
             collector_started = False
             collector_stopped = False
+            last_stream_version = 0
             try:
                 if payload.capture.trace:
                     await self.playwright.start_trace(
@@ -860,7 +1225,7 @@ class BrowserActionService:
                         )
                     except Exception as exc:
                         warnings.append(f"initial screenshot: {str(exc)[:3500]}")
-                for step in payload.flow:
+                for step_index, step in enumerate(payload.flow):
                     self._ensure_finalize_reserve(deadline, f"step {step.step_id}")
                     started = utc_now()
                     try:
@@ -874,8 +1239,27 @@ class BrowserActionService:
                                 session_ref=session_id,
                                 capture_id=capture_id,
                                 condition=step.condition or WaitCondition(type="timeout"),
-                                since_version=0,
+                                since_version=last_stream_version,
                                 deadline=step_deadline,
+                            )
+                            last_stream_version = max(
+                                last_stream_version,
+                                int(result.get("capture_version", 0) or 0),
+                            )
+                            wait_observations.append(
+                                {
+                                    "step_id": step.step_id,
+                                    "step_index": step_index,
+                                    "condition_type": (
+                                        step.condition.type if step.condition else "timeout"
+                                    ),
+                                    "capture_version": result.get("capture_version"),
+                                    "matched_request_ids": result.get(
+                                        "matched_request_ids", []
+                                    ),
+                                    "matched_event": result.get("matched_event"),
+                                    "terminal_status": result.get("terminal_status"),
+                                }
                             )
                             if not result.get("condition_met", True):
                                 raise BrowserServiceError(
@@ -897,7 +1281,7 @@ class BrowserActionService:
                             )
                             raw_snapshot_ref = result.get("snapshot_ref")
                             snapshot_ref = (
-                                self.workspace.relative_path(str(raw_snapshot_ref))
+                                self.evidence.relative_path(str(raw_snapshot_ref))
                                 if raw_snapshot_ref
                                 else None
                             )
@@ -936,8 +1320,25 @@ class BrowserActionService:
                         session_ref=session_id,
                         capture_id=capture_id,
                         condition=payload.wait_for,
-                        since_version=0,
+                        since_version=last_stream_version,
                         deadline=wait_deadline,
+                    )
+                    last_stream_version = max(
+                        last_stream_version,
+                        int(wait_result.get("capture_version", 0) or 0),
+                    )
+                    wait_observations.append(
+                        {
+                            "step_id": "__final_wait__",
+                            "step_index": len(payload.flow),
+                            "condition_type": payload.wait_for.type,
+                            "capture_version": wait_result.get("capture_version"),
+                            "matched_request_ids": wait_result.get(
+                                "matched_request_ids", []
+                            ),
+                            "matched_event": wait_result.get("matched_event"),
+                            "terminal_status": wait_result.get("terminal_status"),
+                        }
                     )
                     final_status_payload = dict(wait_result.get("status_payload") or {})
             except Exception as exc:
@@ -993,6 +1394,7 @@ class BrowserActionService:
                 step_results,
                 primary_requests,
                 alignment,
+                wait_observations,
             )
             capture_summary = (
                 final_status_payload.get("capture")
@@ -1050,7 +1452,7 @@ class BrowserActionService:
                 network_payload,
             )
             for index, screenshot_path in enumerate(screenshot_paths, start=1):
-                descriptor = self.workspace.describe_local_artifact(
+                descriptor = self.evidence.describe_local_artifact(
                     screenshot_path,
                     artifact_id=f"art_{experiment_id}_screenshot_{index}",
                     kind="playwright_screenshot",
@@ -1059,7 +1461,7 @@ class BrowserActionService:
                 if descriptor:
                     artifacts.append(descriptor)
             for index, trace_path in enumerate(trace_paths, start=1):
-                descriptor = self.workspace.describe_local_artifact(
+                descriptor = self.evidence.describe_local_artifact(
                     trace_path,
                     artifact_id=f"art_{experiment_id}_trace_{index}",
                     kind="playwright_trace",
@@ -1070,12 +1472,12 @@ class BrowserActionService:
             relative_screenshot_paths = [
                 relative
                 for path in screenshot_paths
-                if (relative := self.workspace.relative_path(path)) is not None
+                if (relative := self.evidence.relative_path(path)) is not None
             ]
             relative_trace_paths = [
                 relative
                 for path in trace_paths
-                if (relative := self.workspace.relative_path(path)) is not None
+                if (relative := self.evidence.relative_path(path)) is not None
             ]
             manifest.update(
                 {
@@ -1084,6 +1486,7 @@ class BrowserActionService:
                     "steps": [item.model_dump(mode="json") for item in step_results],
                     "stream_capture_id": capture_id,
                     "stream_wait_result": wait_result,
+                    "wait_observations": wait_observations,
                     "collector_integrity": collector_integrity,
                     "primary_request_integrity": primary_integrity,
                     "objective_integrity": objective_integrity,
@@ -1098,7 +1501,7 @@ class BrowserActionService:
                     "errors": errors,
                 }
             )
-            self.workspace.write_manifest(experiment_id, manifest)
+            self.evidence.write_manifest(experiment_id, manifest)
             return BrowserActionResponse(
                 operation=request.operation,
                 status="completed" if objective_ok else "failed",
@@ -1115,22 +1518,27 @@ class BrowserActionService:
             )
 
     async def close(self) -> None:
+        jobs = list(self._jobs.values())
+        for task in jobs:
+            task.cancel()
+        if jobs:
+            await asyncio.gather(*jobs, return_exceptions=True)
         await self.js_reverse.close()
 
 
 def build_browser_service_from_environment() -> BrowserActionService:
-    workspace_root = Path(
-        env_value_from_environment_or_dotenv("WEB_REV_WORKSPACE_DIR")
+    evidence_root = Path(
+        env_value_from_environment_or_dotenv("WEB_REV_EVIDENCE_DIR")
         or "data/analysis-workspace"
     )
-    workspace = WorkspaceStore(workspace_root)
+    evidence = LocalEvidenceStore(evidence_root)
     browser_endpoint = env_value_from_environment_or_dotenv("WEB_REV_BROWSER_CDP_URL")
     playwright = PlaywrightCliAdapter(
         executable=(
             env_value_from_environment_or_dotenv("WEB_REV_PLAYWRIGHT_CLI")
             or "playwright-cli"
         ),
-        cwd=workspace.root,
+        cwd=evidence.root,
     )
     command = (
         env_value_from_environment_or_dotenv("WEB_REV_JS_REVERSE_COMMAND")
@@ -1147,7 +1555,7 @@ def build_browser_service_from_environment() -> BrowserActionService:
     else:
         args = [
             "--allowedRoots",
-            str(workspace.root),
+            str(evidence.root),
             "--streamArtifactRoot",
             "0",
         ]
@@ -1156,13 +1564,13 @@ def build_browser_service_from_environment() -> BrowserActionService:
     transport: McpToolTransport = StdioMcpToolTransport(
         command=command,
         args=args,
-        cwd=workspace.root,
+        cwd=evidence.root,
     )
-    js_reverse = JsReverseMcpAdapter(transport, workspace_root=workspace.root)
+    js_reverse = JsReverseMcpAdapter(transport)
     return BrowserActionService(
         playwright=playwright,
         js_reverse=js_reverse,
-        workspace=workspace,
+        evidence=evidence,
         default_browser_endpoint=browser_endpoint,
         private_mcp_browser_endpoint=browser_endpoint,
         require_private_mcp_endpoint=True,

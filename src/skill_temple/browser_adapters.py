@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -47,6 +48,7 @@ class AlignmentResult:
     status: str
     playwright_page: PageState
     js_reverse_page_index: int | None = None
+    js_reverse_page_id: str | None = None
     js_reverse_page_url: str | None = None
     warnings: list[str] = field(default_factory=list)
 
@@ -74,6 +76,28 @@ class CommandRunner(Protocol):
 
 
 class SubprocessCommandRunner:
+    async def _terminate_tree(self, process: asyncio.subprocess.Process) -> None:
+        if process.returncode is not None:
+            return
+        if os.name == "nt":
+            killer = await asyncio.create_subprocess_exec(
+                "taskkill",
+                "/PID",
+                str(process.pid),
+                "/T",
+                "/F",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await killer.communicate()
+        else:
+            process.kill()
+        try:
+            await asyncio.wait_for(process.communicate(), timeout=5)
+        except TimeoutError:
+            process.kill()
+            await process.communicate()
+
     async def run(
         self,
         argv: list[str],
@@ -83,19 +107,20 @@ class SubprocessCommandRunner:
         allow_failure: bool = False,
     ) -> CommandResult:
         deadline.ensure_remaining("subprocess")
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
         process = await asyncio.create_subprocess_exec(
             *argv,
             cwd=str(cwd) if cwd else None,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            creationflags=creationflags,
         )
         try:
             stdout, stderr = await asyncio.wait_for(
                 process.communicate(), timeout=deadline.remaining_seconds()
             )
         except TimeoutError as exc:
-            process.kill()
-            await process.communicate()
+            await self._terminate_tree(process)
             raise AdapterError(f"Command timed out: {argv[0]} {argv[-1]}") from exc
         result = CommandResult(
             argv=argv,
@@ -630,7 +655,12 @@ class StdioMcpToolTransport:
 
 
 class JsReverseAdapter(Protocol):
-    async def align_page(self, page: PageState, deadline: DeadlineLike) -> AlignmentResult: ...
+    async def align_page(
+        self,
+        page: PageState,
+        deadline: DeadlineLike,
+        page_id: str | None = None,
+    ) -> AlignmentResult: ...
 
     async def start_stream_capture(
         self,
@@ -642,7 +672,13 @@ class JsReverseAdapter(Protocol):
     ) -> dict[str, Any]: ...
 
     async def get_stream_status(
-        self, capture_id: int, deadline: DeadlineLike
+        self,
+        capture_id: int,
+        deadline: DeadlineLike,
+        *,
+        request_id: str | None = None,
+        event_predicate: EventPredicate | None = None,
+        after_event_index: int = -1,
     ) -> dict[str, Any]: ...
 
     async def list_network_requests(
@@ -687,9 +723,8 @@ class JsReverseMcpAdapter:
         }
     )
 
-    def __init__(self, transport: McpToolTransport, *, workspace_root: Path) -> None:
+    def __init__(self, transport: McpToolTransport) -> None:
         self.transport = transport
-        self.workspace_root = workspace_root.resolve()
 
     async def _call(
         self, name: str, arguments: dict[str, Any], deadline: DeadlineLike
@@ -698,9 +733,38 @@ class JsReverseMcpAdapter:
             raise AdapterError(f"MCP tool is not in the private adapter allowlist: {name}")
         return await self.transport.call_tool(name, arguments, deadline)
 
-    async def align_page(self, page: PageState, deadline: DeadlineLike) -> AlignmentResult:
+    async def align_page(
+        self,
+        page: PageState,
+        deadline: DeadlineLike,
+        page_id: str | None = None,
+    ) -> AlignmentResult:
         listing = await self._call("select_page", {"pageSize": 100, "listPageIdx": 0}, deadline)
         pages = listing.get("pages") if isinstance(listing.get("pages"), list) else []
+        if page_id:
+            stable = [item for item in pages if str(item.get("pageId", "")) == page_id]
+            if not stable:
+                return AlignmentResult(
+                    status="not_aligned",
+                    playwright_page=page,
+                    warnings=["The saved js-reverse pageId is no longer available."],
+                )
+            selected = stable[0]
+            if str(selected.get("url", "")) != page.url:
+                return AlignmentResult(
+                    status="not_aligned",
+                    playwright_page=page,
+                    js_reverse_page_id=page_id,
+                    warnings=["The saved pageId now points to a different URL."],
+                )
+            await self._call("select_page", {"pageId": page_id, "pageSize": 100}, deadline)
+            return AlignmentResult(
+                status="aligned",
+                playwright_page=page,
+                js_reverse_page_index=int(selected.get("pageIdx", 0)),
+                js_reverse_page_id=page_id,
+                js_reverse_page_url=str(selected.get("url", "")),
+            )
         indexed = [
             item
             for item in pages
@@ -722,11 +786,17 @@ class JsReverseMcpAdapter:
             )
         selected = candidates[0]
         page_index = int(selected["pageIdx"])
-        await self._call("select_page", {"pageIdx": page_index, "pageSize": 100}, deadline)
+        selected_page_id = str(selected.get("pageId", "")) or None
+        selector = {"pageSize": 100}
+        selector["pageId" if selected_page_id else "pageIdx"] = (
+            selected_page_id if selected_page_id else page_index
+        )
+        await self._call("select_page", selector, deadline)
         return AlignmentResult(
             status="aligned",
             playwright_page=page,
             js_reverse_page_index=page_index,
+            js_reverse_page_id=selected_page_id,
             js_reverse_page_url=str(selected.get("url", "")),
             warnings=(
                 ["Multiple matching pages; selected the first."]
@@ -753,14 +823,47 @@ class JsReverseMcpAdapter:
             arguments["methods"] = [matcher.method]
         if matcher.resource_types:
             arguments["resourceTypes"] = matcher.resource_types
+        if matcher.mime_types:
+            arguments["mimeTypes"] = matcher.mime_types
         return await self._call("start_stream_capture", arguments, deadline)
 
     async def get_stream_status(
-        self, capture_id: int, deadline: DeadlineLike
+        self,
+        capture_id: int,
+        deadline: DeadlineLike,
+        *,
+        request_id: str | None = None,
+        event_predicate: EventPredicate | None = None,
+        after_event_index: int = -1,
     ) -> dict[str, Any]:
+        arguments: dict[str, Any] = {
+            "captureId": capture_id,
+            "pageIdx": 0,
+            "pageSize": 100,
+            "afterEventIndex": after_event_index,
+        }
+        if request_id:
+            arguments["requestId"] = request_id
+        if event_predicate:
+            if event_predicate.type == "exact_data":
+                arguments["eventPredicate"] = {
+                    "type": "exact_data",
+                    "value": str(event_predicate.value),
+                }
+            elif event_predicate.type == "event_name":
+                arguments["eventPredicate"] = {
+                    "type": "event_name",
+                    "value": event_predicate.event_name or "",
+                }
+            elif event_predicate.type == "json_path_equals":
+                arguments["eventPredicate"] = {
+                    "type": "json_path_equals",
+                    "path": event_predicate.path or "",
+                    "value": event_predicate.value,
+                }
         return await self._call(
             "get_stream_status",
-            {"captureId": capture_id, "pageIdx": 0, "pageSize": 100},
+            arguments,
             deadline,
         )
 
@@ -795,76 +898,6 @@ class JsReverseMcpAdapter:
             return False
         return True
 
-    def _artifact_path(self, request: dict[str, Any], kind: str) -> Path | None:
-        artifacts = request.get("coreArtifacts")
-        if not isinstance(artifacts, list):
-            return None
-        descriptor = next(
-            (item for item in artifacts if isinstance(item, dict) and item.get("kind") == kind),
-            None,
-        )
-        if not descriptor:
-            return None
-        relative = descriptor.get("relativePath")
-        if not isinstance(relative, str):
-            return None
-        candidate = (self.workspace_root / Path(relative)).resolve()
-        try:
-            candidate.relative_to(self.workspace_root)
-        except ValueError as exc:
-            raise AdapterError("Stream artifact escaped the workspace root") from exc
-        return candidate
-
-    @staticmethod
-    def _json_path(value: Any, path: str) -> Any:
-        if not path.startswith("$."):
-            return None
-        current = value
-        for segment in path[2:].split("."):
-            if not isinstance(current, dict):
-                return None
-            current = current.get(segment)
-        return current
-
-    def _event_matches(self, event: dict[str, Any], predicate: EventPredicate) -> bool:
-        if predicate.type == "exact_data":
-            return event.get("data") == predicate.value or event.get("dataJson") == predicate.value
-        if predicate.type == "event_name":
-            return event.get("eventName") == predicate.event_name
-        if predicate.type == "json_path_equals":
-            payload = event.get("dataJson")
-            return self._json_path(payload, predicate.path or "") == predicate.value
-        if predicate.type == "network_terminal":
-            return False
-        return False
-
-    def _scan_events(
-        self, requests: list[dict[str, Any]], predicate: EventPredicate
-    ) -> tuple[dict[str, Any] | None, str | None]:
-        for request in requests:
-            path = self._artifact_path(request, "events")
-            if not path or not path.is_file():
-                continue
-            try:
-                with path.open("rb") as handle:
-                    size = path.stat().st_size
-                    start = max(0, size - 256_000)
-                    handle.seek(start)
-                    payload = handle.read(256_000)
-                lines = payload.decode("utf-8", errors="replace").splitlines()
-                if start > 0 and lines:
-                    lines = lines[1:]
-            except OSError:
-                continue
-            for line in reversed(lines[-500:]):
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(event, dict) and self._event_matches(event, predicate):
-                    return event, str(request.get("cdpRequestId", ""))
-        return None, None
-
     async def wait_for_stream_condition(
         self,
         *,
@@ -875,8 +908,23 @@ class JsReverseMcpAdapter:
         deadline: DeadlineLike,
     ) -> StreamWaitResult:
         last_payload: dict[str, Any] = {}
+        after_event_index = -1
         while deadline.remaining_seconds() > 0:
-            payload = await self.get_stream_status(capture_id, deadline)
+            predicate = (
+                condition.predicate
+                if condition.type == "event_predicate"
+                and condition.predicate
+                and condition.predicate.type
+                in {"exact_data", "event_name", "json_path_equals"}
+                else None
+            )
+            payload = await self.get_stream_status(
+                capture_id,
+                deadline,
+                request_id=request_matcher.request_id,
+                event_predicate=predicate,
+                after_event_index=after_event_index,
+            )
             last_payload = payload
             capture = payload.get("capture") if isinstance(payload.get("capture"), dict) else {}
             version = int(capture.get("version", 0) or 0)
@@ -898,6 +946,11 @@ class JsReverseMcpAdapter:
             matched_event: dict[str, Any] | None = None
             if condition.type == "first_event":
                 met = any(int(item.get("rawEventCount", 0)) > 0 for item in requests)
+                for item in requests:
+                    recent = item.get("recentRawEvents")
+                    if isinstance(recent, list) and recent:
+                        matched_event = recent[-1] if isinstance(recent[-1], dict) else None
+                        break
             elif condition.type == "default_done_marker":
                 met = any(bool(item.get("defaultDoneMarkerObserved")) for item in requests)
             elif condition.type == "network_finished":
@@ -918,9 +971,14 @@ class JsReverseMcpAdapter:
                         desired is None or str(desired) == terminal
                     )
                 else:
-                    matched_event, _ = self._scan_events(requests, condition.predicate)
-                    met = matched_event is not None
-            if met and version >= since_version:
+                    candidate = payload.get("eventMatch")
+                    matched_event = candidate if isinstance(candidate, dict) else None
+                    met = bool(matched_event and matched_event.get("matched"))
+                    if matched_event and isinstance(
+                        matched_event.get("matchedEventIndex"), int
+                    ):
+                        after_event_index = int(matched_event["matchedEventIndex"])
+            if met and version > since_version:
                 return StreamWaitResult(
                     condition_met=True,
                     capture_id=capture_id,
