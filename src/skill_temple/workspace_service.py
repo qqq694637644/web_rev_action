@@ -517,6 +517,14 @@ class AnalysisWorkspaceService:
                 f"PowerShell timed out after {timeout}s. stdout={stdout!r} stderr={stderr!r}",
                 408,
             ) from exc
+        except asyncio.CancelledError:
+            cleanup = asyncio.create_task(self._kill_process_tree(process))
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                await cleanup
+            await asyncio.gather(*readers, return_exceptions=True)
+            raise
         await asyncio.gather(*readers, return_exceptions=True)
         stdout_b = b"".join(output_state["stdout"])
         stderr_b = b"".join(output_state["stderr"])
@@ -636,6 +644,15 @@ class AnalysisWorkspaceService:
                     process.stdout.readline() if process.stdout else asyncio.sleep(0, result=b""),
                     timeout=remaining,
                 )
+            except asyncio.CancelledError:
+                cleanup = asyncio.create_task(self._kill_process_tree(process))
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    await cleanup
+                await self._read_stream_capped(process.stdout, 0)
+                await asyncio.gather(stderr_task, return_exceptions=True)
+                raise
             except (TimeoutError, ValueError) as exc:
                 await self._kill_process_tree(process)
                 await self._read_stream_capped(process.stdout, 0)
@@ -694,7 +711,17 @@ class AnalysisWorkspaceService:
                 await self._kill_process_tree(process)
             await self._read_stream_capped(process.stdout, 0)
         else:
-            await process.wait()
+            try:
+                await process.wait()
+            except asyncio.CancelledError:
+                cleanup = asyncio.create_task(self._kill_process_tree(process))
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    await cleanup
+                await self._read_stream_capped(process.stdout, 0)
+                await asyncio.gather(stderr_task, return_exceptions=True)
+                raise
         stderr_b = await stderr_task
         if process.returncode == 2:
             raise WorkspaceToolError(

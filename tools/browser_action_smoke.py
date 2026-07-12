@@ -163,7 +163,7 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
                         "resource_types": ["eventsource"],
                         "mime_types": ["text/event-stream"],
                         "expected_min_matches": 1,
-                        "expected_max_matches": 1,
+                        "expected_max_matches": 2,
                         "allow_supporting_failures": True,
                         "include_in_flight": False,
                     },
@@ -175,7 +175,31 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
                             "timeout_ms": 15_000,
                         },
                         {
-                            "step_id": "run_capture",
+                            "step_id": "run_capture_one",
+                            "action": "click",
+                            "locator": {"css": "#run-capture"},
+                            "timeout_ms": 10_000,
+                        },
+                        {
+                            "step_id": "wait_capture_one_done",
+                            "action": "wait",
+                            "condition": {
+                                "type": "event_predicate",
+                                "request_matcher": {
+                                    "url_contains": "/api/sse",
+                                    "method": "GET",
+                                    "resource_types": ["eventsource"],
+                                    "mime_types": ["text/event-stream"],
+                                },
+                                "predicate": {
+                                    "type": "exact_data",
+                                    "value": "[DONE]",
+                                },
+                                "timeout_ms": 15_000,
+                            },
+                        },
+                        {
+                            "step_id": "run_capture_two",
                             "action": "click",
                             "locator": {"css": "#run-capture"},
                             "timeout_ms": 10_000,
@@ -216,6 +240,16 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
             raise AssertionError(f"Collector did not stop: {health}")
         if health.get("orphan_capture_id") is not None:
             raise AssertionError(f"Orphan capture remained: {health}")
+        waits = manifest.get("wait_observations") or []
+        matched_ids = [
+            str(item["matched_request_ids"][0])
+            for item in waits
+            if isinstance(item, dict) and item.get("matched_request_ids")
+        ]
+        if len(matched_ids) < 2 or len(set(matched_ids[-2:])) != 2:
+            raise AssertionError(
+                f"Sequential waits did not bind to two requests: {waits}"
+            )
         raw = artifact_by_kind(manifest, "raw_bytes")
         events = artifact_by_kind(manifest, "events", "eventsource_events")
         headers = artifact_by_kind(
@@ -283,6 +317,83 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
             raise AssertionError(binary.stdout)
         if f"sha256={expected_sha}" not in binary.stdout:
             raise AssertionError(binary.stdout)
+
+        cancellation_task = asyncio.create_task(
+            service.run(
+                CaptureFlowRequest(
+                    operation="capture_flow",
+                    payload={
+                        "session_id": SESSION_ID,
+                        "objective": "cancel a real slow navigation",
+                        "primary_request": {
+                            "url_contains": "/api/sse",
+                            "method": "GET",
+                            "resource_types": ["eventsource"],
+                            "mime_types": ["text/event-stream"],
+                            "expected_min_matches": 0,
+                            "allow_supporting_failures": True,
+                            "include_in_flight": False,
+                        },
+                        "flow": [
+                            {
+                                "step_id": "cancel_slow_navigation",
+                                "action": "navigate",
+                                "value": f"http://127.0.0.1:{fixture_port}/slow?seconds=10",
+                                "timeout_ms": 20_000,
+                            }
+                        ],
+                        "execution_mode": "sync",
+                        "deadline_ms": 30_000,
+                        "capture": {
+                            "network": False,
+                            "stream": True,
+                            "trace": True,
+                            "screenshots": False,
+                            "scripts": False,
+                        },
+                    },
+                )
+            )
+        )
+        slow_started = server.RequestHandlerClass.slow_started_event
+        for _ in range(200):
+            if slow_started.is_set():
+                break
+            await asyncio.sleep(0.05)
+        if not slow_started.is_set():
+            raise AssertionError("Slow navigation was not observed by the fixture server")
+        cancellation_task.cancel()
+        try:
+            await cancellation_task
+        except asyncio.CancelledError:
+            pass
+        else:
+            raise AssertionError("Slow navigation experiment was not canceled")
+        cancellation_manifests = [
+            path
+            for path in (evidence_root / "experiments").glob("*/manifest.json")
+            if path != manifest_path
+        ]
+        if len(cancellation_manifests) != 1:
+            raise AssertionError(
+                f"Expected one cancellation manifest: {cancellation_manifests}"
+            )
+        cancellation_manifest = json.loads(
+            cancellation_manifests[0].read_text(encoding="utf-8")
+        )
+        if cancellation_manifest.get("status") != "interrupted":
+            raise AssertionError(cancellation_manifest)
+        cancellation_steps = cancellation_manifest.get("steps") or []
+        if not cancellation_steps or cancellation_steps[0].get("status") != (
+            "canceled_outcome_unknown"
+        ):
+            raise AssertionError(cancellation_steps)
+        cancellation_health = cancellation_manifest.get("capture_health") or {}
+        if cancellation_health.get("collector_cleanup") != "completed":
+            raise AssertionError(cancellation_health)
+        if cancellation_health.get("orphan_capture_id") is not None:
+            raise AssertionError(cancellation_health)
+
         closed_response = await service.run(
             CloseSessionRequest(
                 operation="close_session",
@@ -319,6 +430,12 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
                 "collector_started_before_first_mutation"
             ),
             "collector_stopped": health.get("collector_stopped"),
+            "sequential_request_ids": matched_ids[-2:],
+            "cancellation_status": cancellation_manifest.get("status"),
+            "cancellation_step_status": cancellation_steps[0].get("status"),
+            "cancellation_collector_cleanup": cancellation_health.get(
+                "collector_cleanup"
+            ),
             "residual_processes": [],
         }
     finally:

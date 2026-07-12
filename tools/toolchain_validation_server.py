@@ -7,7 +7,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Final
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 SSE_EVENTS: Final[tuple[bytes, ...]] = (
     b'event: message\ndata: {"sequence":1,"value":"alpha"}\n\n',
@@ -19,6 +19,13 @@ SSE_EVENTS: Final[tuple[bytes, ...]] = (
 class ToolchainValidationHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     fixture_root: Path
+    slow_started_event: threading.Event
+
+    def handle(self) -> None:
+        try:
+            super().handle()
+        except (BrokenPipeError, ConnectionResetError):
+            return
 
     def do_GET(self) -> None:  # noqa: N802
         path = urlsplit(self.path).path
@@ -30,6 +37,26 @@ class ToolchainValidationHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/sse":
             self._send_sse()
+            return
+        if path == "/slow":
+            self.slow_started_event.set()
+            query = parse_qs(urlsplit(self.path).query)
+            try:
+                seconds = min(15.0, max(0.0, float(query.get("seconds", ["10"])[0])))
+            except ValueError:
+                seconds = 10.0
+            time.sleep(seconds)
+            body = b"<!doctype html><title>slow navigation completed</title>"
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            self.close_connection = True
             return
         if path == "/health":
             self._send_json({"ok": True})
@@ -108,7 +135,10 @@ def start_server(
     handler_type = type(
         "BoundToolchainValidationHandler",
         (ToolchainValidationHandler,),
-        {"fixture_root": fixture_root},
+        {
+            "fixture_root": fixture_root,
+            "slow_started_event": threading.Event(),
+        },
     )
     server = ThreadingHTTPServer((host, port), handler_type)
     thread = threading.Thread(target=server.serve_forever, name="stage0-fixture", daemon=True)

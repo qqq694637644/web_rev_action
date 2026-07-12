@@ -12,7 +12,7 @@ from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from .browser_models import (
     EventPredicate,
@@ -62,6 +62,22 @@ class AlignmentResult:
 
 
 @dataclass(slots=True)
+class StreamRequestCheckpoint:
+    response_observed: bool = False
+    status: str | None = None
+    terminal_wall_time_ms: float | None = None
+    raw_event_index: int = -1
+    semantic_event_index: int = -1
+    primary_event_source: str = "none"
+
+
+@dataclass(slots=True)
+class StreamCheckpoint:
+    version: int = 0
+    requests: dict[str, StreamRequestCheckpoint] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
 class StreamWaitResult:
     condition_met: bool
     capture_id: int
@@ -69,14 +85,8 @@ class StreamWaitResult:
     matched_request_ids: list[str]
     terminal_status: str | None = None
     matched_event: dict[str, Any] | None = None
-    event_indices: dict[str, int] = field(default_factory=dict)
+    checkpoint: StreamCheckpoint = field(default_factory=StreamCheckpoint)
     status_payload: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass(slots=True)
-class StreamCheckpoint:
-    version: int = 0
-    event_indices: dict[str, int] = field(default_factory=dict)
 
 
 class CommandRunner(Protocol):
@@ -138,6 +148,13 @@ class SubprocessCommandRunner:
             await asyncio.wait_for(process.wait(), timeout=timeout)
         except TimeoutError:
             await self._terminate_tree(process)
+            raise
+        except asyncio.CancelledError:
+            cleanup = asyncio.create_task(self._terminate_tree(process))
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                await cleanup
             raise
         finally:
             await asyncio.gather(*readers, return_exceptions=True)
@@ -622,6 +639,21 @@ class StdioMcpToolTransport:
 
     async def _ensure_started(self) -> None:
         async with self._start_lock:
+            stale_worker = (
+                self._worker_task is not None
+                and (
+                    self._worker_task.done()
+                    or self._ready is None
+                    or self._ready.cancelled()
+                )
+            )
+            if stale_worker:
+                if self._worker_task is not None and not self._worker_task.done():
+                    self._worker_task.cancel()
+                self._queue = None
+                self._worker_task = None
+                self._ready = None
+                self._worker_error = None
             if self._worker_task is None:
                 loop = asyncio.get_running_loop()
                 self._generation += 1
@@ -642,6 +674,7 @@ class StdioMcpToolTransport:
     async def _run_worker(self) -> None:
         ready = self._ready
         queue = self._queue
+        generation = self._generation
         if ready is None or queue is None:
             return
         try:
@@ -705,7 +738,8 @@ class StdioMcpToolTransport:
                         if not call.future.cancelled():
                             call.future.set_result(parsed)
         except BaseException as exc:
-            self._worker_error = exc
+            if generation == self._generation:
+                self._worker_error = exc
             if not ready.done():
                 if isinstance(exc, asyncio.CancelledError):
                     ready.cancel()
@@ -778,6 +812,15 @@ class StdioMcpToolTransport:
             if name in self.SIDE_EFFECTING_TOOLS:
                 await self._abort_worker()
             raise AdapterError(f"MCP tool timed out: {name}") from exc
+        except asyncio.CancelledError:
+            future.cancel()
+            if name in self.SIDE_EFFECTING_TOOLS:
+                cleanup = asyncio.create_task(self._abort_worker())
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    await cleanup
+            raise
 
     async def _abort_worker(self) -> None:
         async with self._start_lock:
@@ -833,6 +876,7 @@ class JsReverseAdapter(Protocol):
         request_id: str | None = None,
         event_predicate: EventPredicate | None = None,
         after_event_index: int = -1,
+        event_source: Literal["raw-stream", "eventsource"] | None = None,
     ) -> dict[str, Any]: ...
 
     async def list_network_requests(
@@ -989,6 +1033,7 @@ class JsReverseMcpAdapter:
         request_id: str | None = None,
         event_predicate: EventPredicate | None = None,
         after_event_index: int = -1,
+        event_source: Literal["raw-stream", "eventsource"] | None = None,
     ) -> dict[str, Any]:
         def arguments_for(page_idx: int) -> dict[str, Any]:
             arguments: dict[str, Any] = {
@@ -999,6 +1044,8 @@ class JsReverseMcpAdapter:
             }
             if request_id:
                 arguments["requestId"] = request_id
+            if event_source:
+                arguments["eventSource"] = event_source
             if event_predicate:
                 if event_predicate.type == "exact_data":
                     arguments["eventPredicate"] = {
@@ -1019,11 +1066,15 @@ class JsReverseMcpAdapter:
             return arguments
 
         if request_id:
-            return await self._call(
+            payload = await self._call(
                 "get_stream_status",
                 arguments_for(0),
                 deadline,
             )
+            request = payload.get("request")
+            if isinstance(request, dict) and not isinstance(payload.get("requests"), list):
+                payload = {**payload, "requests": [request]}
+            return payload
 
         page_idx = 0
         combined: dict[str, Any] = {}
@@ -1071,14 +1122,56 @@ class JsReverseMcpAdapter:
         matcher: RequestMatcher,
         deadline: DeadlineLike,
     ) -> dict[str, Any]:
-        arguments: dict[str, Any] = {"pageIdx": 0, "pageSize": 100}
-        if matcher.url_contains:
-            arguments["urlFilter"] = matcher.url_contains
-        if matcher.method:
-            arguments["methods"] = [matcher.method]
-        if matcher.resource_types:
-            arguments["resourceTypes"] = matcher.resource_types
-        return await self._call("list_network_requests", arguments, deadline)
+        def arguments_for(page_idx: int) -> dict[str, Any]:
+            arguments: dict[str, Any] = {"pageIdx": page_idx, "pageSize": 100}
+            if matcher.url_contains:
+                arguments["urlFilter"] = matcher.url_contains
+            if matcher.method:
+                arguments["methods"] = [matcher.method]
+            if matcher.resource_types:
+                arguments["resourceTypes"] = matcher.resource_types
+            return arguments
+
+        page_idx = 0
+        combined: dict[str, Any] = {}
+        requests: list[dict[str, Any]] = []
+        while True:
+            page = await self._call(
+                "list_network_requests",
+                arguments_for(page_idx),
+                deadline,
+            )
+            if not combined:
+                combined = {
+                    key: value
+                    for key, value in page.items()
+                    if key not in {"requests", "pagination"}
+                }
+            page_requests = page.get("requests")
+            if isinstance(page_requests, list):
+                requests.extend(
+                    item for item in page_requests if isinstance(item, dict)
+                )
+            pagination = (
+                page.get("pagination")
+                if isinstance(page.get("pagination"), dict)
+                else {}
+            )
+            if not pagination.get("hasNextPage"):
+                break
+            page_idx += 1
+            if page_idx >= int(pagination.get("totalPages", page_idx + 1)):
+                break
+        combined["requests"] = requests
+        combined["pagination"] = {
+            "pageIdx": 0,
+            "pageSize": 100,
+            "totalItems": len(requests),
+            "totalPages": max(1, page_idx + 1),
+            "hasNextPage": False,
+            "hasPreviousPage": False,
+        }
+        return combined
 
     @staticmethod
     def _request_matches(request: dict[str, Any], matcher: RequestMatcher) -> bool:
@@ -1106,10 +1199,18 @@ class JsReverseMcpAdapter:
         )
 
     @staticmethod
-    def _last_event_index(request: dict[str, Any]) -> int:
-        raw_count = int(request.get("rawEventCount", 0) or 0)
-        semantic_count = int(request.get("semanticEventCount", 0) or 0)
-        return max(raw_count, semantic_count) - 1
+    def _request_checkpoint(request: dict[str, Any]) -> StreamRequestCheckpoint:
+        ended = request.get("endedWallTimeMs")
+        return StreamRequestCheckpoint(
+            response_observed=bool(request.get("responseObserved")),
+            status=(str(request.get("status")) if request.get("status") else None),
+            terminal_wall_time_ms=(
+                float(ended) if isinstance(ended, (int, float)) else None
+            ),
+            raw_event_index=int(request.get("rawEventCount", 0) or 0) - 1,
+            semantic_event_index=int(request.get("semanticEventCount", 0) or 0) - 1,
+            primary_event_source=str(request.get("primaryEventSource") or "none"),
+        )
 
     @classmethod
     def _event_match_belongs_to_request(
@@ -1134,17 +1235,48 @@ class JsReverseMcpAdapter:
         matcher: RequestMatcher,
     ) -> StreamCheckpoint:
         capture = payload.get("capture") if isinstance(payload.get("capture"), dict) else {}
-        indices: dict[str, int] = {}
+        requests: dict[str, StreamRequestCheckpoint] = {}
         for request in payload.get("requests", []):
             if not isinstance(request, dict) or not cls._request_matches(request, matcher):
                 continue
             request_id = cls._request_id(request)
             if request_id:
-                indices[request_id] = cls._last_event_index(request)
+                requests[request_id] = cls._request_checkpoint(request)
         return StreamCheckpoint(
             version=int(capture.get("version", 0) or 0),
-            event_indices=indices,
+            requests=requests,
         )
+
+    @staticmethod
+    def _terminal_transition(
+        current: StreamRequestCheckpoint,
+        previous: StreamRequestCheckpoint | None,
+        desired: set[str],
+    ) -> bool:
+        if current.status not in desired:
+            return False
+        if previous is None or previous.status != current.status:
+            return True
+        if current.terminal_wall_time_ms is None:
+            return False
+        return (
+            previous.terminal_wall_time_ms is None
+            or current.terminal_wall_time_ms > previous.terminal_wall_time_ms
+        )
+
+    @staticmethod
+    def _advanced_event_sources(
+        current: StreamRequestCheckpoint,
+        previous: StreamRequestCheckpoint | None,
+    ) -> list[tuple[Literal["raw-stream", "eventsource"], int]]:
+        prior_raw = previous.raw_event_index if previous else -1
+        prior_semantic = previous.semantic_event_index if previous else -1
+        sources: list[tuple[Literal["raw-stream", "eventsource"], int]] = []
+        if current.raw_event_index > prior_raw:
+            sources.append(("raw-stream", prior_raw))
+        if current.semantic_event_index > prior_semantic:
+            sources.append(("eventsource", prior_semantic))
+        return sources
 
     async def wait_for_stream_condition(
         self,
@@ -1170,101 +1302,165 @@ class JsReverseMcpAdapter:
                 for item in payload.get("requests", [])
                 if isinstance(item, dict) and self._request_matches(item, request_matcher)
             ]
-            request_ids = [self._request_id(item) for item in requests if self._request_id(item)]
-            event_indices = {
-                request_id: self._last_event_index(item)
+            current_checkpoint = self.checkpoint_from_status(payload, request_matcher)
+            request_by_id = {
+                request_id: item
                 for item in requests
                 if (request_id := self._request_id(item))
             }
-            terminal = next(
-                (
-                    str(item.get("status"))
-                    for item in requests
-                    if item.get("status") in {"finished", "canceled", "failed", "stopped"}
-                ),
-                None,
-            )
             met = False
             matched_event: dict[str, Any] | None = None
+            matched_request_ids: list[str] = []
+            terminal_status: str | None = None
             if condition.type == "first_event":
-                met = any(
-                    event_indices.get(request_id, -1)
-                    > checkpoint.event_indices.get(request_id, -1)
-                    for request_id in request_ids
-                )
+                matched_request_ids = [
+                    request_id
+                    for request_id, current in current_checkpoint.requests.items()
+                    if self._advanced_event_sources(
+                        current,
+                        checkpoint.requests.get(request_id),
+                    )
+                ]
+                met = bool(matched_request_ids)
             elif condition.type == "default_done_marker":
-                for request in requests:
-                    request_id = self._request_id(request)
-                    if not request_id:
-                        continue
-                    prior_index = checkpoint.event_indices.get(request_id, -1)
-                    if event_indices.get(request_id, -1) <= prior_index:
-                        continue
-                    candidate_payload = await self.get_stream_status(
-                        capture_id,
-                        deadline,
-                        request_id=request_id,
-                        event_predicate=ExactDataPredicate(
-                            type="exact_data",
-                            value="[DONE]",
-                        ),
-                        after_event_index=prior_index,
-                    )
-                    candidate = candidate_payload.get("eventMatch")
-                    if self._event_match_belongs_to_request(candidate, request):
-                        matched_event = candidate
-                        met = True
-                        last_payload = candidate_payload
-                        request_ids = [request_id]
-                        break
-            elif condition.type == "network_finished":
-                met = any(item.get("status") == "finished" for item in requests)
-            elif condition.type == "network_canceled":
-                met = any(item.get("status") == "canceled" for item in requests)
-            elif condition.type == "failed":
-                met = any(item.get("status") == "failed" for item in requests)
-            elif condition.type in {"request_observed", "response_observed"}:
-                met = bool(requests) and (
-                    condition.type == "request_observed"
-                    or any(bool(item.get("responseObserved")) for item in requests)
-                )
-            elif condition.type == "event_predicate" and condition.predicate:
-                if condition.predicate.type == "network_terminal":
-                    desired = condition.predicate.value
-                    met = bool(terminal) and (
-                        desired is None or str(desired) == terminal
-                    )
-                else:
-                    for request in requests:
-                        request_id = self._request_id(request)
-                        if not request_id:
-                            continue
-                        prior_index = checkpoint.event_indices.get(request_id, -1)
-                        if event_indices.get(request_id, -1) <= prior_index:
-                            continue
+                for request_id, request in request_by_id.items():
+                    current = current_checkpoint.requests[request_id]
+                    previous = checkpoint.requests.get(request_id)
+                    for source, prior_index in self._advanced_event_sources(
+                        current, previous
+                    ):
                         candidate_payload = await self.get_stream_status(
                             capture_id,
                             deadline,
                             request_id=request_id,
-                            event_predicate=condition.predicate,
+                            event_predicate=ExactDataPredicate(
+                                type="exact_data",
+                                value="[DONE]",
+                            ),
                             after_event_index=prior_index,
+                            event_source=source,
                         )
                         candidate = candidate_payload.get("eventMatch")
                         if self._event_match_belongs_to_request(candidate, request):
                             matched_event = candidate
+                            matched_request_ids = [request_id]
                             met = True
                             last_payload = candidate_payload
-                            request_ids = [request_id]
                             break
-            if met and version > checkpoint.version:
+                    if met:
+                        break
+            elif condition.type == "network_finished":
+                matched_request_ids = [
+                    request_id
+                    for request_id, current in current_checkpoint.requests.items()
+                    if self._terminal_transition(
+                        current,
+                        checkpoint.requests.get(request_id),
+                        {"finished"},
+                    )
+                ]
+                met = bool(matched_request_ids)
+                terminal_status = "finished" if met else None
+            elif condition.type == "network_canceled":
+                matched_request_ids = [
+                    request_id
+                    for request_id, current in current_checkpoint.requests.items()
+                    if self._terminal_transition(
+                        current,
+                        checkpoint.requests.get(request_id),
+                        {"canceled"},
+                    )
+                ]
+                met = bool(matched_request_ids)
+                terminal_status = "canceled" if met else None
+            elif condition.type == "failed":
+                matched_request_ids = [
+                    request_id
+                    for request_id, current in current_checkpoint.requests.items()
+                    if self._terminal_transition(
+                        current,
+                        checkpoint.requests.get(request_id),
+                        {"failed"},
+                    )
+                ]
+                met = bool(matched_request_ids)
+                terminal_status = "failed" if met else None
+            elif condition.type == "request_observed":
+                matched_request_ids = [
+                    request_id
+                    for request_id in current_checkpoint.requests
+                    if request_id not in checkpoint.requests
+                ]
+                met = bool(matched_request_ids)
+            elif condition.type == "response_observed":
+                matched_request_ids = [
+                    request_id
+                    for request_id, current in current_checkpoint.requests.items()
+                    if current.response_observed
+                    and not (
+                        checkpoint.requests.get(request_id)
+                        and checkpoint.requests[request_id].response_observed
+                    )
+                ]
+                met = bool(matched_request_ids)
+            elif condition.type == "event_predicate" and condition.predicate:
+                if condition.predicate.type == "network_terminal":
+                    desired = condition.predicate.value
+                    desired_statuses = (
+                        {str(desired)}
+                        if desired is not None
+                        else {"finished", "canceled", "failed", "stopped"}
+                    )
+                    matched_request_ids = [
+                        request_id
+                        for request_id, current in current_checkpoint.requests.items()
+                        if self._terminal_transition(
+                            current,
+                            checkpoint.requests.get(request_id),
+                            desired_statuses,
+                        )
+                    ]
+                    met = bool(matched_request_ids)
+                    statuses = {
+                        current_checkpoint.requests[request_id].status
+                        for request_id in matched_request_ids
+                    }
+                    terminal_status = (
+                        next(iter(statuses)) if len(statuses) == 1 else None
+                    )
+                else:
+                    for request_id, request in request_by_id.items():
+                        current = current_checkpoint.requests[request_id]
+                        previous = checkpoint.requests.get(request_id)
+                        for source, prior_index in self._advanced_event_sources(
+                            current, previous
+                        ):
+                            candidate_payload = await self.get_stream_status(
+                                capture_id,
+                                deadline,
+                                request_id=request_id,
+                                event_predicate=condition.predicate,
+                                after_event_index=prior_index,
+                                event_source=source,
+                            )
+                            candidate = candidate_payload.get("eventMatch")
+                            if self._event_match_belongs_to_request(candidate, request):
+                                matched_event = candidate
+                                matched_request_ids = [request_id]
+                                met = True
+                                last_payload = candidate_payload
+                                break
+                        if met:
+                            break
+            if met:
                 return StreamWaitResult(
                     condition_met=True,
                     capture_id=capture_id,
                     capture_version=version,
-                    matched_request_ids=request_ids,
-                    terminal_status=terminal,
+                    matched_request_ids=matched_request_ids,
+                    terminal_status=terminal_status,
                     matched_event=matched_event,
-                    event_indices=event_indices,
+                    checkpoint=current_checkpoint,
                     status_payload=payload,
                 )
             await asyncio.sleep(min(0.2, max(0.01, deadline.remaining_seconds())))
@@ -1273,7 +1469,7 @@ class JsReverseMcpAdapter:
             capture_id=capture_id,
             capture_version=int((last_payload.get("capture") or {}).get("version", 0) or 0),
             matched_request_ids=[],
-            event_indices={},
+            checkpoint=self.checkpoint_from_status(last_payload, request_matcher),
             status_payload=last_payload,
         )
 

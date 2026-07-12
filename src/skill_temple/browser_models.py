@@ -437,7 +437,13 @@ InspectBrowserEvidenceRequest = Annotated[
 
 class FlowStepResult(StrictModel):
     step_id: str
-    status: Literal["completed", "failed", "skipped", "timed_out"]
+    status: Literal[
+        "completed",
+        "failed",
+        "skipped",
+        "timed_out",
+        "canceled_outcome_unknown",
+    ]
     started_at: str
     ended_at: str
     snapshot_ref: str | None = None

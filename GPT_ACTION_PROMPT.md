@@ -74,13 +74,15 @@ Capture 请求不要传 target.start_url。需要观察页面初始化时，把 
 
 primary_request 必须明确 url、method、resource_types 和 mime_types。事件正文谓词由 collector 内部匹配；不要为了等待条件把整个 events.jsonl 塞回 Action。
 
-根据目标声明 requirements：require_raw_capture、require_semantic_parse、require_request_snapshot 和 require_artifacts。每次页面变更前后端会建立 stream checkpoint；不要假设旧 `[DONE]`、旧 event name 或旧 JSON 事件可以满足新一轮等待。`request_log_stable` 只表示请求日志输出短时间不变化，不等同于真正的网络空闲。
+根据目标声明 requirements：require_raw_capture、require_semantic_parse、require_request_snapshot 和 require_artifacts。每次页面变更前后端会为每个 request 保存 response/status/terminal time 与 raw、semantic 双游标；不要假设旧终态、旧 `[DONE]` 或 supporting stream 可以满足新一轮等待。`request_log_stable` 只表示请求日志输出短时间不变化，不等同于真正的网络空闲。
 
 执行结果和 get_experiment 只返回有界摘要以及 manifest_relative_path。实验结束后，用 workspaceReadFiles 读取完整 manifest，再用 workspaceInspect 查看 experiment 目录和相关文件。文本搜索使用 workspaceSearch，多文件按行读取使用 workspaceReadFiles。写报告或 schema 使用 workspaceWriteFile / workspaceApplyPatch。raw.bin、Base64、压缩数据、JSONL 批处理和 replay 脚本使用 workspaceExecPwsh。
 
 不要修改 `sessions/`、experiment `manifest.json`、`js-reverse/` 或 `playwright/`。派生分析只能写到 experiment 的 `reports/`、`derived/`、`replay/`，或顶层 `reports/`、`scripts/`。experiment 为 running 时不要调用任何 workspace 写入或 PowerShell。
 
-同一 session 一次只能运行一个后台 experiment；遇到 `session_busy` 时查询现有 experiment，不要重复提交。网络命令过滤只是 best-effort，不要把 `WEB_REV_WORKSPACE_ALLOW_NETWORK=false` 理解为安全沙箱。
+全局一次只能运行一个 experiment。遇到 `session_busy` 时查询该 session 的已有 experiment；遇到 `browser_busy` 时查询当前活动 experiment，不要排队或重复提交。网络命令过滤只是 best-effort，不要把 `WEB_REV_WORKSPACE_ALLOW_NETWORK=false` 理解为安全沙箱。
+
+若 step 状态为 `canceled_outcome_unknown`，只能说明本地命令进程树已终止且后续 step 未执行；不能断言已经发送到页面的副作用未发生，也不要自动重试。
 
 判断结果时优先查看 objective_integrity 和 primary_request_integrity；objective_integrity 可能是 complete、partial 或 failed。collector_integrity 是整体诊断，可能被无关遥测请求拖低。rawCaptureIntegrity、semanticParseIntegrity、requestSnapshotIntegrity 和 artifactIntegrity 必须分开理解。stream 实验中普通 network summary 不能替代 primary stream evidence。
 

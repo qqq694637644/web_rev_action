@@ -102,7 +102,7 @@ GPT 不直接协调 start、click、wait、stop。
 
 Capture 阶段禁止 `target.start_url`。需要观察页面初始化请求、重定向、首屏脚本或初始 SSE 时，必须把导航写成 flow 的第一个显式 `navigate` step。这样 running manifest、Trace 和 stream collector 都会在导航前创建。
 
-`target.page_index` 默认是 `null`，表示复用 session 已选择的 tab；只有显式传值时才切换。所有 open/capture/close 操作通过进程级 browser lock 串行化，因为当前私有 `js-reverse-mcp` 只有一个全局选中页面。
+`target.page_index` 默认是 `null`，表示复用 session 已选择的 tab；只有显式传值时才切换。当前部署共享一个浏览器和一个私有 MCP，因此全局同时只允许一个活动实验，不排队第二个实验。
 
 ### `inspectBrowserEvidence`
 
@@ -119,7 +119,7 @@ get_stream_status
 
 执行 endpoint 和 `get_experiment` 只返回有界实验摘要及 `manifest_relative_path`。完整 manifest、network summary、requests 和 artifact 索引通过 `workspaceReadFiles` 读取。
 
-Stream status 会自动读取全部分页，并在执行 event predicate 前锁定具体 primary request ID；`matchedRequestId` 不属于该 request 时不会满足等待。一个 session 同时只允许一个后台 experiment，重复提交返回 `409 session_busy`。
+Stream 和普通 network status 都会读取全部分页，并在执行 event predicate 前锁定具体 primary request ID；`matchedRequestId` 不属于该 request 时不会满足等待。同一 session 重复提交返回 `409 session_busy`，其他 session 遇到活动实验返回 `409 browser_busy`。
 
 ## Background job
 
@@ -226,7 +226,9 @@ selector_state
 
 正文谓词由 `js-reverse-mcp` collector 在完整事件文件中匹配。MCP 只返回匹配索引和 request ID，不把事件正文塞回 Action。
 
-每个会改变页面或请求状态的动作前，后端记录 capture version 和每个 request 的最后 event index。后续 wait 只匹配 checkpoint 之后的事件，上一轮消息的 `[DONE]` 不会立即满足下一轮等待。`first_event` 同时接受 raw event 和 EventSource semantic mirror。
+每个会改变页面或请求状态的动作前，后端记录每个 request 的 response 状态、terminal wall time、raw event index 和 semantic event index。后续 wait 只匹配 checkpoint 后新出现或发生状态转换的 request/event；raw 与 EventSource semantic mirror 使用独立游标和 source-specific offset。
+
+取消执行型 step 时会终止本地 Playwright 进程树并停止后续 step，但已经送达页面的 click、navigate 或 upload 无法通用回滚。该 step 在 manifest 中标记为 `canceled_outcome_unknown`，不会自动重试。
 
 Objective 可以分别声明：
 

@@ -23,6 +23,7 @@ from .browser_adapters import (
     PlaywrightCliAdapter,
     StdioMcpToolTransport,
     StreamCheckpoint,
+    StreamRequestCheckpoint,
 )
 from .browser_models import (
     BrowserActionResponse,
@@ -304,6 +305,8 @@ class BrowserActionService:
         self._browser_lock = asyncio.Lock()
         self._jobs: dict[str, asyncio.Task[None]] = {}
         self._active_session_jobs: dict[str, str] = {}
+        self._active_browser_experiment_id: str | None = None
+        self._active_browser_session_id: str | None = None
 
     def _session_lock(self, session_id: str) -> asyncio.Lock:
         return self._session_locks.setdefault(session_id, asyncio.Lock())
@@ -350,6 +353,33 @@ class BrowserActionService:
             self._active_session_jobs.pop(session_id, None)
             return None
         return experiment_id
+
+    def _assert_browser_idle(self) -> None:
+        if self._active_browser_experiment_id is None:
+            return
+        raise BrowserServiceError(
+            "browser_busy",
+            "The shared browser already has an active experiment: "
+            f"{self._active_browser_experiment_id} "
+            f"(session {self._active_browser_session_id}).",
+            409,
+        )
+
+    def _reserve_browser_experiment(
+        self,
+        *,
+        session_id: str,
+        experiment_id: str,
+    ) -> None:
+        self._assert_browser_idle()
+        self._active_browser_experiment_id = experiment_id
+        self._active_browser_session_id = session_id
+
+    def _release_browser_experiment(self, experiment_id: str) -> None:
+        if self._active_browser_experiment_id != experiment_id:
+            return
+        self._active_browser_experiment_id = None
+        self._active_browser_session_id = None
 
     @staticmethod
     def _manifest_relative_path(experiment_id: str) -> str:
@@ -425,23 +455,50 @@ class BrowserActionService:
 
     async def run(self, request: RunBrowserExperimentRequest) -> BrowserActionResponse:
         if isinstance(request, OpenSessionRequest):
+            self._assert_browser_idle()
             return await self._open_session(request)
         if isinstance(request, CloseSessionRequest):
+            self._assert_browser_idle()
             return await self._close_session(request)
         if isinstance(request, (CaptureFlowRequest, CaptureBaselineRequest)):
-            active_experiment = self._active_job_for_session(
+            active_session_experiment = self._active_job_for_session(
                 request.payload.session_id
             )
-            if active_experiment is not None:
+            if active_session_experiment is not None:
                 raise BrowserServiceError(
                     "session_busy",
                     "The browser session already has an active background experiment: "
-                    f"{active_experiment}",
+                    f"{active_session_experiment}",
                     409,
                 )
+            self._assert_browser_idle()
             if request.payload.execution_mode == "job":
                 return self._start_capture_job(request)
-            return await self._capture_flow(request)
+            payload = request.payload
+            deadline = Deadline(payload.deadline_ms)
+            experiment_id, experiment_dir, manifest = self.experiments.create_experiment(
+                session_id=payload.session_id,
+                operation=request.operation,
+                objective=payload.objective,
+                deadline=deadline,
+            )
+            manifest["execution_mode"] = "sync"
+            manifest["primary_request_matcher"] = payload.primary_request.model_dump(
+                mode="json", exclude_none=True
+            )
+            self.experiments.write_manifest(experiment_id, manifest)
+            self._reserve_browser_experiment(
+                session_id=payload.session_id,
+                experiment_id=experiment_id,
+            )
+            try:
+                return await self._capture_flow(
+                    request,
+                    deadline=deadline,
+                    prepared=(experiment_id, experiment_dir, manifest),
+                )
+            finally:
+                self._release_browser_experiment(experiment_id)
         raise BrowserServiceError("unsupported_operation", "Unsupported browser operation", 400)
 
     async def inspect(self, request: InspectBrowserEvidenceRequest) -> BrowserActionResponse:
@@ -715,6 +772,59 @@ class BrowserActionService:
         status = await self.js_reverse.get_stream_status(capture_id, deadline)
         return JsReverseMcpAdapter.checkpoint_from_status(status, matcher)
 
+    @staticmethod
+    def _checkpoint_from_wait_result(
+        result: dict[str, Any],
+        fallback: StreamCheckpoint,
+    ) -> StreamCheckpoint:
+        value = result.get("checkpoint")
+        if not isinstance(value, dict):
+            return fallback
+        requests_value = value.get("requests")
+        requests: dict[str, StreamRequestCheckpoint] = {}
+        if isinstance(requests_value, dict):
+            for request_id, request_value in requests_value.items():
+                if not isinstance(request_value, dict):
+                    continue
+                requests[str(request_id)] = StreamRequestCheckpoint(
+                    response_observed=bool(
+                        request_value.get("response_observed", False)
+                    ),
+                    status=(
+                        str(request_value["status"])
+                        if request_value.get("status") is not None
+                        else None
+                    ),
+                    terminal_wall_time_ms=(
+                        float(request_value["terminal_wall_time_ms"])
+                        if isinstance(
+                            request_value.get("terminal_wall_time_ms"),
+                            (int, float),
+                        )
+                        else None
+                    ),
+                    raw_event_index=(
+                        int(request_value["raw_event_index"])
+                        if isinstance(request_value.get("raw_event_index"), int)
+                        else -1
+                    ),
+                    semantic_event_index=(
+                        int(request_value["semantic_event_index"])
+                        if isinstance(request_value.get("semantic_event_index"), int)
+                        else -1
+                    ),
+                    primary_event_source=str(
+                        request_value.get("primary_event_source") or "none"
+                    ),
+                )
+        return StreamCheckpoint(
+            version=max(
+                fallback.version,
+                int(value.get("version", result.get("capture_version", 0)) or 0),
+            ),
+            requests=requests or fallback.requests,
+        )
+
     def _ensure_finalize_reserve(self, deadline: Deadline, operation: str) -> None:
         if deadline.remaining_ms() <= self.FINALIZE_RESERVE_MS:
             raise BrowserServiceError(
@@ -973,6 +1083,10 @@ class BrowserActionService:
             }
         )
         self.experiments.write_manifest(experiment_id, manifest)
+        self._reserve_browser_experiment(
+            session_id=payload.session_id,
+            experiment_id=experiment_id,
+        )
         task = asyncio.create_task(
             self._run_capture_job(
                 request,
@@ -988,6 +1102,7 @@ class BrowserActionService:
             self._jobs.pop(experiment_id, None)
             if self._active_session_jobs.get(payload.session_id) == experiment_id:
                 self._active_session_jobs.pop(payload.session_id, None)
+            self._release_browser_experiment(experiment_id)
 
         task.add_done_callback(clear_job)
         return BrowserActionResponse(
@@ -1186,6 +1301,22 @@ class BrowserActionService:
                 )
             try:
                 alignment = await self._align_session(session, payload, deadline)
+            except asyncio.CancelledError as exc:
+                manifest["status"] = "interrupted"
+                manifest["errors"] = [
+                    "Experiment was canceled during page alignment before flow execution."
+                ]
+                manifest["interrupted_at"] = utc_now()
+                manifest["updated_at"] = utc_now()
+                write_task = asyncio.create_task(
+                    asyncio.to_thread(
+                        self.experiments.write_manifest,
+                        experiment_id,
+                        manifest,
+                    )
+                )
+                await asyncio.shield(write_task)
+                raise exc
             except Exception as exc:
                 manifest["status"] = "failed"
                 manifest["errors"] = [str(exc)[:4000]]
@@ -1208,6 +1339,9 @@ class BrowserActionService:
                 mode="json", exclude_none=True
             )
             capture_id: int | None = None
+            capture_uuid: str | None = None
+            capture_relative_dir: str | None = None
+            capture_metadata_artifact_id: str | None = None
             start_payload: dict[str, Any] = {}
             final_status_payload: dict[str, Any] = {}
             stop_payload: dict[str, Any] = {}
@@ -1252,6 +1386,23 @@ class BrowserActionService:
                             "stream_start_invalid", "Stream collector returned no capture ID", 502
                         )
                     capture_id = int(capture["captureId"])
+                    capture_uuid = (
+                        str(capture["captureUuid"])
+                        if capture.get("captureUuid")
+                        else None
+                    )
+                    capture_relative_dir = (
+                        str(capture["relativeDir"])
+                        if capture.get("relativeDir")
+                        else None
+                    )
+                    metadata_artifact = capture.get("metadataArtifact")
+                    if isinstance(metadata_artifact, dict) and metadata_artifact.get(
+                        "artifactId"
+                    ):
+                        capture_metadata_artifact_id = str(
+                            metadata_artifact["artifactId"]
+                        )
                     collector_started = True
                     collector_start_wall_time_ms = int(
                         capture.get("captureArmedWallTimeMs") or time.time() * 1000
@@ -1311,17 +1462,9 @@ class BrowserActionService:
                                 checkpoint=stream_checkpoint,
                                 deadline=step_deadline,
                             )
-                            stream_checkpoint = StreamCheckpoint(
-                                version=max(
-                                    stream_checkpoint.version,
-                                    int(result.get("capture_version", 0) or 0),
-                                ),
-                                event_indices={
-                                    str(key): int(value)
-                                    for key, value in (
-                                        result.get("event_indices") or {}
-                                    ).items()
-                                },
+                            stream_checkpoint = self._checkpoint_from_wait_result(
+                                result,
+                                stream_checkpoint,
                             )
                             wait_observations.append(
                                 {
@@ -1371,6 +1514,21 @@ class BrowserActionService:
                                 snapshot_ref=snapshot_ref,
                             )
                         )
+                    except asyncio.CancelledError:
+                        step_results.append(
+                            FlowStepResult(
+                                step_id=step.step_id,
+                                status="canceled_outcome_unknown",
+                                started_at=started,
+                                ended_at=utc_now(),
+                                error=(
+                                    "The local command was canceled and its process tree was "
+                                    "terminated. A side effect already delivered to the page "
+                                    "cannot be rolled back generically."
+                                ),
+                            )
+                        )
+                        raise
                     except Exception as exc:
                         timed_out = isinstance(exc, BrowserServiceError) and exc.code in {
                             "deadline_exceeded",
@@ -1400,17 +1558,9 @@ class BrowserActionService:
                         checkpoint=stream_checkpoint,
                         deadline=wait_deadline,
                     )
-                    stream_checkpoint = StreamCheckpoint(
-                        version=max(
-                            stream_checkpoint.version,
-                            int(wait_result.get("capture_version", 0) or 0),
-                        ),
-                        event_indices={
-                            str(key): int(value)
-                            for key, value in (
-                                wait_result.get("event_indices") or {}
-                            ).items()
-                        },
+                    stream_checkpoint = self._checkpoint_from_wait_result(
+                        wait_result,
+                        stream_checkpoint,
                     )
                     wait_observations.append(
                         {
@@ -1596,6 +1746,10 @@ class BrowserActionService:
                     "not_required" if not payload.capture.stream else "unknown",
                 ),
                 "orphan_capture_id": cleanup_result.get("orphan_capture_id"),
+                "capture_uuid": capture_uuid,
+                "capture_relative_dir": capture_relative_dir,
+                "capture_metadata_artifact_id": capture_metadata_artifact_id,
+                "capture_namespace": experiment_id,
                 "entered_finalize_reserve": cleanup_result.get(
                     "entered_finalize_reserve", False
                 ),
@@ -1695,6 +1849,27 @@ class BrowserActionService:
         if jobs:
             await asyncio.gather(*jobs, return_exceptions=True)
         self._active_session_jobs.clear()
+        self._active_browser_experiment_id = None
+        self._active_browser_session_id = None
+        for session_id, session in list(self.sessions.items()):
+            if (
+                session.get("status") != "open"
+                or session.get("service_instance_id") != self.service_instance_id
+            ):
+                continue
+            deadline = Deadline(5_000)
+            try:
+                async with self._locked_browser_session(session_id, deadline):
+                    await self.playwright.close_session(session_id, deadline)
+                    session["status"] = "closed"
+                    session["close_reason"] = "service_shutdown"
+                    session["updated_at"] = utc_now()
+                    self.experiments.save_session(session)
+            except Exception:
+                session["status"] = "stale"
+                session["stale_reason"] = "shutdown_detach_failed"
+                session["updated_at"] = utc_now()
+                self.experiments.save_session(session)
         await self.js_reverse.close()
 
 

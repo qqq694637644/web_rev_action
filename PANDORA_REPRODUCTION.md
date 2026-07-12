@@ -191,7 +191,7 @@ raw / semantic / snapshot / artifact requirements
 
 Capture 阶段不使用 `target.start_url`。若需要记录页面初始化请求，显式 `navigate` 必须是 flow 的第一条页面变更动作。`target.page_index` 省略时复用 session 当前 tab。
 
-每条会改变页面或请求状态的 flow step 之前，后端记录 capture version 和每个 request 的最后 event index。后续 wait 只匹配 checkpoint 之后的事件，因此第二轮消息不能被第一轮的 `[DONE]` 或旧 semantic event 立即满足。
+每条会改变页面或请求状态的 flow step 之前，后端记录每个 request 的 responseObserved、status、terminal wall time、raw event index 和 semantic event index。后续 wait 只接受 checkpoint 后的新 request、状态转换或 source-specific event，因此第二轮消息不能被第一轮的终态、`[DONE]` 或旧 semantic event 满足。
 
 ---
 
@@ -643,12 +643,12 @@ notes/open-questions.md
 - Stop cancellation 不由底层提前解释成用户行为。
 - 执行和 get_experiment 只返回有界摘要；完整 manifest 使用 workspaceReadFiles。
 - 服务重启后的 open session 必须标记 stale 并重新 attach。
-- 一个共享 MCP 实例下的 open/capture/close 必须全局串行化。
+- 一个共享浏览器/MCP 实例下全局只允许一个活动 experiment，不排队第二个实验。
 - credential 默认脱敏。
 - stop 后关闭页面不修改历史 manifest。
 - 所有文本 artifact 相对路径可由 workspaceInspect/Search/ReadFiles 处理。
 - raw.bin、Base64、压缩和批量 JSONL 可由 workspaceExecPwsh 处理。
 - 长流由后台 job 完成；显式快速同步模式才受 42 秒 Action deadline 限制。
 - 原始 `manifest.json`、`js-reverse/` 和 `playwright/` 只读；报告、schema、diff 和 replay 输出写入 `reports/`、`derived/` 或 `replay/`。
-- 同一 session 同时只运行一个后台 experiment；`session_busy` 时查询已有 experiment。
+- 同一 session 重复提交返回 `session_busy`；其他 session 遇到活动实验返回 `browser_busy`。
 - supporting request 的事件不能满足 primary predicate；等待结果必须关联具体 primary request ID。

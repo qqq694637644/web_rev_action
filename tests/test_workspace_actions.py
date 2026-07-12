@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -527,6 +528,60 @@ class WorkspaceActionTests(unittest.TestCase):
                     )
                 )
             self.assertEqual(pwsh_error.exception.status_code, 409)
+
+    @unittest.skipUnless(os.name == "nt", "Windows process-tree behavior")
+    def test_canceling_powershell_terminates_child_process_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            child_pid_file = root / "pwsh-child.pid"
+            marker = root / "pwsh-child-finished.txt"
+            service = AnalysisWorkspaceService(root)
+            python_code = (
+                "import time; from pathlib import Path; "
+                f"time.sleep(2); Path({str(marker)!r}).write_text('finished')"
+            )
+            script = "\n".join(
+                [
+                    "$child = Start-Process -FilePath python -ArgumentList @(",
+                    "  '-c',",
+                    f"  {json.dumps(python_code)}",
+                    ") -PassThru",
+                    f"Set-Content -Path {json.dumps(str(child_pid_file))} -Value $child.Id",
+                    "Start-Sleep -Seconds 30",
+                ]
+            )
+
+            async def exercise() -> None:
+                task = asyncio.create_task(
+                    service.exec_pwsh(
+                        WorkspaceExecPwshRequest(
+                            script=script,
+                            timeout_seconds=60,
+                            plain_output=True,
+                        )
+                    )
+                )
+                for _ in range(100):
+                    if child_pid_file.is_file():
+                        break
+                    await asyncio.sleep(0.02)
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+
+            asyncio.run(exercise())
+            child_pid = child_pid_file.read_text(encoding="utf-8").strip()
+            time.sleep(2.2)
+            self.assertFalse(marker.exists())
+            listing = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {child_pid}", "/FO", "CSV", "/NH"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            self.assertNotIn(f'"{child_pid}"', listing.stdout)
 
     @unittest.skipUnless(os.name == "nt", "Windows single-process lock")
     def test_single_process_guard_rejects_a_second_process_for_same_workspace(self) -> None:

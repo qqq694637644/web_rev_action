@@ -22,6 +22,7 @@ from skill_temple.browser_adapters import (
     PageState,
     StdioMcpToolTransport,
     StreamCheckpoint,
+    StreamRequestCheckpoint,
     StreamWaitResult,
     SubprocessCommandRunner,
     build_playwright_attach_args,
@@ -302,6 +303,8 @@ class FakeJsReverse:
             "responseObserved": True,
             "defaultDoneMarkerObserved": True,
             "rawEventCount": 1,
+            "semanticEventCount": 0,
+            "primaryEventSource": "raw-stream",
             "coreArtifacts": list(artifacts.values()),
         }
         requests = [primary]
@@ -340,6 +343,7 @@ class FakeJsReverse:
         request_id: str | None = None,
         event_predicate: Any | None = None,
         after_event_index: int = -1,
+        event_source: str | None = None,
     ) -> dict[str, Any]:
         self.events.append("js.status")
         if self.primary_status == "canceled":
@@ -380,7 +384,29 @@ class FakeJsReverse:
             matched_request_ids=["primary-cdp"],
             terminal_status=self.primary_status,
             matched_event=matched_event,
-            event_indices={"primary-cdp": version - 2},
+            checkpoint=StreamCheckpoint(
+                version=version,
+                requests={
+                    "primary-cdp": StreamRequestCheckpoint(
+                        response_observed=True,
+                        status=self.primary_status,
+                        terminal_wall_time_ms=(
+                            float(
+                                self.status_payload["requests"][0].get(
+                                    "endedWallTimeMs",
+                                    time.time() * 1000,
+                                )
+                            )
+                            if self.primary_status
+                            in {"finished", "canceled", "failed", "stopped"}
+                            else None
+                        ),
+                        raw_event_index=version - 2,
+                        semantic_event_index=-1,
+                        primary_event_source="raw-stream",
+                    )
+                },
+            ),
             status_payload=self.status_payload,
         )
 
@@ -960,12 +986,14 @@ class BrowserActionTests(unittest.TestCase):
             )
             self.assertFalse(classification["page_remained_aligned"])
 
-    def test_shared_browser_runtime_serializes_different_sessions(self) -> None:
+    def test_shared_browser_runtime_rejects_cross_session_queueing(self) -> None:
         class SlowPlaywright(FakePlaywright):
             def __init__(self, events: list[str]) -> None:
                 super().__init__(events)
                 self.active_steps = 0
                 self.max_active_steps = 0
+                self.started = asyncio.Event()
+                self.release = asyncio.Event()
 
             async def execute_step(
                 self,
@@ -979,8 +1007,9 @@ class BrowserActionTests(unittest.TestCase):
                     self.max_active_steps,
                     self.active_steps,
                 )
+                self.started.set()
                 try:
-                    await asyncio.sleep(0.03)
+                    await self.release.wait()
                     return await super().execute_step(
                         session_ref,
                         step,
@@ -1006,7 +1035,7 @@ class BrowserActionTests(unittest.TestCase):
                 default_browser_endpoint="http://127.0.0.1:9222",
             )
 
-            async def scenario() -> None:
+            async def scenario() -> str:
                 for session_id in ["session_a", "session_b"]:
                     await service.run(
                         OpenSessionRequest(
@@ -1014,8 +1043,8 @@ class BrowserActionTests(unittest.TestCase):
                             payload={"session_id": session_id},
                         )
                     )
-                requests = [
-                    CaptureFlowRequest(
+                requests = {
+                    session_id: CaptureFlowRequest(
                         operation="capture_flow",
                         payload={
                             "session_id": session_id,
@@ -1046,11 +1075,19 @@ class BrowserActionTests(unittest.TestCase):
                         },
                     )
                     for session_id in ["session_a", "session_b"]
-                ]
-                await asyncio.gather(*(service.run(item) for item in requests))
-                await service.close()
+                }
+                first = asyncio.create_task(service.run(requests["session_a"]))
+                await playwright.started.wait()
+                try:
+                    with self.assertRaises(BrowserServiceError) as raised:
+                        await service.run(requests["session_b"])
+                    return raised.exception.code
+                finally:
+                    playwright.release.set()
+                    await first
+                    await service.close()
 
-            asyncio.run(scenario())
+            self.assertEqual(asyncio.run(scenario()), "browser_busy")
             self.assertEqual(playwright.max_active_steps, 1)
 
     def test_task_cancellation_stops_capture_and_writes_interrupted_manifest(self) -> None:
@@ -1131,6 +1168,14 @@ class BrowserActionTests(unittest.TestCase):
             manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
             self.assertEqual(manifest["status"], "interrupted")
             self.assertTrue(manifest["capture_health"]["collector_stopped"])
+            self.assertEqual(
+                manifest["steps"][0]["status"],
+                "canceled_outcome_unknown",
+            )
+            self.assertEqual(
+                manifest["capture_health"]["capture_namespace"],
+                manifest["experiment_id"],
+            )
 
     def test_environment_builder_binds_mcp_to_workspace_and_same_cdp_endpoint(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1309,7 +1354,14 @@ class BrowserActionTests(unittest.TestCase):
                     ),
                     checkpoint=StreamCheckpoint(
                         version=1,
-                        event_indices={"req-7": -1},
+                        requests={
+                            "req-7": StreamRequestCheckpoint(
+                                status="streaming",
+                                raw_event_index=-1,
+                                semantic_event_index=-1,
+                                primary_event_source="raw-stream",
+                            )
+                        },
                     ),
                     deadline=deadline,
                 )
@@ -1578,14 +1630,24 @@ class BrowserActionTests(unittest.TestCase):
                 ),
                 checkpoint=StreamCheckpoint(
                     version=1,
-                    event_indices={"req-semantic": -1},
+                    requests={
+                        "req-semantic": StreamRequestCheckpoint(
+                            status="streaming",
+                            raw_event_index=-1,
+                            semantic_event_index=-1,
+                            primary_event_source="eventsource",
+                        )
+                    },
                 ),
                 deadline=Deadline(2_000),
             )
 
         result = asyncio.run(exercise())
         self.assertTrue(result.condition_met)
-        self.assertEqual(result.event_indices["req-semantic"], 0)
+        self.assertEqual(
+            result.checkpoint.requests["req-semantic"].semantic_event_index,
+            0,
+        )
 
     def test_old_done_event_cannot_satisfy_a_later_checkpoint(self) -> None:
         class CheckpointTransport:
@@ -1650,7 +1712,14 @@ class BrowserActionTests(unittest.TestCase):
                 ),
                 checkpoint=StreamCheckpoint(
                     version=2,
-                    event_indices={"req-checkpoint": 0},
+                    requests={
+                        "req-checkpoint": StreamRequestCheckpoint(
+                            status="streaming",
+                            raw_event_index=0,
+                            semantic_event_index=-1,
+                            primary_event_source="raw-stream",
+                        )
+                    },
                 ),
                 deadline=Deadline(3_000),
             )
@@ -1817,7 +1886,14 @@ class BrowserActionTests(unittest.TestCase):
                 ),
                 checkpoint=StreamCheckpoint(
                     version=2,
-                    event_indices={"primary-request": 0},
+                    requests={
+                        "primary-request": StreamRequestCheckpoint(
+                            status="streaming",
+                            raw_event_index=0,
+                            semantic_event_index=-1,
+                            primary_event_source="raw-stream",
+                        )
+                    },
                 ),
                 deadline=Deadline(3_000),
             )
@@ -1978,6 +2054,343 @@ class BrowserActionTests(unittest.TestCase):
                 check=False,
             )
             self.assertNotIn(f'"{child_pid}"', listing.stdout)
+
+    @unittest.skipUnless(os.name == "nt", "Windows process-tree behavior")
+    def test_playwright_runner_cancellation_terminates_child_process_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            child_pid_file = root / "child.pid"
+            marker = root / "child-finished.txt"
+            parent = root / "parent.py"
+            child_code = (
+                "import time; from pathlib import Path; "
+                f"time.sleep(2); Path({str(marker)!r}).write_text('finished')"
+            )
+            parent.write_text(
+                "\n".join(
+                    [
+                        "import subprocess, sys, time",
+                        "from pathlib import Path",
+                        f"child = subprocess.Popen([sys.executable, '-c', {child_code!r}])",
+                        f"pid_file = Path({str(child_pid_file)!r})",
+                        "pid_file.write_text(str(child.pid), encoding='utf-8')",
+                        "time.sleep(30)",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            async def exercise() -> None:
+                runner = SubprocessCommandRunner()
+                task = asyncio.create_task(
+                    runner.run(
+                        [sys.executable, str(parent)],
+                        deadline=Deadline(30_000),
+                        cwd=root,
+                    )
+                )
+                for _ in range(100):
+                    if child_pid_file.is_file():
+                        break
+                    await asyncio.sleep(0.02)
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+
+            asyncio.run(exercise())
+            child_pid = child_pid_file.read_text(encoding="utf-8").strip()
+            time.sleep(2.2)
+            self.assertFalse(marker.exists())
+            listing = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {child_pid}", "/FO", "CSV", "/NH"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            self.assertNotIn(f'"{child_pid}"', listing.stdout)
+
+    def test_canceling_active_side_effect_mcp_call_restarts_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            server = root / "cancel_mcp_server.py"
+            server.write_text(
+                "\n".join(
+                    [
+                        "import asyncio",
+                        "from pathlib import Path",
+                        "from mcp.server.fastmcp import FastMCP",
+                        "from pydantic import BaseModel",
+                        "server = FastMCP('cancel-test')",
+                        "class Capture(BaseModel):",
+                        "    captureId: int",
+                        "class Result(BaseModel):",
+                        "    capture: Capture",
+                        "@server.tool(structured_output=True)",
+                        "async def start_stream_capture(marker: str, delayMs: int = 0) -> Result:",
+                        "    await asyncio.sleep(delayMs / 1000)",
+                        "    Path(marker).write_text('started', encoding='utf-8')",
+                        "    return Result(capture=Capture(captureId=31))",
+                        "if __name__ == '__main__':",
+                        "    server.run(transport='stdio')",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            canceled_marker = root / "canceled.txt"
+            restarted_marker = root / "restarted.txt"
+            transport = StdioMcpToolTransport(
+                command=sys.executable,
+                args=[str(server)],
+                cwd=root,
+            )
+
+            async def exercise() -> dict[str, Any]:
+                active = asyncio.create_task(
+                    transport.call_tool(
+                        "start_stream_capture",
+                        {"marker": str(canceled_marker), "delayMs": 2_000},
+                        Deadline(10_000),
+                    )
+                )
+                await asyncio.sleep(0.3)
+                active.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await active
+                await asyncio.sleep(2.1)
+                result = await transport.call_tool(
+                    "start_stream_capture",
+                    {"marker": str(restarted_marker), "delayMs": 0},
+                    Deadline(5_000),
+                )
+                await transport.close()
+                return result
+
+            result = asyncio.run(exercise())
+            self.assertFalse(canceled_marker.exists())
+            self.assertTrue(restarted_marker.is_file())
+            self.assertEqual(result["capture"]["captureId"], 31)
+
+    def test_terminal_wait_requires_a_post_checkpoint_transition(self) -> None:
+        class TerminalTransport:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def call_tool(
+                self, name: str, arguments: dict[str, Any], deadline: Deadline
+            ) -> dict[str, Any]:
+                if name != "get_stream_status":
+                    raise AssertionError(name)
+                self.calls += 1
+                new_status = "streaming" if self.calls == 1 else "finished"
+                return {
+                    "capture": {"captureId": 9, "version": 10 + self.calls},
+                    "requests": [
+                        {
+                            "cdpRequestId": "old-finished",
+                            "url": "https://example.test/conversation/old",
+                            "method": "POST",
+                            "resourceType": "fetch",
+                            "status": "finished",
+                            "responseObserved": True,
+                            "endedWallTimeMs": 100,
+                            "rawEventCount": 1,
+                            "semanticEventCount": 0,
+                            "primaryEventSource": "raw-stream",
+                        },
+                        {
+                            "cdpRequestId": "new-request",
+                            "url": "https://example.test/conversation/new",
+                            "method": "POST",
+                            "resourceType": "fetch",
+                            "status": new_status,
+                            "responseObserved": True,
+                            "endedWallTimeMs": 200 if new_status == "finished" else None,
+                            "rawEventCount": 1,
+                            "semanticEventCount": 0,
+                            "primaryEventSource": "raw-stream",
+                        },
+                    ],
+                    "pagination": {"hasNextPage": False, "totalPages": 1},
+                }
+
+            async def close(self) -> None:
+                return None
+
+        async def exercise() -> StreamWaitResult:
+            adapter = JsReverseMcpAdapter(TerminalTransport())
+            return await adapter.wait_for_stream_condition(
+                capture_id=9,
+                request_matcher=RequestMatcher(url_contains="/conversation"),
+                condition=WaitCondition(
+                    type="network_finished",
+                    request_matcher=RequestMatcher(url_contains="/conversation"),
+                ),
+                checkpoint=StreamCheckpoint(
+                    version=10,
+                    requests={
+                        "old-finished": StreamRequestCheckpoint(
+                            response_observed=True,
+                            status="finished",
+                            terminal_wall_time_ms=100,
+                            raw_event_index=0,
+                        ),
+                        "new-request": StreamRequestCheckpoint(
+                            response_observed=True,
+                            status="streaming",
+                            raw_event_index=0,
+                        ),
+                    },
+                ),
+                deadline=Deadline(3_000),
+            )
+
+        result = asyncio.run(exercise())
+        self.assertEqual(result.matched_request_ids, ["new-request"])
+        self.assertEqual(result.terminal_status, "finished")
+
+    def test_semantic_cursor_advances_independently_from_raw_cursor(self) -> None:
+        class DualCursorTransport:
+            def __init__(self) -> None:
+                self.predicate_arguments: dict[str, Any] | None = None
+
+            async def call_tool(
+                self, name: str, arguments: dict[str, Any], deadline: Deadline
+            ) -> dict[str, Any]:
+                if name != "get_stream_status":
+                    raise AssertionError(name)
+                request = {
+                    "cdpRequestId": "dual-request",
+                    "url": "https://example.test/conversation",
+                    "method": "GET",
+                    "resourceType": "eventsource",
+                    "status": "streaming",
+                    "responseObserved": True,
+                    "rawEventCount": 100,
+                    "semanticEventCount": 11,
+                    "primaryEventSource": "raw-stream",
+                }
+                if "eventPredicate" in arguments:
+                    self.predicate_arguments = dict(arguments)
+                    return {
+                        "capture": {"captureId": 10, "version": 22},
+                        "request": request,
+                        "eventMatch": {
+                            "matched": True,
+                            "matchedEventIndex": 10,
+                            "matchedRequestId": "dual-request",
+                            "matchedSource": "eventsource",
+                        },
+                    }
+                return {
+                    "capture": {"captureId": 10, "version": 22},
+                    "requests": [request],
+                    "pagination": {"hasNextPage": False, "totalPages": 1},
+                }
+
+            async def close(self) -> None:
+                return None
+
+        transport = DualCursorTransport()
+
+        async def exercise() -> StreamWaitResult:
+            adapter = JsReverseMcpAdapter(transport)
+            return await adapter.wait_for_stream_condition(
+                capture_id=10,
+                request_matcher=RequestMatcher(url_contains="/conversation"),
+                condition=WaitCondition(
+                    type="event_predicate",
+                    request_matcher=RequestMatcher(url_contains="/conversation"),
+                    predicate=ExactDataPredicate(type="exact_data", value="semantic-new"),
+                ),
+                checkpoint=StreamCheckpoint(
+                    version=21,
+                    requests={
+                        "dual-request": StreamRequestCheckpoint(
+                            response_observed=True,
+                            status="streaming",
+                            raw_event_index=99,
+                            semantic_event_index=9,
+                            primary_event_source="raw-stream",
+                        )
+                    },
+                ),
+                deadline=Deadline(3_000),
+            )
+
+        result = asyncio.run(exercise())
+        self.assertTrue(result.condition_met)
+        self.assertEqual(result.matched_request_ids, ["dual-request"])
+        self.assertEqual(transport.predicate_arguments["eventSource"], "eventsource")
+        self.assertEqual(transport.predicate_arguments["afterEventIndex"], 9)
+
+    def test_network_request_summary_paginates_past_one_hundred(self) -> None:
+        class NetworkTransport:
+            def __init__(self) -> None:
+                self.pages: list[int] = []
+
+            async def call_tool(
+                self, name: str, arguments: dict[str, Any], deadline: Deadline
+            ) -> dict[str, Any]:
+                if name != "list_network_requests":
+                    raise AssertionError(name)
+                page = int(arguments["pageIdx"])
+                self.pages.append(page)
+                if page == 0:
+                    requests = [{"reqid": index} for index in range(100)]
+                    has_next = True
+                else:
+                    requests = [{"reqid": 100}]
+                    has_next = False
+                return {
+                    "requests": requests,
+                    "pagination": {
+                        "hasNextPage": has_next,
+                        "totalPages": 2,
+                    },
+                }
+
+            async def close(self) -> None:
+                return None
+
+        transport = NetworkTransport()
+
+        async def exercise() -> dict[str, Any]:
+            adapter = JsReverseMcpAdapter(transport)
+            return await adapter.list_network_requests(RequestMatcher(), Deadline(2_000))
+
+        result = asyncio.run(exercise())
+        self.assertEqual(transport.pages, [0, 1])
+        self.assertEqual(len(result["requests"]), 101)
+
+    def test_service_shutdown_detaches_open_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            events: list[str] = []
+            service = BrowserActionService(
+                playwright=FakePlaywright(events),
+                js_reverse=FakeJsReverse(events, root),
+                experiments=ExperimentStore(root),
+                default_browser_endpoint="http://127.0.0.1:9222",
+            )
+
+            async def exercise() -> None:
+                await service.run(
+                    OpenSessionRequest(
+                        operation="open_session",
+                        payload={"session_id": "shutdown-open"},
+                    )
+                )
+                await service.close()
+
+            asyncio.run(exercise())
+            self.assertIn("playwright.close", events)
+            saved = json.loads(
+                (root / "sessions" / "shutdown-open.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(saved["status"], "closed")
+            self.assertEqual(saved["close_reason"], "service_shutdown")
 
     def test_action_experiment_summary_is_bounded(self) -> None:
         manifest = {
