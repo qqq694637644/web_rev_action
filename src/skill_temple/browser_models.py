@@ -6,6 +6,49 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+_BROWSER_MANAGED_HEADERS = {
+    "accept-encoding",
+    "connection",
+    "content-length",
+    "cookie",
+    "host",
+    "origin",
+    "proxy-authorization",
+    "referer",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+}
+
+
+def _validate_json_pointer(path: str) -> str:
+    if not path.startswith("/"):
+        raise ValueError("JSON mutation path must be a JSON Pointer starting with '/'")
+    if path == "/":
+        raise ValueError("JSON mutation cannot replace or remove the document root")
+    for token in path.split("/")[1:]:
+        index = 0
+        while index < len(token):
+            if token[index] == "~":
+                if index + 1 >= len(token) or token[index + 1] not in {"0", "1"}:
+                    raise ValueError("JSON Pointer escape must be ~0 or ~1")
+                index += 2
+                continue
+            if token[index] in {"*", "[", "]"}:
+                raise ValueError("JSON Pointer wildcards and bracket expressions are not allowed")
+            index += 1
+    return path
+
+
+def _validate_mutable_header(name: str) -> str:
+    normalized = name.strip().lower()
+    if normalized in _BROWSER_MANAGED_HEADERS or normalized.startswith("sec-"):
+        raise ValueError(
+            f"Header '{name}' is browser-managed and cannot be mutated by browser_context replay"
+        )
+    return name
+
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -409,24 +452,44 @@ class CaptureFlowPayload(StrictModel):
 
 class RemoveJsonPathMutation(StrictModel):
     type: Literal["remove_json_path"]
-    path: str = Field(pattern=r"^\$\.[A-Za-z0-9_.-]+$", max_length=512)
+    path: str = Field(min_length=2, max_length=512)
+
+    @model_validator(mode="after")
+    def validate_path(self) -> RemoveJsonPathMutation:
+        _validate_json_pointer(self.path)
+        return self
 
 
 class ReplaceJsonPathMutation(StrictModel):
     type: Literal["replace_json_path"]
-    path: str = Field(pattern=r"^\$\.[A-Za-z0-9_.-]+$", max_length=512)
+    path: str = Field(min_length=2, max_length=512)
     value: Any
+
+    @model_validator(mode="after")
+    def validate_path(self) -> ReplaceJsonPathMutation:
+        _validate_json_pointer(self.path)
+        return self
 
 
 class RemoveHeaderMutation(StrictModel):
     type: Literal["remove_header"]
     name: str = Field(min_length=1, max_length=256)
 
+    @model_validator(mode="after")
+    def validate_header(self) -> RemoveHeaderMutation:
+        _validate_mutable_header(self.name)
+        return self
+
 
 class ReplaceHeaderMutation(StrictModel):
     type: Literal["replace_header"]
     name: str = Field(min_length=1, max_length=256)
     value: str = Field(max_length=32_000)
+
+    @model_validator(mode="after")
+    def validate_header(self) -> ReplaceHeaderMutation:
+        _validate_mutable_header(self.name)
+        return self
 
 
 class RemoveQueryParameterMutation(StrictModel):
@@ -451,6 +514,27 @@ ReplayMutation = Annotated[
 ]
 
 
+class VolatileBinding(StrictModel):
+    binding_id: str = Field(pattern=r"^[a-zA-Z0-9_.-]+$", min_length=1, max_length=128)
+    target: Literal["json_pointer", "header", "query_parameter"]
+    path: str | None = Field(default=None, max_length=512)
+    name: str | None = Field(default=None, max_length=256)
+    generator: Literal["uuid4", "timestamp_ms", "timestamp_iso", "random_hex_16"]
+
+    @model_validator(mode="after")
+    def validate_target(self) -> VolatileBinding:
+        if self.target == "json_pointer":
+            if not self.path or self.name is not None:
+                raise ValueError("json_pointer binding requires path and forbids name")
+            _validate_json_pointer(self.path)
+        else:
+            if not self.name or self.path is not None:
+                raise ValueError(f"{self.target} binding requires name and forbids path")
+            if self.target == "header":
+                _validate_mutable_header(self.name)
+        return self
+
+
 class ReplayRequestPayload(StrictModel):
     session_id: str = Field(pattern=r"^[a-zA-Z0-9_.-]+$", max_length=128)
     objective: str = Field(min_length=1, max_length=2048)
@@ -461,9 +545,15 @@ class ReplayRequestPayload(StrictModel):
         pattern=r"^[a-zA-Z0-9_.-]+$", max_length=256
     )
     mode: Literal["browser_context"] = "browser_context"
-    mutations: list[ReplayMutation] = Field(default_factory=list, max_length=64)
+    replay_mode: Literal["control", "treatment"]
+    control_experiment_id: str | None = Field(
+        default=None, pattern=r"^[a-zA-Z0-9_.-]+$", max_length=128
+    )
+    mutations: list[ReplayMutation] = Field(default_factory=list, max_length=1)
+    volatile_bindings: list[VolatileBinding] = Field(default_factory=list, max_length=32)
     target: BrowserTarget = Field(default_factory=BrowserTarget)
     wait_for: WaitCondition | None = None
+    verification_flow: list[FlowStep] = Field(default_factory=list, max_length=20)
     execution_mode: Literal["job", "sync"] = "job"
     deadline_ms: int = Field(default=42_000, ge=1_000, le=42_000)
     job_timeout_ms: int = Field(default=300_000, ge=10_000, le=1_800_000)
@@ -486,6 +576,20 @@ class ReplayRequestPayload(StrictModel):
     def validate_replay(self) -> ReplayRequestPayload:
         if self.target.start_url is not None:
             raise ValueError("replay_request does not allow target.start_url")
+        if self.replay_mode == "control":
+            if self.mutations:
+                raise ValueError("control replay requires mutations=[]")
+            if self.control_experiment_id is not None:
+                raise ValueError("control replay cannot reference control_experiment_id")
+        else:
+            if len(self.mutations) != 1:
+                raise ValueError("treatment replay requires exactly one mutation")
+            if self.control_experiment_id is None:
+                raise ValueError("treatment replay requires control_experiment_id")
+            if self.volatile_bindings:
+                raise ValueError(
+                    "treatment replay reuses volatile bindings from the control experiment"
+                )
         return self
 
 
@@ -542,6 +646,13 @@ class ReplayRequestRequest(StrictModel):
     skill_binding: SkillBinding | None = None
 
 
+class SaveScriptSourceRequest(StrictModel):
+    contract_version: Literal["1.0"] = "1.0"
+    operation: Literal["save_script_source"]
+    payload: SaveScriptSourcePayload
+    skill_binding: SkillBinding | None = None
+
+
 class GetSessionPayload(StrictModel):
     session_id: str = Field(pattern=r"^[a-zA-Z0-9_.-]+$", max_length=128)
 
@@ -569,6 +680,10 @@ class ListEvidencePayload(StrictModel):
 class GetNetworkEvidencePayload(StrictModel):
     experiment_id: str = Field(pattern=r"^[a-zA-Z0-9_.-]+$", max_length=128)
     evidence_id: str = Field(pattern=r"^[a-zA-Z0-9_.-]+$", max_length=256)
+
+
+class GetRequestShapePayload(GetNetworkEvidencePayload):
+    pass
 
 
 class GetRequestInitiatorPayload(GetNetworkEvidencePayload):
@@ -605,6 +720,16 @@ class GetScriptSourcePayload(StrictModel):
         return self
 
 
+class SaveScriptSourcePayload(GetScriptSourcePayload):
+    target_experiment_id: str = Field(
+        pattern=r"^[a-zA-Z0-9_.-]+$", max_length=128
+    )
+    initiator_evidence_id: str | None = Field(
+        default=None, pattern=r"^[a-zA-Z0-9_.-]+$", max_length=256
+    )
+    evidence_label: str | None = Field(default=None, max_length=128)
+
+
 class ListConsoleErrorsPayload(StrictModel):
     experiment_id: str = Field(pattern=r"^[a-zA-Z0-9_.-]+$", max_length=128)
     limit: int = Field(default=100, ge=1, le=500)
@@ -634,7 +759,8 @@ RunBrowserExperimentRequest = Annotated[
     | CaptureFlowRequest
     | CloseSessionRequest
     | CancelExperimentRequest
-    | ReplayRequestRequest,
+    | ReplayRequestRequest
+    | SaveScriptSourceRequest,
     Field(discriminator="operation"),
 ]
 
@@ -655,6 +781,12 @@ class GetNetworkEvidenceRequest(StrictModel):
     contract_version: Literal["1.0"] = "1.0"
     operation: Literal["get_network_evidence"]
     payload: GetNetworkEvidencePayload
+
+
+class GetRequestShapeRequest(StrictModel):
+    contract_version: Literal["1.0"] = "1.0"
+    operation: Literal["get_request_shape"]
+    payload: GetRequestShapePayload
 
 
 class GetRequestInitiatorRequest(StrictModel):
@@ -688,6 +820,7 @@ InspectBrowserEvidenceRequest = Annotated[
     | GetStreamStatusRequest
     | ListEvidenceRequest
     | GetNetworkEvidenceRequest
+    | GetRequestShapeRequest
     | GetRequestInitiatorRequest
     | SearchScriptsRequest
     | GetScriptSourceRequest

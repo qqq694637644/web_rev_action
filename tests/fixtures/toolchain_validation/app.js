@@ -12,14 +12,34 @@ function buildPandoraConversationRequest() {
   return {
     conversation_id: "conversation-fixture",
     model: "fixture-model",
-    message: {
-      id: "user-message-1",
-      parent_id: "root-message",
-      content: "hello fixture",
-    },
-    timezone: "UTC",
+    messages: [
+      {
+        id: "user-message-1",
+        author: { role: "user" },
+        content: {
+          content_type: "text",
+          parts: ["hello fixture"],
+        },
+      },
+    ],
+    parent_message_id: "root-message",
+    timezone_offset_min: 0,
     tracking_id: "tracking-only-value",
   };
+}
+
+function parseSseText(text) {
+  const events = [];
+  for (const block of text.split(/\r?\n\r?\n/)) {
+    const data = block
+      .split(/\r?\n/)
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).trim())
+      .join("\n");
+    if (!data) continue;
+    events.push(data === "[DONE]" ? data : JSON.parse(data));
+  }
+  return events;
 }
 
 async function sendPandoraConversation() {
@@ -32,7 +52,10 @@ async function sendPandoraConversation() {
     credentials: "include",
     body: JSON.stringify(buildPandoraConversationRequest()),
   });
-  const payload = await response.json();
+  const contentType = response.headers.get("content-type") || "";
+  const payload = contentType.includes("text/event-stream")
+    ? parseSseText(await response.text())
+    : await response.json();
   document.querySelector("#result").textContent = JSON.stringify(payload, null, 2);
   document.querySelector("#status").textContent = `pandora-${response.status}`;
   return payload;

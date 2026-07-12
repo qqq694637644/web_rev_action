@@ -63,7 +63,8 @@ Skill 不能自行拼接任意 JavaScript、读取 credential artifact 后再发
 
 ```text
 browser operation owner
-  open_session | close_session | capture_baseline | capture_flow | replay_request
+  open_session | close_session | capture_baseline | capture_flow
+  replay_request | save_script_source
 
 protected workspace mutation owner
   workspaceWriteFile | workspaceApplyPatch | workspaceExecPwsh
@@ -107,7 +108,9 @@ create running manifest
 
 GPT 看不到内部 stream primitive，也不能在多个 HTTP 请求之间手工协调 start、click、wait 和 stop。
 
-`replay_request` 同样由后端原子执行：从 source experiment 的 exact network evidence 读取请求，在本地应用一个或多个结构化 mutation，通过当前页面上下文发起 fetch，并捕获新 network/stream/page/console evidence。Cookie、Authorization 和 CSRF 不进入 Action JSON。
+`replay_request` 同样由后端原子执行：从 source experiment 的 exact network evidence 读取请求，先执行无 mutation 的 control，再让 treatment 复用同一组 volatile binding 值并应用唯一一个结构化 mutation，通过当前页面上下文发起 fetch，并捕获新 network/stream/page/console evidence。Cookie、Authorization 和 CSRF 不进入 Action JSON。
+
+JSON body mutation 使用无 wildcard 的 RFC 6901 JSON Pointer，支持对象属性和数组索引。Browser-managed Cookie、Origin、Referer、Host、Content-Length 和 `Sec-*` header mutation 在 schema 层直接拒绝。Treatment 只有在 exact outbound request 中观察到 mutation 时才有效。
 
 ### 2.4 证据以文件为主，Action 返回摘要
 
@@ -215,6 +218,9 @@ private runtime
 - cleanup 和 terminal manifest。
 - 普通 network high-water checkpoint、精确导出和 evidence index。
 - browser-context replay 与 source evidence 绑定。
+- control/treatment replay、volatile binding 复用和 wire mutation effectiveness。
+- JSON request shape/redacted body、stream request/event-range evidence。
+- bounded source region 持久化及 SHA-256。
 - experiment series/predecessor 校验。
 
 `ExperimentStore` 只负责生命周期持久化：
@@ -260,6 +266,7 @@ get_experiment
 get_stream_status
 list_evidence
 get_network_evidence
+get_request_shape
 get_request_initiator
 search_scripts
 get_script_source
@@ -273,6 +280,7 @@ open_session
 capture_baseline
 capture_flow
 replay_request
+save_script_source
 close_session
 cancel_experiment
 ```
@@ -724,8 +732,13 @@ data/analysis-workspace/
         network/
           ev_<experiment>_network_request_<selector>_<reqid>/
             all.json
+            request-shape.json
+            request-body.redacted.json
             initiator.json
             cookie-*.json
+        sources/
+          ev_<experiment>_script_source_<label>_<hash>.js
+          ev_<experiment>_script_source_<label>_<hash>.metadata.json
         console/
           console.jsonl
         capture-<uuid>/
@@ -781,6 +794,9 @@ network_checkpoint
 console_checkpoint
 series
 replay_source
+replay
+replay_http_status
+mutation_assessment
 evidence
 capture_uuid
 capture_relative_dir
@@ -804,7 +820,26 @@ redacted summary
 source_experiment_id / source_evidence_id（replay）
 ```
 
-当前 evidence kind：`network_request`、`console_message`、`page_screenshot`、`page_snapshot`、`replay_attempt`。
+当前 evidence kind：`network_request`、`stream_request`、`stream_event_range`、`console_message`、`page_screenshot`、`page_snapshot`、`replay_attempt`、`script_source`。
+
+每个 JSON network evidence 自动生成 public `request-shape.json` 和 `request-body.redacted.json`。Shape 使用 JSON Pointer 显示对象、数组长度、scalar 类型和安全 placeholder，不返回原始字符串值。
+
+每个 replay classification 使用：
+
+```text
+control replay
+  mutations = []
+  generates volatile bindings
+  must complete with HTTP 2xx/3xx
+
+treatment replay
+  control_experiment_id = control
+  reuses the exact generated values
+  mutations = exactly one
+  requires mutation_effective = true on wire evidence
+```
+
+若 source response 为 `text/event-stream`，后端自动启用 stream collector 和 raw/artifact requirements。成功 treatment 保存 stream evidence；若有效 treatment 得到明确非流 4xx，记录 `protocol_rejection_observed`，raw/semantic 维度为 `not_applicable_protocol_rejection`，而不是误报 collector 故障。
 
 ## 14. Workspace 服务
 
@@ -927,10 +962,14 @@ start Chrome remote debugging
 → source-specific SSE predicate
 → stop/finalize
 → inspect raw/events/headers
-→ capture authenticated Pandora-like JSON request
+→ capture authenticated Pandora-like messages[] request with SSE response
 → export exact network evidence with evidence_id
-→ browser-context replay removing tracking field (200)
-→ browser-context replay removing required parent field (422)
+→ inspect request shape and array JSON Pointer paths
+→ control replay with fresh volatile message ID (SSE 200)
+→ treatment removing tracking field (SSE 200)
+→ treatment removing required message ID (JSON 422)
+→ verify mutation_effective on exact outbound snapshots
+→ verify stream_request / stream_event_range evidence IDs
 → workspace PowerShell SHA verification
 → close_session
 → residual process check
@@ -975,12 +1014,11 @@ workerCoverage = false
 
 Worker / Service Worker auto-attach 不属于当前完成契约。
 
-当前已实现 browser-context replay、ordinary network evidence、initiator/source read-only queries、console/page snapshots、series 和 packaged Pandora Skill。尚未完成：
+当前已实现 paired browser-context replay、JSON Pointer array mutation、request shape/redacted body、ordinary/stream evidence、initiator/source persistence、console/page snapshots、verification flow、series 和 packaged Pandora Skill。尚未完成：
 
 ```text
 trace_request atomic breakpoint lifecycle
 automatic six-scenario Pandora-like fixture series
-source-map materialization
 external HTTP replay
 ```
 
@@ -1026,3 +1064,10 @@ Worker / Service Worker target coverage
 27. Replay 只能从 source experiment/evidence 读取 exact snapshot，不能接受任意本地路径。
 28. Credential artifact 默认不被 workspace inspect/search/read 返回。
 29. Packaged Pandora Skill 负责六组实验、单变量矩阵和报告完成标准。
+30. JSON replay path 使用无 wildcard JSON Pointer，支持数组索引。
+31. Treatment 必须引用成功 control、复用 volatile bindings 且恰好一个 mutation。
+32. Browser-managed header mutation 在 schema 层拒绝。
+33. 每个 treatment 必须由 exact outbound request 证明 mutation_effective=true。
+34. JSON request 自动生成 request shape/redacted body public artifacts。
+35. SSE source replay 自动启用 raw stream capture，并生成 stream evidence IDs。
+36. 保存的源码片段包含 URL/script ID、范围、SHA-256 和 initiator evidence 关联。

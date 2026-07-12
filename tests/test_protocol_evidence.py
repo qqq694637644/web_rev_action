@@ -6,15 +6,18 @@ import unittest
 from skill_temple.browser_models import (
     RemoveHeaderMutation,
     RemoveJsonPathMutation,
-    RemoveQueryParameterMutation,
     ReplaceJsonPathMutation,
+    ReplayRequestPayload,
     RequestMatcher,
 )
 from skill_temple.protocol_evidence import (
+    assess_mutation_effectiveness,
     build_replay_spec,
     network_checkpoint,
     network_request_matches,
     public_network_summary,
+    redacted_request_body_from_snapshot,
+    request_shape_from_snapshot,
     requests_after_checkpoint,
 )
 
@@ -42,10 +45,17 @@ class ProtocolEvidenceTests(unittest.TestCase):
                 "size": 80,
                 "text": json.dumps(
                     {
-                        "required": "yes",
-                        "optional": "keep",
-                        "tracking": "abc",
-                        "nested": {"value": 1},
+                        "messages": [
+                            {
+                                "id": "message-secret-id",
+                                "author": {"role": "user"},
+                                "content": {"parts": ["hello secret text"]},
+                            }
+                        ],
+                        "parent_message_id": "parent-secret-id",
+                        "model": "fixture-model",
+                        "timezone_offset_min": 480,
+                        "tracking_id": "tracking-secret-id",
                     }
                 ),
             },
@@ -102,38 +112,134 @@ class ProtocolEvidenceTests(unittest.TestCase):
         self.assertEqual(response_headers["set-cookie"], "<redacted>")
         self.assertNotIn("text", summary["request_body"])
         self.assertNotIn("text", summary["response_body"])
+        self.assertIn("/messages/0/id", summary["request_shape"]["paths"])
+        self.assertEqual(
+            summary["request_shape"]["paths"]["/messages/0/id"]["value"],
+            "<identifier>",
+        )
 
-    def test_replay_mutations_drop_browser_managed_headers(
-        self,
-    ) -> None:
+    def test_request_shape_and_redacted_body_preserve_structure_without_values(self) -> None:
+        shape = request_shape_from_snapshot(self.snapshot())
+        redacted = redacted_request_body_from_snapshot(self.snapshot())
+
+        self.assertEqual(shape["paths"]["/messages"]["type"], "array")
+        self.assertEqual(shape["paths"]["/messages"]["length"], 1)
+        self.assertEqual(shape["paths"]["/timezone_offset_min"]["value"], 480)
+        self.assertEqual(redacted["messages"][0]["id"], "<identifier>")
+        self.assertEqual(redacted["messages"][0]["content"]["parts"][0], "<text>")
+        self.assertNotIn("message-secret-id", json.dumps(redacted))
+        self.assertNotIn("hello secret text", json.dumps(redacted))
+
+    def test_json_pointer_mutations_support_arrays(self) -> None:
         spec, diff = build_replay_spec(
             self.snapshot(),
             [
-                RemoveJsonPathMutation(type="remove_json_path", path="$.tracking"),
                 ReplaceJsonPathMutation(
                     type="replace_json_path",
-                    path="$.nested.value",
-                    value=2,
-                ),
-                RemoveHeaderMutation(type="remove_header", name="X-Tracking"),
-                RemoveQueryParameterMutation(
-                    type="remove_query_parameter",
-                    name="tracking",
+                    path="/messages/0/content/parts/0",
+                    value="replacement text",
                 ),
             ],
         )
-
-        header_names = {item["name"].lower() for item in spec["headers"]}
         body = json.loads(spec["body"]["text"])
 
-        self.assertIn("authorization", header_names)
-        self.assertNotIn("cookie", header_names)
-        self.assertNotIn("x-tracking", header_names)
-        self.assertNotIn("tracking=", spec["url"])
-        self.assertEqual(body["nested"]["value"], 2)
-        self.assertNotIn("tracking", body)
+        self.assertEqual(body["messages"][0]["content"]["parts"][0], "replacement text")
+        self.assertEqual(diff["mutations"][0]["value"], "<string>")
+
+        removed, _ = build_replay_spec(
+            self.snapshot(),
+            [RemoveJsonPathMutation(type="remove_json_path", path="/messages/0/id")],
+        )
+        removed_body = json.loads(removed["body"]["text"])
+        self.assertNotIn("id", removed_body["messages"][0])
+
+        with self.assertRaisesRegex(ValueError, "out of range"):
+            build_replay_spec(
+                self.snapshot(),
+                [
+                    RemoveJsonPathMutation(
+                        type="remove_json_path",
+                        path="/messages/9/id",
+                    )
+                ],
+            )
+
+    def test_diff_keeps_source_headers_and_redacts_replacement_values(self) -> None:
+        spec, diff = build_replay_spec(
+            self.snapshot(),
+            [RemoveHeaderMutation(type="remove_header", name="X-Tracking")],
+        )
+        source_headers = {name.lower() for name in diff["source"]["header_names"]}
+        replay_headers = {name.lower() for name in diff["replay"]["header_names"]}
+
+        self.assertIn("x-tracking", source_headers)
+        self.assertNotIn("x-tracking", replay_headers)
+        self.assertIn("authorization", replay_headers)
+        self.assertNotIn("cookie", {item["name"].lower() for item in spec["headers"]})
         self.assertNotIn("Bearer secret", json.dumps(diff))
         self.assertNotIn("session=secret", json.dumps(diff))
+
+    def test_browser_managed_header_mutations_are_rejected(self) -> None:
+        for name in ["Cookie", "Origin", "Referer", "Content-Length", "Sec-Fetch-Site"]:
+            with self.subTest(name=name), self.assertRaisesRegex(
+                ValueError,
+                "browser-managed",
+            ):
+                RemoveHeaderMutation(type="remove_header", name=name)
+
+    def test_mutation_effectiveness_uses_actual_wire_snapshot(self) -> None:
+        mutation = RemoveJsonPathMutation(
+            type="remove_json_path",
+            path="/messages/0/id",
+        )
+        replay_spec, _ = build_replay_spec(self.snapshot(), [mutation])
+        wire = self.snapshot()
+        wire["requestBody"] = replay_spec["body"]
+        effective = assess_mutation_effectiveness(mutation, wire)
+        ineffective = assess_mutation_effectiveness(mutation, self.snapshot())
+
+        self.assertTrue(effective["mutation_effective"])
+        self.assertEqual(effective["mutation_observed_on_wire"], "<absent>")
+        self.assertFalse(ineffective["mutation_effective"])
+
+    def test_replay_mode_enforces_control_and_single_treatment_mutation(self) -> None:
+        base = {
+            "session_id": "session_one",
+            "objective": "paired replay",
+            "source_experiment_id": "exp_source",
+            "source_evidence_id": "ev_source",
+        }
+        control = ReplayRequestPayload.model_validate(
+            {**base, "replay_mode": "control", "mutations": []}
+        )
+        self.assertEqual(control.replay_mode, "control")
+
+        with self.assertRaisesRegex(ValueError, "control replay requires mutations"):
+            ReplayRequestPayload.model_validate(
+                {
+                    **base,
+                    "replay_mode": "control",
+                    "mutations": [
+                        {
+                            "type": "remove_json_path",
+                            "path": "/tracking_id",
+                        }
+                    ],
+                }
+            )
+        with self.assertRaisesRegex(ValueError, "control_experiment_id"):
+            ReplayRequestPayload.model_validate(
+                {
+                    **base,
+                    "replay_mode": "treatment",
+                    "mutations": [
+                        {
+                            "type": "remove_json_path",
+                            "path": "/tracking_id",
+                        }
+                    ],
+                }
+            )
 
     def test_network_matcher_uses_stable_reqid_url_method_and_resource_type(self) -> None:
         request = {

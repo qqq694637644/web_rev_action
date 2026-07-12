@@ -53,8 +53,8 @@ Use these sections:
 
 The field necessity matrix should contain:
 
-| Field or header | Location | Classification | Baseline evidence | Replay evidence | State verification | Notes |
-|---|---|---|---|---|---|---|
+| Field or header | JSON Pointer/header/query | Classification | Control experiment | Treatment experiment | Mutation effective | State verification | Notes |
+|---|---|---|---|---|---|---|---|
 
 Never include credential values. Header names are allowed.
 
@@ -130,7 +130,7 @@ Generate JSON Schema from observed and replay-tested request bodies. Add custom 
 }
 ```
 
-A field should be in `required` only after a controlled replay or a directly observed server validation error.
+A field should be in `required` only after a successful control replay and an effective one-variable treatment, or a directly observed server validation error. Record the request-shape evidence ID, control/treatment experiment IDs, actual wire mutation assessment, and any reload/retrieval verification.
 
 ## `schemas/stream-events.schema.json`
 
@@ -159,6 +159,7 @@ Rules:
 - credentials come from environment variables or explicit placeholders;
 - never embed captured Cookie, Authorization, CSRF, or token values;
 - preserve a comment with source experiment/evidence IDs;
+- preserve control/treatment experiment IDs when the script is derived from a classification replay;
 - expose required/optional fields as typed parameters;
 - print bounded status and response diagnostics;
 - support stream decoding only when the stream report confirms the framing.

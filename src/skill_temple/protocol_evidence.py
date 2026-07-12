@@ -9,7 +9,12 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from .browser_models import NetworkEvidenceSelector, ReplayMutation, RequestMatcher
+from .browser_models import (
+    NetworkEvidenceSelector,
+    ReplayMutation,
+    RequestMatcher,
+    VolatileBinding,
+)
 
 _SENSITIVE_HEADER_NAMES = {
     "authorization",
@@ -169,6 +174,7 @@ def public_network_summary(snapshot: dict[str, Any]) -> dict[str, Any]:
             response_headers if isinstance(response_headers, list) else []
         ),
         "request_body": _public_body_summary(snapshot.get("requestBody")),
+        "request_shape": request_shape_from_snapshot(snapshot),
         "response_body": _public_body_summary(snapshot.get("responseBody")),
         "observed_at": snapshot.get("observedAt"),
         "timing": snapshot.get("timing"),
@@ -195,15 +201,150 @@ def load_snapshot(path: Path) -> dict[str, Any]:
     return value
 
 
+def response_content_type(snapshot: dict[str, Any]) -> str | None:
+    headers = snapshot.get("responseHeadersArray")
+    if not isinstance(headers, list):
+        return None
+    for item in headers:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("name", "")).lower() == "content-type":
+            return str(item.get("value", "")).split(";", 1)[0].strip().lower()
+    return None
+
+
+def request_shape_from_snapshot(snapshot: dict[str, Any]) -> dict[str, Any] | None:
+    body = _decode_json_request_body(snapshot.get("requestBody"))
+    if body is None:
+        return None
+    paths: dict[str, dict[str, Any]] = {}
+    _collect_shape(body, "", paths, key_hint=None)
+    return {"format": "json-pointer-v1", "paths": paths}
+
+
+def redacted_request_body_from_snapshot(snapshot: dict[str, Any]) -> Any | None:
+    body = _decode_json_request_body(snapshot.get("requestBody"))
+    if body is None:
+        return None
+    return _redact_json_value(body, key_hint=None)
+
+
+def _decode_json_request_body(value: Any) -> Any | None:
+    if not isinstance(value, dict) or not value.get("available"):
+        return None
+    if value.get("encoding") != "utf8":
+        return None
+    try:
+        return json.loads(str(value.get("text", "")))
+    except json.JSONDecodeError:
+        return None
+
+
+def _collect_shape(
+    value: Any,
+    pointer: str,
+    output: dict[str, dict[str, Any]],
+    *,
+    key_hint: str | None,
+) -> None:
+    if isinstance(value, dict):
+        output[pointer or "/"] = {
+            "type": "object",
+            "keys": sorted(str(key) for key in value),
+        }
+        for key, child in value.items():
+            token = _encode_pointer_token(str(key))
+            _collect_shape(child, f"{pointer}/{token}", output, key_hint=str(key))
+        return
+    if isinstance(value, list):
+        output[pointer or "/"] = {"type": "array", "length": len(value)}
+        for index, child in enumerate(value):
+            _collect_shape(child, f"{pointer}/{index}", output, key_hint=key_hint)
+        return
+    entry = {"type": _json_type(value)}
+    entry["value"] = _redact_scalar(value, key_hint=key_hint)
+    output[pointer or "/"] = entry
+
+
+def _json_type(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    return type(value).__name__
+
+
+def _redact_json_value(value: Any, *, key_hint: str | None) -> Any:
+    if isinstance(value, dict):
+        return {
+            str(key): _redact_json_value(child, key_hint=str(key))
+            for key, child in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_json_value(child, key_hint=key_hint) for child in value]
+    return _redact_scalar(value, key_hint=key_hint)
+
+
+def _redact_scalar(value: Any, *, key_hint: str | None) -> Any:
+    normalized = (key_hint or "").lower()
+    if any(
+        fragment in normalized
+        for fragment in (
+            "token",
+            "secret",
+            "password",
+            "api-key",
+            "apikey",
+            "cookie",
+            "authorization",
+            "csrf",
+            "xsrf",
+            "session",
+            "signature",
+        )
+    ):
+        return "<redacted>"
+    if normalized == "id" or normalized.endswith("_id") or normalized.endswith("id"):
+        return "<identifier>"
+    if not isinstance(value, str):
+        return value
+    if normalized in {"content", "parts", "text", "prompt", "query", "title"}:
+        return "<text>"
+    return "<string>"
+
+
 def build_replay_spec(
     snapshot: dict[str, Any],
     mutations: list[ReplayMutation],
+    *,
+    volatile_bindings: list[VolatileBinding] | None = None,
+    binding_values: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     url = str(snapshot.get("url", ""))
     method = str(snapshot.get("method", "GET")).upper()
     headers = _normalized_headers(snapshot.get("requestHeadersArray"))
     body = copy.deepcopy(snapshot.get("requestBody"))
+    source_url = url
+    source_headers = copy.deepcopy(headers)
+    source_body = copy.deepcopy(body)
     ignored_headers: list[str] = []
+
+    for binding in volatile_bindings or []:
+        if binding_values is None or binding.binding_id not in binding_values:
+            raise ValueError(f"Missing volatile binding value: {binding.binding_id}")
+        binding_value = binding_values[binding.binding_id]
+        if binding.target == "json_pointer":
+            body = _replace_json_pointer(body, str(binding.path), binding_value)
+        elif binding.target == "header":
+            headers = _replace_header(headers, str(binding.name), str(binding_value))
+        else:
+            url = _mutate_query(url, str(binding.name), str(binding_value), remove=False)
 
     for mutation in mutations:
         if mutation.type == "remove_header":
@@ -242,10 +383,10 @@ def build_replay_spec(
     }
     diff = {
         "source": {
-            "url": str(snapshot.get("url", ""))[:8192],
+            "url": source_url[:8192],
             "method": method,
-            "header_names": [item["name"] for item in headers],
-            "request_body": _public_body_summary(snapshot.get("requestBody")),
+            "header_names": [item["name"] for item in source_headers],
+            "request_body": _public_body_summary(source_body),
         },
         "replay": {
             "url": url[:8192],
@@ -254,9 +395,109 @@ def build_replay_spec(
             "ignored_browser_managed_headers": sorted(set(ignored_headers)),
             "request_body": _public_body_summary(body),
         },
-        "mutations": [mutation.model_dump(mode="json") for mutation in mutations],
+        "mutations": [_redacted_mutation(mutation) for mutation in mutations],
+        "volatile_bindings": [
+            {
+                "binding_id": binding.binding_id,
+                "target": binding.target,
+                "path": binding.path,
+                "name": binding.name,
+                "generator": binding.generator,
+                "value": "<generated>",
+            }
+            for binding in volatile_bindings or []
+        ],
     }
     return spec, diff
+
+
+def assess_mutation_effectiveness(
+    mutation: ReplayMutation | None,
+    wire_snapshot: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if mutation is None:
+        return {
+            "mutation_requested": None,
+            "mutation_observed_on_wire": None,
+            "mutation_effective": None,
+            "reason": "control replay has no classification mutation",
+        }
+    requested = _redacted_mutation(mutation)
+    if wire_snapshot is None:
+        return {
+            "mutation_requested": requested,
+            "mutation_observed_on_wire": None,
+            "mutation_effective": False,
+            "reason": "exact replay request snapshot was not exported",
+        }
+    try:
+        if mutation.type in {"remove_json_path", "replace_json_path"}:
+            body_value = _decode_json_request_body(wire_snapshot.get("requestBody"))
+            if body_value is None:
+                raise ValueError("wire request has no JSON body")
+            exists, observed = _read_pointer(body_value, mutation.path)
+            effective = (
+                not exists
+                if mutation.type == "remove_json_path"
+                else exists and observed == mutation.value
+            )
+            observed_public = (
+                "<absent>"
+                if not exists
+                else _redact_json_value(observed, key_hint=_last_pointer_token(mutation.path))
+            )
+        elif mutation.type in {"remove_header", "replace_header"}:
+            headers = _normalized_headers(wire_snapshot.get("requestHeadersArray"))
+            values = [
+                item["value"]
+                for item in headers
+                if item["name"].lower() == mutation.name.lower()
+            ]
+            effective = (
+                not values
+                if mutation.type == "remove_header"
+                else any(value == mutation.value for value in values)
+            )
+            observed_public = "<absent>" if not values else "<present>"
+        else:
+            query = parse_qsl(
+                urlsplit(str(wire_snapshot.get("url", ""))).query,
+                keep_blank_values=True,
+            )
+            values = [value for name, value in query if name == mutation.name]
+            effective = (
+                not values
+                if mutation.type == "remove_query_parameter"
+                else any(value == mutation.value for value in values)
+            )
+            observed_public = "<absent>" if not values else "<present>"
+        return {
+            "mutation_requested": requested,
+            "mutation_observed_on_wire": observed_public,
+            "mutation_effective": effective,
+            "reason": (
+                "wire request matches requested mutation"
+                if effective
+                else "wire request does not match requested mutation"
+            ),
+        }
+    except ValueError as exc:
+        return {
+            "mutation_requested": requested,
+            "mutation_observed_on_wire": None,
+            "mutation_effective": False,
+            "reason": str(exc),
+        }
+
+
+def _redacted_mutation(mutation: ReplayMutation) -> dict[str, Any]:
+    value = mutation.model_dump(mode="json")
+    if "value" in value:
+        value["value"] = _redact_json_value(
+            value["value"],
+            key_hint=(value.get("name") or _last_pointer_token(str(value.get("path", "")))),
+        )
+    return value
 
 
 def _normalized_headers(value: Any) -> list[dict[str, str]]:
@@ -267,6 +508,14 @@ def _normalized_headers(value: Any) -> list[dict[str, str]]:
         for item in value
         if isinstance(item, dict) and str(item.get("name", "")).strip()
     ]
+
+
+def _replace_header(
+    headers: list[dict[str, str]], name: str, value: str
+) -> list[dict[str, str]]:
+    result = [item for item in headers if item["name"].lower() != name.lower()]
+    result.append({"name": name, "value": value})
+    return result
 
 
 def _mutate_query(url: str, name: str, value: str | None, *, remove: bool) -> str:
@@ -298,23 +547,11 @@ def _mutate_json_body(body: Any, mutation: ReplayMutation) -> dict[str, Any]:
         value = json.loads(str(body.get("text", "")))
     except json.JSONDecodeError as exc:
         raise ValueError("JSON mutation requires a valid JSON request body") from exc
-    if not isinstance(value, dict):
-        raise ValueError("JSON mutation currently requires an object request body")
-    path = str(getattr(mutation, "path", ""))[2:].split(".")
-    parent: Any = value
-    for segment in path[:-1]:
-        if not isinstance(parent, dict) or segment not in parent:
-            raise ValueError(f"JSON path does not exist: $.{'.'.join(path)}")
-        parent = parent[segment]
-    if not isinstance(parent, dict):
-        raise ValueError(f"JSON path parent is not an object: $.{'.'.join(path)}")
-    leaf = path[-1]
+    path = str(getattr(mutation, "path", ""))
     if mutation.type == "remove_json_path":
-        if leaf not in parent:
-            raise ValueError(f"JSON path does not exist: $.{'.'.join(path)}")
-        del parent[leaf]
+        _remove_pointer(value, path)
     else:
-        parent[leaf] = mutation.value
+        _replace_pointer(value, path, mutation.value)
     encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
     return {
         "available": True,
@@ -322,3 +559,103 @@ def _mutate_json_body(body: Any, mutation: ReplayMutation) -> dict[str, Any]:
         "encoding": "utf8",
         "text": encoded,
     }
+
+
+def _replace_json_pointer(body: Any, path: str, value: Any) -> dict[str, Any]:
+    if not isinstance(body, dict) or not body.get("available"):
+        raise ValueError("JSON volatile binding requires an available request body")
+    if body.get("encoding") != "utf8":
+        raise ValueError("JSON volatile binding requires a UTF-8 request body")
+    try:
+        decoded = json.loads(str(body.get("text", "")))
+    except json.JSONDecodeError as exc:
+        raise ValueError("JSON volatile binding requires a valid JSON request body") from exc
+    _replace_pointer(decoded, path, value)
+    encoded = json.dumps(decoded, ensure_ascii=False, separators=(",", ":"))
+    return {
+        "available": True,
+        "size": len(encoded.encode("utf-8")),
+        "encoding": "utf8",
+        "text": encoded,
+    }
+
+
+def _decode_pointer(path: str) -> list[str]:
+    if not path.startswith("/") or path == "/":
+        raise ValueError(f"Invalid JSON Pointer: {path}")
+    return [token.replace("~1", "/").replace("~0", "~") for token in path.split("/")[1:]]
+
+
+def _encode_pointer_token(token: str) -> str:
+    return token.replace("~", "~0").replace("/", "~1")
+
+
+def _last_pointer_token(path: str) -> str | None:
+    try:
+        return _decode_pointer(path)[-1]
+    except (ValueError, IndexError):
+        return None
+
+
+def _resolve_parent(document: Any, path: str) -> tuple[Any, str]:
+    tokens = _decode_pointer(path)
+    parent = document
+    for token in tokens[:-1]:
+        if isinstance(parent, dict):
+            if token not in parent:
+                raise ValueError(f"JSON Pointer path does not exist: {path}")
+            parent = parent[token]
+        elif isinstance(parent, list):
+            index = _parse_list_index(token, len(parent), path)
+            parent = parent[index]
+        else:
+            raise ValueError(f"JSON Pointer traverses a scalar value: {path}")
+    return parent, tokens[-1]
+
+
+def _parse_list_index(token: str, length: int, path: str) -> int:
+    if not token.isdigit():
+        raise ValueError(f"JSON Pointer array token must be a non-negative index: {path}")
+    index = int(token)
+    if index >= length:
+        raise ValueError(f"JSON Pointer array index is out of range: {path}")
+    return index
+
+
+def _read_pointer(document: Any, path: str) -> tuple[bool, Any]:
+    try:
+        parent, leaf = _resolve_parent(document, path)
+        if isinstance(parent, dict):
+            return (leaf in parent, parent.get(leaf))
+        if isinstance(parent, list):
+            index = _parse_list_index(leaf, len(parent), path)
+            return True, parent[index]
+        return False, None
+    except ValueError:
+        return False, None
+
+
+def _remove_pointer(document: Any, path: str) -> None:
+    parent, leaf = _resolve_parent(document, path)
+    if isinstance(parent, dict):
+        if leaf not in parent:
+            raise ValueError(f"JSON Pointer path does not exist: {path}")
+        del parent[leaf]
+        return
+    if isinstance(parent, list):
+        del parent[_parse_list_index(leaf, len(parent), path)]
+        return
+    raise ValueError(f"JSON Pointer parent is not a container: {path}")
+
+
+def _replace_pointer(document: Any, path: str, value: Any) -> None:
+    parent, leaf = _resolve_parent(document, path)
+    if isinstance(parent, dict):
+        if leaf not in parent:
+            raise ValueError(f"JSON Pointer path does not exist: {path}")
+        parent[leaf] = value
+        return
+    if isinstance(parent, list):
+        parent[_parse_list_index(leaf, len(parent), path)] = value
+        return
+    raise ValueError(f"JSON Pointer parent is not a container: {path}")

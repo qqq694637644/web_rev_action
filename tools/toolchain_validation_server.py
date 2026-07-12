@@ -20,6 +20,8 @@ class ToolchainValidationHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     fixture_root: Path
     slow_started_event: threading.Event
+    conversation_lock: threading.Lock
+    conversation_states: dict[str, dict[str, object]]
 
     def handle(self) -> None:
         try:
@@ -118,19 +120,30 @@ class ToolchainValidationHandler(BaseHTTPRequestHandler):
                 HTTPStatus.BAD_REQUEST,
             )
             return
-        message = payload.get("message") if isinstance(payload, dict) else None
+        messages = payload.get("messages") if isinstance(payload, dict) else None
+        message = (
+            messages[0]
+            if isinstance(messages, list) and messages and isinstance(messages[0], dict)
+            else None
+        )
+        author = message.get("author") if isinstance(message, dict) else None
+        content = message.get("content") if isinstance(message, dict) else None
+        parts = content.get("parts") if isinstance(content, dict) else None
         required = {
             "conversation_id": payload.get("conversation_id")
             if isinstance(payload, dict)
             else None,
             "model": payload.get("model") if isinstance(payload, dict) else None,
-            "message.id": message.get("id") if isinstance(message, dict) else None,
-            "message.parent_id": (
-                message.get("parent_id") if isinstance(message, dict) else None
+            "messages[0].id": message.get("id") if isinstance(message, dict) else None,
+            "messages[0].author.role": (
+                author.get("role") if isinstance(author, dict) else None
             ),
-            "message.content": (
-                message.get("content") if isinstance(message, dict) else None
+            "messages[0].content.parts[0]": (
+                parts[0] if isinstance(parts, list) and parts else None
             ),
+            "parent_message_id": payload.get("parent_message_id")
+            if isinstance(payload, dict)
+            else None,
         }
         missing = [name for name, value in required.items() if not value]
         if missing:
@@ -143,19 +156,61 @@ class ToolchainValidationHandler(BaseHTTPRequestHandler):
                 HTTPStatus.UNPROCESSABLE_ENTITY,
             )
             return
-        self._send_json(
-            {
-                "ok": True,
-                "conversation_id": payload["conversation_id"],
-                "accepted_message_id": message["id"],
-                "parent_message_id": message["parent_id"],
-                "assistant_message_id": f"assistant-{message['id']}",
-                "current_node": f"assistant-{message['id']}",
-                "model": payload["model"],
-                "optional_timezone_seen": "timezone" in payload,
-                "tracking_seen": "tracking_id" in payload,
+        conversation_id = str(payload["conversation_id"])
+        user_message_id = str(message["id"])
+        parent_message_id = str(payload["parent_message_id"])
+        assistant_message_id = f"assistant-{user_message_id}"
+        with self.conversation_lock:
+            state = self.conversation_states.setdefault(
+                conversation_id,
+                {
+                    "conversation_id": conversation_id,
+                    "mapping": {},
+                    "current_node": parent_message_id,
+                },
+            )
+            mapping = state["mapping"]
+            assert isinstance(mapping, dict)
+            mapping[user_message_id] = {
+                "id": user_message_id,
+                "parent": parent_message_id,
+                "role": author["role"],
+                "content": parts,
             }
+            mapping[assistant_message_id] = {
+                "id": assistant_message_id,
+                "parent": user_message_id,
+                "role": "assistant",
+                "content": ["fixture answer"],
+            }
+            state["current_node"] = assistant_message_id
+            state_snapshot = json.loads(json.dumps(state))
+        events = (
+            {
+                "type": "message_start",
+                "conversation_id": conversation_id,
+                "message": {
+                    "id": assistant_message_id,
+                    "parent_id": user_message_id,
+                    "author": {"role": "assistant"},
+                },
+            },
+            {
+                "type": "message_delta",
+                "message_id": assistant_message_id,
+                "delta": "fixture answer",
+            },
+            {
+                "type": "conversation_state",
+                "conversation_id": conversation_id,
+                "current_node": assistant_message_id,
+                "mapping": state_snapshot["mapping"],
+                "model": payload["model"],
+                "optional_timezone_seen": "timezone_offset_min" in payload,
+                "tracking_seen": "tracking_id" in payload,
+            },
         )
+        self._send_sse_json(events)
 
     def log_message(self, format: str, *args: object) -> None:
         return
@@ -206,6 +261,24 @@ class ToolchainValidationHandler(BaseHTTPRequestHandler):
             time.sleep(0.05)
         self.close_connection = True
 
+    def _send_sse_json(self, events: tuple[dict[str, object], ...]) -> None:
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        for index, payload in enumerate(events):
+            event = (
+                f"event: message\nid: {index}\ndata: "
+                f"{json.dumps(payload, separators=(',', ':'), ensure_ascii=False)}\n\n"
+            ).encode()
+            self.wfile.write(event)
+            self.wfile.flush()
+            time.sleep(0.03)
+        self.wfile.write(b"event: done\ndata: [DONE]\n\n")
+        self.wfile.flush()
+        self.close_connection = True
+
 
 def start_server(
     fixture_root: Path,
@@ -218,6 +291,8 @@ def start_server(
         {
             "fixture_root": fixture_root,
             "slow_started_event": threading.Event(),
+            "conversation_lock": threading.Lock(),
+            "conversation_states": {},
         },
     )
     server = ThreadingHTTPServer((host, port), handler_type)

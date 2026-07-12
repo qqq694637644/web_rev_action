@@ -101,6 +101,7 @@ open_session
 capture_baseline
 capture_flow
 replay_request
+save_script_source
 close_session
 cancel_experiment
 ```
@@ -124,15 +125,21 @@ GPT 不直接协调 start、click、wait、stop。
 
 ```text
 验证 source_experiment_id + source_evidence_id
+→ control 生成 volatile bindings，treatment 复用同一组值
 → 本地读取 exact network snapshot
-→ 应用结构化 header/query/JSON mutation
+→ treatment 应用唯一一个结构化 header/query/JSON Pointer mutation
 → 启动新 experiment 和 capture/checkpoint
 → 在当前页面上下文执行 fetch(credentials=include)
 → 导出新 network/page/console evidence
+→ 对 actual outbound request 验证 mutation_effective
 → 保存 request diff 与 response artifact
 ```
 
-公开 payload 不接受任意本地路径，也不返回 Cookie、Authorization 或 CSRF。普通 JSON replay 默认不要求 SSE raw capture；流式 replay 可显式开启 stream requirements。
+公开 payload 不接受任意本地路径，也不返回 Cookie、Authorization 或 CSRF。JSON mutation 使用 RFC 6901 Pointer，例如 `/messages/0/content/parts/0`；不支持 wildcard。Cookie、Origin、Referer、Host、Content-Length 和 `Sec-*` 等 browser-managed header mutation 会被拒绝。
+
+Control 必须 `mutations=[]` 且 HTTP 2xx/3xx。Treatment 必须引用 control、恰好一个 mutation并复用 control 的 volatile ID/timestamp 值。若 actual wire snapshot 没有观察到请求变更，实验直接失败。
+
+若 source response 是 `text/event-stream`，replay 自动开启 stream capture 和 raw artifact requirements。有效 treatment 返回非流 4xx 时记录为 protocol rejection，而不是 collector 失败。`verification_flow` 可在 fetch 后执行 reload、重新打开 conversation 或 retrieval 检查。
 
 Capture 阶段禁止 `target.start_url`。需要观察页面初始化请求、重定向、首屏脚本或初始 SSE 时，必须把导航写成 flow 的第一个显式 `navigate` step。这样 running manifest、Trace 和 stream collector 都会在导航前创建。
 
@@ -157,6 +164,7 @@ get_experiment
 get_stream_status
 list_evidence
 get_network_evidence
+get_request_shape
 get_request_initiator
 search_scripts
 get_script_source
@@ -183,6 +191,10 @@ experiment_id + evidence_id + artifact_id
 ```
 
 `capture_flow.network_evidence` 在第一条页面 mutation 前记录 reqid high-water mark，finalize 时只选择本 experiment 窗口中的请求，并在 MCP generation 仍有效时导出 exact headers/body/initiator。`series` 字段保存 analysis series、scenario、predecessor、sequence 和 conversation key。
+
+每个 JSON request evidence 还生成 public `request-shape.json` 和 `request-body.redacted.json`。Shape 保留对象/数组结构、数组长度、类型和安全 placeholder，使 Skill 无需读取 credential artifact 即可选择 `/messages/0/id` 等 mutation path。
+
+流请求生成 `stream_request` 和 `stream_event_range` evidence，关联 persistent/CDP/network IDs 与 raw/events/chunks/metadata artifact。源码搜索结果可通过 consequential `save_script_source` 持久化到目标 experiment，并保存 script URL/ID、范围、SHA-256 和 initiator evidence 关联。
 
 Stream 和普通 network status 都会读取全部分页，并在执行 event predicate 前锁定具体 primary request ID；`matchedRequestId` 不属于该 request 时不会满足等待。同一 session 重复提交返回 `409 session_busy`，其他 browser operation 返回 `409 browser_busy`。Protected workspace mutation 与 browser operation 通过同一 RuntimeCoordinator 双向互斥，避免 TOCTOU。
 
@@ -460,7 +472,12 @@ data/analysis-workspace/
         network/
           ev_<experiment>_network_request_<selector>_<reqid>/
             all.json
+            request-shape.json
+            request-body.redacted.json
             initiator.json
+        sources/
+          ev_<experiment>_script_source_<label>_<hash>.js
+          ev_<experiment>_script_source_<label>_<hash>.metadata.json
         console/
           console.jsonl
         capture-<uuid>/

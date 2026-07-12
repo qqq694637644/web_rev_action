@@ -12,7 +12,7 @@ Use this Skill when the user wants to understand, reproduce, compare, or documen
 Follow this separation throughout the task:
 
 - This Skill decides the experiment sequence, one-variable mutations, evidence interpretation, and report contents.
-- `runBrowserExperiment` performs atomic browser operations such as `capture_flow`, `replay_request`, and `cancel_experiment`.
+- `runBrowserExperiment` performs atomic browser operations such as `capture_flow`, paired `replay_request`, `save_script_source`, and `cancel_experiment`.
 - `inspectBrowserEvidence` reads bounded experiment, evidence, initiator, script, console, and stream summaries.
 - Workspace tools read evidence files and write only derived reports, schemas, notes, and replay scripts.
 - Never reconstruct browser fetches with arbitrary PowerShell or JavaScript when `replay_request` can perform the operation.
@@ -63,12 +63,38 @@ After completion:
 1. Call `list_evidence`.
 2. Select the primary `network_request` evidence.
 3. Call `get_network_evidence` for its redacted summary.
-4. Call `get_request_initiator`.
-5. Use `search_scripts` and `get_script_source` for the identified request builder.
+4. Call `get_request_shape` before choosing a JSON mutation path.
+5. Call `get_request_initiator`.
+6. Use `search_scripts` and `get_script_source` for the identified request builder.
+7. Persist the bounded source region with `save_script_source`, linked to the network evidence ID.
 
 ### 4. Determine field necessity with browser-context replay
 
-Use `replay_request` with exactly one mutation per experiment:
+Replay classification is always a pair:
+
+```text
+control replay
+  replay_mode = control
+  mutations = []
+  volatile_bindings generate fresh IDs/timestamps/nonces
+
+treatment replay
+  replay_mode = treatment
+  control_experiment_id = <control>
+  mutations = exactly one
+  reuses the control volatile values
+```
+
+Use RFC 6901 JSON Pointer paths, including array indices:
+
+```text
+/messages/0/id
+/messages/0/author/role
+/messages/0/content/parts/0
+/parent_message_id
+```
+
+Wildcards and bracket expressions are not allowed. The single treatment mutation may be:
 
 ```text
 remove_json_path
@@ -79,13 +105,17 @@ remove_query_parameter
 replace_query_parameter
 ```
 
-Keep the source `experiment_id` and `evidence_id` fixed while changing one field. Classify a field only after comparing:
+Browser-managed headers such as Cookie, Origin, Referer, Host, Content-Length, and `Sec-*` cannot be mutated through browser-context fetch and must be rejected rather than classified. Classify a field only when `mutation_effective=true`, after comparing:
 
 - replay HTTP status and response evidence;
 - stream or network terminal behavior;
 - page snapshot/state effects;
 - conversation persistence or subsequent retrieval;
 - console errors.
+
+If the source response is `text/event-stream`, replay automatically enables stream capture and raw artifact requirements. A treatment that produces an exact non-stream 4xx response is recorded as a protocol rejection, not a collector failure.
+
+Use `verification_flow` for reload, conversation detail retrieval, or reopening the conversation after fetch. Without persistent-state verification, do not classify a 2xx result beyond `partial` or `unknown`.
 
 Use these classifications:
 
@@ -141,8 +171,11 @@ The generated HTTP replay script must use placeholders or environment variables 
 ## Decision rules
 
 - If no exact full network snapshot exists, capture a new experiment with `export_parts=["all"]`; do not approximate the request from a summary.
+- If `get_request_shape` is unavailable, recapture the request; do not guess array paths from source text alone.
 - If initiator evidence is absent, reproduce the request in a new experiment and capture it again before broad source searching.
-- If a source match is minified, use bounded source offsets and document the loaded script URL/hash.
+- If a source match is minified, use bounded source offsets and persist it with `save_script_source`; document the loaded script URL/hash and initiator evidence ID.
+- If a treatment reports `mutation_effective=false`, discard it as inconclusive and fix the matcher or mutation path.
+- If a source request is stateful, require a successful control replay before running a treatment.
 - If an experiment is submitted incorrectly, call `cancel_experiment`; do not close the session or restart the service.
 - If `changed_during_read=true`, do not cite the file hash as stable. Re-read after the experiment reaches a terminal state.
 - If an evidence or replay result is partial, preserve the uncertainty in reports and `notes/open-questions.md`.
@@ -153,8 +186,11 @@ The protocol reproduction is complete only when:
 
 - all six scenarios have an explicit experiment chain;
 - primary ordinary and streaming requests have stable evidence IDs;
+- request shapes and redacted request bodies expose mutation paths without exposing values;
 - request construction has initiator and source evidence;
-- important fields have one-variable replay results;
+- important fields have successful control plus one-variable treatment results;
+- every treatment verifies the mutation on the actual outbound request;
+- streaming requests have `stream_request` and `stream_event_range` evidence;
 - stream events and conversation state transitions are documented;
 - Stop behavior is observed rather than assumed;
 - every core report conclusion is traceable to experiment, evidence, and artifact IDs;

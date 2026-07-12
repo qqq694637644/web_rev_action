@@ -32,13 +32,21 @@ Use `export_parts=["all"]` for requests that may become replay sources. Use boun
 
 ## Field mutation matrix
 
-Create one `replay_request` experiment per row. Do not combine removals.
+Create one control replay followed by one treatment replay per row. The treatment must reuse the control's volatile bindings and contain exactly one mutation.
+
+Use JSON Pointer rather than dotted JSONPath:
+
+```text
+/messages/0/id
+/messages/0/content/parts/0
+/parent_message_id
+```
 
 | Candidate | Mutation | Validation beyond HTTP status |
 |---|---|---|
-| conversation ID | remove/replace JSON path | New or rejected conversation, persisted tree |
-| parent message ID | remove/replace JSON path | Branch attachment and current node |
-| user message ID | remove/replace JSON path | Server-generated vs client-required identity |
+| conversation ID | remove/replace JSON Pointer | New or rejected conversation, persisted tree |
+| parent message ID | remove/replace JSON Pointer | Branch attachment and current node |
+| user message ID | remove/replace JSON Pointer | Server-generated vs client-required identity |
 | model/variant | remove/replace JSON path | Model selection and stream metadata |
 | timezone/locale | remove JSON path | Response semantics vs tracking only |
 | client tracking ID | remove JSON/query/header | Request acceptance and persisted state |
@@ -47,6 +55,8 @@ Create one `replay_request` experiment per row. Do not combine removals.
 | query feature flag | remove/replace query parameter | Feature behavior and response schema |
 
 Classify each result as `required`, `conditionally_required`, `optional`, `tracking_only`, or `unknown`.
+
+Do not test browser-managed Cookie, Origin, Referer, Host, Content-Length, or `Sec-*` through header mutation. Use a dedicated browser-context credential experiment when needed.
 
 ## Stop observation template
 

@@ -31,6 +31,7 @@ from skill_temple.browser_models import (
     CancelExperimentRequest,
     CaptureFlowRequest,
     CloseSessionRequest,
+    GetRequestShapeRequest,
     OpenSessionRequest,
     ReplayRequestRequest,
 )
@@ -356,6 +357,7 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
                         "url_contains": "/api/pandora/conversation",
                         "method": "POST",
                         "resource_types": ["fetch"],
+                        "mime_types": ["text/event-stream"],
                         "expected_min_matches": 1,
                         "expected_max_matches": 1,
                         "allow_supporting_failures": True,
@@ -382,14 +384,14 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
                     "deadline_ms": 30_000,
                     "capture": {
                         "network": True,
-                        "stream": False,
+                        "stream": True,
                         "trace": False,
                         "screenshots": False,
                         "page_snapshots": True,
                         "console_errors": True,
                     },
                     "requirements": {
-                        "require_raw_capture": False,
+                        "require_raw_capture": True,
                         "require_semantic_parse": False,
                         "require_request_snapshot": True,
                         "require_artifacts": True,
@@ -442,6 +444,92 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
         if "fixture-token" in public_evidence or "fixture-session" in public_evidence:
             raise AssertionError("Public evidence leaked fixture credentials")
 
+        shape = await service.inspect(
+            GetRequestShapeRequest(
+                operation="get_request_shape",
+                payload={
+                    "experiment_id": pandora_capture.experiment_id,
+                    "evidence_id": source_evidence["evidence_id"],
+                },
+            )
+        )
+        shape_paths = (
+            shape.result.get("request_shape", {}).get("paths", {})
+            if isinstance(shape.result, dict)
+            else {}
+        )
+        for expected_pointer in [
+            "/messages/0/id",
+            "/messages/0/content/parts/0",
+            "/parent_message_id",
+            "/tracking_id",
+        ]:
+            if expected_pointer not in shape_paths:
+                raise AssertionError(shape.model_dump())
+
+        control = await service.run(
+            ReplayRequestRequest(
+                operation="replay_request",
+                payload={
+                    "session_id": SESSION_ID,
+                    "objective": "Pandora-like control replay",
+                    "source_experiment_id": pandora_capture.experiment_id,
+                    "source_evidence_id": source_evidence["evidence_id"],
+                    "replay_mode": "control",
+                    "mutations": [],
+                    "volatile_bindings": [
+                        {
+                            "binding_id": "message_id",
+                            "target": "json_pointer",
+                            "path": "/messages/0/id",
+                            "generator": "uuid4",
+                        }
+                    ],
+                    "execution_mode": "sync",
+                    "deadline_ms": 30_000,
+                    "capture": {
+                        "network": True,
+                        "stream": False,
+                        "trace": False,
+                        "screenshots": False,
+                        "page_snapshots": True,
+                        "console_errors": True,
+                    },
+                    "series": {
+                        "analysis_series_id": "pandora-fixture-series",
+                        "scenario_type": "control_replay",
+                        "predecessor_experiment_id": pandora_capture.experiment_id,
+                        "sequence_index": 2,
+                        "conversation_key": "conversation-fixture",
+                    },
+                },
+            )
+        )
+        if control.status != "completed":
+            raise AssertionError(control.model_dump())
+        control_manifest = json.loads(
+            (
+                evidence_root
+                / "experiments"
+                / str(control.experiment_id)
+                / "manifest.json"
+            ).read_text(encoding="utf-8")
+        )
+        if control_manifest.get("replay_http_status") != 200:
+            raise AssertionError(control_manifest)
+        if not control_manifest.get("replay", {}).get("source_is_stream"):
+            raise AssertionError(control_manifest)
+        control_stream = next(
+            (
+                item
+                for item in control_manifest.get("evidence", [])
+                if item.get("kind") == "stream_request"
+            ),
+            None,
+        )
+        if not control_stream:
+            raise AssertionError("Control replay produced no stream_request evidence")
+
         async def run_replay(
             *,
             scenario_type: str,
@@ -456,9 +544,11 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
                         "objective": f"Pandora-like replay: {scenario_type}",
                         "source_experiment_id": pandora_capture.experiment_id,
                         "source_evidence_id": source_evidence["evidence_id"],
+                        "replay_mode": "treatment",
+                        "control_experiment_id": control.experiment_id,
                         "mutations": [mutation],
                         "execution_mode": "sync",
-                        "deadline_ms": 20_000,
+                        "deadline_ms": 30_000,
                         "capture": {
                             "network": True,
                             "stream": False,
@@ -470,7 +560,7 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
                         "series": {
                             "analysis_series_id": "pandora-fixture-series",
                             "scenario_type": scenario_type,
-                            "predecessor_experiment_id": pandora_capture.experiment_id,
+                            "predecessor_experiment_id": control.experiment_id,
                             "sequence_index": sequence_index,
                             "conversation_key": "conversation-fixture",
                         },
@@ -503,20 +593,20 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
 
         tracking_manifest, tracking_status = await run_replay(
             scenario_type="remove_tracking_field",
-            sequence_index=2,
+            sequence_index=3,
             mutation={
                 "type": "remove_json_path",
-                "path": "$.tracking_id",
+                "path": "/tracking_id",
             },
         )
         if tracking_status != 200:
             raise AssertionError(tracking_manifest)
         required_manifest, required_status = await run_replay(
-            scenario_type="remove_required_parent",
-            sequence_index=3,
+            scenario_type="remove_required_message_id",
+            sequence_index=4,
             mutation={
                 "type": "remove_json_path",
-                "path": "$.message.parent_id",
+                "path": "/messages/0/id",
             },
         )
         if required_status != 422:
@@ -531,6 +621,11 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
                 "evidence_id"
             ):
                 raise AssertionError(replay_attempt)
+            if replay_attempt.get("control_experiment_id") != control.experiment_id:
+                raise AssertionError(replay_attempt)
+            mutation_assessment = replay_manifest.get("mutation_assessment") or {}
+            if mutation_assessment.get("mutation_effective") is not True:
+                raise AssertionError(mutation_assessment)
             diff_artifact = artifact_by_kind(
                 replay_manifest,
                 "replay_request_diff",
@@ -540,6 +635,18 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
             ).read_text(encoding="utf-8")
             if "fixture-token" in diff_text or "fixture-session" in diff_text:
                 raise AssertionError("Replay diff leaked fixture credentials")
+        tracking_stream = next(
+            (
+                item
+                for item in tracking_manifest.get("evidence", [])
+                if item.get("kind") == "stream_request"
+            ),
+            None,
+        )
+        if not tracking_stream:
+            raise AssertionError("Tracking treatment produced no stream evidence")
+        if not required_manifest.get("protocol_rejection_observed"):
+            raise AssertionError(required_manifest)
 
         cancellation_started = await service.run(
             CaptureFlowRequest(
@@ -658,8 +765,19 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
             "sequential_request_ids": matched_ids[-2:],
             "pandora_source_experiment_id": pandora_capture.experiment_id,
             "pandora_source_evidence_id": source_evidence["evidence_id"],
+            "pandora_control_experiment_id": control.experiment_id,
+            "pandora_control_status": control_manifest.get("replay_http_status"),
             "pandora_tracking_replay_status": tracking_status,
+            "pandora_tracking_mutation_effective": tracking_manifest.get(
+                "mutation_assessment", {}
+            ).get("mutation_effective"),
             "pandora_required_replay_status": required_status,
+            "pandora_required_mutation_effective": required_manifest.get(
+                "mutation_assessment", {}
+            ).get("mutation_effective"),
+            "pandora_required_protocol_rejection": required_manifest.get(
+                "protocol_rejection_observed"
+            ),
             "cancellation_status": cancellation_manifest.get("status"),
             "cancellation_step_status": cancellation_steps[0].get("status"),
             "cancellation_collector_cleanup": cancellation_health.get(

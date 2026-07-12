@@ -18,10 +18,13 @@ Current evidence kinds include:
 
 ```text
 network_request
+stream_request
+stream_event_range
 console_message
 page_screenshot
 page_snapshot
 replay_attempt
+script_source
 ```
 
 A network evidence entry contains stable request identities, selector ID, collector generation, step IDs, artifact IDs, artifact paths, and a redacted summary.
@@ -44,7 +47,7 @@ For replay, the backend reads the exact artifact locally and creates the browser
 Use the following order:
 
 1. `list_evidence` to discover stable evidence IDs.
-2. `get_network_evidence`, `get_request_initiator`, or `list_console_errors` for bounded summaries.
+2. `get_network_evidence`, `get_request_shape`, `get_request_initiator`, or `list_console_errors` for bounded summaries.
 3. `workspaceReadFiles` for non-credential text artifacts.
 4. `workspaceExecPwsh` for binary, offset, compressed, or hash analysis.
 
@@ -62,7 +65,7 @@ source line/offset range
 source artifact or bounded source response
 ```
 
-A broad script search is supporting evidence, not proof that a function initiated the request. Prefer saved initiator evidence.
+A broad script search is supporting evidence, not proof that a function initiated the request. Prefer saved initiator evidence, then persist the selected source region with `save_script_source` so URL/script ID/range/SHA-256 remain auditable after navigation.
 
 ## Replay evidence
 
@@ -72,9 +75,13 @@ A replay attempt should link:
 source_experiment_id
 source_evidence_id
 mutation list
+control_experiment_id
+volatile binding metadata
+mutation_requested / mutation_observed_on_wire / mutation_effective
 request diff artifact
 replay response artifact
 new network evidence IDs
+stream request/event-range evidence IDs
 page and console evidence IDs
 ```
 
