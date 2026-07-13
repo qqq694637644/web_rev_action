@@ -20,9 +20,11 @@ from skill_temple.browser_models import (
     VolatileBinding,
 )
 from skill_temple.protocol_evidence import (
+    aggregate_observation_completeness,
     analyze_replay_response,
     assess_paired_mutation_effectiveness,
     binding_value_from_snapshot,
+    build_network_observation,
     build_replay_spec,
     network_checkpoint,
     network_request_matches,
@@ -79,6 +81,82 @@ class ProtocolEvidenceTests(unittest.TestCase):
                 "text": '{"ok":true}',
             },
         }
+
+    def test_network_observation_combines_sources_without_duplicate_verdicts(self) -> None:
+        observation = build_network_observation(
+            observation_id="obs_one",
+            network_evidence={
+                "evidence_id": "ev_network",
+                "request_ids": {"reqid": 7, "network_request_id": "network-7"},
+                "artifact_ids": ["art_network"],
+                "artifact_paths": {"all": "network/request.json"},
+                "summary": {
+                    "url": "https://example.test/conversation",
+                    "method": "POST",
+                    "status": 200,
+                    "snapshot_integrity": {
+                        "request_headers_completeness": "partial",
+                        "request_body_completeness": "complete",
+                        "response_headers_completeness": "complete",
+                        "response_body_completeness": "complete",
+                    },
+                },
+            },
+            stream_request={
+                "persistentRequestId": "persistent-7",
+                "rawCaptureIntegrity": "complete",
+                "semanticParseIntegrity": "partial",
+                "artifactIntegrity": "complete",
+                "coreArtifacts": [
+                    {
+                        "kind": "request_headers",
+                        "writeStatus": "written",
+                        "bytes": 10,
+                        "artifactId": "art_headers",
+                    },
+                    {
+                        "kind": "request_headers_extra",
+                        "writeStatus": "written",
+                        "bytes": 10,
+                        "artifactId": "art_headers_extra",
+                    },
+                ],
+            },
+            association={"status": "matched", "method": "network_request_id"},
+        )
+
+        self.assertEqual(observation["association"]["confidence"], "exact")
+        self.assertEqual(observation["completeness"]["request_headers"], "complete")
+        self.assertEqual(observation["completeness"]["request_body"], "complete")
+        self.assertEqual(observation["completeness"]["semantic_stream"], "partial")
+        self.assertEqual(
+            observation["artifact_ids"],
+            ["art_headers", "art_headers_extra", "art_network"],
+        )
+        self.assertNotIn("integrity_status", observation)
+
+    def test_observation_quality_aggregates_only_required_dimensions(self) -> None:
+        observations = [
+            {
+                "completeness": {
+                    "request_body": "complete",
+                    "semantic_stream": "partial",
+                    "response_body": "unknown",
+                },
+                "missing_evidence": ["semantic_stream", "response_body"],
+            }
+        ]
+
+        dimensions, missing = aggregate_observation_completeness(
+            observations,
+            required_dimensions={"request_body", "semantic_stream"},
+        )
+
+        self.assertEqual(
+            dimensions,
+            {"request_body": "complete", "semantic_stream": "partial"},
+        )
+        self.assertEqual(missing, ["semantic_stream"])
 
     def test_network_checkpoint_excludes_old_requests_and_optionally_includes_inflight(
         self,

@@ -1045,16 +1045,25 @@ class BrowserActionTests(unittest.TestCase):
             summary = body["result"]["experiment"]
             manifest = root / body["result"]["manifest_relative_path"]
             experiment = json.loads(manifest.read_text(encoding="utf-8"))
-            self.assertEqual(summary["execution_integrity"], "complete")
-            self.assertEqual(summary["evidence_integrity"], "complete")
-            self.assertEqual(experiment["primary_request_integrity"], "complete")
+            self.assertEqual(summary["execution"]["status"], "complete")
+            self.assertEqual(summary["quality_summary"]["status"], "complete")
+            self.assertEqual(summary["quality_summary"]["missing_evidence"], [])
+            self.assertEqual(len(experiment["network_observations"]), 1)
             self.assertNotIn("objective_integrity", experiment)
-            self.assertEqual(experiment["collector_integrity"], "failed")
+            self.assertNotIn("collector_integrity", experiment)
+            self.assertNotIn("primary_request_integrity", experiment)
             self.assertTrue(experiment["capture_health"]["collector_stopped"])
             self.assertFalse(experiment["capture_health"]["worker_coverage"])
             artifact_kinds = {item["kind"] for item in experiment["artifacts"]}
             self.assertIn("playwright_screenshot", artifact_kinds)
             self.assertIn("playwright_trace", artifact_kinds)
+            self.assertTrue(
+                all("completeness" in item for item in experiment["artifacts"])
+            )
+            self.assertIn(
+                "page_screenshot",
+                {item["kind"] for item in experiment["evidence"]},
+            )
             self.assertTrue(experiment["network_summary"]["requests"])
             self.assertLess(events.index("js.start"), events.index("playwright.step:send_message"))
             self.assertLess(events.index("playwright.step:click_send"), events.index("js.wait"))
@@ -1145,8 +1154,8 @@ class BrowserActionTests(unittest.TestCase):
             self.assertEqual(body["operation"], "capture_baseline")
             self.assertEqual(experiment["operation"], "capture_flow")
             self.assertEqual(response.json()["status"], "completed")
-            self.assertEqual(experiment["execution_integrity"], "complete")
-            self.assertEqual(experiment["evidence_integrity"], "complete")
+            self.assertEqual(experiment["execution"]["status"], "complete")
+            self.assertEqual(experiment["quality_summary"]["status"], "complete")
 
     def test_baseline_alias_rejects_non_empty_flow(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1169,6 +1178,72 @@ class BrowserActionTests(unittest.TestCase):
                 )
             self.assertEqual(response.status_code, 422, response.text)
 
+    def test_step_failure_does_not_pollute_empty_quality_requirements(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            client, _, _ = self.make_client(
+                root,
+                fail_step="snapshot_only",
+                include_supporting_failure=False,
+            )
+            request = {
+                "operation": "capture_flow",
+                "payload": {
+                    "session_id": "session_one",
+                    "objective": "separate execution failure from evidence quality",
+                    "primary_request": {
+                        "expected_min_matches": 0,
+                        "expected_max_matches": 100,
+                    },
+                    "capture": {
+                        "network": False,
+                        "stream": False,
+                        "trace": False,
+                        "screenshots": False,
+                        "page_snapshots": False,
+                        "console_errors": False,
+                    },
+                    "requirements": {
+                        "require_raw_capture": False,
+                        "require_semantic_parse": False,
+                        "require_request_snapshot": False,
+                        "require_artifacts": False,
+                    },
+                    "flow": [
+                        {
+                            "step_id": "snapshot_only",
+                            "action": "snapshot",
+                        }
+                    ],
+                    "execution_mode": "sync",
+                    "deadline_ms": 10_000,
+                },
+            }
+            with client:
+                self.open_session(client)
+                response = client.post("/v1/browser/run", json=request)
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json()["status"], "failed")
+            manifest = json.loads(
+                (root / response.json()["result"]["manifest_relative_path"]).read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(manifest["execution"]["status"], "failed")
+            self.assertTrue(manifest["execution"]["errors"])
+            self.assertEqual(
+                manifest["quality_summary"],
+                {
+                    "status": "complete",
+                    "observation_count": 0,
+                    "expected_observation_count": {"min": 0, "max": 100},
+                    "count_satisfied": True,
+                    "required_completeness": {},
+                    "missing_evidence": [],
+                    "errors": [],
+                },
+            )
+
     def test_supporting_failure_can_be_made_objective_fatal(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             client, _, _ = self.make_client(Path(temp_dir))
@@ -1184,10 +1259,9 @@ class BrowserActionTests(unittest.TestCase):
                     encoding="utf-8"
                 )
             )
-            self.assertEqual(experiment["primary_request_integrity"], "complete")
-            self.assertEqual(experiment["collector_integrity"], "failed")
-            self.assertEqual(experiment["execution_integrity"], "complete")
-            self.assertEqual(experiment["evidence_integrity"], "failed")
+            self.assertEqual(experiment["execution"]["status"], "complete")
+            self.assertEqual(experiment["quality_summary"]["status"], "failed")
+            self.assertIn("collector", experiment["quality_summary"]["missing_evidence"])
 
     def test_stop_intent_correlates_only_the_primary_network_cancellation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1237,7 +1311,9 @@ class BrowserActionTests(unittest.TestCase):
             self.assertEqual(classification["classification"], "expected_user_cancel")
             self.assertTrue(classification["within_stop_window"])
             self.assertEqual(
-                experiment["primary_requests"][0]["experimentCancellationClassification"],
+                experiment["network_observations"][0]["facts"][
+                    "experiment_cancellation_classification"
+                ],
                 "expected_user_cancel",
             )
             self.assertIsNotNone(classification["stream_before_stop"])
@@ -1423,10 +1499,10 @@ class BrowserActionTests(unittest.TestCase):
                     encoding="utf-8"
                 )
             )
-            self.assertEqual(manifest["execution_integrity"], "complete")
-            self.assertEqual(manifest["evidence_integrity"], "partial")
+            self.assertEqual(manifest["execution"]["status"], "complete")
+            self.assertEqual(manifest["quality_summary"]["status"], "partial")
             self.assertEqual(
-                manifest["primary_integrity_dimensions"]["raw_capture"],
+                manifest["quality_summary"]["required_completeness"]["raw_stream"],
                 "partial",
             )
 
@@ -3491,7 +3567,7 @@ class BrowserActionTests(unittest.TestCase):
             manifest = asyncio.run(exercise())
             self.assertEqual(manifest["steps"][0]["status"], "canceled")
 
-    def test_stream_disabled_uses_not_required_collector_integrity(self) -> None:
+    def test_stream_disabled_has_complete_empty_quality_summary(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             client, _, _ = self.make_client(Path(temp_dir))
             request = {
@@ -3524,7 +3600,9 @@ class BrowserActionTests(unittest.TestCase):
                     encoding="utf-8"
                 )
             )
-            self.assertEqual(manifest["collector_integrity"], "not_required")
+            self.assertEqual(manifest["quality_summary"]["status"], "complete")
+            self.assertEqual(manifest["quality_summary"]["observation_count"], 0)
+            self.assertNotIn("collector_integrity", manifest)
 
     def test_network_evidence_window_public_inspection_and_script_queries(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3861,8 +3939,8 @@ class BrowserActionTests(unittest.TestCase):
             self.assertEqual(control_manifest["replay_http_status"], 200)
             self.assertEqual(control_manifest["replay"]["replay_mode"], "control")
             self.assertEqual(replay_manifest["series"]["sequence_index"], 3)
-            self.assertEqual(replay_manifest["execution_integrity"], "complete")
-            self.assertEqual(replay_manifest["evidence_integrity"], "complete")
+            self.assertEqual(replay_manifest["execution"]["status"], "complete")
+            self.assertEqual(replay_manifest["quality_summary"]["status"], "complete")
             self.assertNotIn("objective_integrity", replay_manifest)
             self.assertEqual(
                 replay_manifest["causal_comparability"],
@@ -4006,14 +4084,16 @@ class BrowserActionTests(unittest.TestCase):
                 replay_manifest["replay_response_content_type"],
                 "text/event-stream",
             )
-            self.assertEqual(replay_manifest["execution_integrity"], "complete")
-            self.assertEqual(replay_manifest["evidence_integrity"], "complete")
+            self.assertEqual(replay_manifest["execution"]["status"], "complete")
+            self.assertEqual(replay_manifest["quality_summary"]["status"], "complete")
             self.assertEqual(
-                replay_manifest["primary_integrity_dimensions"]["raw_capture"],
+                replay_manifest["quality_summary"]["required_completeness"]["raw_stream"],
                 "complete",
             )
             self.assertEqual(
-                replay_manifest["primary_integrity_dimensions"]["artifacts"],
+                replay_manifest["quality_summary"]["required_completeness"][
+                    "stream_artifacts"
+                ],
                 "complete",
             )
             evidence_kinds = {item["kind"] for item in replay_manifest["evidence"]}
@@ -4585,7 +4665,8 @@ class BrowserActionTests(unittest.TestCase):
                 ).read_text(encoding="utf-8")
             )
             self.assertFalse(manifest["mutation_assessment"]["mutation_effective"])
-            self.assertEqual(manifest["evidence_integrity"], "failed")
+            self.assertEqual(manifest["execution"]["status"], "failed")
+            self.assertEqual(manifest["quality_summary"]["status"], "complete")
 
     def test_sse_treatment_json_rejection_remains_protocol_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -4663,11 +4744,15 @@ class BrowserActionTests(unittest.TestCase):
             self.assertNotIn("protocol_rejection_observed", manifest)
             self.assertEqual(manifest["replay_http_status"], 422)
             self.assertEqual(
-                manifest["primary_integrity_dimensions"]["raw_capture"],
-                "not_applicable_non_stream_response",
+                manifest["network_observations"][0]["completeness"]["raw_stream"],
+                "not_required",
             )
-            self.assertEqual(manifest["execution_integrity"], "complete")
-            self.assertEqual(manifest["evidence_integrity"], "complete")
+            self.assertNotIn(
+                "raw_stream",
+                manifest["quality_summary"]["required_completeness"],
+            )
+            self.assertEqual(manifest["execution"]["status"], "complete")
+            self.assertEqual(manifest["quality_summary"]["status"], "complete")
             self.assertNotIn("objective_integrity", manifest)
             self.assertIn(
                 "field_required",
@@ -4892,8 +4977,8 @@ class BrowserActionTests(unittest.TestCase):
                     client,
                     root,
                 )
-                control_manifest.pop("execution_integrity")
-                control_manifest.pop("evidence_integrity")
+                control_manifest.pop("execution")
+                control_manifest.pop("quality_summary")
                 control_manifest["objective_integrity"] = "complete"
                 (root / "experiments" / control_id / "manifest.json").write_text(
                     json.dumps(control_manifest), encoding="utf-8"
@@ -5123,7 +5208,7 @@ class BrowserActionTests(unittest.TestCase):
             )
             self.assertNotIn("protocol_rejection_observed", manifest)
             self.assertEqual(
-                manifest["primary_integrity_dimensions"]["request_snapshot"],
+                manifest["network_observations"][0]["completeness"]["request_headers"],
                 "complete",
             )
             replay_network = next(
@@ -5131,8 +5216,9 @@ class BrowserActionTests(unittest.TestCase):
                 for item in manifest["evidence"]
                 if item.get("evidence_id") == manifest["replay"]["network_evidence_id"]
             )
+            self.assertNotIn("snapshot_integrity", replay_network["summary"])
             self.assertEqual(
-                replay_network["summary"]["snapshot_integrity"]["response_body_completeness"],
+                manifest["network_observations"][0]["completeness"]["response_body"],
                 "partial",
             )
 
@@ -5181,6 +5267,8 @@ class BrowserActionTests(unittest.TestCase):
                     ).read_text(encoding="utf-8")
                 )
                 self.assertTrue(manifest["mutation_assessment"]["mutation_effective"])
+                self.assertEqual(manifest["execution"]["status"], "complete")
+                self.assertEqual(manifest["quality_summary"]["status"], "complete")
                 self.assertNotIn("protocol_rejection_observed", manifest)
                 self.assertEqual(
                     self.replay_response_analysis(manifest)["classification"],
@@ -5233,11 +5321,51 @@ class BrowserActionTests(unittest.TestCase):
         self.assertEqual(matched["evidence_id"], "ev_two")
         self.assertEqual(
             association["method"],
-            "network_request_id_and_generation",
+            "network_request_id+cdp_request_id",
         )
         self.assertIsNone(ambiguous)
         self.assertEqual(fallback["status"], "ambiguous")
         self.assertEqual(fallback["candidate_count"], 2)
+
+        duplicate_network_ids = [
+            {
+                "evidence_id": "ev_a",
+                "request_ids": {
+                    "network_request_id": "shared",
+                    "cdp_request_id": "cdp-a",
+                },
+                "summary": {
+                    "url": "https://example.test/conversation",
+                    "method": "POST",
+                },
+            },
+            {
+                "evidence_id": "ev_b",
+                "request_ids": {
+                    "network_request_id": "shared",
+                    "cdp_request_id": "cdp-b",
+                },
+                "summary": {
+                    "url": "https://example.test/conversation",
+                    "method": "POST",
+                },
+            },
+        ]
+        disambiguated, combined = BrowserActionService._associate_stream_network_evidence(
+            {
+                "networkRequestId": "shared",
+                "cdpRequestId": "cdp-b",
+                "url": "https://example.test/conversation",
+                "method": "POST",
+            },
+            duplicate_network_ids,
+        )
+        self.assertEqual(disambiguated["evidence_id"], "ev_b")
+        self.assertEqual(combined["status"], "matched")
+        self.assertEqual(
+            combined["method"],
+            "network_request_id+cdp_request_id",
+        )
 
     def test_network_snapshot_does_not_upgrade_stream_artifact_integrity(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -5273,12 +5401,11 @@ class BrowserActionTests(unittest.TestCase):
                 stream["summary"]["stream_artifact_integrity"],
                 "failed",
             )
+            self.assertNotIn("network_snapshot_integrity", stream["summary"])
             self.assertEqual(
-                stream["summary"]["network_snapshot_integrity"],
-                "complete",
-            )
-            self.assertEqual(
-                manifest["primary_integrity_dimensions"]["artifacts"],
+                manifest["network_observations"][0]["completeness"][
+                    "stream_artifacts"
+                ],
                 "failed",
             )
 
@@ -5356,12 +5483,12 @@ class BrowserActionTests(unittest.TestCase):
                     root / "experiments" / control.json()["experiment_id"] / "manifest.json"
                 ).read_text(encoding="utf-8")
             )
-            self.assertEqual(len(manifest["primary_requests"]), 1)
+            self.assertEqual(len(manifest["network_observations"]), 1)
             self.assertEqual(
-                manifest["primary_requests"][0]["networkEvidenceId"],
+                manifest["network_observations"][0]["sources"]["network_evidence_id"],
                 manifest["replay"]["network_evidence_id"],
             )
-            self.assertEqual(manifest["primary_request_integrity"], "complete")
+            self.assertEqual(manifest["quality_summary"]["status"], "complete")
             supporting = [
                 item
                 for item in manifest["stream_status"]["requests"]
@@ -5778,15 +5905,19 @@ async function runCase(chunks, responseControl, contentType = 'text/event-stream
             "experiment_id": "exp_many",
             "session_id": "session_many",
             "status": "completed",
-            "execution_integrity": "complete",
-            "evidence_integrity": "complete",
-            "primary_requests": [
+            "execution": {"status": "complete"},
+            "quality_summary": {"status": "complete"},
+            "network_observations": [
                 {
-                    "cdpRequestId": f"request-{index}",
-                    "url": "https://example.test/" + ("x" * 5_000),
-                    "method": "POST",
-                    "status": "finished",
-                    "coreArtifacts": [{"large": "y" * 10_000}],
+                    "observation_id": f"obs-{index}",
+                    "facts": {
+                        "url": "https://example.test/" + ("x" * 5_000),
+                        "method": "POST",
+                        "status": "finished",
+                    },
+                    "association": {"confidence": "exact"},
+                    "completeness": {"request_body": "complete"},
+                    "missing_evidence": [],
                 }
                 for index in range(500)
             ],
@@ -5796,8 +5927,8 @@ async function runCase(chunks, responseControl, contentType = 'text/event-stream
             "errors": [],
         }
         summary = BrowserActionService._experiment_summary(manifest)
-        self.assertEqual(summary["primary_request_count"], 500)
-        self.assertEqual(len(summary["primary_requests"]), 10)
+        self.assertEqual(summary["network_observation_count"], 500)
+        self.assertEqual(len(summary["network_observations"]), 10)
         self.assertNotIn("network_summary", summary)
         self.assertNotIn("artifacts", summary)
         self.assertLess(len(json.dumps(summary).encode("utf-8")), 50_000)
