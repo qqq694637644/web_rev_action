@@ -237,7 +237,23 @@ capture_uuid (optional)
 
 需要查看 `manifest.json`、`events.jsonl`、源码、schema、脚本或报告时，使用 workspace Actions。
 
-执行 endpoint 和 `get_experiment` 只返回有界实验摘要及 `manifest_relative_path`。完整 manifest、network summary、requests 和 artifact 索引通过 `workspaceReadFiles` 读取。
+执行 endpoint 和 `get_experiment` 只返回有界实验摘要及 `manifest_relative_path`。完整 manifest、raw network/stream source、canonical network observations 和 artifact 索引通过 `workspaceReadFiles` 读取。
+
+Manifest 的质量模型只保留：
+
+```text
+execution.status
+quality_summary.status
+quality_summary.required_completeness
+quality_summary.missing_evidence
+network_observations[].completeness
+network_observations[].association.confidence
+artifacts[].completeness
+```
+
+不再生成顶层 `execution_integrity`、`evidence_integrity`、
+`collector_integrity`、`primary_request_integrity`、
+`primary_integrity_dimensions` 或 `primary_requests`。旧 manifest 不做兼容转换。
 
 核心结论使用稳定引用：
 
@@ -277,7 +293,14 @@ manifest 时命令直接失败，不生成看似完整的空报告。
 
 每个 JSON request evidence 还生成 public `request-shape.json` 和 `request-body.redacted.json`。`get_request_shape` 默认只返回有界路径页，支持 `path_prefix`、`page_idx`、`page_size`、`max_depth` 和 `max_array_items`；只有显式 `include_redacted_body=true` 才返回裁剪后的 redacted subtree。Identifier 脱敏只匹配 `id`、`*_id` 和 camelCase `*Id/*ID`，不会把 `valid`、`grid`、`hybrid` 或 `solid` 误标为 identifier。
 
-流请求生成 `stream_request` 和按 source 分开的 `stream_event_range` evidence。Stream 与 ordinary network evidence 优先按 `networkRequestId + collectorGeneration`、CDP ID、persistent ID关联；URL+method只允许作为唯一候选 fallback。Replay 找到唯一 ordinary evidence 后，primary stream再锁定到同一稳定请求；同 URL 的其他流只作为 supporting evidence，不能拖低 replay objective。Ordinary snapshot只补充request body/header完整性，不能升级缺失的raw/events/metadata stream artifact。
+流请求生成 `stream_request` 和按 source 分开的 `stream_event_range` evidence。Stream 与 ordinary network evidence 优先按 `networkRequestId + collectorGeneration`、CDP ID、persistent ID关联；URL+method只允许作为唯一候选 fallback。Replay 找到唯一 ordinary evidence 后，primary stream再锁定到同一稳定请求；同 URL 的其他流只作为 supporting evidence。
+
+每个选中的请求只生成一条 `network_observations[]` 派生视图。它引用 ordinary
+network evidence、stream source、artifact ID 和 association method，并集中保存 request/
+response、raw/semantic stream 与 artifact completeness。`network_request` 和
+`stream_request` evidence 只保留各自来源事实及 `network_observation_id`，不再复制
+snapshot/stream 完整性结论。Ordinary snapshot 不能升级缺失的 raw/events/metadata
+stream artifact。
 
 Replay 使用 `replay_attempt_id + 有上下界的dispatch window + canonical request
 body SHA-256` 锁定唯一 outbound request。缺少 numeric `observedAt` 的请求不参与

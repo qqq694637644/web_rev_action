@@ -64,10 +64,12 @@ from .browser_models import (
     WaitCondition,
 )
 from .protocol_evidence import (
+    aggregate_observation_completeness,
     assess_control_wire_baseline,
     assess_mutation_effectiveness,
     assess_paired_mutation_effectiveness,
     binding_value_from_snapshot,
+    build_network_observation,
     build_replay_spec,
     canonical_json_sha256,
     classify_replay_response,
@@ -86,6 +88,7 @@ from .protocol_evidence import (
     response_content_type,
     response_value_from_snapshot,
     select_network_evidence,
+    stream_request_has_complete_request_headers,
     validate_binding_mutation_compatibility,
 )
 from .runtime import env_value_from_environment_or_dotenv
@@ -257,8 +260,8 @@ class ExperimentStore:
                     "objective": manifest.get("objective"),
                     "status": manifest.get("status"),
                     "created_at": manifest.get("created_at"),
-                    "execution_integrity": manifest.get("execution_integrity"),
-                    "evidence_integrity": manifest.get("evidence_integrity"),
+                    "execution": manifest.get("execution"),
+                    "quality_summary": manifest.get("quality_summary"),
                 }
             )
             if len(items) >= limit:
@@ -897,17 +900,19 @@ class BrowserActionService:
             return payload, bindings, values, protocol, None, mutations
         control_id = payload.control_experiment_id
         control = self.experiments.load_manifest(control_id)
-        execution_integrity = control.get("execution_integrity")
-        evidence_integrity = control.get("evidence_integrity")
+        execution = control.get("execution")
+        execution = execution if isinstance(execution, dict) else {}
+        quality_summary = control.get("quality_summary")
+        quality_summary = quality_summary if isinstance(quality_summary, dict) else {}
         if (
             control.get("status") != "completed"
-            or execution_integrity != "complete"
-            or evidence_integrity != "complete"
+            or execution.get("status") != "complete"
+            or quality_summary.get("status") != "complete"
         ):
             raise BrowserServiceError(
                 "control_replay_not_usable",
                 "Treatment replay requires a completed control with complete execution "
-                "and evidence integrity.",
+                "and quality summary.",
                 409,
             )
         control_http_status = control.get("replay_http_status")
@@ -1563,32 +1568,6 @@ class BrowserActionService:
             "candidate_count": 0,
         }
 
-    @staticmethod
-    def _stream_request_has_complete_request_headers(
-        request: dict[str, Any],
-    ) -> bool:
-        artifacts = request.get("coreArtifacts")
-        if not isinstance(artifacts, list):
-            return False
-        by_kind = {
-            str(item.get("kind")): item
-            for item in artifacts
-            if isinstance(item, dict) and item.get("kind")
-        }
-        request_headers = by_kind.get("request_headers")
-        request_headers_extra = by_kind.get("request_headers_extra")
-        if not isinstance(request_headers, dict) or not isinstance(
-            request_headers_extra,
-            dict,
-        ):
-            return False
-        for descriptor in (request_headers, request_headers_extra):
-            if descriptor.get("writeStatus") not in {None, "written"}:
-                return False
-            if isinstance(descriptor.get("bytes"), int) and descriptor["bytes"] <= 0:
-                return False
-        return True
-
     @classmethod
     def _mark_snapshot_headers_complete_from_stream(
         cls,
@@ -1597,62 +1576,73 @@ class BrowserActionService:
     ) -> None:
         if not isinstance(snapshot, dict) or not isinstance(stream_request, dict):
             return
-        if cls._stream_request_has_complete_request_headers(stream_request):
+        if stream_request_has_complete_request_headers(stream_request):
             snapshot["requestHeadersCompleteness"] = "complete"
 
-    @staticmethod
-    def _augment_network_request_with_evidence(
-        request: dict[str, Any],
-        evidence_entries: list[dict[str, Any]],
-    ) -> dict[str, Any]:
-        reqid = request.get("reqid")
-        candidates = [
-            item
-            for item in evidence_entries
-            if item.get("kind") == "network_request"
-            and isinstance(item.get("request_ids"), dict)
-            and item["request_ids"].get("reqid") == reqid
-        ]
-        if len(candidates) != 1:
-            return {
-                **request,
-                "networkEvidenceAssociation": {
-                    "status": "ambiguous" if candidates else "not_found",
+    @classmethod
+    def _build_network_observations(
+        cls,
+        experiment_id: str,
+        primary_requests: list[dict[str, Any]],
+        network_entries: list[dict[str, Any]],
+        *,
+        stream_capture: bool,
+    ) -> list[dict[str, Any]]:
+        observations: list[dict[str, Any]] = []
+        for ordinal, request in enumerate(primary_requests, start=1):
+            linked_network: dict[str, Any] | None
+            association: dict[str, Any]
+            if stream_capture:
+                linked_network, association = cls._associate_stream_network_evidence(
+                    request,
+                    network_entries,
+                )
+            else:
+                reqid = request.get("reqid")
+                candidates = [
+                    item
+                    for item in network_entries
+                    if isinstance(item.get("request_ids"), dict)
+                    and item["request_ids"].get("reqid") == reqid
+                ]
+                linked_network = candidates[0] if len(candidates) == 1 else None
+                association = {
+                    "status": (
+                        "matched"
+                        if len(candidates) == 1
+                        else "ambiguous"
+                        if candidates
+                        else "not_found"
+                    ),
+                    "method": "reqid" if candidates else None,
                     "candidate_count": len(candidates),
-                },
-            }
-        evidence = candidates[0]
-        summary = evidence.get("summary")
-        summary = summary if isinstance(summary, dict) else {}
-        integrity = summary.get("snapshot_integrity")
-        integrity = integrity if isinstance(integrity, dict) else {}
-        network_snapshot_integrity = str(integrity.get("network_snapshot_integrity") or "partial")
-        network_artifact_integrity = (
-            "complete"
-            if isinstance(evidence.get("artifact_paths"), dict)
-            and evidence["artifact_paths"].get("all")
-            else "partial"
-        )
-        return {
-            **request,
-            "networkEvidenceId": evidence.get("evidence_id"),
-            "networkEvidenceAssociation": {
-                "status": "matched",
-                "method": "reqid",
-                "candidate_count": 1,
-            },
-            "networkSnapshotIntegrity": network_snapshot_integrity,
-            "requestBodyCompleteness": integrity.get("request_body_completeness"),
-            "requestHeadersCompleteness": integrity.get("request_headers_completeness"),
-            "responseBodyCompleteness": integrity.get("response_body_completeness"),
-            "responseHeadersCompleteness": integrity.get("response_headers_completeness"),
-            "networkArtifactIntegrity": network_artifact_integrity,
-            "artifactIntegrity": network_artifact_integrity,
-            "integrityStatus": max(
-                (network_snapshot_integrity, network_artifact_integrity),
-                key=BrowserActionService._integrity_severity,
-            ),
-        }
+                }
+            stable_id = (
+                request.get("persistentRequestId")
+                or request.get("cdpRequestId")
+                or request.get("networkRequestId")
+                or request.get("reqid")
+                or ordinal
+            )
+            observation_id = evidence_id(
+                experiment_id,
+                "network_observation",
+                stable_id=stable_id,
+            ).replace("ev_", "obs_", 1)
+            observation = build_network_observation(
+                observation_id=observation_id,
+                network_evidence=linked_network,
+                stream_request=request if stream_capture else None,
+                association=association,
+            )
+            observations.append(observation)
+            request["networkObservationId"] = observation_id
+            if linked_network is not None:
+                linked_network["network_observation_id"] = observation_id
+                summary = linked_network.get("summary")
+                if isinstance(summary, dict):
+                    summary.pop("snapshot_integrity", None)
+        return observations
 
     @classmethod
     def _extract_http_status(cls, value: Any) -> int | None:
@@ -2074,7 +2064,6 @@ class BrowserActionService:
     def _stream_evidence_entries(
         experiment_id: str,
         primary_requests: list[dict[str, Any]],
-        network_entries: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
         entries: list[dict[str, Any]] = []
         for ordinal, request in enumerate(primary_requests, start=1):
@@ -2094,21 +2083,6 @@ class BrowserActionService:
                 for item in core_artifacts
                 if item.get("relativePath")
             }
-            linked_network, association = BrowserActionService._associate_stream_network_evidence(
-                request,
-                network_entries,
-            )
-            linked_network_id = (
-                linked_network.get("evidence_id") if isinstance(linked_network, dict) else None
-            )
-            linked_summary = (
-                linked_network.get("summary")
-                if isinstance(linked_network, dict)
-                and isinstance(linked_network.get("summary"), dict)
-                else {}
-            )
-            snapshot_integrity = linked_summary.get("snapshot_integrity")
-            snapshot_integrity = snapshot_integrity if isinstance(snapshot_integrity, dict) else {}
             stream_id = evidence_id(
                 experiment_id,
                 "stream_request",
@@ -2118,12 +2092,12 @@ class BrowserActionService:
                 {
                     "evidence_id": stream_id,
                     "kind": "stream_request",
+                    "network_observation_id": request.get("networkObservationId"),
                     "request_ids": {
                         "persistent": persistent_id,
                         "cdp": cdp_id,
                         "network": request.get("networkRequestId"),
                         "collector_generation": request.get("collectorGeneration"),
-                        "network_evidence_id": linked_network_id,
                     },
                     "artifact_ids": artifact_ids,
                     "artifact_paths": artifact_paths,
@@ -2137,18 +2111,7 @@ class BrowserActionService:
                         "semantic_event_count": request.get("semanticEventCount"),
                         "raw_capture_integrity": request.get("rawCaptureIntegrity"),
                         "semantic_parse_integrity": request.get("semanticParseIntegrity"),
-                        "request_snapshot_integrity": request.get("requestSnapshotIntegrity"),
                         "stream_artifact_integrity": request.get("artifactIntegrity"),
-                        "network_snapshot_integrity": snapshot_integrity.get(
-                            "network_snapshot_integrity"
-                        ),
-                        "request_body_completeness": snapshot_integrity.get(
-                            "request_body_completeness"
-                        ),
-                        "request_headers_completeness": snapshot_integrity.get(
-                            "request_headers_completeness"
-                        ),
-                        "network_evidence_association": association,
                     },
                 }
             )
@@ -2453,24 +2416,23 @@ class BrowserActionService:
 
     @staticmethod
     def _experiment_summary(manifest: dict[str, Any]) -> dict[str, Any]:
-        primary_requests = manifest.get("primary_requests")
-        request_summaries: list[dict[str, Any]] = []
-        if isinstance(primary_requests, list):
-            for request in primary_requests[:10]:
-                if not isinstance(request, dict):
+        observations = manifest.get("network_observations")
+        observation_summaries: list[dict[str, Any]] = []
+        if isinstance(observations, list):
+            for observation in observations[:10]:
+                if not isinstance(observation, dict):
                     continue
-                request_summaries.append(
+                facts = observation.get("facts")
+                facts = facts if isinstance(facts, dict) else {}
+                observation_summaries.append(
                     {
-                        "cdp_request_id": request.get("cdpRequestId"),
-                        "persistent_request_id": request.get("persistentRequestId"),
-                        "url": str(request.get("url", ""))[:2048],
-                        "method": request.get("method"),
-                        "status": request.get("status"),
-                        "integrity_status": request.get("integrityStatus"),
-                        "raw_capture_integrity": request.get("rawCaptureIntegrity"),
-                        "semantic_parse_integrity": request.get("semanticParseIntegrity"),
-                        "request_snapshot_integrity": request.get("requestSnapshotIntegrity"),
-                        "artifact_integrity": request.get("artifactIntegrity"),
+                        "observation_id": observation.get("observation_id"),
+                        "url": str(facts.get("url", ""))[:2048],
+                        "method": facts.get("method"),
+                        "status": facts.get("status"),
+                        "association": observation.get("association"),
+                        "completeness": observation.get("completeness"),
+                        "missing_evidence": observation.get("missing_evidence"),
                     }
                 )
         health = manifest.get("capture_health")
@@ -2479,16 +2441,13 @@ class BrowserActionService:
             "session_id": manifest.get("session_id"),
             "operation": manifest.get("operation"),
             "status": manifest.get("status"),
-            "execution_integrity": manifest.get("execution_integrity"),
-            "evidence_integrity": manifest.get("evidence_integrity"),
+            "execution": manifest.get("execution"),
+            "quality_summary": manifest.get("quality_summary"),
             "causal_comparability": manifest.get("causal_comparability"),
             "inference_eligibility": manifest.get("inference_eligibility"),
-            "collector_integrity": manifest.get("collector_integrity"),
-            "primary_request_integrity": manifest.get("primary_request_integrity"),
-            "primary_integrity_dimensions": manifest.get("primary_integrity_dimensions"),
-            "primary_requests": request_summaries,
-            "primary_request_count": (
-                len(primary_requests) if isinstance(primary_requests, list) else 0
+            "network_observations": observation_summaries,
+            "network_observation_count": (
+                len(observations) if isinstance(observations, list) else 0
             ),
             "capture_health": dict(health) if isinstance(health, dict) else {},
             "series": (
@@ -2951,7 +2910,7 @@ class BrowserActionService:
                             "relativeDir": runtime.get("capture_relative_dir"),
                             "status": manifest.get("status"),
                         },
-                        "requests": manifest.get("primary_requests", []),
+                        "requests": [],
                     }
                 )
                 source = "manifest"
@@ -3255,24 +3214,12 @@ class BrowserActionService:
         return deadline.child(min(requested_ms, available_ms))
 
     @staticmethod
-    def _integrity_severity(value: str) -> int:
-        return {
-            "complete": 0,
-            "not_required": 0,
-            "not_applicable_protocol_rejection": 0,
-            "not_applicable_non_stream_response": 0,
-            "semantic-only": 1,
-            "partial": 2,
-            "failed": 3,
-        }.get(value, 2)
-
-    def _primary_result(
-        self,
+    def _select_primary_requests(
         payload: CaptureFlowPayload,
         status_payload: dict[str, Any],
         network_payload: dict[str, Any],
-    ) -> tuple[list[dict[str, Any]], str, bool, dict[str, str]]:
-        matcher = self._request_matcher(payload)
+    ) -> tuple[list[dict[str, Any]], bool]:
+        matcher = BrowserActionService._request_matcher(payload)
         requests = [
             item
             for item in status_payload.get("requests", [])
@@ -3280,11 +3227,7 @@ class BrowserActionService:
         ]
         if not requests and not payload.capture.stream:
             requests = [
-                {
-                    **item,
-                    "integrityStatus": item.get("integrityStatus", "partial"),
-                    "evidenceSource": "network-summary",
-                }
+                dict(item)
                 for item in network_payload.get("requests", [])
                 if isinstance(item, dict) and JsReverseMcpAdapter._request_matches(item, matcher)
             ]
@@ -3293,79 +3236,7 @@ class BrowserActionService:
             <= len(requests)
             <= payload.primary_request.expected_max_matches
         )
-        if not requests:
-            if payload.primary_request.expected_min_matches == 0:
-                return (
-                    requests,
-                    "complete",
-                    count_ok,
-                    {
-                        "raw_capture": "complete",
-                        "semantic_parse": "complete",
-                        "request_snapshot": "complete",
-                        "artifacts": "complete",
-                    },
-                )
-            integrity = "failed"
-            return (
-                requests,
-                integrity,
-                count_ok,
-                {
-                    "raw_capture": "failed" if payload.capture.stream else "partial",
-                    "semantic_parse": "failed" if payload.capture.stream else "partial",
-                    "request_snapshot": "failed" if payload.capture.stream else "partial",
-                    "artifacts": "failed" if payload.capture.stream else "partial",
-                },
-            )
-        dimensions = {
-            "raw_capture": (
-                max(
-                    (str(item.get("rawCaptureIntegrity", "partial")) for item in requests),
-                    key=self._integrity_severity,
-                )
-                if payload.capture.stream
-                else "not_required"
-            ),
-            "semantic_parse": (
-                max(
-                    (str(item.get("semanticParseIntegrity", "partial")) for item in requests),
-                    key=self._integrity_severity,
-                )
-                if payload.capture.stream
-                else "not_required"
-            ),
-            "request_snapshot": max(
-                (
-                    str(
-                        item.get("networkSnapshotIntegrity")
-                        or item.get("requestSnapshotIntegrity", "partial")
-                    )
-                    for item in requests
-                ),
-                key=self._integrity_severity,
-            ),
-            "artifacts": max(
-                (str(item.get("artifactIntegrity", "partial")) for item in requests),
-                key=self._integrity_severity,
-            ),
-        }
-        applicable_values = [
-            value
-            for value in dimensions.values()
-            if value
-            not in {
-                "not_required",
-                "not_applicable_protocol_rejection",
-                "not_applicable_non_stream_response",
-            }
-        ]
-        integrity = (
-            max(applicable_values, key=self._integrity_severity)
-            if applicable_values
-            else "complete"
-        )
-        return requests, integrity, count_ok, dimensions
+        return requests, count_ok
 
     @staticmethod
     def _classify_cancellations(
@@ -4970,57 +4841,9 @@ class BrowserActionService:
                             "Control/Treatment pre-dispatch environment is not fully "
                             f"equivalent: {environment_comparison.get('status')}."
                         )
-            primary_network_payload["requests"] = [
-                self._augment_network_request_with_evidence(item, evidence_entries)
-                for item in primary_network_payload["requests"]
+            network_evidence_entries = [
+                item for item in evidence_entries if item.get("kind") == "network_request"
             ]
-            stream_requests = final_status_payload.get("requests")
-            if isinstance(stream_requests, list):
-                for stream_request in stream_requests:
-                    if not isinstance(stream_request, dict):
-                        continue
-                    exact_evidence, association = self._associate_stream_network_evidence(
-                        stream_request,
-                        [
-                            item
-                            for item in evidence_entries
-                            if item.get("kind") == "network_request"
-                        ],
-                    )
-                    if exact_evidence is None:
-                        stream_request["networkEvidenceAssociation"] = association
-                        continue
-                    summary = exact_evidence.get("summary")
-                    summary = summary if isinstance(summary, dict) else {}
-                    snapshot_integrity = summary.get("snapshot_integrity")
-                    snapshot_integrity = (
-                        snapshot_integrity if isinstance(snapshot_integrity, dict) else {}
-                    )
-                    request_headers_completeness = str(
-                        snapshot_integrity.get("request_headers_completeness") or "partial"
-                    )
-                    if self._stream_request_has_complete_request_headers(stream_request):
-                        request_headers_completeness = "complete"
-                    request_body_completeness = str(
-                        snapshot_integrity.get("request_body_completeness") or "unknown"
-                    )
-                    network_snapshot_integrity = (
-                        "complete"
-                        if request_headers_completeness == "complete"
-                        and request_body_completeness in {"complete", "not_required"}
-                        else "partial"
-                    )
-                    stream_request["networkEvidenceId"] = exact_evidence.get("evidence_id")
-                    stream_request["networkEvidenceAssociation"] = association
-                    stream_request["networkSnapshotIntegrity"] = network_snapshot_integrity
-                    stream_request["requestBodyCompleteness"] = request_body_completeness
-                    stream_request["requestHeadersCompleteness"] = request_headers_completeness
-                    stream_request["responseBodyCompleteness"] = snapshot_integrity.get(
-                        "response_body_completeness"
-                    )
-                    stream_request["responseHeadersCompleteness"] = snapshot_integrity.get(
-                        "response_headers_completeness"
-                    )
             non_stream_error_response_observed = bool(
                 replay_plan is not None
                 and replay_plan.get("replay_mode") == "treatment"
@@ -5046,12 +4869,19 @@ class BrowserActionService:
                 and replay_network_evidence_id
                 and not non_stream_error_response_observed
             ):
-                locked_stream_requests = [
-                    item
-                    for item in final_status_payload.get("requests", [])
-                    if isinstance(item, dict)
-                    and item.get("networkEvidenceId") == replay_network_evidence_id
-                ]
+                locked_stream_requests: list[dict[str, Any]] = []
+                for item in final_status_payload.get("requests", []):
+                    if not isinstance(item, dict):
+                        continue
+                    linked_network, _ = self._associate_stream_network_evidence(
+                        item,
+                        network_evidence_entries,
+                    )
+                    if (
+                        isinstance(linked_network, dict)
+                        and linked_network.get("evidence_id") == replay_network_evidence_id
+                    ):
+                        locked_stream_requests.append(item)
                 primary_status_payload = {
                     **final_status_payload,
                     "requests": locked_stream_requests,
@@ -5062,12 +4892,7 @@ class BrowserActionService:
                         "networkRequestId + collectorGeneration association."
                     )
 
-            (
-                primary_requests,
-                primary_integrity,
-                count_ok,
-                primary_dimensions,
-            ) = self._primary_result(
+            primary_requests, count_ok = self._select_primary_requests(
                 payload,
                 primary_status_payload,
                 primary_network_payload,
@@ -5079,66 +4904,6 @@ class BrowserActionService:
                     <= len(primary_requests)
                     <= payload.primary_request.expected_max_matches
                 )
-                replay_summary = (
-                    replay_network_entry.get("summary")
-                    if isinstance(replay_network_entry, dict)
-                    and isinstance(replay_network_entry.get("summary"), dict)
-                    else {}
-                )
-                snapshot_dimensions = replay_summary.get("snapshot_integrity")
-                snapshot_dimensions = (
-                    snapshot_dimensions if isinstance(snapshot_dimensions, dict) else {}
-                )
-                artifact_paths = (
-                    replay_network_entry.get("artifact_paths")
-                    if isinstance(replay_network_entry, dict)
-                    and isinstance(replay_network_entry.get("artifact_paths"), dict)
-                    else {}
-                )
-                request_snapshot_integrity = str(
-                    snapshot_dimensions.get("network_snapshot_integrity") or "partial"
-                )
-                network_artifact_integrity = "complete" if artifact_paths.get("all") else "partial"
-                response_body_completeness = str(
-                    snapshot_dimensions.get("response_body_completeness") or "unknown"
-                )
-                if response_evidence_source == "complete_replay_response_body":
-                    response_body_completeness = "complete"
-                response_headers_completeness = str(
-                    snapshot_dimensions.get("response_headers_completeness") or "partial"
-                )
-                primary_dimensions = {
-                    "raw_capture": "not_applicable_non_stream_response",
-                    "semantic_parse": "not_applicable_non_stream_response",
-                    "request_snapshot": request_snapshot_integrity,
-                    "artifacts": network_artifact_integrity,
-                }
-                applicable = [
-                    request_snapshot_integrity,
-                    network_artifact_integrity,
-                    response_body_completeness,
-                    response_headers_completeness,
-                ]
-                primary_integrity = (
-                    max(applicable, key=self._integrity_severity) if count_ok else "failed"
-                )
-                if any(value != "complete" for value in applicable):
-                    replay_inconclusive = True
-                    warnings.append(
-                        "Non-stream error response evidence is incomplete; field "
-                        "classification is inconclusive."
-                    )
-            if payload.capture.stream:
-                network_evidence_entries = [
-                    item for item in evidence_entries if item.get("kind") == "network_request"
-                ]
-                evidence_entries.extend(
-                    self._stream_evidence_entries(
-                        experiment_id,
-                        primary_requests,
-                        network_evidence_entries,
-                    )
-                )
             cancellation_classifications = self._classify_cancellations(
                 payload,
                 step_results,
@@ -5147,6 +4912,34 @@ class BrowserActionService:
                 post_alignment,
                 wait_observations,
             )
+            network_observations = self._build_network_observations(
+                experiment_id,
+                primary_requests,
+                network_evidence_entries,
+                stream_capture=payload.capture.stream
+                and not non_stream_error_response_observed,
+            )
+            if (
+                non_stream_error_response_observed
+                and response_evidence_source == "complete_replay_response_body"
+            ):
+                for observation in network_observations:
+                    completeness = observation.get("completeness")
+                    if not isinstance(completeness, dict):
+                        continue
+                    completeness["response_body"] = "complete"
+                    missing = observation.get("missing_evidence")
+                    if isinstance(missing, list):
+                        observation["missing_evidence"] = [
+                            item for item in missing if item != "response_body"
+                        ]
+            if payload.capture.stream and not non_stream_error_response_observed:
+                evidence_entries.extend(
+                    self._stream_evidence_entries(
+                        experiment_id,
+                        primary_requests,
+                    )
+                )
             capture_summary = (
                 final_status_payload.get("capture")
                 if isinstance(final_status_payload.get("capture"), dict)
@@ -5167,23 +4960,39 @@ class BrowserActionService:
                 or not wait_met
                 or (payload.capture.stream and not collector_stopped)
             )
-            required_dimensions = {
-                "raw_capture": (
+            required_dimensions: set[str] = set()
+            if payload.primary_request.expected_min_matches > 0:
+                if (
                     payload.requirements.require_raw_capture
                     and not non_stream_error_response_observed
-                ),
-                "semantic_parse": (
+                ):
+                    required_dimensions.add("raw_stream")
+                if (
                     payload.requirements.require_semantic_parse
                     and not non_stream_error_response_observed
-                ),
-                "request_snapshot": payload.requirements.require_request_snapshot,
-                "artifacts": payload.requirements.require_artifacts,
-            }
-            required_values = [
-                primary_dimensions[name]
-                for name, required in required_dimensions.items()
-                if required and payload.primary_request.expected_min_matches > 0
-            ]
+                ):
+                    required_dimensions.add("semantic_stream")
+                if payload.requirements.require_request_snapshot:
+                    required_dimensions.update({"request_headers", "request_body"})
+                if payload.requirements.require_artifacts:
+                    if payload.capture.stream and not non_stream_error_response_observed:
+                        required_dimensions.add("stream_artifacts")
+                    else:
+                        required_dimensions.add("network_artifacts")
+                if non_stream_error_response_observed:
+                    required_dimensions.update({"response_headers", "response_body"})
+            observation_dimensions, missing_evidence = aggregate_observation_completeness(
+                network_observations,
+                required_dimensions=required_dimensions,
+            )
+            required_values = list(observation_dimensions.values())
+            if (
+                payload.capture.stream
+                and not payload.primary_request.allow_supporting_failures
+                and collector_integrity != "complete"
+            ):
+                missing_evidence.append("collector")
+                missing_evidence = sorted(set(missing_evidence))
             evidence_failed = (
                 bool(errors)
                 or not count_ok
@@ -5207,6 +5016,17 @@ class BrowserActionService:
             evidence_integrity = (
                 "failed" if evidence_failed else "partial" if evidence_partial else "complete"
             )
+            quality_summary = {
+                "status": evidence_integrity,
+                "observation_count": len(network_observations),
+                "expected_observation_count": {
+                    "min": payload.primary_request.expected_min_matches,
+                    "max": payload.primary_request.expected_max_matches,
+                },
+                "count_satisfied": count_ok,
+                "required_completeness": observation_dimensions,
+                "missing_evidence": missing_evidence,
+            }
             causal_comparability = (
                 str(environment_comparison.get("status") or "insufficient")
                 if replay_plan is not None
@@ -5260,7 +5080,6 @@ class BrowserActionService:
                 "include_in_flight_requested": payload.primary_request.include_in_flight,
                 "pre_arm_request_count": pre_arm_request_count,
                 "primary_request_match_count_ok": count_ok,
-                "primary_integrity_dimensions": primary_dimensions,
                 "wait_condition_met": wait_met,
                 "collector_stopped": collector_stopped or not payload.capture.stream,
                 "collector_cleanup": cleanup_result.get(
@@ -5337,6 +5156,15 @@ class BrowserActionService:
                 )
                 if descriptor:
                     artifacts.append(descriptor)
+            for artifact in artifacts:
+                write_status = artifact.get("writeStatus") or artifact.get("write_status")
+                relative_path = artifact.get("relativePath") or artifact.get("relative_path")
+                if write_status not in {None, "written"}:
+                    artifact["completeness"] = "failed"
+                elif relative_path:
+                    artifact["completeness"] = "complete"
+                else:
+                    artifact["completeness"] = "partial"
             relative_screenshot_paths = [
                 relative
                 for path in screenshot_paths
@@ -5460,15 +5288,12 @@ class BrowserActionService:
                     },
                     "stream_wait_result": wait_result,
                     "wait_observations": wait_observations,
-                    "collector_integrity": collector_integrity,
-                    "primary_request_integrity": primary_integrity,
-                    "execution_integrity": execution_integrity,
-                    "evidence_integrity": evidence_integrity,
+                    "execution": {"status": execution_integrity},
+                    "quality_summary": quality_summary,
                     "causal_comparability": causal_comparability,
                     "inference_eligibility": inference_eligibility,
                     "objective_requirements": payload.requirements.model_dump(mode="json"),
-                    "primary_integrity_dimensions": primary_dimensions,
-                    "primary_requests": primary_requests,
+                    "network_observations": network_observations,
                     "cancellation_classifications": cancellation_classifications,
                     "post_flow_alignment": asdict(post_alignment),
                     "capture_health": capture_health,

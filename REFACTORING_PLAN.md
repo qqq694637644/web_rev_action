@@ -302,6 +302,10 @@ missing_evidence[]
 
 如果需要摘要，只生成一个可重算的 `quality_summary`，不再在 manifest 顶层保存多个相互推导的 verdict。
 
+当前状态：核心 manifest 已改为 `execution.status + quality_summary +
+network_observations[].completeness + artifacts[].completeness`。旧的 execution、
+evidence、collector、primary request 多套 integrity 字段不再生成，也不做兼容转换。
+
 ### 7.5 network snapshot 与 stream request 的重复摘要
 
 当前同一个请求可能同时存在：
@@ -571,8 +575,8 @@ capture 时，阶段 B 的事实确认项仍保持未完成。
 - [ ] 统一 flow/setup/verification step executor。
 - [ ] 删除 `inference_eligibility`。
 - [ ] 将固定 response classifier 降级为可选 analyzer。
-- [ ] 合并完整性和 completeness 字段。
-- [ ] 建立 canonical network observation，删除重复 summary 计算。
+- [x] 合并完整性和 completeness 字段。
+- [x] 建立 canonical network observation，删除重复 summary 计算。
 
 ### 阶段 D：简化 replay 模型
 

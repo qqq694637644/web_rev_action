@@ -25,8 +25,12 @@ class CurrentSiteInventoryTests(unittest.TestCase):
             "objective": "inventory current site",
             "status": "completed",
             "created_at": "2026-07-13T12:00:00Z",
-            "execution_integrity": "complete",
-            "evidence_integrity": "complete",
+            "execution": {"status": "complete"},
+            "quality_summary": {
+                "status": "complete",
+                "observation_count": 1,
+                "missing_evidence": [],
+            },
             "series": {
                 "analysis_series_id": "series_current",
                 "scenario_type": "reconnaissance",
@@ -83,7 +87,6 @@ class CurrentSiteInventoryTests(unittest.TestCase):
                                 "/payload": {"type": "object"},
                             },
                         },
-                        "snapshot_integrity": {"network_snapshot_integrity": "complete"},
                     },
                 },
                 {
@@ -111,6 +114,29 @@ class CurrentSiteInventoryTests(unittest.TestCase):
                     "evidence_id": "ev_source",
                     "kind": "script_source",
                 },
+            ],
+            "network_observations": [
+                {
+                    "observation_id": "obs_current",
+                    "facts": {
+                        "url": "https://api.example.test/v2/stream?cursor=secret-value",
+                        "method": "POST",
+                        "status": 200,
+                    },
+                    "association": {
+                        "status": "matched",
+                        "method": "network_request_id",
+                        "confidence": "exact",
+                    },
+                    "completeness": {
+                        "request_headers": "complete",
+                        "request_body": "complete",
+                        "raw_stream": "complete",
+                        "semantic_stream": "complete",
+                        "stream_artifacts": "complete",
+                    },
+                    "missing_evidence": [],
+                }
             ],
         }
 
@@ -142,6 +168,7 @@ class CurrentSiteInventoryTests(unittest.TestCase):
             questions = paths["open-questions.md"].read_text(encoding="utf-8")
 
             self.assertIn("series_current", inventory)
+            self.assertIn("Canonical network observations: 1", inventory)
             self.assertIn("Authorization", inventory)
             self.assertIn("X-Client-Secret", inventory)
             self.assertIn("/clientRequestId", inventory)

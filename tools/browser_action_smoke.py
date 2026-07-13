@@ -909,8 +909,16 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
             "status": "passed",
             "experiment_id": captured.experiment_id,
             "manifest_relative_path": manifest_relative,
-            "execution_integrity": manifest.get("execution_integrity"),
-            "evidence_integrity": manifest.get("evidence_integrity"),
+            "execution_status": (
+                manifest.get("execution", {}).get("status")
+                if isinstance(manifest.get("execution"), dict)
+                else None
+            ),
+            "quality_status": (
+                manifest.get("quality_summary", {}).get("status")
+                if isinstance(manifest.get("quality_summary"), dict)
+                else None
+            ),
             "raw_bytes": len(expected_raw),
             "raw_sha256": expected_sha,
             "trace_count": len(manifest.get("trace_paths") or []),
