@@ -276,7 +276,7 @@ request_headers_completeness
 response_body_completeness
 causal_comparability
 inference_eligibility
-objective_integrity（PR #6 已停止生成）
+objective_integrity（PR #6 已删除，不兼容旧 manifest）
 ```
 
 问题：
@@ -532,6 +532,7 @@ reports/open-questions.md
 
 - [x] 删除 replay response 中无信息的 `conclusion` 和 `usable_for_required_classification`。
 - [x] 停止生成 `objective_integrity`。
+- [x] 删除 Treatment 对旧 `objective_integrity` manifest 的兼容兜底。
 - [x] 移除固定 Stop 顺序拒绝。
 - [x] 删除 IDAPython 示例 Skill、docs、eval 和专用测试。
 - [x] 清理仍引用 `objective_integrity` 的 smoke 输出和旧文档。

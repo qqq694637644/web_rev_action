@@ -4770,6 +4770,42 @@ class BrowserActionTests(unittest.TestCase):
                 "control_pair_protocol_invalid",
             )
 
+    def test_treatment_rejects_legacy_objective_integrity_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            client, _, _ = self.make_client(root, include_supporting_failure=False)
+            with client:
+                self.open_session(client)
+                _, _, control_id, control_manifest = self.capture_source_and_control(
+                    client,
+                    root,
+                )
+                control_manifest.pop("execution_integrity")
+                control_manifest.pop("evidence_integrity")
+                control_manifest["objective_integrity"] = "complete"
+                (root / "experiments" / control_id / "manifest.json").write_text(
+                    json.dumps(control_manifest), encoding="utf-8"
+                )
+                treatment = client.post(
+                    "/v1/browser/run",
+                    json={
+                        "operation": "replay_request",
+                        "payload": {
+                            "replay_mode": "treatment",
+                            "control_experiment_id": control_id,
+                            "mutation": {
+                                "type": "remove_json_path",
+                                "path": "/tracking_id",
+                            },
+                        },
+                    },
+                )
+            self.assertEqual(treatment.status_code, 409, treatment.text)
+            self.assertEqual(
+                treatment.json()["detail"]["error"]["code"],
+                "control_replay_not_usable",
+            )
+
     def test_replay_request_candidate_ambiguity_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

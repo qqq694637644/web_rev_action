@@ -899,9 +899,6 @@ class BrowserActionService:
         control = self.experiments.load_manifest(control_id)
         execution_integrity = control.get("execution_integrity")
         evidence_integrity = control.get("evidence_integrity")
-        if execution_integrity is None and evidence_integrity is None:
-            execution_integrity = control.get("objective_integrity")
-            evidence_integrity = control.get("objective_integrity")
         if (
             control.get("status") != "completed"
             or execution_integrity != "complete"
