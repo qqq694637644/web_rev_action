@@ -1119,9 +1119,32 @@ class BrowserActionTests(unittest.TestCase):
             )
             self.assertEqual(experiment["primary_request_matcher"]["expected_min_matches"], 0)
             self.assertEqual(experiment["steps"], [])
+            self.assertEqual(body["operation"], "capture_baseline")
+            self.assertEqual(experiment["operation"], "capture_flow")
             self.assertEqual(response.json()["status"], "completed")
             self.assertEqual(experiment["execution_integrity"], "complete")
             self.assertEqual(experiment["evidence_integrity"], "complete")
+
+    def test_baseline_alias_rejects_non_empty_flow(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client, _, _ = self.make_client(Path(temp_dir), include_supporting_failure=False)
+            with client:
+                response = client.post(
+                    "/v1/browser/run",
+                    json={
+                        "operation": "capture_baseline",
+                        "payload": {
+                            "session_id": "session_one",
+                            "flow": [
+                                {
+                                    "step_id": "not_a_baseline",
+                                    "action": "snapshot",
+                                }
+                            ],
+                        },
+                    },
+                )
+            self.assertEqual(response.status_code, 422, response.text)
 
     def test_supporting_failure_can_be_made_objective_fatal(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -4434,6 +4457,14 @@ class BrowserActionTests(unittest.TestCase):
             self.assertEqual(
                 control_manifest["replay"]["pair_protocol"]["setup_flow"][0]["step_id"],
                 "setup_restore",
+            )
+            self.assertEqual(
+                [item["phase"] for item in control_manifest["steps"]],
+                ["setup", "replay", "verification"],
+            )
+            self.assertEqual(
+                [item["phase"] for item in treatment_manifest["steps"]],
+                ["setup", "replay", "verification"],
             )
             setup_indices = [
                 index

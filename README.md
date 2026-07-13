@@ -98,13 +98,17 @@ Analysis workspace
 
 ```text
 open_session
-capture_baseline
 capture_flow
 replay_request
 save_script_source
 close_session
 cancel_experiment
 ```
+
+旧客户端仍可发送 `capture_baseline`。它只在请求边界应用一个 `capture_flow`
+preset：默认 baseline objective、primary request 允许 0 到 100 个匹配、`flow=[]`。
+随后内部调度和 manifest 都使用 `capture_flow`。非空 flow 会被拒绝；新调用不应再
+生成 `capture_baseline`。
 
 一次 `capture_flow` 由后端原子执行：
 
@@ -118,6 +122,10 @@ cancel_experiment
 → 收集网络摘要、截图和 Trace
 → 写 completed / failed manifest
 ```
+
+普通 `flow`、replay `setup_flow` 和 `verification_flow` 使用同一个 step executor。
+phase 只是 step result 中的 `setup`、`action` 或 `verification` 标签，不改变可执行
+step 类型、checkpoint、超时、失败或取消语义。
 
 GPT 不直接协调 start、click、wait、stop。
 

@@ -37,6 +37,7 @@ from .browser_models import (
     CaptureFlowPayload,
     CaptureFlowRequest,
     CloseSessionRequest,
+    FlowStep,
     FlowStepResult,
     GetExperimentRequest,
     GetNetworkEvidenceRequest,
@@ -148,6 +149,155 @@ class Deadline:
         )
         child.timeout_ms = min(timeout_ms, self.remaining_ms())
         return child
+
+
+class StepExecutor:
+    """Execute setup, action, and verification steps with one lifecycle."""
+
+    READ_ONLY_ACTIONS = {"wait", "assert", "snapshot"}
+
+    @classmethod
+    async def execute_many(
+        cls,
+        service: BrowserActionService,
+        *,
+        phase: str,
+        steps: list[FlowStep],
+        session_id: str,
+        experiment_dir: Path,
+        deadline: Deadline,
+        capture_id: int | None,
+        request_matcher: RequestMatcher,
+        stream_checkpoint: StreamCheckpoint,
+        first_mutation_wall_time_ms: int | None,
+        step_results: list[FlowStepResult],
+        wait_observations: list[dict[str, Any]],
+    ) -> tuple[StreamCheckpoint, int | None]:
+        for step_index, step in enumerate(steps):
+            label = f"{phase} step {step.step_id}"
+            service._ensure_finalize_reserve(deadline, label)
+            started = utc_now()
+            try:
+                if step.action not in cls.READ_ONLY_ACTIONS:
+                    if capture_id is not None:
+                        stream_checkpoint = await service._stream_checkpoint(
+                            capture_id,
+                            request_matcher,
+                            service._operation_deadline(
+                                deadline,
+                                1_500,
+                                f"checkpoint before {label}",
+                            ),
+                        )
+                    if first_mutation_wall_time_ms is None:
+                        first_mutation_wall_time_ms = int(time.time() * 1000)
+                step_deadline = service._operation_deadline(
+                    deadline,
+                    step.timeout_ms,
+                    label,
+                )
+                if step.action in {"wait", "assert"}:
+                    result = await service._wait_condition(
+                        session_ref=session_id,
+                        capture_id=capture_id,
+                        condition=step.condition,
+                        checkpoint=stream_checkpoint,
+                        deadline=step_deadline,
+                    )
+                    stream_checkpoint = service._checkpoint_from_wait_result(
+                        result,
+                        stream_checkpoint,
+                    )
+                    wait_observations.append(
+                        {
+                            "phase": phase,
+                            "step_id": step.step_id,
+                            "step_index": step_index,
+                            "condition_type": (
+                                step.condition.type if step.condition else "timeout"
+                            ),
+                            "capture_version": result.get("capture_version"),
+                            "matched_request_ids": result.get("matched_request_ids", []),
+                            "matched_event": result.get("matched_event"),
+                            "terminal_status": result.get("terminal_status"),
+                        }
+                    )
+                    if not result.get("condition_met", True):
+                        raise BrowserServiceError(
+                            (
+                                "assertion_failed"
+                                if step.action == "assert"
+                                else "wait_condition_timeout"
+                            ),
+                            f"{phase.capitalize()} condition failed: {step.step_id}",
+                            409,
+                        )
+                    snapshot_ref = None
+                else:
+                    result = await service.playwright.execute_step(
+                        session_id,
+                        step,
+                        experiment_dir,
+                        step_deadline,
+                    )
+                    raw_snapshot_ref = result.get("snapshot_ref")
+                    snapshot_ref = (
+                        service.experiments.relative_path(str(raw_snapshot_ref))
+                        if raw_snapshot_ref
+                        else None
+                    )
+                step_results.append(
+                    FlowStepResult(
+                        step_id=step.step_id,
+                        phase=phase,
+                        status="completed",
+                        started_at=started,
+                        ended_at=utc_now(),
+                        snapshot_ref=snapshot_ref,
+                    )
+                )
+            except asyncio.CancelledError:
+                canceled_status = (
+                    "canceled"
+                    if step.action in cls.READ_ONLY_ACTIONS
+                    else "canceled_outcome_unknown"
+                )
+                step_results.append(
+                    FlowStepResult(
+                        step_id=step.step_id,
+                        phase=phase,
+                        status=canceled_status,
+                        started_at=started,
+                        ended_at=utc_now(),
+                        error=(
+                            f"The {phase} read-only step was canceled."
+                            if canceled_status == "canceled"
+                            else (
+                                f"The {phase} mutation step was canceled after dispatch; "
+                                "page side effects cannot be rolled back generically."
+                            )
+                        ),
+                    )
+                )
+                raise
+            except Exception as exc:
+                timed_out = isinstance(exc, BrowserServiceError) and exc.code in {
+                    "deadline_exceeded",
+                    "deadline_finalize_reserve",
+                    "wait_condition_timeout",
+                }
+                step_results.append(
+                    FlowStepResult(
+                        step_id=step.step_id,
+                        phase=phase,
+                        status="timed_out" if timed_out else "failed",
+                        started_at=started,
+                        ended_at=utc_now(),
+                        error=str(exc)[:4000],
+                    )
+                )
+                raise
+        return stream_checkpoint, first_mutation_wall_time_ms
 
 
 def utc_now() -> str:
@@ -2518,6 +2668,22 @@ class BrowserActionService:
         self.sessions[session_id] = session
         return session
 
+    @staticmethod
+    def _normalize_capture_alias(
+        request: CaptureFlowRequest | CaptureBaselineRequest,
+    ) -> tuple[CaptureFlowRequest, str | None]:
+        if isinstance(request, CaptureFlowRequest):
+            return request, None
+        return (
+            CaptureFlowRequest(
+                contract_version=request.contract_version,
+                operation="capture_flow",
+                payload=request.payload,
+                skill_binding=request.skill_binding,
+            ),
+            request.operation,
+        )
+
     async def run(self, request: RunBrowserExperimentRequest) -> BrowserActionResponse:
         if isinstance(request, CancelExperimentRequest):
             return await self._cancel_experiment(request)
@@ -2546,14 +2712,13 @@ class BrowserActionService:
                 return await self._close_session(request)
             finally:
                 await self._release_browser_operation(owner_id)
-        if isinstance(
-            request,
-            (CaptureFlowRequest, CaptureBaselineRequest, ReplayRequestRequest),
-        ):
+        if isinstance(request, (CaptureFlowRequest, CaptureBaselineRequest, ReplayRequestRequest)):
+            requested_operation: str | None = None
             replay_plan: dict[str, Any] | None = None
             if isinstance(request, ReplayRequestRequest):
                 payload, replay_plan = self._prepare_replay_execution(request)
             else:
+                request, requested_operation = self._normalize_capture_alias(request)
                 payload = request.payload
             experiment_id = self.experiments.new_experiment_id()
             await self._reserve_browser_operation(
@@ -2564,12 +2729,15 @@ class BrowserActionService:
             )
             if payload.execution_mode == "job":
                 try:
-                    return self._start_capture_job(
+                    response = self._start_capture_job(
                         request,
                         experiment_id=experiment_id,
                         payload=payload,
                         replay_plan=replay_plan,
                     )
+                    if requested_operation is not None:
+                        response.operation = requested_operation
+                    return response
                 except Exception:
                     await self._release_browser_operation(experiment_id)
                     raise
@@ -2618,13 +2786,16 @@ class BrowserActionService:
                         ],
                     }
                 self.experiments.write_manifest(experiment_id, manifest)
-                return await self._capture_flow(
+                response = await self._capture_flow(
                     request,
                     deadline=deadline,
                     prepared=(experiment_id, experiment_dir, manifest),
                     payload=payload,
                     replay_plan=replay_plan,
                 )
+                if requested_operation is not None:
+                    response.operation = requested_operation
+                return response
             finally:
                 await self._release_browser_operation(experiment_id)
         raise BrowserServiceError("unsupported_operation", "Unsupported browser operation", 400)
@@ -4049,117 +4220,23 @@ class BrowserActionService:
                         else None
                     )
                     if isinstance(setup_steps, list) and setup_steps:
-                        for setup_index, step in enumerate(setup_steps):
-                            self._ensure_finalize_reserve(
-                                deadline,
-                                f"setup step {step.step_id}",
-                            )
-                            started = utc_now()
-                            try:
-                                if step.action not in {"wait", "assert", "snapshot"}:
-                                    if capture_id is not None:
-                                        stream_checkpoint = await self._stream_checkpoint(
-                                            capture_id,
-                                            request_matcher,
-                                            self._operation_deadline(
-                                                deadline,
-                                                1_500,
-                                                f"checkpoint before setup {step.step_id}",
-                                            ),
-                                        )
-                                    if first_mutation_wall_time_ms is None:
-                                        first_mutation_wall_time_ms = int(time.time() * 1000)
-                                step_deadline = self._operation_deadline(
-                                    deadline,
-                                    step.timeout_ms,
-                                    f"setup step {step.step_id}",
-                                )
-                                if step.action in {"wait", "assert"}:
-                                    result = await self._wait_condition(
-                                        session_ref=session_id,
-                                        capture_id=capture_id,
-                                        condition=step.condition,
-                                        checkpoint=stream_checkpoint,
-                                        deadline=step_deadline,
-                                    )
-                                    stream_checkpoint = self._checkpoint_from_wait_result(
-                                        result,
-                                        stream_checkpoint,
-                                    )
-                                    wait_observations.append(
-                                        {
-                                            "phase": "setup",
-                                            "step_id": step.step_id,
-                                            "step_index": setup_index,
-                                            "condition_type": step.condition.type,
-                                            "capture_version": result.get("capture_version"),
-                                            "matched_request_ids": result.get(
-                                                "matched_request_ids", []
-                                            ),
-                                            "matched_event": result.get("matched_event"),
-                                            "terminal_status": result.get("terminal_status"),
-                                        }
-                                    )
-                                    if not result.get("condition_met", True):
-                                        raise BrowserServiceError(
-                                            (
-                                                "assertion_failed"
-                                                if step.action == "assert"
-                                                else "wait_condition_timeout"
-                                            ),
-                                            f"Setup condition failed: {step.step_id}",
-                                            409,
-                                        )
-                                    snapshot_ref = None
-                                else:
-                                    result = await self.playwright.execute_step(
-                                        session_id,
-                                        step,
-                                        experiment_dir,
-                                        step_deadline,
-                                    )
-                                    raw_snapshot_ref = result.get("snapshot_ref")
-                                    snapshot_ref = (
-                                        self.experiments.relative_path(str(raw_snapshot_ref))
-                                        if raw_snapshot_ref
-                                        else None
-                                    )
-                                step_results.append(
-                                    FlowStepResult(
-                                        step_id=step.step_id,
-                                        status="completed",
-                                        started_at=started,
-                                        ended_at=utc_now(),
-                                        snapshot_ref=snapshot_ref,
-                                    )
-                                )
-                            except asyncio.CancelledError:
-                                canceled_status = (
-                                    "canceled"
-                                    if step.action in {"wait", "assert", "snapshot"}
-                                    else "canceled_outcome_unknown"
-                                )
-                                step_results.append(
-                                    FlowStepResult(
-                                        step_id=step.step_id,
-                                        status=canceled_status,
-                                        started_at=started,
-                                        ended_at=utc_now(),
-                                        error="The replay setup step was canceled.",
-                                    )
-                                )
-                                raise
-                            except Exception as exc:
-                                step_results.append(
-                                    FlowStepResult(
-                                        step_id=step.step_id,
-                                        status="failed",
-                                        started_at=started,
-                                        ended_at=utc_now(),
-                                        error=str(exc)[:4000],
-                                    )
-                                )
-                                raise
+                        (
+                            stream_checkpoint,
+                            first_mutation_wall_time_ms,
+                        ) = await StepExecutor.execute_many(
+                            self,
+                            phase="setup",
+                            steps=setup_steps,
+                            session_id=session_id,
+                            experiment_dir=experiment_dir,
+                            deadline=deadline,
+                            capture_id=capture_id,
+                            request_matcher=request_matcher,
+                            stream_checkpoint=stream_checkpoint,
+                            first_mutation_wall_time_ms=first_mutation_wall_time_ms,
+                            step_results=step_results,
+                            wait_observations=wait_observations,
+                        )
                         if isinstance(setup_output_checkpoint, dict):
                             (
                                 setup_values,
@@ -4354,6 +4431,7 @@ class BrowserActionService:
                         step_results.append(
                             FlowStepResult(
                                 step_id="replay_request",
+                                phase="replay",
                                 status="completed",
                                 started_at=started,
                                 ended_at=utc_now(),
@@ -4363,6 +4441,7 @@ class BrowserActionService:
                         step_results.append(
                             FlowStepResult(
                                 step_id="replay_request",
+                                phase="replay",
                                 status="canceled_outcome_unknown",
                                 started_at=started,
                                 ended_at=utc_now(),
@@ -4374,6 +4453,7 @@ class BrowserActionService:
                         step_results.append(
                             FlowStepResult(
                                 step_id="replay_request",
+                                phase="replay",
                                 status="failed",
                                 started_at=started,
                                 ended_at=utc_now(),
@@ -4413,126 +4493,23 @@ class BrowserActionService:
                         )
                         if descriptor:
                             replay_artifacts.append(descriptor)
-                for step_index, step in enumerate(payload.flow):
-                    self._ensure_finalize_reserve(deadline, f"step {step.step_id}")
-                    started = utc_now()
-                    try:
-                        if step.action not in {"wait", "assert", "snapshot"}:
-                            if capture_id is not None:
-                                stream_checkpoint = await self._stream_checkpoint(
-                                    capture_id,
-                                    request_matcher,
-                                    self._operation_deadline(
-                                        deadline,
-                                        1_500,
-                                        f"checkpoint before {step.step_id}",
-                                    ),
-                                )
-                            if first_mutation_wall_time_ms is None:
-                                first_mutation_wall_time_ms = int(time.time() * 1000)
-                        step_deadline = self._operation_deadline(
-                            deadline,
-                            step.timeout_ms,
-                            f"step {step.step_id}",
-                        )
-                        if step.action in {"wait", "assert"}:
-                            result = await self._wait_condition(
-                                session_ref=session_id,
-                                capture_id=capture_id,
-                                condition=step.condition,
-                                checkpoint=stream_checkpoint,
-                                deadline=step_deadline,
-                            )
-                            stream_checkpoint = self._checkpoint_from_wait_result(
-                                result,
-                                stream_checkpoint,
-                            )
-                            wait_observations.append(
-                                {
-                                    "step_id": step.step_id,
-                                    "step_index": step_index,
-                                    "condition_type": (
-                                        step.condition.type if step.condition else "timeout"
-                                    ),
-                                    "capture_version": result.get("capture_version"),
-                                    "matched_request_ids": result.get("matched_request_ids", []),
-                                    "matched_event": result.get("matched_event"),
-                                    "terminal_status": result.get("terminal_status"),
-                                }
-                            )
-                            if not result.get("condition_met", True):
-                                raise BrowserServiceError(
-                                    (
-                                        "assertion_failed"
-                                        if step.action == "assert"
-                                        else "wait_condition_timeout"
-                                    ),
-                                    f"Condition failed: {step.step_id}",
-                                    409,
-                                )
-                            snapshot_ref = None
-                        else:
-                            result = await self.playwright.execute_step(
-                                session_id,
-                                step,
-                                experiment_dir,
-                                step_deadline,
-                            )
-                            raw_snapshot_ref = result.get("snapshot_ref")
-                            snapshot_ref = (
-                                self.experiments.relative_path(str(raw_snapshot_ref))
-                                if raw_snapshot_ref
-                                else None
-                            )
-                        step_results.append(
-                            FlowStepResult(
-                                step_id=step.step_id,
-                                status="completed",
-                                started_at=started,
-                                ended_at=utc_now(),
-                                snapshot_ref=snapshot_ref,
-                            )
-                        )
-                    except asyncio.CancelledError:
-                        canceled_status = (
-                            "canceled"
-                            if step.action in {"wait", "assert", "snapshot"}
-                            else "canceled_outcome_unknown"
-                        )
-                        step_results.append(
-                            FlowStepResult(
-                                step_id=step.step_id,
-                                status=canceled_status,
-                                started_at=started,
-                                ended_at=utc_now(),
-                                error=(
-                                    "The read-only step was canceled."
-                                    if canceled_status == "canceled"
-                                    else (
-                                        "The local command was canceled and its process tree "
-                                        "was terminated. A side effect already delivered to "
-                                        "the page cannot be rolled back generically."
-                                    )
-                                ),
-                            )
-                        )
-                        raise
-                    except Exception as exc:
-                        timed_out = isinstance(exc, BrowserServiceError) and exc.code in {
-                            "deadline_exceeded",
-                            "deadline_finalize_reserve",
-                            "wait_condition_timeout",
-                        }
-                        step_results.append(
-                            FlowStepResult(
-                                step_id=step.step_id,
-                                status="timed_out" if timed_out else "failed",
-                                started_at=started,
-                                ended_at=utc_now(),
-                                error=str(exc)[:4000],
-                            )
-                        )
-                        raise
+                (
+                    stream_checkpoint,
+                    first_mutation_wall_time_ms,
+                ) = await StepExecutor.execute_many(
+                    self,
+                    phase=("verification" if replay_plan is not None else "action"),
+                    steps=payload.flow,
+                    session_id=session_id,
+                    experiment_dir=experiment_dir,
+                    deadline=deadline,
+                    capture_id=capture_id,
+                    request_matcher=request_matcher,
+                    stream_checkpoint=stream_checkpoint,
+                    first_mutation_wall_time_ms=first_mutation_wall_time_ms,
+                    step_results=step_results,
+                    wait_observations=wait_observations,
+                )
                 if payload.wait_for:
                     wait_deadline = self._operation_deadline(
                         deadline,
