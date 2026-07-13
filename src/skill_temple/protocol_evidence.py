@@ -89,11 +89,7 @@ def network_request_matches(request: dict[str, Any], matcher: RequestMatcher) ->
 
 
 def network_checkpoint(requests: list[dict[str, Any]], *, generation: int) -> dict[str, Any]:
-    reqids = sorted(
-        int(item["reqid"])
-        for item in requests
-        if isinstance(item.get("reqid"), int)
-    )
+    reqids = sorted(int(item["reqid"]) for item in requests if isinstance(item.get("reqid"), int))
     return {
         "collector_generation": generation,
         "max_reqid": max(reqids, default=0),
@@ -114,9 +110,7 @@ def requests_after_checkpoint(
 ) -> list[dict[str, Any]]:
     max_reqid = int(checkpoint.get("max_reqid", 0) or 0)
     allowed_in_flight = {
-        int(item)
-        for item in checkpoint.get("in_flight_reqids", [])
-        if isinstance(item, int)
+        int(item) for item in checkpoint.get("in_flight_reqids", []) if isinstance(item, int)
     }
     selected = []
     for item in requests:
@@ -131,11 +125,9 @@ def requests_after_checkpoint(
 def select_network_evidence(
     requests: list[dict[str, Any]], selector: NetworkEvidenceSelector
 ) -> list[dict[str, Any]]:
-    return [
-        item
-        for item in requests
-        if network_request_matches(item, selector.matcher)
-    ][: selector.max_matches]
+    return [item for item in requests if network_request_matches(item, selector.matcher)][
+        : selector.max_matches
+    ]
 
 
 def is_sensitive_header(name: str) -> bool:
@@ -193,22 +185,15 @@ def network_snapshot_dimensions(snapshot: dict[str, Any]) -> dict[str, str]:
         or snapshot.get("requestExtraInfo")
         or snapshot.get("requestWillBeSentExtraInfo")
     )
-    extra_headers = (
-        snapshot.get("requestHeadersExtraArray")
-        or snapshot.get("requestHeadersExtra")
-    )
+    extra_headers = snapshot.get("requestHeadersExtraArray") or snapshot.get("requestHeadersExtra")
     associated_cookies = snapshot.get("associatedCookies")
     extra_info_complete = bool(
         isinstance(extra_info, dict)
         and isinstance(associated_cookies, list)
-        and (
-            isinstance(extra_headers, list)
-            or isinstance(extra_info.get("headers"), (dict, list))
-        )
+        and (isinstance(extra_headers, list) or isinstance(extra_info.get("headers"), (dict, list)))
     )
     headers_complete = bool(
-        isinstance(request_headers, list)
-        and (explicit_headers_complete or extra_info_complete)
+        isinstance(request_headers, list) and (explicit_headers_complete or extra_info_complete)
     )
     request_body = snapshot.get("requestBody")
     if method in {"GET", "HEAD"} and not (
@@ -319,6 +304,13 @@ def response_value_from_snapshot(
     return None
 
 
+def json_pointer_value(document: Any, path: str) -> Any:
+    exists, value = _read_pointer(document, path)
+    if not exists:
+        raise ValueError(f"JSON Pointer path does not exist: {path}")
+    return copy.deepcopy(value)
+
+
 def binding_value_from_snapshot(
     snapshot: dict[str, Any],
     binding: VolatileBinding,
@@ -339,7 +331,12 @@ def binding_value_from_snapshot(
         ]
         if not values:
             raise ValueError(f"preserve_source binding header is missing: {binding.name}")
-        return values[0]
+        if binding.occurrence >= len(values):
+            raise ValueError(
+                f"preserve_source binding header occurrence is missing: "
+                f"{binding.name}[{binding.occurrence}]"
+            )
+        return values[binding.occurrence]
     values = [
         value
         for name, value in parse_qsl(
@@ -350,14 +347,22 @@ def binding_value_from_snapshot(
     ]
     if not values:
         raise ValueError(f"preserve_source query parameter is missing: {binding.name}")
-    return values[0]
+    if binding.occurrence >= len(values):
+        raise ValueError(
+            f"preserve_source query occurrence is missing: {binding.name}[{binding.occurrence}]"
+        )
+    return values[binding.occurrence]
 
 
 def validate_binding_mutation_compatibility(
     bindings: list[VolatileBinding],
     mutation: ReplayMutation | None,
 ) -> None:
-    if mutation is None or mutation.type not in {"remove_json_path", "replace_json_path"}:
+    if mutation is None or mutation.type not in {
+        "remove_json_path",
+        "replace_json_path",
+        "add_json_path",
+    }:
         return
     mutation_tokens = _decode_pointer(mutation.path)
     for binding in bindings:
@@ -444,8 +449,7 @@ def _json_type(value: Any) -> str:
 def _redact_json_value(value: Any, *, key_hint: str | None) -> Any:
     if isinstance(value, dict):
         return {
-            str(key): _redact_json_value(child, key_hint=str(key))
-            for key, child in value.items()
+            str(key): _redact_json_value(child, key_hint=str(key)) for key, child in value.items()
         }
     if isinstance(value, list):
         return [_redact_json_value(child, key_hint=key_hint) for child in value]
@@ -473,9 +477,7 @@ def _redact_scalar(value: Any, *, key_hint: str | None) -> Any:
     ):
         return "<redacted>"
     identifier_key = bool(
-        raw_hint == "id"
-        or normalized.endswith("_id")
-        or re.search(r"(?:Id|ID)$", raw_hint)
+        raw_hint == "id" or normalized.endswith("_id") or re.search(r"(?:Id|ID)$", raw_hint)
     )
     if identifier_key:
         return "<identifier>"
@@ -509,29 +511,42 @@ def build_replay_spec(
         if binding.target == "json_pointer":
             body = _replace_json_pointer(body, str(binding.path), binding_value)
         elif binding.target == "header":
-            headers = _replace_header(headers, str(binding.name), str(binding_value))
+            headers = _replace_header(
+                headers,
+                str(binding.name),
+                str(binding_value),
+                occurrence=binding.occurrence,
+            )
         else:
-            url = _mutate_query(url, str(binding.name), str(binding_value), remove=False)
+            url = _mutate_query(
+                url,
+                str(binding.name),
+                str(binding_value),
+                operation="replace",
+                occurrence=binding.occurrence,
+            )
 
     for mutation in mutations:
-        if mutation.type == "remove_header":
-            headers = [
-                item
-                for item in headers
-                if item["name"].lower() != mutation.name.lower()
-            ]
-        elif mutation.type == "replace_header":
-            headers = [
-                item
-                for item in headers
-                if item["name"].lower() != mutation.name.lower()
-            ]
-            headers.append({"name": mutation.name, "value": mutation.value})
-        elif mutation.type == "remove_query_parameter":
-            url = _mutate_query(url, mutation.name, None, remove=True)
-        elif mutation.type == "replace_query_parameter":
-            url = _mutate_query(url, mutation.name, mutation.value, remove=False)
-        elif mutation.type in {"remove_json_path", "replace_json_path"}:
+        if mutation.type in {"remove_header", "replace_header", "add_header"}:
+            headers = _mutate_headers(headers, mutation)
+        elif mutation.type in {
+            "remove_query_parameter",
+            "replace_query_parameter",
+            "add_query_parameter",
+        }:
+            operation = mutation.type.split("_", 1)[0]
+            url = _mutate_query(
+                url,
+                mutation.name,
+                getattr(mutation, "value", None),
+                operation=operation,
+                occurrence=mutation.occurrence,
+            )
+        elif mutation.type in {
+            "remove_json_path",
+            "replace_json_path",
+            "add_json_path",
+        }:
             body = _mutate_json_body(body, mutation)
 
     replay_headers: list[dict[str, str]] = []
@@ -632,7 +647,11 @@ def assess_mutation_effectiveness(
             "reason": "exact replay request snapshot was not exported",
         }
     try:
-        if mutation.type in {"remove_json_path", "replace_json_path"}:
+        if mutation.type in {
+            "remove_json_path",
+            "replace_json_path",
+            "add_json_path",
+        }:
             body_value = _decode_json_request_body(wire_snapshot.get("requestBody"))
             if body_value is None:
                 raise ValueError("wire request has no JSON body")
@@ -647,29 +666,28 @@ def assess_mutation_effectiveness(
                 if not exists
                 else _redact_json_value(observed, key_hint=_last_pointer_token(mutation.path))
             )
-        elif mutation.type in {"remove_header", "replace_header"}:
-            headers = _normalized_headers(wire_snapshot.get("requestHeadersArray"))
-            values = [
-                item["value"]
-                for item in headers
-                if item["name"].lower() == mutation.name.lower()
-            ]
+        elif mutation.type in {"remove_header", "replace_header", "add_header"}:
+            _, values = _observe_mutation_target(wire_snapshot, mutation)
             effective = (
                 not values
                 if mutation.type == "remove_header"
-                else any(value == mutation.value for value in values)
+                else _occurrence_value_matches(
+                    values,
+                    mutation.value,
+                    mutation.occurrence,
+                )
             )
             observed_public = "<absent>" if not values else "<present>"
         else:
-            query = parse_qsl(
-                urlsplit(str(wire_snapshot.get("url", ""))).query,
-                keep_blank_values=True,
-            )
-            values = [value for name, value in query if name == mutation.name]
+            _, values = _observe_mutation_target(wire_snapshot, mutation)
             effective = (
                 not values
                 if mutation.type == "remove_query_parameter"
-                else any(value == mutation.value for value in values)
+                else _occurrence_value_matches(
+                    values,
+                    mutation.value,
+                    mutation.occurrence,
+                )
             )
             observed_public = "<absent>" if not values else "<present>"
         return {
@@ -699,6 +717,7 @@ def assess_paired_mutation_effectiveness(
     volatile_bindings: list[VolatileBinding],
     control_binding_values: dict[str, Any],
     treatment_binding_values: dict[str, Any],
+    normalize_wire_order: bool = False,
 ) -> dict[str, Any]:
     requested = _redacted_mutation(mutation)
     if control_snapshot is None or treatment_snapshot is None:
@@ -722,11 +741,7 @@ def assess_paired_mutation_effectiveness(
             mutation,
         )
         control_count = (
-            len(control_value)
-            if isinstance(control_value, list)
-            else 1
-            if control_exists
-            else 0
+            len(control_value) if isinstance(control_value, list) else 1 if control_exists else 0
         )
         treatment_count = (
             len(treatment_value)
@@ -737,6 +752,17 @@ def assess_paired_mutation_effectiveness(
         )
         if mutation.type.startswith("remove_"):
             target_delta = control_exists and not treatment_exists
+        elif mutation.type.startswith("add_"):
+            expected = mutation.value
+            target_delta = (
+                treatment_exists
+                and treatment_value != control_value
+                and _occurrence_value_matches(
+                    treatment_value if isinstance(treatment_value, list) else [treatment_value],
+                    expected,
+                    mutation.occurrence if hasattr(mutation, "occurrence") else 0,
+                )
+            )
         else:
             expected_treatment = (
                 [mutation.value]
@@ -765,21 +791,20 @@ def assess_paired_mutation_effectiveness(
             volatile_bindings,
             mutation,
             role="control",
+            normalize_order=normalize_wire_order,
         )
         treatment_view = _canonical_pair_view(
             treatment_snapshot,
             volatile_bindings,
             mutation,
             role="treatment",
+            normalize_order=normalize_wire_order,
         )
         control_hash = canonical_json_sha256(control_view)
         treatment_hash = canonical_json_sha256(treatment_view)
         non_target_equivalent = control_hash == treatment_hash
         effective = bool(
-            target_delta
-            and control_bindings_ok
-            and treatment_bindings_ok
-            and non_target_equivalent
+            target_delta and control_bindings_ok and treatment_bindings_ok and non_target_equivalent
         )
         reasons: list[str] = []
         if not control_exists:
@@ -807,9 +832,7 @@ def assess_paired_mutation_effectiveness(
             "treatment_value_count": treatment_count,
             "multiplicity_changed": control_count != treatment_count,
             "non_target_fields_equivalent": non_target_equivalent,
-            "volatile_bindings_effective": (
-                control_bindings_ok and treatment_bindings_ok
-            ),
+            "volatile_bindings_effective": (control_bindings_ok and treatment_bindings_ok),
             "control_non_target_sha256": control_hash,
             "treatment_non_target_sha256": treatment_hash,
             "mutation_effective": effective,
@@ -881,94 +904,106 @@ def classify_replay_response(
     source_url: str | None = None,
     source_content_type: str | None = None,
 ) -> dict[str, Any]:
-    if redirected:
-        return {
-            "classification": "unexpected_redirect",
-            "conclusion": "inconclusive",
-            "usable_for_required_classification": False,
-            "status": status,
-            "content_type": content_type,
-            "final_url": final_url,
-        }
-    if (
+    reference = (
+        _mutation_reference_evidence(response_value, mutation)
+        if mutation is not None
+        else {"strength": "none", "semantic": "none", "signals_conflict": False}
+    )
+    contract_mismatch = bool(
         status is not None
         and 200 <= status < 400
         and source_content_type
         and (not content_type or source_content_type != content_type)
-    ):
-        return {
-            "classification": "response_contract_mismatch",
-            "conclusion": "inconclusive",
-            "usable_for_required_classification": False,
-            "status": status,
-            "content_type": content_type,
-            "source_content_type": source_content_type,
-            "final_url": final_url,
-        }
-    reference = (
-        _mutation_reference_evidence(response_value, mutation)
-        if mutation is not None
-        else {"strength": "none", "semantic": "none"}
     )
-    if status is None:
+    validation_like = bool(
+        status in {400, 422}
+        and reference.get("strength") == "strong_structured"
+        and reference.get("semantic")
+        in {"field_required", "not_required", "value_constraint", "conflicting"}
+    )
+    conflict_like = status == 409
+    authentication_like = status in {401, 403}
+    rate_limit_like = status == 429
+    server_failure_like = isinstance(status, int) and status >= 500
+    redirect_like = bool(redirected or (isinstance(status, int) and 300 <= status < 400))
+    success_like = bool(
+        isinstance(status, int) and 200 <= status < 400 and not redirected and not contract_mismatch
+    )
+    if redirected:
+        classification = "unexpected_redirect"
+    elif contract_mismatch:
+        classification = "response_contract_mismatch"
+    elif status is None:
         classification = "unknown_response"
-        conclusion = "inconclusive"
-    elif status in {401, 403}:
+    elif authentication_like:
         classification = "authentication_failure"
-        conclusion = "inconclusive"
-    elif status == 429:
+    elif rate_limit_like:
         classification = "rate_limited"
-        conclusion = "inconclusive"
-    elif status >= 500:
+    elif server_failure_like:
         classification = "server_failure"
-        conclusion = "inconclusive"
-    elif 300 <= status < 400:
+    elif redirect_like:
         classification = "redirect_or_cache_response"
-        conclusion = "inconclusive"
-    elif status == 409:
+    elif conflict_like:
         classification = "conflict"
-        conclusion = "conflict"
     elif status in {400, 422}:
-        if reference.get("strength") == "strong_structured":
-            if (
-                mutation is not None
-                and mutation.type.startswith("remove_")
-                and reference.get("semantic") == "field_required"
-            ):
-                classification = "validation_rejection"
-                conclusion = "required"
-            elif (
-                mutation is not None
-                and mutation.type.startswith("replace_")
-                and reference.get("semantic") == "value_constraint"
-            ):
-                classification = "value_constraint"
-                conclusion = "constrained_value"
-            else:
-                classification = "field_rejection"
-                conclusion = "inconclusive"
-        else:
-            classification = "unknown_rejection"
-            conclusion = "inconclusive"
+        semantic = reference.get("semantic")
+        classification = (
+            "validation_rejection"
+            if validation_like and semantic == "field_required"
+            else "value_constraint"
+            if validation_like and semantic == "value_constraint"
+            else "field_rejection"
+            if validation_like
+            else "unknown_rejection"
+        )
     elif status >= 400:
         classification = "unknown_rejection"
-        conclusion = "inconclusive"
     else:
         classification = "success"
-        conclusion = (
-            "candidate_alternative_value"
-            if mutation is not None and mutation.type.startswith("replace_")
-            else "candidate_optional"
-            if mutation is not None and mutation.type.startswith("remove_")
-            else "success"
-        )
+    matches = reference.get("matches") if isinstance(reference, dict) else None
+    raw_paths = [
+        item.get("raw_path")
+        for item in matches or []
+        if isinstance(item, dict) and item.get("raw_path") is not None
+    ]
+    normalized_paths = [
+        item.get("normalized_path")
+        for item in matches or []
+        if isinstance(item, dict) and item.get("normalized_path") is not None
+    ]
+    observations = {
+        "http_status": status,
+        "response_content_type": content_type,
+        "mutation_effective": None,
+        "target_reference_strength": reference.get("strength"),
+        "raw_validation_paths": raw_paths,
+        "normalized_validation_paths": normalized_paths,
+        "validation_like": validation_like,
+        "conflict_like": conflict_like,
+        "authentication_like": authentication_like,
+        "rate_limit_like": rate_limit_like,
+        "server_failure_like": server_failure_like,
+        "redirect_like": redirect_like,
+        "success_like": success_like,
+        "signals_conflict": bool(reference.get("signals_conflict")),
+    }
+    inference_hints: list[str] = []
+    semantic = reference.get("semantic")
+    if validation_like and semantic and semantic != "none":
+        inference_hints.append(str(semantic))
+    if success_like and mutation is not None:
+        inference_hints.append("mutation_accepted_by_response")
+    if observations["signals_conflict"]:
+        inference_hints.append("conflicting_validation_signals")
     return {
         "classification": classification,
-        "conclusion": conclusion,
-        "usable_for_required_classification": (
-            classification == "validation_rejection" and conclusion == "required"
+        "conclusion": (
+            "success" if mutation is None and classification == "success" else "inconclusive"
         ),
+        "usable_for_required_classification": False,
         "validation_evidence": reference,
+        "observations": observations,
+        "inference_hints": inference_hints,
         "status": status,
         "content_type": content_type,
         "source_content_type": source_content_type,
@@ -980,12 +1015,16 @@ def _observe_mutation_target(
     snapshot: dict[str, Any],
     mutation: ReplayMutation,
 ) -> tuple[bool, Any]:
-    if mutation.type in {"remove_json_path", "replace_json_path"}:
+    if mutation.type in {
+        "remove_json_path",
+        "replace_json_path",
+        "add_json_path",
+    }:
         body = _decode_json_request_body(snapshot.get("requestBody"))
         if body is None:
             raise ValueError("wire request has no JSON body")
         return _read_pointer(body, mutation.path)
-    if mutation.type in {"remove_header", "replace_header"}:
+    if mutation.type in {"remove_header", "replace_header", "add_header"}:
         values = [
             item["value"]
             for item in _normalized_headers(snapshot.get("requestHeadersArray"))
@@ -1043,8 +1082,9 @@ def _bindings_match_snapshot(
                 for item in _normalized_headers(snapshot.get("requestHeadersArray"))
                 if item["name"].lower() == str(binding.name).lower()
             ]
-            exists, observed = bool(values), values
-            expected = [str(expected)]
+            exists = binding.occurrence < len(values)
+            observed = values[binding.occurrence] if exists else None
+            expected = str(expected)
         else:
             values = [
                 value
@@ -1054,8 +1094,9 @@ def _bindings_match_snapshot(
                 )
                 if name == binding.name
             ]
-            exists, observed = bool(values), values
-            expected = [str(expected)]
+            exists = binding.occurrence < len(values)
+            observed = values[binding.occurrence] if exists else None
+            expected = str(expected)
         if not exists or observed != expected:
             return False
     return True
@@ -1065,7 +1106,11 @@ def _binding_targets_mutation(
     binding: VolatileBinding,
     mutation: ReplayMutation,
 ) -> bool:
-    if mutation.type in {"remove_json_path", "replace_json_path"}:
+    if mutation.type in {
+        "remove_json_path",
+        "replace_json_path",
+        "add_json_path",
+    }:
         if binding.target != "json_pointer":
             return False
         binding_tokens = _decode_pointer(str(binding.path))
@@ -1074,14 +1119,19 @@ def _binding_targets_mutation(
             len(mutation_tokens) <= len(binding_tokens)
             and binding_tokens[: len(mutation_tokens)] == mutation_tokens
         )
-    if mutation.type in {"remove_header", "replace_header"}:
+    if mutation.type in {"remove_header", "replace_header", "add_header"}:
         return (
             binding.target == "header"
             and str(binding.name).lower() == mutation.name.lower()
+            and (
+                mutation.occurrence in {"all", "append"}
+                or binding.occurrence == mutation.occurrence
+            )
         )
     return (
         binding.target == "query_parameter"
         and binding.name == mutation.name
+        and (mutation.occurrence in {"all", "append"} or binding.occurrence == mutation.occurrence)
     )
 
 
@@ -1091,6 +1141,7 @@ def _canonical_pair_view(
     mutation: ReplayMutation,
     *,
     role: str,
+    normalize_order: bool = False,
 ) -> dict[str, Any]:
     split = urlsplit(str(snapshot.get("url", "")))
     query = list(parse_qsl(split.query, keep_blank_values=True))
@@ -1116,26 +1167,46 @@ def _canonical_pair_view(
                     item["value"] = placeholder
         else:
             query = [
-                (name, placeholder if name == binding.name else value)
-                for name, value in query
+                (name, placeholder if name == binding.name else value) for name, value in query
             ]
-    if mutation.type in {"remove_json_path", "replace_json_path"} and body is not None:
-        should_remove_target = mutation.type == "replace_json_path" or role == "control"
+    if (
+        mutation.type
+        in {
+            "remove_json_path",
+            "replace_json_path",
+            "add_json_path",
+        }
+        and body is not None
+    ):
+        should_remove_target = mutation.type != "remove_json_path" or role == "control"
         if should_remove_target:
             exists, _ = _read_pointer(body, mutation.path)
             if exists:
                 _remove_pointer(body, mutation.path)
-    elif mutation.type in {"remove_header", "replace_header"}:
-        headers = [
-            item for item in headers if item["name"] != mutation.name.lower()
-        ]
+    elif mutation.type in {"remove_header", "replace_header", "add_header"}:
+        if mutation.type != "add_header" or role == "treatment":
+            headers = _remove_named_occurrence(
+                headers,
+                mutation.name,
+                mutation.occurrence,
+                case_sensitive=False,
+            )
     else:
-        query = [(name, value) for name, value in query if name != mutation.name]
+        if mutation.type != "add_query_parameter" or role == "treatment":
+            query = _remove_named_occurrence(
+                query,
+                mutation.name,
+                mutation.occurrence,
+                case_sensitive=True,
+            )
+    if normalize_order:
+        query = sorted(query)
+        headers = sorted(headers, key=lambda item: (item["name"], item["value"]))
     return {
         "method": str(snapshot.get("method", "GET")).upper(),
         "url": urlunsplit((split.scheme, split.netloc, split.path, "", "")),
-        "query": sorted(query),
-        "headers": sorted(headers, key=lambda item: (item["name"], item["value"])),
+        "query": query,
+        "headers": headers,
         "body": body_descriptor,
     }
 
@@ -1172,11 +1243,21 @@ def _mutation_reference_evidence(
 ) -> dict[str, Any]:
     target_tokens = (
         _decode_pointer(mutation.path)
-        if mutation.type in {"remove_json_path", "replace_json_path"}
+        if mutation.type
+        in {
+            "remove_json_path",
+            "replace_json_path",
+            "add_json_path",
+        }
         else [mutation.name]
     )
-    case_sensitive = mutation.type not in {"remove_header", "replace_header"}
+    case_sensitive = mutation.type not in {
+        "remove_header",
+        "replace_header",
+        "add_header",
+    }
     structured = _structured_validation_references(response_value)
+    matches: list[dict[str, Any]] = []
     for item in structured:
         path_tokens = item.get("path_tokens")
         if isinstance(path_tokens, list) and _validation_path_matches(
@@ -1192,6 +1273,13 @@ def _mutation_reference_evidence(
                 "value_error.missing",
             }:
                 semantic = "field_required"
+            elif source_key in {"optional", "not_required"} or code in {
+                "not_required",
+                "field_not_required",
+                "extra_forbidden",
+                "value_error.extra",
+            }:
+                semantic = "not_required"
             elif code in {
                 "enum",
                 "invalid_enum",
@@ -1206,15 +1294,38 @@ def _mutation_reference_evidence(
                 semantic = "value_constraint"
             else:
                 semantic = "field_reference"
-            return {
-                "strength": "strong_structured",
-                "semantic": semantic,
-                "matched_path": item.get("raw_path"),
-                "validation_code": item.get("code"),
-                "source_key": item.get("source_key"),
-            }
+            matches.append(
+                {
+                    "semantic": semantic,
+                    "raw_path": item.get("raw_path"),
+                    "normalized_path": item.get("normalized_path"),
+                    "normalization_applied": item.get("normalization_applied", False),
+                    "validation_code": item.get("code"),
+                    "source_key": item.get("source_key"),
+                }
+            )
+    if matches:
+        semantics = {str(item["semantic"]) for item in matches}
+        signals_conflict = "field_required" in semantics and "not_required" in semantics
+        semantic = (
+            "conflicting"
+            if signals_conflict
+            else next(iter(semantics))
+            if len(semantics) == 1
+            else "field_reference"
+        )
+        return {
+            "strength": "strong_structured",
+            "semantic": semantic,
+            "signals_conflict": signals_conflict,
+            "matches": matches,
+        }
     strings = list(_validation_strings(response_value))
-    if mutation.type in {"remove_json_path", "replace_json_path"}:
+    if mutation.type in {
+        "remove_json_path",
+        "replace_json_path",
+        "add_json_path",
+    }:
         pointer = mutation.path
         token = target_tokens[-1] if target_tokens else ""
         candidates = [pointer, token]
@@ -1231,8 +1342,9 @@ def _mutation_reference_evidence(
                     "strength": "weak_text_match",
                     "semantic": "field_reference",
                     "matched_text": candidate,
+                    "signals_conflict": False,
                 }
-    return {"strength": "none", "semantic": "none"}
+    return {"strength": "none", "semantic": "none", "signals_conflict": False}
 
 
 def _structured_validation_references(value: Any) -> list[dict[str, Any]]:
@@ -1248,20 +1360,30 @@ def _structured_validation_references(value: Any) -> list[dict[str, Any]]:
                     break
             for key, child in item.items():
                 normalized = str(key).lower()
-                if normalized in {"field", "path", "loc", "missing", "fields"}:
+                if normalized in {
+                    "field",
+                    "path",
+                    "loc",
+                    "missing",
+                    "fields",
+                    "optional",
+                    "not_required",
+                }:
                     raw_paths = (
                         child
-                        if isinstance(child, list)
-                        and normalized in {"missing", "fields"}
+                        if isinstance(child, list) and normalized in {"missing", "fields"}
                         else [child]
                     )
                     for raw_path in raw_paths:
-                        tokens = _validation_path_tokens(raw_path)
+                        details = _validation_path_details(raw_path)
+                        tokens = details["tokens"]
                         if tokens:
                             result.append(
                                 {
                                     "path_tokens": tokens,
                                     "raw_path": raw_path,
+                                    "normalized_path": details["normalized_path"],
+                                    "normalization_applied": details["normalization_applied"],
                                     "source_key": normalized,
                                     "code": local_code,
                                 }
@@ -1281,23 +1403,42 @@ def _structured_validation_references(value: Any) -> list[dict[str, Any]]:
     return result
 
 
-def _validation_path_tokens(value: Any) -> list[str]:
+def _validation_path_details(value: Any) -> dict[str, Any]:
+    normalization_applied = False
     if isinstance(value, list):
         tokens = [str(item) for item in value]
+        path_kind = "framework_location"
     elif isinstance(value, str):
         text = value.strip()
         if text.startswith("/"):
             try:
                 tokens = _decode_pointer(text)
             except ValueError:
-                return []
+                return {
+                    "tokens": [],
+                    "normalized_path": None,
+                    "normalization_applied": False,
+                }
+            path_kind = "json_pointer"
         else:
             tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_-]*|\d+", text)
+            path_kind = "framework_location"
     else:
-        return []
-    while tokens and tokens[0].lower() in {"body", "request", "payload", "json"}:
-        tokens.pop(0)
-    return tokens
+        return {
+            "tokens": [],
+            "normalized_path": None,
+            "normalization_applied": False,
+        }
+    if path_kind == "framework_location":
+        while tokens and tokens[0].lower() in {"body", "request", "payload", "json"}:
+            tokens.pop(0)
+            normalization_applied = True
+    normalized_path = "/" + "/".join(_encode_pointer_token(item) for item in tokens)
+    return {
+        "tokens": tokens,
+        "normalized_path": normalized_path if tokens else None,
+        "normalization_applied": normalization_applied,
+    }
 
 
 def _normalize_validation_code(value: Any) -> str:
@@ -1314,9 +1455,7 @@ def _validation_path_matches(
     expected_values = [str(item) for item in expected]
     if case_sensitive:
         return observed_values == expected_values
-    return [item.lower() for item in observed_values] == [
-        item.lower() for item in expected_values
-    ]
+    return [item.lower() for item in observed_values] == [item.lower() for item in expected_values]
 
 
 def _validation_strings(value: Any, *, key: str | None = None) -> list[str]:
@@ -1370,22 +1509,80 @@ def _normalized_headers(value: Any) -> list[dict[str, str]]:
 
 
 def _replace_header(
-    headers: list[dict[str, str]], name: str, value: str
+    headers: list[dict[str, str]],
+    name: str,
+    value: str,
+    *,
+    occurrence: int = 0,
 ) -> list[dict[str, str]]:
-    result = [item for item in headers if item["name"].lower() != name.lower()]
-    result.append({"name": name, "value": value})
+    result = copy.deepcopy(headers)
+    matches = [index for index, item in enumerate(result) if item["name"].lower() == name.lower()]
+    if occurrence >= len(matches):
+        raise ValueError(f"Header occurrence does not exist: {name}[{occurrence}]")
+    result[matches[occurrence]] = {"name": name, "value": value}
     return result
 
 
-def _mutate_query(url: str, name: str, value: str | None, *, remove: bool) -> str:
-    split = urlsplit(url)
-    entries = [
-        (key, item)
-        for key, item in parse_qsl(split.query, keep_blank_values=True)
-        if key != name
+def _mutate_headers(
+    headers: list[dict[str, str]],
+    mutation: ReplayMutation,
+) -> list[dict[str, str]]:
+    result = copy.deepcopy(headers)
+    matches = [
+        index for index, item in enumerate(result) if item["name"].lower() == mutation.name.lower()
     ]
-    if not remove:
+    occurrence = mutation.occurrence
+    if mutation.type == "add_header":
+        result.append({"name": mutation.name, "value": mutation.value})
+        return result
+    if occurrence == "all":
+        if mutation.type == "remove_header":
+            return [item for item in result if item["name"].lower() != mutation.name.lower()]
+        if not matches:
+            raise ValueError(f"Header does not exist: {mutation.name}")
+        for index in matches:
+            result[index] = {"name": mutation.name, "value": mutation.value}
+        return result
+    if occurrence >= len(matches):
+        raise ValueError(f"Header occurrence does not exist: {mutation.name}[{occurrence}]")
+    target_index = matches[occurrence]
+    if mutation.type == "remove_header":
+        del result[target_index]
+    else:
+        result[target_index] = {"name": mutation.name, "value": mutation.value}
+    return result
+
+
+def _mutate_query(
+    url: str,
+    name: str,
+    value: str | None,
+    *,
+    operation: str,
+    occurrence: int | str,
+) -> str:
+    split = urlsplit(url)
+    entries = list(parse_qsl(split.query, keep_blank_values=True))
+    matches = [index for index, (key, _) in enumerate(entries) if key == name]
+    if operation == "add":
         entries.append((name, value or ""))
+    elif occurrence == "all":
+        if operation == "remove":
+            entries = [(key, item) for key, item in entries if key != name]
+        else:
+            if not matches:
+                raise ValueError(f"Query parameter does not exist: {name}")
+            for index in matches:
+                entries[index] = (name, value or "")
+    else:
+        selected = int(occurrence)
+        if selected >= len(matches):
+            raise ValueError(f"Query occurrence does not exist: {name}[{selected}]")
+        target_index = matches[selected]
+        if operation == "remove":
+            del entries[target_index]
+        else:
+            entries[target_index] = (name, value or "")
     return urlunsplit(
         (
             split.scheme,
@@ -1409,6 +1606,8 @@ def _mutate_json_body(body: Any, mutation: ReplayMutation) -> dict[str, Any]:
     path = str(getattr(mutation, "path", ""))
     if mutation.type == "remove_json_path":
         _remove_pointer(value, path)
+    elif mutation.type == "add_json_path":
+        _add_pointer(value, path, mutation.value)
     else:
         _replace_pointer(value, path, mutation.value)
     encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
@@ -1518,3 +1717,65 @@ def _replace_pointer(document: Any, path: str, value: Any) -> None:
         parent[_parse_list_index(leaf, len(parent), path)] = value
         return
     raise ValueError(f"JSON Pointer parent is not a container: {path}")
+
+
+def _add_pointer(document: Any, path: str, value: Any) -> None:
+    parent, leaf = _resolve_parent(document, path)
+    if isinstance(parent, dict):
+        parent[leaf] = value
+        return
+    if isinstance(parent, list):
+        if leaf == "-":
+            parent.append(value)
+            return
+        if not leaf.isdigit():
+            raise ValueError(f"JSON Pointer array token must be an index or '-': {path}")
+        index = int(leaf)
+        if index > len(parent):
+            raise ValueError(f"JSON Pointer array index is out of range: {path}")
+        parent.insert(index, value)
+        return
+    raise ValueError(f"JSON Pointer parent is not a container: {path}")
+
+
+def _occurrence_value_matches(
+    values: list[Any],
+    expected: Any,
+    occurrence: int | str,
+) -> bool:
+    if occurrence in {"all", "append"}:
+        return bool(values) and (
+            all(value == expected for value in values)
+            if occurrence == "all"
+            else values[-1] == expected
+        )
+    return occurrence < len(values) and values[occurrence] == expected
+
+
+def _remove_named_occurrence(
+    entries: list[Any],
+    name: str,
+    occurrence: int | str,
+    *,
+    case_sensitive: bool,
+) -> list[Any]:
+    def entry_name(item: Any) -> str:
+        if isinstance(item, dict):
+            return str(item.get("name", ""))
+        return str(item[0])
+
+    def matches(item: Any) -> bool:
+        current = entry_name(item)
+        return current == name if case_sensitive else current.lower() == name.lower()
+
+    result = copy.deepcopy(entries)
+    indexes = [index for index, item in enumerate(result) if matches(item)]
+    if occurrence == "all":
+        return [item for item in result if not matches(item)]
+    if occurrence == "append":
+        if indexes:
+            del result[indexes[-1]]
+        return result
+    if occurrence < len(indexes):
+        del result[indexes[occurrence]]
+    return result

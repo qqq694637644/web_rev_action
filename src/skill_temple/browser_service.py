@@ -52,6 +52,7 @@ from .browser_models import (
     OpenSessionRequest,
     PrimaryRequest,
     ReplayControlPayload,
+    ReplayExploratoryPayload,
     ReplayRequestPayload,
     ReplayRequestRequest,
     ReplayTreatmentPayload,
@@ -64,12 +65,14 @@ from .browser_models import (
 )
 from .protocol_evidence import (
     assess_control_wire_baseline,
+    assess_mutation_effectiveness,
     assess_paired_mutation_effectiveness,
     binding_value_from_snapshot,
     build_replay_spec,
     canonical_json_sha256,
     classify_replay_response,
     evidence_id,
+    json_pointer_value,
     load_snapshot,
     network_checkpoint,
     network_request_matches,
@@ -194,10 +197,7 @@ class ExperimentStore:
 
     @staticmethod
     def new_experiment_id() -> str:
-        return (
-            f"exp_{datetime.now(UTC).strftime('%Y%m%dT%H%M%S')}_"
-            f"{uuid.uuid4().hex[:10]}"
-        )
+        return f"exp_{datetime.now(UTC).strftime('%Y%m%dT%H%M%S')}_{uuid.uuid4().hex[:10]}"
 
     def create_experiment(
         self,
@@ -276,11 +276,7 @@ class ExperimentStore:
             manifest["status"] = "interrupted"
             manifest["interrupted_at"] = utc_now()
             manifest["errors"] = [
-                *(
-                    manifest.get("errors")
-                    if isinstance(manifest.get("errors"), list)
-                    else []
-                ),
+                *(manifest.get("errors") if isinstance(manifest.get("errors"), list) else []),
                 "The service restarted before this experiment reached a terminal manifest.",
             ]
             self.write_manifest(str(manifest["experiment_id"]), manifest)
@@ -522,11 +518,14 @@ class BrowserActionService:
         if not isinstance(source_text, str):
             source_text = json.dumps(result, ensure_ascii=False, indent=2)
         digest = hashlib.sha256(source_text.encode("utf-8")).hexdigest()
-        label = re.sub(
-            r"[^A-Za-z0-9_.-]+",
-            "-",
-            payload.evidence_label or payload.script_id or payload.url or "script",
-        ).strip("-._")[:80] or "script"
+        label = (
+            re.sub(
+                r"[^A-Za-z0-9_.-]+",
+                "-",
+                payload.evidence_label or payload.script_id or payload.url or "script",
+            ).strip("-._")[:80]
+            or "script"
+        )
         ev_id = evidence_id(
             payload.target_experiment_id,
             "script_source",
@@ -572,18 +571,12 @@ class BrowserActionService:
             kind="script_source_metadata",
             sensitivity="private",
         )
-        artifacts = [
-            item
-            for item in (source_descriptor, metadata_descriptor)
-            if item is not None
-        ]
+        artifacts = [item for item in (source_descriptor, metadata_descriptor) if item is not None]
         evidence = {
             "evidence_id": ev_id,
             "kind": "script_source",
             "artifact_ids": [item["artifactId"] for item in artifacts],
-            "artifact_paths": {
-                item["kind"]: item["relativePath"] for item in artifacts
-            },
+            "artifact_paths": {item["kind"]: item["relativePath"] for item in artifacts},
             "initiator_evidence_id": payload.initiator_evidence_id,
             "script_url": payload.url,
             "script_id": payload.script_id,
@@ -642,9 +635,7 @@ class BrowserActionService:
                     if isinstance(value.get("metadataArtifact"), dict)
                     else None
                 ),
-                "capture_metadata_relative_path": self.experiments.relative_path(
-                    str(path)
-                ),
+                "capture_metadata_relative_path": self.experiments.relative_path(str(path)),
             }
         return None
 
@@ -659,9 +650,7 @@ class BrowserActionService:
             "capture_id": manifest.get("stream_capture_id"),
             "capture_uuid": health.get("capture_uuid"),
             "capture_relative_dir": health.get("capture_relative_dir"),
-            "capture_metadata_artifact_id": health.get(
-                "capture_metadata_artifact_id"
-            ),
+            "capture_metadata_artifact_id": health.get("capture_metadata_artifact_id"),
             "transport_generation": health.get("transport_generation"),
             "start_status": health.get("stream_start_status"),
         }
@@ -698,9 +687,7 @@ class BrowserActionService:
         return manifest["evidence"]
 
     @classmethod
-    def _find_evidence(
-        cls, manifest: dict[str, Any], target_evidence_id: str
-    ) -> dict[str, Any]:
+    def _find_evidence(cls, manifest: dict[str, Any], target_evidence_id: str) -> dict[str, Any]:
         for item in cls._evidence_index(manifest):
             if item.get("evidence_id") == target_evidence_id:
                 return item
@@ -714,10 +701,7 @@ class BrowserActionService:
     def _pointer_tokens(path: str) -> list[str]:
         if path == "/":
             return []
-        return [
-            token.replace("~1", "/").replace("~0", "~")
-            for token in path.split("/")[1:]
-        ]
+        return [token.replace("~1", "/").replace("~0", "~") for token in path.split("/")[1:]]
 
     @classmethod
     def _filter_shape_paths(
@@ -739,10 +723,7 @@ class BrowserActionService:
             relative = tokens[len(prefix_tokens) :]
             if len(relative) > max_depth:
                 continue
-            if any(
-                token.isdigit() and int(token) >= max_array_items
-                for token in relative
-            ):
+            if any(token.isdigit() and int(token) >= max_array_items for token in relative):
                 continue
             selected.append((path, descriptor))
         return sorted(selected, key=lambda item: item[0])
@@ -782,14 +763,9 @@ class BrowserActionService:
                     result["$truncated_key_count"] = len(item) - len(keys)
                 return result
             if isinstance(item, list):
-                result = [
-                    prune(child, depth + 1)
-                    for child in item[:max_array_items]
-                ]
+                result = [prune(child, depth + 1) for child in item[:max_array_items]]
                 if len(item) > max_array_items:
-                    result.append(
-                        {"$truncated_array_items": len(item) - max_array_items}
-                    )
+                    result.append({"$truncated_array_items": len(item) - max_array_items})
                 return result
             return item
 
@@ -813,9 +789,7 @@ class BrowserActionService:
                     409,
                 )
             predecessor_series = predecessor.get("series")
-            predecessor_series = (
-                predecessor_series if isinstance(predecessor_series, dict) else {}
-            )
+            predecessor_series = predecessor_series if isinstance(predecessor_series, dict) else {}
             requested_series = series.get("analysis_series_id")
             existing_series = predecessor_series.get("analysis_series_id")
             if requested_series and existing_series and requested_series != existing_series:
@@ -858,8 +832,10 @@ class BrowserActionService:
             "mode": control.mode,
             "target": control.target.model_dump(mode="json", exclude_none=True),
             "setup_flow": [
-                step.model_dump(mode="json", exclude_none=True)
-                for step in control.setup_flow
+                step.model_dump(mode="json", exclude_none=True) for step in control.setup_flow
+            ],
+            "setup_outputs": [
+                item.model_dump(mode="json", exclude_none=True) for item in control.setup_outputs
             ],
             "wait_for": (
                 control.wait_for.model_dump(mode="json", exclude_none=True)
@@ -877,14 +853,21 @@ class BrowserActionService:
             "stream_idle_timeout_ms": control.stream_idle_timeout_ms,
             "default_done_marker": control.default_done_marker,
             "default_done_event_name": control.default_done_event_name,
+            "response_mode": control.response_mode,
+            "terminal_conditions": [
+                item.model_dump(mode="json", exclude_none=True)
+                for item in control.terminal_conditions
+            ],
             "raw_only": control.raw_only,
             "ignored_cookie_names": control.ignored_cookie_names,
             "ignored_context_headers": control.ignored_context_headers,
+            "normalize_wire_order": control.normalize_wire_order,
+            "environment_comparison": control.environment_comparison.model_dump(mode="json"),
+            "transport": control.transport.model_dump(mode="json"),
             "capture": control.capture.model_dump(mode="json"),
             "requirements": control.requirements.model_dump(mode="json"),
             "network_evidence": [
-                item.model_dump(mode="json", exclude_none=True)
-                for item in control.network_evidence
+                item.model_dump(mode="json", exclude_none=True) for item in control.network_evidence
             ],
             "volatile_bindings": [
                 item.model_dump(mode="json", exclude_none=True)
@@ -907,16 +890,26 @@ class BrowserActionService:
             bindings = list(payload.volatile_bindings)
             values = self._generate_volatile_binding_values(bindings)
             protocol = self._pair_protocol(payload)
-            return payload, bindings, values, protocol, None, None
+            mutations = (
+                list(payload.mutations) if isinstance(payload, ReplayExploratoryPayload) else []
+            )
+            return payload, bindings, values, protocol, None, mutations
         control_id = payload.control_experiment_id
         control = self.experiments.load_manifest(control_id)
+        execution_integrity = control.get("execution_integrity")
+        evidence_integrity = control.get("evidence_integrity")
+        if execution_integrity is None and evidence_integrity is None:
+            execution_integrity = control.get("objective_integrity")
+            evidence_integrity = control.get("objective_integrity")
         if (
             control.get("status") != "completed"
-            or control.get("objective_integrity") != "complete"
+            or execution_integrity != "complete"
+            or evidence_integrity != "complete"
         ):
             raise BrowserServiceError(
                 "control_replay_not_usable",
-                "Treatment replay requires a completed control with complete objective integrity.",
+                "Treatment replay requires a completed control with complete execution "
+                "and evidence integrity.",
                 409,
             )
         control_http_status = control.get("replay_http_status")
@@ -930,12 +923,16 @@ class BrowserActionService:
                 "Treatment replay requires a control replay with a successful HTTP status.",
                 409,
             )
-        control_response_classification = control.get(
-            "replay_response_classification"
+        control_response_classification = control.get("replay_response_classification")
+        control_observations = (
+            control_response_classification.get("observations")
+            if isinstance(control_response_classification, dict)
+            else None
         )
-        if (
-            not isinstance(control_response_classification, dict)
-            or control_response_classification.get("classification") != "success"
+        if not isinstance(control_response_classification, dict) or not (
+            control_response_classification.get("classification") == "success"
+            or isinstance(control_observations, dict)
+            and control_observations.get("success_like") is True
         ):
             raise BrowserServiceError(
                 "control_replay_response_contract_failed",
@@ -952,9 +949,7 @@ class BrowserActionService:
             )
         pair_protocol = replay.get("pair_protocol")
         pair_protocol_hash = replay.get("pair_protocol_hash")
-        if not isinstance(pair_protocol, dict) or not isinstance(
-            pair_protocol_hash, str
-        ):
+        if not isinstance(pair_protocol, dict) or not isinstance(pair_protocol_hash, str):
             raise BrowserServiceError(
                 "control_pair_protocol_missing",
                 "Control replay has no immutable pair protocol.",
@@ -998,15 +993,14 @@ class BrowserActionService:
                 "Control replay contains invalid volatile binding metadata.",
                 409,
             ) from exc
-        treatment_values = {
-            binding.binding_id: (
-                control_values[binding.binding_id]
-                if binding.value_source == "preserve_source"
-                or binding.reuse_policy == "same_value"
-                else self._generate_binding_value(binding)
-            )
-            for binding in parsed_specs
-        }
+        treatment_values: dict[str, Any] = {}
+        for binding in parsed_specs:
+            if binding.value_source == "setup_output":
+                continue
+            if binding.value_source == "preserve_source" or binding.reuse_policy == "same_value":
+                treatment_values[binding.binding_id] = control_values[binding.binding_id]
+            else:
+                treatment_values[binding.binding_id] = self._generate_binding_value(binding)
         return (
             effective_control,
             parsed_specs,
@@ -1022,9 +1016,83 @@ class BrowserActionService:
             deadline,
         )
         requests = payload.get("requests")
-        return [item for item in requests if isinstance(item, dict)] if isinstance(
-            requests, list
-        ) else []
+        return (
+            [item for item in requests if isinstance(item, dict)]
+            if isinstance(requests, list)
+            else []
+        )
+
+    async def _resolve_setup_output_bindings(
+        self,
+        *,
+        setup_outputs: list[Any],
+        checkpoint: dict[str, Any],
+        experiment_dir: Path,
+        deadline: Deadline,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        requests = requests_after_checkpoint(
+            await self._all_network_requests(deadline),
+            checkpoint,
+            include_in_flight=True,
+        )
+        values: dict[str, Any] = {}
+        records: list[dict[str, Any]] = []
+        output_dir = experiment_dir / "replay" / "setup-outputs"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        for output in setup_outputs:
+            matches = [item for item in requests if network_request_matches(item, output.selector)]
+            occurrence = output.occurrence
+            if occurrence == "first":
+                selected = matches[0] if matches else None
+            elif occurrence == "last":
+                selected = matches[-1] if matches else None
+            else:
+                selected = matches[occurrence] if occurrence < len(matches) else None
+            if not isinstance(selected, dict) or not isinstance(selected.get("reqid"), int):
+                raise BrowserServiceError(
+                    "setup_output_request_missing",
+                    f"No setup request matched output binding {output.binding_id}.",
+                    409,
+                )
+            reqid = int(selected["reqid"])
+            snapshot_path = output_dir / f"{output.binding_id}.json"
+            await self.js_reverse.export_network_request(
+                reqid,
+                snapshot_path,
+                "all",
+                deadline.child(min(5_000, deadline.remaining_ms())),
+            )
+            snapshot = load_snapshot(snapshot_path)
+            response_value = response_value_from_snapshot(snapshot)
+            if response_value is None:
+                raise BrowserServiceError(
+                    "setup_output_response_unavailable",
+                    f"Setup output {output.binding_id} has no complete response body.",
+                    409,
+                )
+            try:
+                value = json_pointer_value(response_value, output.pointer)
+            except ValueError as exc:
+                raise BrowserServiceError(
+                    "setup_output_pointer_missing",
+                    f"Setup output {output.binding_id}: {exc}",
+                    409,
+                ) from exc
+            values[output.binding_id] = value
+            records.append(
+                {
+                    "binding_id": output.binding_id,
+                    "source": output.source,
+                    "pointer": output.pointer,
+                    "request_id": reqid,
+                    "request_url_sha256": canonical_json_sha256(
+                        str(selected.get("url") or "")
+                    ),
+                    "value_sha256": canonical_json_sha256(value),
+                    "snapshot_relative_path": self.experiments.relative_path(snapshot_path),
+                }
+            )
+        return values, records
 
     async def _export_network_evidence(
         self,
@@ -1129,9 +1197,7 @@ class BrowserActionService:
                         if descriptor:
                             artifacts.append(descriptor)
                             artifact_ids.append(shape_artifact_id)
-                            artifact_paths["request_shape"] = str(
-                                descriptor["relativePath"]
-                            )
+                            artifact_paths["request_shape"] = str(descriptor["relativePath"])
                     if redacted_body is not None:
                         redacted_file = target_dir / "request-body.redacted.json"
                         redacted_file.write_text(
@@ -1172,13 +1238,9 @@ class BrowserActionService:
                         if descriptor:
                             artifacts.append(descriptor)
                             artifact_ids.append(initiator_artifact_id)
-                            artifact_paths["initiator"] = str(
-                                descriptor["relativePath"]
-                            )
+                            artifact_paths["initiator"] = str(descriptor["relativePath"])
                     except Exception as exc:
-                        warnings.append(
-                            f"request initiator reqid={reqid}: {str(exc)[:2000]}"
-                        )
+                        warnings.append(f"request initiator reqid={reqid}: {str(exc)[:2000]}")
                 cookie_artifacts: list[str] = []
                 if selector.include_cookie_provenance:
                     for cookie_name in selector.cookie_names:
@@ -1187,9 +1249,7 @@ class BrowserActionService:
                                 cookie_name,
                                 deadline.child(min(3_000, deadline.remaining_ms())),
                             )
-                            safe_cookie = re.sub(
-                                r"[^A-Za-z0-9_.-]+", "-", cookie_name
-                            )
+                            safe_cookie = re.sub(r"[^A-Za-z0-9_.-]+", "-", cookie_name)
                             cookie_file = target_dir / f"cookie-{safe_cookie}.json"
                             cookie_file.write_text(
                                 json.dumps(cookie_flow, ensure_ascii=False, indent=2) + "\n",
@@ -1208,9 +1268,7 @@ class BrowserActionService:
                                 artifact_ids.append(cookie_artifact_id)
                                 cookie_artifacts.append(cookie_artifact_id)
                         except Exception as exc:
-                            warnings.append(
-                                f"cookie provenance {cookie_name}: {str(exc)[:2000]}"
-                            )
+                            warnings.append(f"cookie provenance {cookie_name}: {str(exc)[:2000]}")
                 evidence_entries.append(
                     {
                         "evidence_id": ev_id,
@@ -1276,9 +1334,11 @@ class BrowserActionService:
             types=["error", "warn"],
         )
         messages = payload.get("messages")
-        values = [item for item in messages if isinstance(item, dict)] if isinstance(
-            messages, list
-        ) else []
+        values = (
+            [item for item in messages if isinstance(item, dict)]
+            if isinstance(messages, list)
+            else []
+        )
         ids = [int(item["msgid"]) for item in values if isinstance(item.get("msgid"), int)]
         return {"max_msgid": max(ids, default=0)}
 
@@ -1298,9 +1358,11 @@ class BrowserActionService:
         except Exception as exc:
             return [], [], [f"console evidence: {str(exc)[:2000]}"]
         messages = payload.get("messages")
-        values = [item for item in messages if isinstance(item, dict)] if isinstance(
-            messages, list
-        ) else []
+        values = (
+            [item for item in messages if isinstance(item, dict)]
+            if isinstance(messages, list)
+            else []
+        )
         max_msgid = int(checkpoint.get("max_msgid", 0) or 0)
         selected = [
             item
@@ -1335,9 +1397,7 @@ class BrowserActionService:
                 "kind": "console_message",
                 "message_id": item.get("msgid"),
                 "artifact_ids": [artifact_id] if descriptor else [],
-                "artifact_paths": {
-                    "console": descriptor["relativePath"] if descriptor else None
-                },
+                "artifact_paths": {"console": descriptor["relativePath"] if descriptor else None},
                 "message_index": index - 1,
                 "summary": {
                     key: item.get(key)
@@ -1381,6 +1441,10 @@ class BrowserActionService:
         replay_plan: dict[str, Any],
     ) -> tuple[dict[str, Any] | None, str | None]:
         expected_hash = replay_plan.get("expected_request_body_canonical_sha256")
+        expected_spec = replay_plan.get("spec")
+        expected_spec = expected_spec if isinstance(expected_spec, dict) else {}
+        expected_url = str(expected_spec.get("url") or "")
+        expected_method = str(expected_spec.get("method") or "GET").upper()
         dispatch_wall_time_ms = replay_plan.get("dispatch_wall_time_ms")
         window_end_wall_time_ms = replay_plan.get("correlation_window_end_wall_time_ms")
         if not isinstance(dispatch_wall_time_ms, int) or not isinstance(
@@ -1392,9 +1456,11 @@ class BrowserActionService:
             for item in entries
             if item.get("kind") == "network_request"
             and item.get("selector_id") == "replay_request"
+            and isinstance(item.get("summary"), dict)
+            and str(item["summary"].get("url") or "") == expected_url
+            and str(item["summary"].get("method") or "").upper() == expected_method
             and (
-                expected_hash is None
-                or item.get("request_body_canonical_sha256") == expected_hash
+                expected_hash is None or item.get("request_body_canonical_sha256") == expected_hash
             )
             and (
                 isinstance(item.get("observed_at"), (int, float))
@@ -1406,11 +1472,15 @@ class BrowserActionService:
         if len(candidates) == 1:
             return candidates[0], None
         if not candidates:
-            return None, "No replay request matched the expected canonical body fingerprint."
+            return (
+                None,
+                "No replay request matched the expected method, full URL, canonical body "
+                "fingerprint, and dispatch window.",
+            )
         return (
             None,
-            "Multiple replay requests matched the dispatch window and canonical body "
-            "fingerprint; the replay request is ambiguous.",
+            "Multiple replay requests matched the method, full URL, canonical body "
+            "fingerprint, and dispatch window; the replay request is ambiguous.",
         )
 
     @staticmethod
@@ -1432,12 +1502,10 @@ class BrowserActionService:
                     [
                         item
                         for item in network_entries
-                        if request_ids(item).get("network_request_id")
-                        == network_request_id
+                        if request_ids(item).get("network_request_id") == network_request_id
                         and (
                             collector_generation is None
-                            or request_ids(item).get("collector_generation")
-                            == collector_generation
+                            or request_ids(item).get("collector_generation") == collector_generation
                         )
                     ],
                 )
@@ -1462,8 +1530,7 @@ class BrowserActionService:
                     [
                         item
                         for item in network_entries
-                        if request_ids(item).get("persistent_request_id")
-                        == persistent_request_id
+                        if request_ids(item).get("persistent_request_id") == persistent_request_id
                     ],
                 )
             )
@@ -1561,9 +1628,7 @@ class BrowserActionService:
         summary = summary if isinstance(summary, dict) else {}
         integrity = summary.get("snapshot_integrity")
         integrity = integrity if isinstance(integrity, dict) else {}
-        network_snapshot_integrity = str(
-            integrity.get("network_snapshot_integrity") or "partial"
-        )
+        network_snapshot_integrity = str(integrity.get("network_snapshot_integrity") or "partial")
         network_artifact_integrity = (
             "complete"
             if isinstance(evidence.get("artifact_paths"), dict)
@@ -1580,15 +1645,9 @@ class BrowserActionService:
             },
             "networkSnapshotIntegrity": network_snapshot_integrity,
             "requestBodyCompleteness": integrity.get("request_body_completeness"),
-            "requestHeadersCompleteness": integrity.get(
-                "request_headers_completeness"
-            ),
-            "responseBodyCompleteness": integrity.get(
-                "response_body_completeness"
-            ),
-            "responseHeadersCompleteness": integrity.get(
-                "response_headers_completeness"
-            ),
+            "requestHeadersCompleteness": integrity.get("request_headers_completeness"),
+            "responseBodyCompleteness": integrity.get("response_body_completeness"),
+            "responseHeadersCompleteness": integrity.get("response_headers_completeness"),
             "networkArtifactIntegrity": network_artifact_integrity,
             "artifactIntegrity": network_artifact_integrity,
             "integrityStatus": max(
@@ -1635,12 +1694,7 @@ class BrowserActionService:
                         isinstance(item, dict)
                         and str(item.get("name", "")).lower() == "content-type"
                     ):
-                        return (
-                            str(item.get("value", ""))
-                            .split(";", 1)[0]
-                            .strip()
-                            .lower()
-                        )
+                        return str(item.get("value", "")).split(";", 1)[0].strip().lower()
             for child in value.values():
                 found = cls._extract_response_content_type(child)
                 if found:
@@ -1710,12 +1764,22 @@ class BrowserActionService:
             return None
         response_control = replay_plan.get("spec", {}).get("responseControl", {})
         response_control = response_control if isinstance(response_control, dict) else {}
+        response_mode = str(response_control.get("responseMode") or "auto")
+        observed_mode = cls._extract_response_field(replay_response, "responseMode")
+        terminal_conditions = response_control.get("terminalConditions")
+        terminal_conditions = (
+            [item for item in terminal_conditions if isinstance(item, dict)]
+            if isinstance(terminal_conditions, list)
+            else []
+        )
         marker = response_control.get("doneMarker")
         event_name = response_control.get("doneEventName")
         termination = cls._extract_response_field(replay_response, "terminationReason")
-        marker_observed = bool(
-            cls._extract_response_field(replay_response, "doneMarkerObserved")
+        terminal_condition_matched = cls._extract_response_field(
+            replay_response,
+            "terminalConditionMatched",
         )
+        marker_observed = bool(cls._extract_response_field(replay_response, "doneMarkerObserved"))
         observed_event_name = cls._extract_response_field(
             replay_response,
             "doneEventNameObserved",
@@ -1726,19 +1790,43 @@ class BrowserActionService:
         else:
             marker_ok = not marker or marker_observed
             event_ok = not event_name or observed_event_name == event_name
+            terminal_types = {
+                str(item.get("type")) for item in terminal_conditions if item.get("type")
+            } or {"network_close"}
+            terminal_ok = bool(
+                ("exact_sse_data" in terminal_types and termination == "done_marker")
+                or ("byte_pattern" in terminal_types and termination == "byte_pattern")
+                or (
+                    "network_close" in terminal_types
+                    and termination in {"network_close", "no_response_body"}
+                )
+                or ("idle_window" in terminal_types and termination == "idle_timeout")
+            )
+            mode_ok = bool(
+                response_mode == "raw_stream"
+                or response_mode == "auto"
+                or response_mode == "sse"
+                and content_type == "text/event-stream"
+                or response_mode == "ndjson"
+                and content_type
+                in {"application/x-ndjson", "application/ndjson", "application/json-seq"}
+            )
             complete = bool(
                 isinstance(status, int)
                 and 200 <= status < 400
-                and content_type == "text/event-stream"
+                and mode_ok
                 and marker_ok
                 and event_ok
-                and termination in {"done_marker", "network_close"}
+                and terminal_ok
                 and not truncated
             )
             contract_status = "complete" if complete else "partial"
         return {
             "status": contract_status,
-            "expected_termination": "done_marker" if marker else "network_close",
+            "response_mode": response_mode,
+            "observed_response_mode": observed_mode,
+            "terminal_conditions": terminal_conditions,
+            "terminal_condition_matched": terminal_condition_matched,
             "observed_termination": termination,
             "done_marker_required": bool(marker),
             "done_marker_observed": marker_observed,
@@ -1758,13 +1846,10 @@ class BrowserActionService:
         *,
         ignored_cookie_names: list[str] | None = None,
         ignored_context_headers: list[str] | None = None,
+        context_header_names: list[str] | None = None,
     ) -> dict[str, Any]:
         headers = snapshot.get("requestHeadersArray") if isinstance(snapshot, dict) else None
-        dimensions = (
-            network_snapshot_dimensions(snapshot)
-            if isinstance(snapshot, dict)
-            else {}
-        )
+        dimensions = network_snapshot_dimensions(snapshot) if isinstance(snapshot, dict) else {}
         if (
             not isinstance(headers, list)
             or dimensions.get("request_headers_completeness") != "complete"
@@ -1774,21 +1859,32 @@ class BrowserActionService:
                 "cookie_name_value_sha256": None,
                 "authorization_sha256": None,
                 "csrf_header_sha256": None,
+                "context_headers_sha256": None,
                 "request_context_sha256": None,
             }
         ignored_cookies = {
-            item.strip().lower()
-            for item in (ignored_cookie_names or [])
-            if item.strip()
+            item.strip().lower() for item in (ignored_cookie_names or []) if item.strip()
         }
         ignored_headers = {
+            item.strip().lower() for item in (ignored_context_headers or []) if item.strip()
+        }
+        selected_context_headers = {
             item.strip().lower()
-            for item in (ignored_context_headers or [])
+            for item in (
+                context_header_names
+                or [
+                    "authorization",
+                    "proxy-authorization",
+                    "x-csrf-token",
+                    "x-xsrf-token",
+                ]
+            )
             if item.strip()
         }
         cookies: list[str] = []
         authorization: list[str] = []
         csrf: list[str] = []
+        context_headers: list[str] = []
         for header_index, item in enumerate(headers):
             if not isinstance(item, dict):
                 continue
@@ -1804,30 +1900,32 @@ class BrowserActionService:
                     cookie_name = normalized_segment.split("=", 1)[0].strip().lower()
                     if cookie_name in ignored_cookies:
                         continue
-                    cookies.append(
-                        f"{header_index}:{segment_index}:{normalized_segment}"
-                    )
+                    cookies.append(f"{header_index}:{segment_index}:{normalized_segment}")
             elif name in {"authorization", "proxy-authorization"}:
                 authorization.append(f"{header_index}:{name}:{value}")
             elif "csrf" in name or "xsrf" in name:
                 csrf.append(f"{header_index}:{name}:{value}")
+            if name in selected_context_headers:
+                context_headers.append(f"{header_index}:{name}:{value}")
         cookie_hash = cls._sha256_lines(cookies)
         authorization_hash = cls._sha256_lines(authorization)
         csrf_hash = cls._sha256_lines(csrf)
+        context_headers_hash = cls._sha256_lines(context_headers)
         return {
             "status": "observed",
             "cookie_name_value_sha256": cookie_hash,
             "authorization_sha256": authorization_hash,
             "csrf_header_sha256": csrf_hash,
+            "context_headers_sha256": context_headers_hash,
             "request_context_sha256": cls._sha256_lines(
                 [
                     f"cookie:{cookie_hash}",
-                    f"authorization:{authorization_hash}",
-                    f"csrf:{csrf_hash}",
+                    f"context_headers:{context_headers_hash}",
                 ]
             ),
             "ignored_cookie_names": sorted(ignored_cookies),
             "ignored_context_headers": sorted(ignored_headers),
+            "context_header_names": sorted(selected_context_headers),
         }
 
     @classmethod
@@ -1840,6 +1938,7 @@ class BrowserActionService:
         include_request_context: bool = True,
         ignored_cookie_names: list[str] | None = None,
         ignored_context_headers: list[str] | None = None,
+        context_header_names: list[str] | None = None,
     ) -> dict[str, Any]:
         page_id = alignment.js_reverse_page_id if alignment is not None else None
         page_url = (
@@ -1848,17 +1947,14 @@ class BrowserActionService:
             else None
         )
         page_split = urlsplit(page_url or "")
-        request_url = (
-            str(wire_snapshot.get("url", ""))
-            if isinstance(wire_snapshot, dict)
-            else ""
-        )
+        request_url = str(wire_snapshot.get("url", "")) if isinstance(wire_snapshot, dict) else ""
         request_split = urlsplit(request_url)
         request_context = (
             cls._request_context_hashes(
                 wire_snapshot,
                 ignored_cookie_names=ignored_cookie_names,
                 ignored_context_headers=ignored_context_headers,
+                context_header_names=context_header_names,
             )
             if include_request_context
             else {
@@ -1866,9 +1962,11 @@ class BrowserActionService:
                 "cookie_name_value_sha256": None,
                 "authorization_sha256": None,
                 "csrf_header_sha256": None,
+                "context_headers_sha256": None,
                 "request_context_sha256": None,
                 "ignored_cookie_names": sorted(ignored_cookie_names or []),
                 "ignored_context_headers": sorted(ignored_context_headers or []),
+                "context_header_names": sorted(context_header_names or []),
             }
         )
         unavailable = [
@@ -1902,55 +2000,76 @@ class BrowserActionService:
     def _compare_pair_environments(
         control: dict[str, Any] | None,
         treatment: dict[str, Any],
+        *,
+        required_dimensions: list[str] | None = None,
+        advisory_dimensions: list[str] | None = None,
     ) -> dict[str, Any]:
-        required_keys = [
-            "page_id",
-            "page_url",
-            "page_origin",
-            "request_origin",
-            "request_path",
-            "request_context_sha256",
-            "conversation_current_node",
-            "critical_bundle_sha256",
+        required_keys = list(
+            dict.fromkeys(required_dimensions or ["page_origin", "request_context_sha256"])
+        )
+        advisory_keys = [
+            item
+            for item in dict.fromkeys(
+                advisory_dimensions
+                or [
+                    "page_url",
+                    "request_origin",
+                    "request_path",
+                    "conversation_current_node",
+                    "critical_bundle_sha256",
+                ]
+            )
+            if item not in required_keys
         ]
+        all_keys = [*required_keys, *advisory_keys]
         if not isinstance(control, dict):
             return {
                 "status": "insufficient",
                 "equivalent": False,
                 "differences": ["control_environment_fingerprint_missing"],
                 "compared_dimensions": [],
-                "unavailable_dimensions": required_keys,
+                "unavailable_dimensions": all_keys,
                 "required_dimensions_missing": required_keys,
+                "advisory_dimensions_missing": advisory_keys,
+                "required_dimensions": required_keys,
+                "advisory_dimensions": advisory_keys,
             }
         compared = [
             key
-            for key in required_keys
+            for key in all_keys
             if control.get(key) is not None and treatment.get(key) is not None
         ]
-        missing = [key for key in required_keys if key not in compared]
+        required_missing = [key for key in required_keys if key not in compared]
+        advisory_missing = [key for key in advisory_keys if key not in compared]
         unavailable = sorted(
             set(control.get("unavailable_dimensions") or [])
             | set(treatment.get("unavailable_dimensions") or [])
         )
-        missing = sorted(set(missing) | set(unavailable))
-        differences = [
-            key for key in compared if control.get(key) != treatment.get(key)
-        ]
+        required_missing = sorted(set(required_missing) | (set(unavailable) & set(required_keys)))
+        advisory_missing = sorted(set(advisory_missing) | (set(unavailable) & set(advisory_keys)))
+        differences = [key for key in compared if control.get(key) != treatment.get(key)]
+        required_differences = [key for key in differences if key in required_keys]
+        advisory_differences = [key for key in differences if key in advisory_keys]
         status = (
             "different"
-            if differences
+            if required_differences
             else "insufficient"
-            if missing
+            if required_missing
             else "observed_equivalent"
         )
         return {
             "status": status,
             "equivalent": status == "observed_equivalent",
-            "observed_dimensions_equivalent": not differences,
+            "observed_dimensions_equivalent": not required_differences,
             "differences": differences,
+            "required_differences": required_differences,
+            "advisory_differences": advisory_differences,
             "compared_dimensions": compared,
             "unavailable_dimensions": unavailable,
-            "required_dimensions_missing": missing,
+            "required_dimensions_missing": required_missing,
+            "advisory_dimensions_missing": advisory_missing,
+            "required_dimensions": required_keys,
+            "advisory_dimensions": advisory_keys,
         }
 
     @staticmethod
@@ -1970,27 +2089,19 @@ class BrowserActionService:
                 else []
             )
             artifact_ids = [
-                str(item.get("artifactId"))
-                for item in core_artifacts
-                if item.get("artifactId")
+                str(item.get("artifactId")) for item in core_artifacts if item.get("artifactId")
             ]
             artifact_paths = {
-                str(item.get("kind") or item.get("artifactId")): str(
-                    item.get("relativePath")
-                )
+                str(item.get("kind") or item.get("artifactId")): str(item.get("relativePath"))
                 for item in core_artifacts
                 if item.get("relativePath")
             }
-            linked_network, association = (
-                BrowserActionService._associate_stream_network_evidence(
-                    request,
-                    network_entries,
-                )
+            linked_network, association = BrowserActionService._associate_stream_network_evidence(
+                request,
+                network_entries,
             )
             linked_network_id = (
-                linked_network.get("evidence_id")
-                if isinstance(linked_network, dict)
-                else None
+                linked_network.get("evidence_id") if isinstance(linked_network, dict) else None
             )
             linked_summary = (
                 linked_network.get("summary")
@@ -1999,9 +2110,7 @@ class BrowserActionService:
                 else {}
             )
             snapshot_integrity = linked_summary.get("snapshot_integrity")
-            snapshot_integrity = (
-                snapshot_integrity if isinstance(snapshot_integrity, dict) else {}
-            )
+            snapshot_integrity = snapshot_integrity if isinstance(snapshot_integrity, dict) else {}
             stream_id = evidence_id(
                 experiment_id,
                 "stream_request",
@@ -2029,15 +2138,9 @@ class BrowserActionService:
                         "raw_event_count": request.get("rawEventCount"),
                         "semantic_event_count": request.get("semanticEventCount"),
                         "raw_capture_integrity": request.get("rawCaptureIntegrity"),
-                        "semantic_parse_integrity": request.get(
-                            "semanticParseIntegrity"
-                        ),
-                        "request_snapshot_integrity": request.get(
-                            "requestSnapshotIntegrity"
-                        ),
-                        "stream_artifact_integrity": request.get(
-                            "artifactIntegrity"
-                        ),
+                        "semantic_parse_integrity": request.get("semanticParseIntegrity"),
+                        "request_snapshot_integrity": request.get("requestSnapshotIntegrity"),
+                        "stream_artifact_integrity": request.get("artifactIntegrity"),
                         "network_snapshot_integrity": snapshot_integrity.get(
                             "network_snapshot_integrity"
                         ),
@@ -2067,8 +2170,7 @@ class BrowserActionService:
                 event_artifacts = [
                     str(item.get("artifactId"))
                     for item in core_artifacts
-                    if str(item.get("kind", "")) in artifact_kinds
-                    and item.get("artifactId")
+                    if str(item.get("kind", "")) in artifact_kinds and item.get("artifactId")
                 ]
                 if event_count <= 0 or not event_artifacts:
                     continue
@@ -2101,22 +2203,24 @@ class BrowserActionService:
             current_binding_values,
             pair_protocol,
             control_manifest,
-            mutation,
+            mutation_payload,
         ) = self._resolve_replay_pair(request_payload)
+        mutations = (
+            list(mutation_payload)
+            if isinstance(mutation_payload, list)
+            else [mutation_payload]
+            if mutation_payload is not None
+            else []
+        )
+        mutation = mutations[0] if len(mutations) == 1 else None
         replay_mode = request_payload.replay_mode
         pair_protocol_hash = canonical_json_sha256(pair_protocol)
         control_values = (
-            dict(
-                (control_manifest.get("replay") or {}).get(
-                    "control_volatile_binding_values", {}
-                )
-            )
+            dict((control_manifest.get("replay") or {}).get("control_volatile_binding_values", {}))
             if isinstance(control_manifest, dict)
             else dict(current_binding_values)
         )
-        source_manifest = self.experiments.load_manifest(
-            control_payload.source_experiment_id
-        )
+        source_manifest = self.experiments.load_manifest(control_payload.source_experiment_id)
         if source_manifest.get("session_id") != control_payload.session_id:
             raise BrowserServiceError(
                 "source_experiment_session_mismatch",
@@ -2159,19 +2263,29 @@ class BrowserActionService:
             )
         try:
             snapshot = load_snapshot(snapshot_path)
-            validate_binding_mutation_compatibility(binding_specs, mutation)
+            for requested_mutation in mutations:
+                validate_binding_mutation_compatibility(
+                    binding_specs,
+                    requested_mutation,
+                )
             if not isinstance(control_manifest, dict):
                 for binding in binding_specs:
                     if binding.value_source == "preserve_source":
-                        current_binding_values[binding.binding_id] = (
-                            binding_value_from_snapshot(snapshot, binding)
+                        current_binding_values[binding.binding_id] = binding_value_from_snapshot(
+                            snapshot, binding
                         )
                 control_values = dict(current_binding_values)
+            provisional_binding_values = dict(current_binding_values)
+            for binding in binding_specs:
+                if binding.value_source == "setup_output":
+                    provisional_binding_values[binding.binding_id] = (
+                        f"<setup-output:{binding.binding_id}>"
+                    )
             spec, diff = build_replay_spec(
                 snapshot,
-                [mutation] if mutation is not None else [],
+                mutations,
                 volatile_bindings=binding_specs,
-                binding_values=current_binding_values,
+                binding_values=provisional_binding_values,
             )
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             raise BrowserServiceError(
@@ -2183,7 +2297,15 @@ class BrowserActionService:
         source_method = str(snapshot.get("method", "GET")).upper()
         source_resource_type = str(snapshot.get("resourceType", "fetch"))
         source_content_type = response_content_type(snapshot)
-        source_is_stream = source_content_type == "text/event-stream"
+        source_is_stream = control_payload.response_mode in {
+            "sse",
+            "ndjson",
+            "raw_stream",
+        } or (
+            control_payload.response_mode == "auto"
+            and source_content_type
+            in {"text/event-stream", "application/x-ndjson", "application/ndjson"}
+        )
         matcher = RequestMatcher(
             url_contains=source_url.split("?", 1)[0],
             method=source_method,
@@ -2221,13 +2343,17 @@ class BrowserActionService:
         spec["responseControl"] = {
             "maxResponseBytes": control_payload.max_response_bytes,
             "idleTimeoutMs": control_payload.stream_idle_timeout_ms,
-            "doneMarker": (
-                control_payload.default_done_marker if source_is_stream else None
-            ),
+            "responseMode": control_payload.response_mode,
+            "terminalConditions": [
+                item.model_dump(mode="json", exclude_none=True)
+                for item in control_payload.terminal_conditions
+            ],
+            "doneMarker": (control_payload.default_done_marker if source_is_stream else None),
             "doneEventName": (
                 control_payload.default_done_event_name if source_is_stream else None
             ),
         }
+        spec["transport"] = control_payload.transport.model_dump(mode="json")
         if isinstance(control_manifest, dict):
             control_series = control_manifest.get("series")
             control_series = control_series if isinstance(control_series, dict) else {}
@@ -2237,10 +2363,11 @@ class BrowserActionService:
                 "predecessor_experiment_id": request_payload.control_experiment_id,
                 "sequence_index": int(control_series.get("sequence_index") or 0) + 1,
             }
-            objective = (
-                f"Treatment for {request_payload.control_experiment_id}: "
-                f"{mutation.type}"
-            )
+            objective = f"Treatment for {request_payload.control_experiment_id}: {mutation.type}"
+        elif replay_mode == "exploratory":
+            series = control_payload.series.model_dump(mode="json", exclude_none=True)
+            series["scenario_type"] = series.get("scenario_type") or "exploratory_replay"
+            objective = control_payload.objective
         else:
             series = control_payload.series.model_dump(mode="json", exclude_none=True)
             objective = control_payload.objective
@@ -2248,18 +2375,14 @@ class BrowserActionService:
             {
                 "session_id": control_payload.session_id,
                 "objective": objective,
-                "target": control_payload.target.model_dump(
-                    mode="json", exclude_none=True
-                ),
+                "target": control_payload.target.model_dump(mode="json", exclude_none=True),
                 "primary_request": primary.model_dump(mode="json"),
                 "flow": [
                     item.model_dump(mode="json", exclude_none=True)
                     for item in control_payload.verification_flow
                 ],
                 "wait_for": (
-                    wait_for.model_dump(mode="json", exclude_none=True)
-                    if wait_for
-                    else None
+                    wait_for.model_dump(mode="json", exclude_none=True) if wait_for else None
                 ),
                 "execution_mode": control_payload.execution_mode,
                 "deadline_ms": control_payload.deadline_ms,
@@ -2310,9 +2433,22 @@ class BrowserActionService:
                 step.model_dump(mode="json", exclude_none=True)
                 for step in control_payload.setup_flow
             ],
+            "setup_outputs": [
+                item.model_dump(mode="json", exclude_none=True)
+                for item in control_payload.setup_outputs
+            ],
             "_setup_flow_steps": list(control_payload.setup_flow),
+            "_setup_outputs": list(control_payload.setup_outputs),
+            "_source_snapshot": snapshot,
+            "_binding_specs": binding_specs,
             "ignored_cookie_names": list(control_payload.ignored_cookie_names),
             "ignored_context_headers": list(control_payload.ignored_context_headers),
+            "normalize_wire_order": control_payload.normalize_wire_order,
+            "environment_comparison": control_payload.environment_comparison.model_dump(
+                mode="json"
+            ),
+            "transport": control_payload.transport.model_dump(mode="json"),
+            "mutations": mutations,
             "mutation": mutation,
             "replay_attempt_id": replay_attempt_id,
             "expected_request_body_canonical_sha256": (
@@ -2338,15 +2474,9 @@ class BrowserActionService:
                         "method": request.get("method"),
                         "status": request.get("status"),
                         "integrity_status": request.get("integrityStatus"),
-                        "raw_capture_integrity": request.get(
-                            "rawCaptureIntegrity"
-                        ),
-                        "semantic_parse_integrity": request.get(
-                            "semanticParseIntegrity"
-                        ),
-                        "request_snapshot_integrity": request.get(
-                            "requestSnapshotIntegrity"
-                        ),
+                        "raw_capture_integrity": request.get("rawCaptureIntegrity"),
+                        "semantic_parse_integrity": request.get("semanticParseIntegrity"),
+                        "request_snapshot_integrity": request.get("requestSnapshotIntegrity"),
                         "artifact_integrity": request.get("artifactIntegrity"),
                     }
                 )
@@ -2356,23 +2486,21 @@ class BrowserActionService:
             "session_id": manifest.get("session_id"),
             "operation": manifest.get("operation"),
             "status": manifest.get("status"),
+            "execution_integrity": manifest.get("execution_integrity"),
+            "evidence_integrity": manifest.get("evidence_integrity"),
+            "causal_comparability": manifest.get("causal_comparability"),
+            "inference_eligibility": manifest.get("inference_eligibility"),
             "objective_integrity": manifest.get("objective_integrity"),
             "collector_integrity": manifest.get("collector_integrity"),
-            "primary_request_integrity": manifest.get(
-                "primary_request_integrity"
-            ),
-            "primary_integrity_dimensions": manifest.get(
-                "primary_integrity_dimensions"
-            ),
+            "primary_request_integrity": manifest.get("primary_request_integrity"),
+            "primary_integrity_dimensions": manifest.get("primary_integrity_dimensions"),
             "primary_requests": request_summaries,
             "primary_request_count": (
                 len(primary_requests) if isinstance(primary_requests, list) else 0
             ),
             "capture_health": dict(health) if isinstance(health, dict) else {},
             "series": (
-                dict(manifest["series"])
-                if isinstance(manifest.get("series"), dict)
-                else {}
+                dict(manifest["series"]) if isinstance(manifest.get("series"), dict) else {}
             ),
             "evidence_count": len(manifest.get("evidence", []))
             if isinstance(manifest.get("evidence"), list)
@@ -2455,18 +2583,16 @@ class BrowserActionService:
                     raise
             deadline = Deadline(payload.deadline_ms)
             try:
-                experiment_id, experiment_dir, manifest = (
-                    self.experiments.create_experiment(
-                        session_id=payload.session_id,
-                        operation=request.operation,
-                        objective=payload.objective,
-                        deadline=deadline,
-                        experiment_id=experiment_id,
-                    )
+                experiment_id, experiment_dir, manifest = self.experiments.create_experiment(
+                    session_id=payload.session_id,
+                    operation=request.operation,
+                    objective=payload.objective,
+                    deadline=deadline,
+                    experiment_id=experiment_id,
                 )
                 manifest["execution_mode"] = "sync"
-                manifest["primary_request_matcher"] = (
-                    payload.primary_request.model_dump(mode="json", exclude_none=True)
+                manifest["primary_request_matcher"] = payload.primary_request.model_dump(
+                    mode="json", exclude_none=True
                 )
                 self._validate_and_store_series(
                     session_id=payload.session_id,
@@ -2482,9 +2608,7 @@ class BrowserActionService:
                         "replay_mode": replay_plan["replay_mode"],
                         "source_experiment_id": replay_plan["source_experiment_id"],
                         "source_evidence_id": replay_plan["source_evidence_id"],
-                        "control_experiment_id": replay_plan[
-                            "control_experiment_id"
-                        ],
+                        "control_experiment_id": replay_plan["control_experiment_id"],
                         "source_content_type": replay_plan["source_content_type"],
                         "source_is_stream": replay_plan["source_is_stream"],
                         "volatile_bindings": replay_plan["volatile_bindings"],
@@ -2574,8 +2698,7 @@ class BrowserActionService:
             manifest_status = str(manifest.get("status", "partial"))
             response_status = (
                 manifest_status
-                if manifest_status
-                in {"running", "completed", "failed", "partial", "interrupted"}
+                if manifest_status in {"running", "completed", "failed", "partial", "interrupted"}
                 else "partial"
             )
             return BrowserActionResponse(
@@ -2594,9 +2717,7 @@ class BrowserActionService:
             manifest = self.experiments.load_manifest(request.payload.experiment_id)
             evidence = self._evidence_index(manifest)
             if request.payload.kind:
-                evidence = [
-                    item for item in evidence if item.get("kind") == request.payload.kind
-                ]
+                evidence = [item for item in evidence if item.get("kind") == request.payload.kind]
             evidence = evidence[: request.payload.limit]
             return BrowserActionResponse(
                 operation=request.operation,
@@ -2645,10 +2766,7 @@ class BrowserActionService:
                 shape_path.relative_to(self.experiments.root)
                 shape = json.loads(shape_path.read_text(encoding="utf-8"))
                 redacted = None
-                if (
-                    request.payload.include_redacted_body
-                    and isinstance(redacted_relative, str)
-                ):
+                if request.payload.include_redacted_body and isinstance(redacted_relative, str):
                     redacted_path = (self.experiments.root / redacted_relative).resolve()
                     redacted_path.relative_to(self.experiments.root)
                     redacted = self._bounded_redacted_subtree(
@@ -2695,9 +2813,7 @@ class BrowserActionService:
                     "limits": {
                         "max_depth": request.payload.max_depth,
                         "max_array_items": request.payload.max_array_items,
-                        "include_redacted_body": (
-                            request.payload.include_redacted_body
-                        ),
+                        "include_redacted_body": (request.payload.include_redacted_body),
                     },
                 },
             )
@@ -2818,9 +2934,7 @@ class BrowserActionService:
                 and recorded_generation == self._transport_generation()
             )
             if live:
-                status = await self.js_reverse.get_stream_status(
-                    int(capture_id), Deadline(10_000)
-                )
+                status = await self.js_reverse.get_stream_status(int(capture_id), Deadline(10_000))
                 returned_capture = status.get("capture")
                 returned_uuid = (
                     returned_capture.get("captureUuid")
@@ -2851,9 +2965,7 @@ class BrowserActionService:
                 source = "manifest"
             return BrowserActionResponse(
                 operation=request.operation,
-                status=(
-                    "running" if manifest.get("status") == "running" else "completed"
-                ),
+                status=("running" if manifest.get("status") == "running" else "completed"),
                 session_id=manifest.get("session_id"),
                 experiment_id=request.payload.experiment_id,
                 result={"stream": status, "source": source},
@@ -2882,10 +2994,7 @@ class BrowserActionService:
                 "Configure WEB_REV_BROWSER_CDP_URL before running browser experiments",
                 503,
             )
-        if (
-            self.private_mcp_browser_endpoint
-            and endpoint != self.private_mcp_browser_endpoint
-        ):
+        if self.private_mcp_browser_endpoint and endpoint != self.private_mcp_browser_endpoint:
             raise BrowserServiceError(
                 "browser_endpoint_mismatch",
                 "Playwright and js-reverse-mcp must use the same CDP endpoint",
@@ -2972,9 +3081,7 @@ class BrowserActionService:
             selected_index,
             deadline,
         )
-        page = await self.playwright.current_page(
-            str(session["playwright_session_ref"]), deadline
-        )
+        page = await self.playwright.current_page(str(session["playwright_session_ref"]), deadline)
         if (
             payload.target.expected_url_contains
             and payload.target.expected_url_contains not in page.url
@@ -2988,9 +3095,7 @@ class BrowserActionService:
             page,
             deadline,
             page_id=(
-                str(session["js_reverse_page_id"])
-                if session.get("js_reverse_page_id")
-                else None
+                str(session["js_reverse_page_id"]) if session.get("js_reverse_page_id") else None
             ),
         )
         if alignment.status != "aligned":
@@ -3099,9 +3204,7 @@ class BrowserActionService:
                 if not isinstance(request_value, dict):
                     continue
                 requests[str(request_id)] = StreamRequestCheckpoint(
-                    response_observed=bool(
-                        request_value.get("response_observed", False)
-                    ),
+                    response_observed=bool(request_value.get("response_observed", False)),
                     status=(
                         str(request_value["status"])
                         if request_value.get("status") is not None
@@ -3125,9 +3228,7 @@ class BrowserActionService:
                         if isinstance(request_value.get("semantic_event_index"), int)
                         else -1
                     ),
-                    primary_event_source=str(
-                        request_value.get("primary_event_source") or "none"
-                    ),
+                    primary_event_source=str(request_value.get("primary_event_source") or "none"),
                 )
         return StreamCheckpoint(
             version=max(
@@ -3183,8 +3284,7 @@ class BrowserActionService:
         requests = [
             item
             for item in status_payload.get("requests", [])
-            if isinstance(item, dict)
-            and JsReverseMcpAdapter._request_matches(item, matcher)
+            if isinstance(item, dict) and JsReverseMcpAdapter._request_matches(item, matcher)
         ]
         if not requests and not payload.capture.stream:
             requests = [
@@ -3194,8 +3294,7 @@ class BrowserActionService:
                     "evidenceSource": "network-summary",
                 }
                 for item in network_payload.get("requests", [])
-                if isinstance(item, dict)
-                and JsReverseMcpAdapter._request_matches(item, matcher)
+                if isinstance(item, dict) and JsReverseMcpAdapter._request_matches(item, matcher)
             ]
         count_ok = (
             payload.primary_request.expected_min_matches
@@ -3204,26 +3303,33 @@ class BrowserActionService:
         )
         if not requests:
             if payload.primary_request.expected_min_matches == 0:
-                return requests, "complete", count_ok, {
-                    "raw_capture": "complete",
-                    "semantic_parse": "complete",
-                    "request_snapshot": "complete",
-                    "artifacts": "complete",
-                }
+                return (
+                    requests,
+                    "complete",
+                    count_ok,
+                    {
+                        "raw_capture": "complete",
+                        "semantic_parse": "complete",
+                        "request_snapshot": "complete",
+                        "artifacts": "complete",
+                    },
+                )
             integrity = "failed"
-            return requests, integrity, count_ok, {
-                "raw_capture": "failed" if payload.capture.stream else "partial",
-                "semantic_parse": "failed" if payload.capture.stream else "partial",
-                "request_snapshot": "failed" if payload.capture.stream else "partial",
-                "artifacts": "failed" if payload.capture.stream else "partial",
-            }
+            return (
+                requests,
+                integrity,
+                count_ok,
+                {
+                    "raw_capture": "failed" if payload.capture.stream else "partial",
+                    "semantic_parse": "failed" if payload.capture.stream else "partial",
+                    "request_snapshot": "failed" if payload.capture.stream else "partial",
+                    "artifacts": "failed" if payload.capture.stream else "partial",
+                },
+            )
         dimensions = {
             "raw_capture": (
                 max(
-                    (
-                        str(item.get("rawCaptureIntegrity", "partial"))
-                        for item in requests
-                    ),
+                    (str(item.get("rawCaptureIntegrity", "partial")) for item in requests),
                     key=self._integrity_severity,
                 )
                 if payload.capture.stream
@@ -3231,10 +3337,7 @@ class BrowserActionService:
             ),
             "semantic_parse": (
                 max(
-                    (
-                        str(item.get("semanticParseIntegrity", "partial"))
-                        for item in requests
-                    ),
+                    (str(item.get("semanticParseIntegrity", "partial")) for item in requests),
                     key=self._integrity_severity,
                 )
                 if payload.capture.stream
@@ -3282,9 +3385,7 @@ class BrowserActionService:
         wait_observations: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
         completed_by_id = {
-            result.step_id: result
-            for result in step_results
-            if result.status == "completed"
+            result.step_id: result for result in step_results if result.status == "completed"
         }
         stop_candidates: list[dict[str, Any]] = []
         for index, step in enumerate(payload.flow):
@@ -3299,8 +3400,7 @@ class BrowserActionService:
                     item
                     for item in reversed(wait_observations)
                     if int(item.get("step_index", -1)) < index
-                    and item.get("condition_type")
-                    in {"first_event", "event_predicate"}
+                    and item.get("condition_type") in {"first_event", "event_predicate"}
                 ),
                 None,
             )
@@ -3314,9 +3414,7 @@ class BrowserActionService:
                 None,
             )
             try:
-                stop_wall_ms = int(
-                    datetime.fromisoformat(result.ended_at).timestamp() * 1000
-                )
+                stop_wall_ms = int(datetime.fromisoformat(result.ended_at).timestamp() * 1000)
             except ValueError:
                 continue
             stop_candidates.append(
@@ -3330,10 +3428,8 @@ class BrowserActionService:
         page_remained_aligned = (
             initial_alignment.status == "aligned"
             and post_alignment.status == "aligned"
-            and initial_alignment.js_reverse_page_id
-            == post_alignment.js_reverse_page_id
-            and initial_alignment.playwright_page.url
-            == post_alignment.playwright_page.url
+            and initial_alignment.js_reverse_page_id == post_alignment.js_reverse_page_id
+            and initial_alignment.playwright_page.url == post_alignment.playwright_page.url
         )
         classifications: list[dict[str, Any]] = []
         for request in primary_requests:
@@ -3356,34 +3452,24 @@ class BrowserActionService:
             }
             before_ids = set((nearest.get("before") or {}).get("matched_request_ids", []))
             after_ids = set((nearest.get("after") or {}).get("matched_request_ids", []))
-            same_request_observed = bool(request_ids & before_ids) and bool(
-                request_ids & after_ids
-            )
+            same_request_observed = bool(request_ids & before_ids) and bool(request_ids & after_ids)
             expected = within_window and page_remained_aligned and same_request_observed
             classification = {
                 "request_id": request.get("cdpRequestId"),
                 "persistent_request_id": request.get("persistentRequestId"),
                 "source_terminal_reason": "network_canceled",
                 "classification": (
-                    "expected_user_cancel"
-                    if expected
-                    else "unclassified_network_cancel"
+                    "expected_user_cancel" if expected else "unclassified_network_cancel"
                 ),
                 "stop_step_id": nearest["step_id"],
                 "stop_delta_ms": delta_ms,
                 "within_stop_window": within_window,
                 "page_remained_aligned": page_remained_aligned,
                 "same_request_observed": same_request_observed,
-                "stream_before_stop": (
-                    (nearest.get("before") or {}).get("matched_event")
-                ),
-                "stream_after_stop": (
-                    (nearest.get("after") or {}).get("matched_event")
-                ),
+                "stream_before_stop": ((nearest.get("before") or {}).get("matched_event")),
+                "stream_after_stop": ((nearest.get("after") or {}).get("matched_event")),
             }
-            request["experimentCancellationClassification"] = classification[
-                "classification"
-            ]
+            request["experimentCancellationClassification"] = classification["classification"]
             classifications.append(classification)
         return classifications
 
@@ -3453,12 +3539,8 @@ class BrowserActionService:
                 "source_content_type": replay_plan["source_content_type"],
                 "source_is_stream": replay_plan["source_is_stream"],
                 "volatile_bindings": replay_plan["volatile_bindings"],
-                "control_volatile_binding_values": replay_plan[
-                    "control_volatile_binding_values"
-                ],
-                "current_volatile_binding_values": replay_plan[
-                    "current_volatile_binding_values"
-                ],
+                "control_volatile_binding_values": replay_plan["control_volatile_binding_values"],
+                "current_volatile_binding_values": replay_plan["current_volatile_binding_values"],
                 "pair_protocol": replay_plan["pair_protocol"],
                 "pair_protocol_hash": replay_plan["pair_protocol_hash"],
                 "replay_attempt_id": replay_plan["replay_attempt_id"],
@@ -3521,11 +3603,7 @@ class BrowserActionService:
                 manifest = self.experiments.load_manifest(experiment_id)
                 manifest["status"] = "interrupted"
                 manifest["errors"] = [
-                    *(
-                        manifest.get("errors")
-                        if isinstance(manifest.get("errors"), list)
-                        else []
-                    ),
+                    *(manifest.get("errors") if isinstance(manifest.get("errors"), list) else []),
                     "Background experiment task was canceled.",
                 ]
                 self.experiments.write_manifest(experiment_id, manifest)
@@ -3534,11 +3612,7 @@ class BrowserActionService:
                 manifest = self.experiments.load_manifest(experiment_id)
                 manifest["status"] = "failed"
                 manifest["errors"] = [
-                    *(
-                        manifest.get("errors")
-                        if isinstance(manifest.get("errors"), list)
-                        else []
-                    ),
+                    *(manifest.get("errors") if isinstance(manifest.get("errors"), list) else []),
                     str(exc)[:4000],
                 ]
                 self.experiments.write_manifest(experiment_id, manifest)
@@ -3605,27 +3679,19 @@ class BrowserActionService:
                 result["orphan_capture_id"] = capture_id
                 message = str(exc).lower()
                 result["collector_cleanup"] = (
-                    "timed_out"
-                    if "timed out" in message or "deadline" in message
-                    else "unknown"
+                    "timed_out" if "timed out" in message or "deadline" in message else "unknown"
                 )
             else:
                 if not canceled and cleanup_deadline.remaining_ms() > 500:
                     try:
-                        result["final_status_payload"] = (
-                            await self.js_reverse.get_stream_status(
-                                capture_id,
-                                cleanup_deadline.child(1_500),
-                            )
+                        result["final_status_payload"] = await self.js_reverse.get_stream_status(
+                            capture_id,
+                            cleanup_deadline.child(1_500),
                         )
                     except Exception as exc:
-                        result["warnings"].append(
-                            f"post-stop status: {str(exc)[:3500]}"
-                        )
+                        result["warnings"].append(f"post-stop status: {str(exc)[:3500]}")
                 if not result["final_status_payload"] and result["stop_payload"]:
-                    result["final_status_payload"] = (
-                        dict(result["stop_payload"])
-                    )
+                    result["final_status_payload"] = dict(result["stop_payload"])
         elif payload.capture.stream and stream_start_status in {
             "confirmed",
             "outcome_unknown",
@@ -3644,25 +3710,15 @@ class BrowserActionService:
                 )
             except Exception as exc:
                 result["warnings"].append(f"trace finalize: {str(exc)[:3500]}")
-        if (
-            not canceled
-            and not entered_reserve
-            and execution_deadline.remaining_ms() > 1_000
-        ):
+        if not canceled and not entered_reserve and execution_deadline.remaining_ms() > 1_000:
             if payload.capture.network or payload.network_evidence:
                 try:
-                    result["network_payload"] = (
-                        await self.js_reverse.list_network_requests(
-                            RequestMatcher(),
-                            execution_deadline.child(
-                                min(2_000, execution_deadline.remaining_ms())
-                            ),
-                        )
+                    result["network_payload"] = await self.js_reverse.list_network_requests(
+                        RequestMatcher(),
+                        execution_deadline.child(min(2_000, execution_deadline.remaining_ms())),
                     )
                 except Exception as exc:
-                    result["warnings"].append(
-                        f"network summary: {str(exc)[:3500]}"
-                    )
+                    result["warnings"].append(f"network summary: {str(exc)[:3500]}")
             if payload.capture.screenshots and execution_deadline.remaining_ms() > 500:
                 try:
                     result["screenshot_paths"].append(
@@ -3670,15 +3726,11 @@ class BrowserActionService:
                             session_id,
                             experiment_dir,
                             "after-flow",
-                            execution_deadline.child(
-                                min(2_000, execution_deadline.remaining_ms())
-                            ),
+                            execution_deadline.child(min(2_000, execution_deadline.remaining_ms())),
                         )
                     )
                 except Exception as exc:
-                    result["warnings"].append(
-                        f"final screenshot: {str(exc)[:3500]}"
-                    )
+                    result["warnings"].append(f"final screenshot: {str(exc)[:3500]}")
             if payload.capture.page_snapshots and execution_deadline.remaining_ms() > 500:
                 try:
                     result["snapshot_paths"].append(
@@ -3686,15 +3738,11 @@ class BrowserActionService:
                             session_id,
                             experiment_dir,
                             "after-flow",
-                            execution_deadline.child(
-                                min(2_000, execution_deadline.remaining_ms())
-                            ),
+                            execution_deadline.child(min(2_000, execution_deadline.remaining_ms())),
                         )
                     )
                 except Exception as exc:
-                    result["warnings"].append(
-                        f"final page snapshot: {str(exc)[:3500]}"
-                    )
+                    result["warnings"].append(f"final page snapshot: {str(exc)[:3500]}")
         return result
 
     async def _capture_flow(
@@ -3740,9 +3788,7 @@ class BrowserActionService:
                     experiment_id=experiment_id,
                     result={
                         "experiment": self._experiment_summary(manifest),
-                        "manifest_relative_path": self._manifest_relative_path(
-                            experiment_id
-                        ),
+                        "manifest_relative_path": self._manifest_relative_path(experiment_id),
                     },
                     errors=manifest["errors"],
                 )
@@ -3775,9 +3821,7 @@ class BrowserActionService:
                     experiment_id=experiment_id,
                     result={
                         "experiment": self._experiment_summary(manifest),
-                        "manifest_relative_path": self._manifest_relative_path(
-                            experiment_id
-                        ),
+                        "manifest_relative_path": self._manifest_relative_path(experiment_id),
                     },
                     errors=manifest["errors"],
                 )
@@ -3892,9 +3936,7 @@ class BrowserActionService:
                                 else None
                             )
                             capture_uuid = discovered.get("capture_uuid")
-                            capture_relative_dir = discovered.get(
-                                "capture_relative_dir"
-                            )
+                            capture_relative_dir = discovered.get("capture_relative_dir")
                             capture_metadata_artifact_id = discovered.get(
                                 "capture_metadata_artifact_id"
                             )
@@ -3903,9 +3945,7 @@ class BrowserActionService:
                             manifest=manifest,
                             start_status=stream_start_status,
                             capture_id=capture_id,
-                            capture_uuid=(
-                                str(capture_uuid) if capture_uuid is not None else None
-                            ),
+                            capture_uuid=(str(capture_uuid) if capture_uuid is not None else None),
                             capture_relative_dir=(
                                 str(capture_relative_dir)
                                 if capture_relative_dir is not None
@@ -3922,9 +3962,7 @@ class BrowserActionService:
                     except McpToolCallError as exc:
                         capture_transport_generation = exc.transport_generation
                         stream_start_status = (
-                            "outcome_unknown"
-                            if exc.outcome_unknown
-                            else "failed_before_send"
+                            "outcome_unknown" if exc.outcome_unknown else "failed_before_send"
                         )
                         discovered = (
                             self._discover_capture_metadata(experiment_id)
@@ -3938,9 +3976,7 @@ class BrowserActionService:
                                 else None
                             )
                             capture_uuid = discovered.get("capture_uuid")
-                            capture_relative_dir = discovered.get(
-                                "capture_relative_dir"
-                            )
+                            capture_relative_dir = discovered.get("capture_relative_dir")
                             capture_metadata_artifact_id = discovered.get(
                                 "capture_metadata_artifact_id"
                             )
@@ -3949,9 +3985,7 @@ class BrowserActionService:
                             manifest=manifest,
                             start_status=stream_start_status,
                             capture_id=capture_id,
-                            capture_uuid=(
-                                str(capture_uuid) if capture_uuid is not None else None
-                            ),
+                            capture_uuid=(str(capture_uuid) if capture_uuid is not None else None),
                             capture_relative_dir=(
                                 str(capture_relative_dir)
                                 if capture_relative_dir is not None
@@ -3974,22 +4008,14 @@ class BrowserActionService:
                     capture_transport_generation = self._transport_generation()
                     stream_start_status = "confirmed"
                     capture_uuid = (
-                        str(capture["captureUuid"])
-                        if capture.get("captureUuid")
-                        else None
+                        str(capture["captureUuid"]) if capture.get("captureUuid") else None
                     )
                     capture_relative_dir = (
-                        str(capture["relativeDir"])
-                        if capture.get("relativeDir")
-                        else None
+                        str(capture["relativeDir"]) if capture.get("relativeDir") else None
                     )
                     metadata_artifact = capture.get("metadataArtifact")
-                    if isinstance(metadata_artifact, dict) and metadata_artifact.get(
-                        "artifactId"
-                    ):
-                        capture_metadata_artifact_id = str(
-                            metadata_artifact["artifactId"]
-                        )
+                    if isinstance(metadata_artifact, dict) and metadata_artifact.get("artifactId"):
+                        capture_metadata_artifact_id = str(metadata_artifact["artifactId"])
                     collector_started = True
                     collector_start_wall_time_ms = int(
                         capture.get("captureArmedWallTimeMs") or time.time() * 1000
@@ -4015,6 +4041,21 @@ class BrowserActionService:
                     )
                 if replay_plan is not None:
                     setup_steps = replay_plan.get("_setup_flow_steps")
+                    setup_outputs = replay_plan.get("_setup_outputs")
+                    setup_output_checkpoint = (
+                        network_checkpoint(
+                            await self._all_network_requests(
+                                self._operation_deadline(
+                                    deadline,
+                                    2_500,
+                                    "setup output network checkpoint",
+                                )
+                            ),
+                            generation=self._transport_generation(),
+                        )
+                        if isinstance(setup_outputs, list) and setup_outputs
+                        else None
+                    )
                     if isinstance(setup_steps, list) and setup_steps:
                         for setup_index, step in enumerate(setup_steps):
                             self._ensure_finalize_reserve(
@@ -4035,9 +4076,7 @@ class BrowserActionService:
                                             ),
                                         )
                                     if first_mutation_wall_time_ms is None:
-                                        first_mutation_wall_time_ms = int(
-                                            time.time() * 1000
-                                        )
+                                        first_mutation_wall_time_ms = int(time.time() * 1000)
                                 step_deadline = self._operation_deadline(
                                     deadline,
                                     step.timeout_ms,
@@ -4061,18 +4100,12 @@ class BrowserActionService:
                                             "step_id": step.step_id,
                                             "step_index": setup_index,
                                             "condition_type": step.condition.type,
-                                            "capture_version": result.get(
-                                                "capture_version"
-                                            ),
+                                            "capture_version": result.get("capture_version"),
                                             "matched_request_ids": result.get(
                                                 "matched_request_ids", []
                                             ),
-                                            "matched_event": result.get(
-                                                "matched_event"
-                                            ),
-                                            "terminal_status": result.get(
-                                                "terminal_status"
-                                            ),
+                                            "matched_event": result.get("matched_event"),
+                                            "terminal_status": result.get("terminal_status"),
                                         }
                                     )
                                     if not result.get("condition_met", True):
@@ -4095,9 +4128,7 @@ class BrowserActionService:
                                     )
                                     raw_snapshot_ref = result.get("snapshot_ref")
                                     snapshot_ref = (
-                                        self.experiments.relative_path(
-                                            str(raw_snapshot_ref)
-                                        )
+                                        self.experiments.relative_path(str(raw_snapshot_ref))
                                         if raw_snapshot_ref
                                         else None
                                     )
@@ -4137,6 +4168,57 @@ class BrowserActionService:
                                     )
                                 )
                                 raise
+                        if isinstance(setup_output_checkpoint, dict):
+                            (
+                                setup_values,
+                                setup_output_records,
+                            ) = await self._resolve_setup_output_bindings(
+                                setup_outputs=setup_outputs,
+                                checkpoint=setup_output_checkpoint,
+                                experiment_dir=experiment_dir,
+                                deadline=self._operation_deadline(
+                                    deadline,
+                                    8_000,
+                                    "resolve setup outputs",
+                                ),
+                            )
+                            replay_plan["current_volatile_binding_values"].update(setup_values)
+                            if replay_plan.get("replay_mode") == "control":
+                                replay_plan["control_volatile_binding_values"].update(setup_values)
+                            rebuilt_spec, rebuilt_diff = build_replay_spec(
+                                replay_plan["_source_snapshot"],
+                                replay_plan["mutations"],
+                                volatile_bindings=replay_plan["_binding_specs"],
+                                binding_values=replay_plan["current_volatile_binding_values"],
+                            )
+                            rebuilt_spec["responseControl"] = replay_plan["spec"]["responseControl"]
+                            rebuilt_spec["transport"] = replay_plan["spec"]["transport"]
+                            replay_plan["spec"] = rebuilt_spec
+                            replay_plan["diff"] = rebuilt_diff
+                            replay_plan["expected_request_body_canonical_sha256"] = (
+                                request_body_canonical_sha256_from_spec(rebuilt_spec)
+                            )
+                            replay_plan["setup_output_bindings"] = setup_output_records
+                            replay_manifest = manifest.get("replay")
+                            if isinstance(replay_manifest, dict):
+                                replay_manifest.update(
+                                    {
+                                        "current_volatile_binding_values": replay_plan[
+                                            "current_volatile_binding_values"
+                                        ],
+                                        "control_volatile_binding_values": replay_plan[
+                                            "control_volatile_binding_values"
+                                        ],
+                                        "expected_request_body_canonical_sha256": replay_plan[
+                                            "expected_request_body_canonical_sha256"
+                                        ],
+                                        "setup_output_bindings": setup_output_records,
+                                    }
+                                )
+                                self.experiments.write_manifest(
+                                    experiment_id,
+                                    manifest,
+                                )
                         try:
                             setup_page = await self.playwright.current_page(
                                 session_id,
@@ -4160,9 +4242,7 @@ class BrowserActionService:
                                 ),
                             )
                         except Exception as exc:
-                            warnings.append(
-                                f"pre-dispatch alignment: {str(exc)[:1000]}"
-                            )
+                            warnings.append(f"pre-dispatch alignment: {str(exc)[:1000]}")
                 if payload.capture.screenshots:
                     try:
                         screenshot_paths.append(
@@ -4213,30 +4293,27 @@ class BrowserActionService:
                     diff_file = replay_dir / "request-diff.json"
                     result_file = replay_dir / "response.json"
                     spec_file.write_text(
-                        json.dumps(replay_plan["spec"], ensure_ascii=False, indent=2)
-                        + "\n",
+                        json.dumps(replay_plan["spec"], ensure_ascii=False, indent=2) + "\n",
                         encoding="utf-8",
                     )
                     diff_file.write_text(
-                        json.dumps(replay_plan["diff"], ensure_ascii=False, indent=2)
-                        + "\n",
+                        json.dumps(replay_plan["diff"], ensure_ascii=False, indent=2) + "\n",
                         encoding="utf-8",
                     )
                     started = utc_now()
                     try:
                         replay_plan["dispatch_wall_time_ms"] = int(time.time() * 1000)
-                        replay_plan["correlation_window_end_wall_time_ms"] = (
-                            replay_plan["dispatch_wall_time_ms"]
-                            + max(1_000, deadline.remaining_ms())
-                        )
+                        replay_plan["correlation_window_end_wall_time_ms"] = replay_plan[
+                            "dispatch_wall_time_ms"
+                        ] + max(1_000, deadline.remaining_ms())
                         replay_manifest = manifest.get("replay")
                         if isinstance(replay_manifest, dict):
                             replay_manifest["dispatch_wall_time_ms"] = replay_plan[
                                 "dispatch_wall_time_ms"
                             ]
-                            replay_manifest["correlation_window_end_wall_time_ms"] = (
-                                replay_plan["correlation_window_end_wall_time_ms"]
-                            )
+                            replay_manifest["correlation_window_end_wall_time_ms"] = replay_plan[
+                                "correlation_window_end_wall_time_ms"
+                            ]
                             self.experiments.write_manifest(experiment_id, manifest)
                         replay_result = await self.js_reverse.evaluate_browser_replay(
                             spec_file,
@@ -4252,18 +4329,12 @@ class BrowserActionService:
                                 replay_response = json.loads(
                                     result_file.read_text(encoding="utf-8")
                                 )
-                                replay_http_status = self._extract_http_status(
+                                replay_http_status = self._extract_http_status(replay_response)
+                                replay_response_content_type = self._extract_response_content_type(
                                     replay_response
                                 )
-                                replay_response_content_type = (
-                                    self._extract_response_content_type(
-                                        replay_response
-                                    )
-                                )
                             except (OSError, json.JSONDecodeError) as exc:
-                                warnings.append(
-                                    f"replay response status: {str(exc)[:1000]}"
-                                )
+                                warnings.append(f"replay response status: {str(exc)[:1000]}")
                         try:
                             response_page = await self.playwright.current_page(
                                 session_id,
@@ -4279,16 +4350,11 @@ class BrowserActionService:
                                 ),
                             )
                         except Exception as exc:
-                            warnings.append(
-                                f"post-response alignment: {str(exc)[:1000]}"
-                            )
-                        if (
-                            replay_plan.get("replay_mode") == "control"
-                            and (
-                                replay_http_status is None
-                                or replay_http_status < 200
-                                or replay_http_status >= 300
-                            )
+                            warnings.append(f"post-response alignment: {str(exc)[:1000]}")
+                        if replay_plan.get("replay_mode") == "control" and (
+                            replay_http_status is None
+                            or replay_http_status < 200
+                            or replay_http_status >= 300
                         ):
                             errors.append(
                                 "Control replay did not produce a successful HTTP response."
@@ -4397,9 +4463,7 @@ class BrowserActionService:
                                         step.condition.type if step.condition else "timeout"
                                     ),
                                     "capture_version": result.get("capture_version"),
-                                    "matched_request_ids": result.get(
-                                        "matched_request_ids", []
-                                    ),
+                                    "matched_request_ids": result.get("matched_request_ids", []),
                                     "matched_event": result.get("matched_event"),
                                     "terminal_status": result.get("terminal_status"),
                                 }
@@ -4500,9 +4564,7 @@ class BrowserActionService:
                             "step_index": len(payload.flow),
                             "condition_type": payload.wait_for.type,
                             "capture_version": wait_result.get("capture_version"),
-                            "matched_request_ids": wait_result.get(
-                                "matched_request_ids", []
-                            ),
+                            "matched_request_ids": wait_result.get("matched_request_ids", []),
                             "matched_event": wait_result.get("matched_event"),
                             "terminal_status": wait_result.get("terminal_status"),
                         }
@@ -4533,32 +4595,24 @@ class BrowserActionService:
                 except asyncio.CancelledError:
                     cleanup_result = await cleanup_task
                 stop_payload = dict(cleanup_result.get("stop_payload") or {})
-                cleanup_status = dict(
-                    cleanup_result.get("final_status_payload") or {}
-                )
+                cleanup_status = dict(cleanup_result.get("final_status_payload") or {})
                 if cleanup_status:
                     final_status_payload = cleanup_status
                 trace_paths = list(cleanup_result.get("trace_paths") or [])
                 screenshot_paths.extend(
-                    str(item)
-                    for item in cleanup_result.get("screenshot_paths", [])
+                    str(item) for item in cleanup_result.get("screenshot_paths", [])
                 )
                 snapshot_paths.extend(
-                    str(item)
-                    for item in cleanup_result.get("snapshot_paths", [])
+                    str(item) for item in cleanup_result.get("snapshot_paths", [])
                 )
-                network_payload = dict(
-                    cleanup_result.get("network_payload") or {}
-                )
+                network_payload = dict(cleanup_result.get("network_payload") or {})
                 collector_stopped = bool(cleanup_result.get("collector_stopped"))
                 warnings.extend(str(item) for item in cleanup_result.get("warnings", []))
                 errors.extend(str(item) for item in cleanup_result.get("errors", []))
 
             post_alignment = AlignmentResult(
                 status=(
-                    "not_checked_due_to_cancel"
-                    if cancelled_error is not None
-                    else "not_checked"
+                    "not_checked_due_to_cancel" if cancelled_error is not None else "not_checked"
                 ),
                 playwright_page=alignment.playwright_page,
                 warnings=[
@@ -4624,19 +4678,19 @@ class BrowserActionService:
                 )
             ):
                 try:
-                    exported_entries, exported_artifacts, export_warnings = (
-                        await self._export_network_evidence(
-                            experiment_id=experiment_id,
-                            experiment_dir=experiment_dir,
-                            selectors=payload.network_evidence,
-                            requests=window_requests,
-                            deadline=Deadline(8_000),
-                            step_ids=[
-                                item.step_id
-                                for item in step_results
-                                if item.status == "completed"
-                            ],
-                        )
+                    (
+                        exported_entries,
+                        exported_artifacts,
+                        export_warnings,
+                    ) = await self._export_network_evidence(
+                        experiment_id=experiment_id,
+                        experiment_dir=experiment_dir,
+                        selectors=payload.network_evidence,
+                        requests=window_requests,
+                        deadline=Deadline(8_000),
+                        step_ids=[
+                            item.step_id for item in step_results if item.status == "completed"
+                        ],
                     )
                     evidence_entries.extend(exported_entries)
                     evidence_artifacts.extend(exported_artifacts)
@@ -4644,13 +4698,15 @@ class BrowserActionService:
                 except Exception as exc:
                     warnings.append(f"network evidence export: {str(exc)[:3000]}")
             if cancelled_error is None and payload.capture.console_errors:
-                console_entries, console_artifacts, console_warnings = (
-                    await self._export_console_evidence(
-                        experiment_id=experiment_id,
-                        experiment_dir=experiment_dir,
-                        checkpoint=console_checkpoint_value,
-                        deadline=Deadline(4_000),
-                    )
+                (
+                    console_entries,
+                    console_artifacts,
+                    console_warnings,
+                ) = await self._export_console_evidence(
+                    experiment_id=experiment_id,
+                    experiment_dir=experiment_dir,
+                    checkpoint=console_checkpoint_value,
+                    deadline=Deadline(4_000),
                 )
                 evidence_entries.extend(console_entries)
                 evidence_artifacts.extend(console_artifacts)
@@ -4667,11 +4723,9 @@ class BrowserActionService:
             post_verification_environment: dict[str, Any] | None = None
             environment_comparison: dict[str, Any] | None = None
             if replay_plan is not None:
-                replay_network_entry, replay_selection_error = (
-                    self._select_replay_network_evidence(
-                        evidence_entries,
-                        replay_plan,
-                    )
+                replay_network_entry, replay_selection_error = self._select_replay_network_evidence(
+                    evidence_entries,
+                    replay_plan,
                 )
                 if replay_selection_error:
                     errors.append(replay_selection_error)
@@ -4700,8 +4754,7 @@ class BrowserActionService:
                         )
                         if (
                             isinstance(exact_evidence, dict)
-                            and exact_evidence.get("evidence_id")
-                            == replay_network_evidence_id
+                            and exact_evidence.get("evidence_id") == replay_network_evidence_id
                         ):
                             associated_replay_streams.append(stream_request)
                 if len(associated_replay_streams) == 1:
@@ -4719,27 +4772,20 @@ class BrowserActionService:
                 replay_plan["network_evidence_id"] = replay_network_evidence_id
                 replay_manifest = manifest.get("replay")
                 if isinstance(replay_manifest, dict):
-                    replay_manifest["network_evidence_id"] = (
-                        replay_network_evidence_id
-                    )
+                    replay_manifest["network_evidence_id"] = replay_network_evidence_id
                 mutation = replay_plan.get("mutation")
                 if replay_plan.get("replay_mode") == "treatment" and mutation is not None:
                     control_manifest = self.experiments.load_manifest(
                         str(replay_plan["control_experiment_id"])
                     )
                     control_replay = control_manifest.get("replay")
-                    control_replay = (
-                        control_replay if isinstance(control_replay, dict) else {}
-                    )
-                    control_network_evidence_id = control_replay.get(
-                        "network_evidence_id"
-                    )
+                    control_replay = control_replay if isinstance(control_replay, dict) else {}
+                    control_network_evidence_id = control_replay.get("network_evidence_id")
                     control_entry = next(
                         (
                             item
                             for item in self._evidence_index(control_manifest)
-                            if item.get("evidence_id")
-                            == control_network_evidence_id
+                            if item.get("evidence_id") == control_network_evidence_id
                         ),
                         None,
                     )
@@ -4755,13 +4801,31 @@ class BrowserActionService:
                             VolatileBinding.model_validate(item)
                             for item in replay_plan["volatile_bindings"]
                         ],
-                        control_binding_values=replay_plan[
-                            "control_volatile_binding_values"
-                        ],
-                        treatment_binding_values=replay_plan[
-                            "current_volatile_binding_values"
-                        ],
+                        control_binding_values=replay_plan["control_volatile_binding_values"],
+                        treatment_binding_values=replay_plan["current_volatile_binding_values"],
+                        normalize_wire_order=bool(replay_plan.get("normalize_wire_order")),
                     )
+                elif replay_plan.get("replay_mode") == "exploratory":
+                    exploratory_assessments = [
+                        assess_mutation_effectiveness(item, wire_snapshot)
+                        for item in replay_plan.get("mutations", [])
+                    ]
+                    mutation_assessment = {
+                        "mode": "exploratory",
+                        "mutations": exploratory_assessments,
+                        "all_mutations_effective": all(
+                            item.get("mutation_effective") is True
+                            for item in exploratory_assessments
+                        )
+                        if exploratory_assessments
+                        else True,
+                        "mutation_effective": None,
+                        "reason": (
+                            "exploratory mutations were evaluated independently"
+                            if exploratory_assessments
+                            else "exploratory replay requested no mutations"
+                        ),
+                    }
                 else:
                     mutation_assessment = assess_control_wire_baseline(
                         wire_snapshot,
@@ -4769,22 +4833,15 @@ class BrowserActionService:
                             VolatileBinding.model_validate(item)
                             for item in replay_plan["volatile_bindings"]
                         ],
-                        binding_values=replay_plan[
-                            "current_volatile_binding_values"
-                        ],
+                        binding_values=replay_plan["current_volatile_binding_values"],
                     )
-                    if (
-                        mutation_assessment.get("volatile_bindings_effective")
-                        is not True
-                    ):
+                    if mutation_assessment.get("volatile_bindings_effective") is not True:
                         errors.append(
                             "Control replay volatile bindings were not observed on the "
                             "outbound wire request."
                         )
                 exact_response_value = response_value_from_snapshot(wire_snapshot)
-                exact_replay_response_value = self._complete_replay_response_value(
-                    replay_response
-                )
+                exact_replay_response_value = self._complete_replay_response_value(replay_response)
                 response_value = (
                     exact_response_value
                     if exact_response_value is not None
@@ -4804,9 +4861,7 @@ class BrowserActionService:
                     content_type=replay_response_content_type,
                     response_value=response_value,
                     mutation=mutation,
-                    redirected=bool(
-                        self._extract_response_field(replay_response, "redirected")
-                    ),
+                    redirected=bool(self._extract_response_field(replay_response, "redirected")),
                     final_url=(
                         str(value)
                         if (
@@ -4821,33 +4876,17 @@ class BrowserActionService:
                     source_content_type=replay_plan.get("source_content_type"),
                 )
                 response_classification["evidence_source"] = response_evidence_source
-                if (
-                    response_classification.get(
-                        "usable_for_required_classification"
-                    )
-                    and response_evidence_source
-                    not in {
-                        "exact_network_response_body",
-                        "complete_replay_response_body",
-                    }
+                response_classification["evidence_sufficient"] = response_evidence_source in {
+                    "exact_network_response_body",
+                    "complete_replay_response_body",
+                }
+                observations = response_classification.get("observations")
+                if isinstance(observations, dict) and isinstance(
+                    mutation_assessment,
+                    dict,
                 ):
-                    response_classification[
-                        "usable_for_required_classification"
-                    ] = False
-                    response_classification["conclusion"] = "inconclusive"
-                    response_classification["evidence_sufficient"] = False
-                    replay_inconclusive = True
-                    warnings.append(
-                        "Required-field evidence was found only in the bounded replay "
-                        "preview; exact response body evidence is required."
-                    )
-                else:
-                    response_classification["evidence_sufficient"] = (
-                        response_evidence_source
-                        in {
-                            "exact_network_response_body",
-                            "complete_replay_response_body",
-                        }
+                    observations["mutation_effective"] = mutation_assessment.get(
+                        "mutation_effective"
                     )
                 stream_response_contract = self._stream_response_contract(
                     replay_plan,
@@ -4881,21 +4920,30 @@ class BrowserActionService:
                 elif classification not in {
                     "success",
                     "validation_rejection",
-                    "value_constraint",
                 }:
-                    replay_inconclusive = True
-                    warnings.append(
-                        "Treatment response is inconclusive for field classification: "
-                        f"{classification}."
-                    )
+                    if replay_plan.get("replay_mode") == "treatment":
+                        replay_inconclusive = True
+                        warnings.append(
+                            "Treatment response is inconclusive for protocol inference: "
+                            f"{classification}."
+                        )
+                environment_policy = replay_plan.get("environment_comparison")
+                environment_policy = (
+                    environment_policy if isinstance(environment_policy, dict) else {}
+                )
+                context_header_names = environment_policy.get("context_header_names")
+                context_header_names = (
+                    [str(item) for item in context_header_names]
+                    if isinstance(context_header_names, list)
+                    else None
+                )
                 pre_dispatch_environment = self._environment_fingerprint(
                     pre_dispatch_alignment,
                     wire_snapshot,
                     phase="pre_dispatch",
                     ignored_cookie_names=replay_plan.get("ignored_cookie_names"),
-                    ignored_context_headers=replay_plan.get(
-                        "ignored_context_headers"
-                    ),
+                    ignored_context_headers=replay_plan.get("ignored_context_headers"),
+                    context_header_names=context_header_names,
                 )
                 post_response_environment = self._environment_fingerprint(
                     post_response_alignment,
@@ -4903,9 +4951,8 @@ class BrowserActionService:
                     phase="post_response",
                     include_request_context=False,
                     ignored_cookie_names=replay_plan.get("ignored_cookie_names"),
-                    ignored_context_headers=replay_plan.get(
-                        "ignored_context_headers"
-                    ),
+                    ignored_context_headers=replay_plan.get("ignored_context_headers"),
+                    context_header_names=context_header_names,
                 )
                 post_verification_environment = self._environment_fingerprint(
                     post_alignment,
@@ -4913,22 +4960,20 @@ class BrowserActionService:
                     phase="post_verification",
                     include_request_context=False,
                     ignored_cookie_names=replay_plan.get("ignored_cookie_names"),
-                    ignored_context_headers=replay_plan.get(
-                        "ignored_context_headers"
-                    ),
+                    ignored_context_headers=replay_plan.get("ignored_context_headers"),
+                    context_header_names=context_header_names,
                 )
                 if replay_plan.get("replay_mode") == "treatment":
                     control_manifest_for_environment = self.experiments.load_manifest(
                         str(replay_plan["control_experiment_id"])
                     )
                     environment_comparison = self._compare_pair_environments(
-                        control_manifest_for_environment.get(
-                            "pre_dispatch_environment"
-                        ),
+                        control_manifest_for_environment.get("pre_dispatch_environment"),
                         pre_dispatch_environment,
+                        required_dimensions=environment_policy.get("required_dimensions"),
+                        advisory_dimensions=environment_policy.get("advisory_dimensions"),
                     )
                     if environment_comparison.get("status") != "observed_equivalent":
-                        replay_inconclusive = True
                         warnings.append(
                             "Control/Treatment pre-dispatch environment is not fully "
                             f"equivalent: {environment_comparison.get('status')}."
@@ -4942,15 +4987,13 @@ class BrowserActionService:
                 for stream_request in stream_requests:
                     if not isinstance(stream_request, dict):
                         continue
-                    exact_evidence, association = (
-                        self._associate_stream_network_evidence(
-                            stream_request,
-                            [
-                                item
-                                for item in evidence_entries
-                                if item.get("kind") == "network_request"
-                            ],
-                        )
+                    exact_evidence, association = self._associate_stream_network_evidence(
+                        stream_request,
+                        [
+                            item
+                            for item in evidence_entries
+                            if item.get("kind") == "network_request"
+                        ],
                     )
                     if exact_evidence is None:
                         stream_request["networkEvidenceAssociation"] = association
@@ -4959,47 +5002,32 @@ class BrowserActionService:
                     summary = summary if isinstance(summary, dict) else {}
                     snapshot_integrity = summary.get("snapshot_integrity")
                     snapshot_integrity = (
-                        snapshot_integrity
-                        if isinstance(snapshot_integrity, dict)
-                        else {}
+                        snapshot_integrity if isinstance(snapshot_integrity, dict) else {}
                     )
                     request_headers_completeness = str(
-                        snapshot_integrity.get("request_headers_completeness")
-                        or "partial"
+                        snapshot_integrity.get("request_headers_completeness") or "partial"
                     )
-                    if self._stream_request_has_complete_request_headers(
-                        stream_request
-                    ):
+                    if self._stream_request_has_complete_request_headers(stream_request):
                         request_headers_completeness = "complete"
                     request_body_completeness = str(
-                        snapshot_integrity.get("request_body_completeness")
-                        or "unknown"
+                        snapshot_integrity.get("request_body_completeness") or "unknown"
                     )
                     network_snapshot_integrity = (
                         "complete"
                         if request_headers_completeness == "complete"
-                        and request_body_completeness
-                        in {"complete", "not_required"}
+                        and request_body_completeness in {"complete", "not_required"}
                         else "partial"
                     )
-                    stream_request["networkEvidenceId"] = exact_evidence.get(
-                        "evidence_id"
-                    )
+                    stream_request["networkEvidenceId"] = exact_evidence.get("evidence_id")
                     stream_request["networkEvidenceAssociation"] = association
-                    stream_request["networkSnapshotIntegrity"] = (
-                        network_snapshot_integrity
+                    stream_request["networkSnapshotIntegrity"] = network_snapshot_integrity
+                    stream_request["requestBodyCompleteness"] = request_body_completeness
+                    stream_request["requestHeadersCompleteness"] = request_headers_completeness
+                    stream_request["responseBodyCompleteness"] = snapshot_integrity.get(
+                        "response_body_completeness"
                     )
-                    stream_request["requestBodyCompleteness"] = (
-                        request_body_completeness
-                    )
-                    stream_request["requestHeadersCompleteness"] = (
-                        request_headers_completeness
-                    )
-                    stream_request["responseBodyCompleteness"] = (
-                        snapshot_integrity.get("response_body_completeness")
-                    )
-                    stream_request["responseHeadersCompleteness"] = (
-                        snapshot_integrity.get("response_headers_completeness")
+                    stream_request["responseHeadersCompleteness"] = snapshot_integrity.get(
+                        "response_headers_completeness"
                     )
             non_stream_error_response_observed = bool(
                 replay_plan is not None
@@ -5015,12 +5043,8 @@ class BrowserActionService:
             protocol_rejection_observed = bool(
                 non_stream_error_response_observed
                 and response_classification is not None
-                and response_classification.get("classification")
-                == "validation_rejection"
-                and response_classification.get(
-                    "usable_for_required_classification"
-                )
-                is True
+                and isinstance(response_classification.get("observations"), dict)
+                and response_classification["observations"].get("validation_like") is True
             )
 
             primary_status_payload = final_status_payload
@@ -5034,8 +5058,7 @@ class BrowserActionService:
                     item
                     for item in final_status_payload.get("requests", [])
                     if isinstance(item, dict)
-                    and item.get("networkEvidenceId")
-                    == replay_network_evidence_id
+                    and item.get("networkEvidenceId") == replay_network_evidence_id
                 ]
                 primary_status_payload = {
                     **final_status_payload,
@@ -5072,9 +5095,7 @@ class BrowserActionService:
                 )
                 snapshot_dimensions = replay_summary.get("snapshot_integrity")
                 snapshot_dimensions = (
-                    snapshot_dimensions
-                    if isinstance(snapshot_dimensions, dict)
-                    else {}
+                    snapshot_dimensions if isinstance(snapshot_dimensions, dict) else {}
                 )
                 artifact_paths = (
                     replay_network_entry.get("artifact_paths")
@@ -5085,18 +5106,14 @@ class BrowserActionService:
                 request_snapshot_integrity = str(
                     snapshot_dimensions.get("network_snapshot_integrity") or "partial"
                 )
-                network_artifact_integrity = (
-                    "complete" if artifact_paths.get("all") else "partial"
-                )
+                network_artifact_integrity = "complete" if artifact_paths.get("all") else "partial"
                 response_body_completeness = str(
-                    snapshot_dimensions.get("response_body_completeness")
-                    or "unknown"
+                    snapshot_dimensions.get("response_body_completeness") or "unknown"
                 )
                 if response_evidence_source == "complete_replay_response_body":
                     response_body_completeness = "complete"
                 response_headers_completeness = str(
-                    snapshot_dimensions.get("response_headers_completeness")
-                    or "partial"
+                    snapshot_dimensions.get("response_headers_completeness") or "partial"
                 )
                 primary_dimensions = {
                     "raw_capture": "not_applicable_non_stream_response",
@@ -5111,9 +5128,7 @@ class BrowserActionService:
                     response_headers_completeness,
                 ]
                 primary_integrity = (
-                    max(applicable, key=self._integrity_severity)
-                    if count_ok
-                    else "failed"
+                    max(applicable, key=self._integrity_severity) if count_ok else "failed"
                 )
                 if any(value != "complete" for value in applicable):
                     replay_inconclusive = True
@@ -5123,9 +5138,7 @@ class BrowserActionService:
                     )
             if payload.capture.stream:
                 network_evidence_entries = [
-                    item
-                    for item in evidence_entries
-                    if item.get("kind") == "network_request"
+                    item for item in evidence_entries if item.get("kind") == "network_request"
                 ]
                 evidence_entries.extend(
                     self._stream_evidence_entries(
@@ -5156,19 +5169,11 @@ class BrowserActionService:
             )
             wait_met = wait_result is None or bool(wait_result.get("condition_met"))
             steps_ok = all(item.status == "completed" for item in step_results)
-            objective_failed = (
+            execution_failed = (
                 cancelled_error is not None
-                or bool(errors)
                 or not steps_ok
-                or not count_ok
                 or not wait_met
                 or (payload.capture.stream and not collector_stopped)
-                or (
-                    payload.capture.stream
-                    and
-                    not payload.primary_request.allow_supporting_failures
-                    and collector_integrity == "failed"
-                )
             )
             required_dimensions = {
                 "raw_capture": (
@@ -5187,27 +5192,60 @@ class BrowserActionService:
                 for name, required in required_dimensions.items()
                 if required and payload.primary_request.expected_min_matches > 0
             ]
-            if any(value == "failed" for value in required_values):
-                objective_failed = True
-            objective_partial = (
-                not objective_failed
-                and (
-                    replay_inconclusive
-                    or
-                    any(value != "complete" for value in required_values)
-                    or (
-                        payload.capture.stream
-                        and
-                        not payload.primary_request.allow_supporting_failures
-                        and collector_integrity != "complete"
-                    )
+            evidence_failed = (
+                bool(errors)
+                or not count_ok
+                or any(value == "failed" for value in required_values)
+                or (
+                    payload.capture.stream
+                    and not payload.primary_request.allow_supporting_failures
+                    and collector_integrity == "failed"
                 )
             )
+            evidence_partial = not evidence_failed and (
+                replay_inconclusive
+                or any(value != "complete" for value in required_values)
+                or (
+                    payload.capture.stream
+                    and not payload.primary_request.allow_supporting_failures
+                    and collector_integrity != "complete"
+                )
+            )
+            execution_integrity = "failed" if execution_failed else "complete"
+            evidence_integrity = (
+                "failed" if evidence_failed else "partial" if evidence_partial else "complete"
+            )
+            causal_comparability = (
+                str(environment_comparison.get("status") or "insufficient")
+                if replay_plan is not None
+                and replay_plan.get("replay_mode") == "treatment"
+                and isinstance(environment_comparison, dict)
+                else "insufficient"
+                if replay_plan is not None and replay_plan.get("replay_mode") == "treatment"
+                else "not_applicable"
+            )
+            if replay_plan is None or replay_plan.get("replay_mode") != "treatment":
+                inference_eligibility = "ineligible"
+            elif execution_integrity == "failed" or (
+                isinstance(mutation_assessment, dict)
+                and mutation_assessment.get("mutation_effective") is False
+            ):
+                inference_eligibility = "ineligible"
+            elif (
+                execution_integrity == "complete"
+                and evidence_integrity == "complete"
+                and causal_comparability == "observed_equivalent"
+                and isinstance(mutation_assessment, dict)
+                and mutation_assessment.get("mutation_effective") is True
+            ):
+                inference_eligibility = "eligible"
+            else:
+                inference_eligibility = "supervised_only"
             objective_integrity = (
                 "failed"
-                if objective_failed
+                if "failed" in {execution_integrity, evidence_integrity}
                 else "partial"
-                if objective_partial
+                if "partial" in {execution_integrity, evidence_integrity}
                 else "complete"
             )
             response_status = (
@@ -5220,9 +5258,7 @@ class BrowserActionService:
                 else "completed"
             )
             pre_arm_request_count = sum(
-                1
-                for item in primary_requests
-                if bool(item.get("requestStartedBeforeCapture"))
+                1 for item in primary_requests if bool(item.get("requestStartedBeforeCapture"))
             )
             collector_before_mutation = (
                 None
@@ -5253,9 +5289,7 @@ class BrowserActionService:
                 "capture_namespace": experiment_id,
                 "stream_start_status": stream_start_status,
                 "transport_generation": capture_transport_generation,
-                "entered_finalize_reserve": cleanup_result.get(
-                    "entered_finalize_reserve", False
-                ),
+                "entered_finalize_reserve": cleanup_result.get("entered_finalize_reserve", False),
                 "capture_scope": capture_summary.get("captureScope", "page-target-only"),
                 "worker_coverage": capture_summary.get("workerCoverage", False),
             }
@@ -5285,9 +5319,7 @@ class BrowserActionService:
                             ),
                             "kind": "page_screenshot",
                             "artifact_ids": [descriptor["artifactId"]],
-                            "artifact_paths": {
-                                "screenshot": descriptor["relativePath"]
-                            },
+                            "artifact_paths": {"screenshot": descriptor["relativePath"]},
                         }
                     )
             for index, snapshot_path in enumerate(snapshot_paths, start=1):
@@ -5308,9 +5340,7 @@ class BrowserActionService:
                             ),
                             "kind": "page_snapshot",
                             "artifact_ids": [descriptor["artifactId"]],
-                            "artifact_paths": {
-                                "snapshot": descriptor["relativePath"]
-                            },
+                            "artifact_paths": {"snapshot": descriptor["relativePath"]},
                         }
                     )
             for index, trace_path in enumerate(trace_paths, start=1):
@@ -5338,14 +5368,20 @@ class BrowserActionService:
                 if (relative := self.experiments.relative_path(path)) is not None
             ]
             if replay_plan is not None:
+                replay_transport_semantics = {
+                    **(
+                        replay_plan.get("transport")
+                        if isinstance(replay_plan.get("transport"), dict)
+                        else {}
+                    ),
+                    "source_fetch_options_known": False,
+                }
                 replay_manifest = manifest.get("replay")
                 if isinstance(replay_manifest, dict):
                     replay_manifest.update(
                         {
                             "network_evidence_id": replay_network_evidence_id,
-                            "dispatch_wall_time_ms": replay_plan.get(
-                                "dispatch_wall_time_ms"
-                            ),
+                            "dispatch_wall_time_ms": replay_plan.get("dispatch_wall_time_ms"),
                             "replay_http_status": replay_http_status,
                             "response_classification": response_classification,
                             "mutation_assessment": mutation_assessment,
@@ -5353,10 +5389,9 @@ class BrowserActionService:
                             "response_evidence_source": response_evidence_source,
                             "pre_dispatch_environment": pre_dispatch_environment,
                             "post_response_environment": post_response_environment,
-                            "post_verification_environment": (
-                                post_verification_environment
-                            ),
+                            "post_verification_environment": (post_verification_environment),
                             "environment_comparison": environment_comparison,
+                            "transport_semantics": replay_transport_semantics,
                         }
                     )
                 replay_artifact_ids = [
@@ -5377,9 +5412,7 @@ class BrowserActionService:
                         "source_experiment_id": replay_plan["source_experiment_id"],
                         "source_evidence_id": replay_plan["source_evidence_id"],
                         "replay_mode": replay_plan["replay_mode"],
-                        "control_experiment_id": replay_plan[
-                            "control_experiment_id"
-                        ],
+                        "control_experiment_id": replay_plan["control_experiment_id"],
                         "network_evidence_id": replay_network_evidence_id,
                         "mutation_assessment": mutation_assessment,
                         "response_classification": response_classification,
@@ -5387,18 +5420,15 @@ class BrowserActionService:
                         "response_evidence_source": response_evidence_source,
                         "pre_dispatch_environment": pre_dispatch_environment,
                         "post_response_environment": post_response_environment,
-                        "post_verification_environment": (
-                            post_verification_environment
-                        ),
+                        "post_verification_environment": (post_verification_environment),
                         "environment_comparison": environment_comparison,
+                        "transport_semantics": replay_transport_semantics,
                         "artifact_ids": replay_artifact_ids,
                         "step_ids": ["replay_request"],
                         "summary": {
                             "http_status": replay_http_status,
                             "response_content_type": replay_response_content_type,
-                            "protocol_rejection_observed": (
-                                protocol_rejection_observed
-                            ),
+                            "protocol_rejection_observed": (protocol_rejection_observed),
                             "non_stream_error_response_observed": (
                                 non_stream_error_response_observed
                             ),
@@ -5407,12 +5437,9 @@ class BrowserActionService:
                                 if isinstance(response_classification, dict)
                                 else None
                             ),
-                            "control_http_status": replay_plan.get(
-                                "control_http_status"
-                            ),
+                            "control_http_status": replay_plan.get("control_http_status"),
                             "http_status_differs_from_control": (
-                                replay_http_status
-                                != replay_plan.get("control_http_status")
+                                replay_http_status != replay_plan.get("control_http_status")
                                 if replay_plan.get("replay_mode") == "treatment"
                                 else None
                             ),
@@ -5442,9 +5469,7 @@ class BrowserActionService:
                         "capture_id": capture_id,
                         "capture_uuid": capture_uuid,
                         "capture_relative_dir": capture_relative_dir,
-                        "capture_metadata_artifact_id": (
-                            capture_metadata_artifact_id
-                        ),
+                        "capture_metadata_artifact_id": (capture_metadata_artifact_id),
                         "transport_generation": capture_transport_generation,
                         "capture_namespace": experiment_id,
                     },
@@ -5452,6 +5477,10 @@ class BrowserActionService:
                     "wait_observations": wait_observations,
                     "collector_integrity": collector_integrity,
                     "primary_request_integrity": primary_integrity,
+                    "execution_integrity": execution_integrity,
+                    "evidence_integrity": evidence_integrity,
+                    "causal_comparability": causal_comparability,
+                    "inference_eligibility": inference_eligibility,
                     "objective_integrity": objective_integrity,
                     "objective_requirements": payload.requirements.model_dump(mode="json"),
                     "primary_integrity_dimensions": primary_dimensions,
@@ -5472,36 +5501,28 @@ class BrowserActionService:
                     "stream_response_contract": stream_response_contract,
                     "response_evidence_source": response_evidence_source,
                     "replay_attempt_id": (
-                        replay_plan["replay_attempt_id"]
-                        if replay_plan is not None
-                        else None
+                        replay_plan["replay_attempt_id"] if replay_plan is not None else None
                     ),
                     "pair_protocol_hash": (
-                        replay_plan["pair_protocol_hash"]
-                        if replay_plan is not None
-                        else None
+                        replay_plan["pair_protocol_hash"] if replay_plan is not None else None
                     ),
                     "pre_dispatch_environment": pre_dispatch_environment,
                     "post_response_environment": post_response_environment,
                     "post_verification_environment": post_verification_environment,
                     "pair_environment_comparison": environment_comparison,
-                    "protocol_rejection_observed": protocol_rejection_observed,
-                    "non_stream_error_response_observed": (
-                        non_stream_error_response_observed
+                    "replay_transport_semantics": (
+                        replay_transport_semantics if replay_plan is not None else None
                     ),
+                    "protocol_rejection_observed": protocol_rejection_observed,
+                    "non_stream_error_response_observed": (non_stream_error_response_observed),
                     "replay_comparison": (
                         {
                             "replay_mode": replay_plan["replay_mode"],
-                            "control_experiment_id": replay_plan[
-                                "control_experiment_id"
-                            ],
-                            "control_http_status": replay_plan.get(
-                                "control_http_status"
-                            ),
+                            "control_experiment_id": replay_plan["control_experiment_id"],
+                            "control_http_status": replay_plan.get("control_http_status"),
                             "treatment_http_status": replay_http_status,
                             "status_differs": (
-                                replay_http_status
-                                != replay_plan.get("control_http_status")
+                                replay_http_status != replay_plan.get("control_http_status")
                                 if replay_plan["replay_mode"] == "treatment"
                                 else None
                             ),
@@ -5510,9 +5531,7 @@ class BrowserActionService:
                                 if isinstance(response_classification, dict)
                                 else None
                             ),
-                            "pair_protocol_hash": replay_plan[
-                                "pair_protocol_hash"
-                            ],
+                            "pair_protocol_hash": replay_plan["pair_protocol_hash"],
                             "environment_comparison": environment_comparison,
                         }
                         if replay_plan is not None
@@ -5544,9 +5563,7 @@ class BrowserActionService:
                 experiment_id=experiment_id,
                 result={
                     "experiment": self._experiment_summary(manifest),
-                    "manifest_relative_path": self._manifest_relative_path(
-                        experiment_id
-                    ),
+                    "manifest_relative_path": self._manifest_relative_path(experiment_id),
                 },
                 warnings=warnings,
                 errors=errors,
@@ -5585,10 +5602,14 @@ class BrowserActionService:
 
 
 def analysis_workspace_root_from_environment() -> Path:
-    return Path(
-        env_value_from_environment_or_dotenv("WEB_REV_EVIDENCE_DIR")
-        or "data/analysis-workspace"
-    ).expanduser().resolve()
+    return (
+        Path(
+            env_value_from_environment_or_dotenv("WEB_REV_EVIDENCE_DIR")
+            or "data/analysis-workspace"
+        )
+        .expanduser()
+        .resolve()
+    )
 
 
 def build_browser_service_from_environment(
@@ -5601,15 +5622,11 @@ def build_browser_service_from_environment(
     browser_endpoint = env_value_from_environment_or_dotenv("WEB_REV_BROWSER_CDP_URL")
     playwright = PlaywrightCliAdapter(
         executable=(
-            env_value_from_environment_or_dotenv("WEB_REV_PLAYWRIGHT_CLI")
-            or "playwright-cli"
+            env_value_from_environment_or_dotenv("WEB_REV_PLAYWRIGHT_CLI") or "playwright-cli"
         ),
         cwd=experiments.root,
     )
-    command = (
-        env_value_from_environment_or_dotenv("WEB_REV_JS_REVERSE_COMMAND")
-        or "js-reverse-mcp"
-    )
+    command = env_value_from_environment_or_dotenv("WEB_REV_JS_REVERSE_COMMAND") or "js-reverse-mcp"
     critical_args = [
         "--allowedRoots",
         str(experiments.root),
@@ -5618,23 +5635,17 @@ def build_browser_service_from_environment(
     ]
     if browser_endpoint:
         critical_args[0:0] = ["--browserUrl", browser_endpoint]
-    raw_args = env_value_from_environment_or_dotenv(
-        "WEB_REV_JS_REVERSE_EXTRA_ARGS"
-    )
+    raw_args = env_value_from_environment_or_dotenv("WEB_REV_JS_REVERSE_EXTRA_ARGS")
     extra_args: list[str] = []
     if raw_args:
         try:
             parsed_args = json.loads(raw_args)
         except json.JSONDecodeError as exc:
-            raise RuntimeError(
-                "WEB_REV_JS_REVERSE_EXTRA_ARGS must be a JSON array"
-            ) from exc
+            raise RuntimeError("WEB_REV_JS_REVERSE_EXTRA_ARGS must be a JSON array") from exc
         if not isinstance(parsed_args, list) or not all(
             isinstance(item, str) for item in parsed_args
         ):
-            raise RuntimeError(
-                "WEB_REV_JS_REVERSE_EXTRA_ARGS must be a JSON string array"
-            )
+            raise RuntimeError("WEB_REV_JS_REVERSE_EXTRA_ARGS must be a JSON string array")
         forbidden = {"--browserUrl", "--allowedRoots", "--streamArtifactRoot"}
         for item in parsed_args:
             option = item.split("=", 1)[0]

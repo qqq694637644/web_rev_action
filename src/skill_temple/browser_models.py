@@ -160,16 +160,20 @@ class WaitCondition(StrictModel):
     def validate_condition(self) -> WaitCondition:
         if self.type in {"selector_visible", "selector_hidden"} and not self.locator:
             raise ValueError(f"{self.type} requires locator")
-        if self.type in {
-            "request_observed",
-            "response_observed",
-            "first_event",
-            "event_predicate",
-            "default_done_marker",
-            "network_finished",
-            "network_canceled",
-            "failed",
-        } and not self.request_matcher:
+        if (
+            self.type
+            in {
+                "request_observed",
+                "response_observed",
+                "first_event",
+                "event_predicate",
+                "default_done_marker",
+                "network_finished",
+                "network_canceled",
+                "failed",
+            }
+            and not self.request_matcher
+        ):
             raise ValueError(f"{self.type} requires request_matcher")
         if self.type == "event_predicate" and not self.predicate:
             raise ValueError("event_predicate requires predicate")
@@ -284,11 +288,7 @@ class PrimaryRequest(StrictModel):
     url_contains: str | None = Field(default=None, max_length=4096)
     method: str | None = Field(default=None, pattern=r"^[A-Z]+$", max_length=16)
     resource_types: list[str] = Field(default_factory=list, max_length=16)
-    mime_types: list[str] = Field(
-        default_factory=lambda: ["text/event-stream"],
-        min_length=1,
-        max_length=16,
-    )
+    mime_types: list[str] = Field(default_factory=list, max_length=16)
     expected_min_matches: int = Field(default=1, ge=0, le=100)
     expected_max_matches: int = Field(default=1, ge=1, le=100)
     allow_supporting_failures: bool = True
@@ -320,9 +320,7 @@ NetworkExportPart = Literal[
 
 
 class NetworkEvidenceSelector(StrictModel):
-    selector_id: str = Field(
-        pattern=r"^[a-zA-Z0-9_.-]+$", min_length=1, max_length=128
-    )
+    selector_id: str = Field(pattern=r"^[a-zA-Z0-9_.-]+$", min_length=1, max_length=128)
     matcher: RequestMatcher = Field(default_factory=RequestMatcher)
     max_matches: int = Field(default=5, ge=1, le=50)
     export_parts: list[NetworkExportPart] = Field(
@@ -381,9 +379,7 @@ class CaptureFlowPayload(StrictModel):
     job_timeout_ms: int = Field(default=300_000, ge=10_000, le=1_800_000)
     capture: CaptureOptions = Field(default_factory=CaptureOptions)
     requirements: ObjectiveRequirements = Field(default_factory=ObjectiveRequirements)
-    network_evidence: list[NetworkEvidenceSelector] = Field(
-        default_factory=list, max_length=20
-    )
+    network_evidence: list[NetworkEvidenceSelector] = Field(default_factory=list, max_length=20)
     series: ExperimentSeries = Field(default_factory=ExperimentSeries)
 
     @model_validator(mode="after")
@@ -460,6 +456,17 @@ class RemoveJsonPathMutation(StrictModel):
         return self
 
 
+class AddJsonPathMutation(StrictModel):
+    type: Literal["add_json_path"]
+    path: str = Field(min_length=2, max_length=512)
+    value: Any
+
+    @model_validator(mode="after")
+    def validate_path(self) -> AddJsonPathMutation:
+        _validate_json_pointer(self.path)
+        return self
+
+
 class ReplaceJsonPathMutation(StrictModel):
     type: Literal["replace_json_path"]
     path: str = Field(min_length=2, max_length=512)
@@ -474,6 +481,7 @@ class ReplaceJsonPathMutation(StrictModel):
 class RemoveHeaderMutation(StrictModel):
     type: Literal["remove_header"]
     name: str = Field(min_length=1, max_length=256)
+    occurrence: int | Literal["all"] = Field(default="all")
 
     @model_validator(mode="after")
     def validate_header(self) -> RemoveHeaderMutation:
@@ -485,6 +493,7 @@ class ReplaceHeaderMutation(StrictModel):
     type: Literal["replace_header"]
     name: str = Field(min_length=1, max_length=256)
     value: str = Field(max_length=32_000)
+    occurrence: int | Literal["all"] = Field(default="all")
 
     @model_validator(mode="after")
     def validate_header(self) -> ReplaceHeaderMutation:
@@ -492,24 +501,48 @@ class ReplaceHeaderMutation(StrictModel):
         return self
 
 
+class AddHeaderMutation(StrictModel):
+    type: Literal["add_header"]
+    name: str = Field(min_length=1, max_length=256)
+    value: str = Field(max_length=32_000)
+    occurrence: int | Literal["append"] = Field(default="append")
+
+    @model_validator(mode="after")
+    def validate_header(self) -> AddHeaderMutation:
+        _validate_mutable_header(self.name)
+        return self
+
+
 class RemoveQueryParameterMutation(StrictModel):
     type: Literal["remove_query_parameter"]
     name: str = Field(min_length=1, max_length=512)
+    occurrence: int | Literal["all"] = Field(default="all")
 
 
 class ReplaceQueryParameterMutation(StrictModel):
     type: Literal["replace_query_parameter"]
     name: str = Field(min_length=1, max_length=512)
     value: str = Field(max_length=32_000)
+    occurrence: int | Literal["all"] = Field(default="all")
+
+
+class AddQueryParameterMutation(StrictModel):
+    type: Literal["add_query_parameter"]
+    name: str = Field(min_length=1, max_length=512)
+    value: str = Field(max_length=32_000)
+    occurrence: int | Literal["append"] = Field(default="append")
 
 
 ReplayMutation = Annotated[
     RemoveJsonPathMutation
+    | AddJsonPathMutation
     | ReplaceJsonPathMutation
     | RemoveHeaderMutation
     | ReplaceHeaderMutation
+    | AddHeaderMutation
     | RemoveQueryParameterMutation
-    | ReplaceQueryParameterMutation,
+    | ReplaceQueryParameterMutation
+    | AddQueryParameterMutation,
     Field(discriminator="type"),
 ]
 
@@ -519,13 +552,17 @@ class VolatileBinding(StrictModel):
     target: Literal["json_pointer", "header", "query_parameter"]
     path: str | None = Field(default=None, max_length=512)
     name: str | None = Field(default=None, max_length=256)
-    value_source: Literal["generated", "preserve_source"] = "generated"
-    generator: Literal[
-        "uuid4",
-        "timestamp_ms",
-        "timestamp_iso",
-        "random_hex_16",
-    ] | None = None
+    occurrence: int = Field(default=0, ge=0, le=255)
+    value_source: Literal["generated", "preserve_source", "setup_output"] = "generated"
+    generator: (
+        Literal[
+            "uuid4",
+            "timestamp_ms",
+            "timestamp_iso",
+            "random_hex_16",
+        ]
+        | None
+    ) = None
     reuse_policy: Literal["fresh_equivalent", "same_value"] = "fresh_equivalent"
 
     @model_validator(mode="after")
@@ -546,24 +583,149 @@ class VolatileBinding(StrictModel):
                 raise ValueError("preserve_source binding must not declare generator")
             if self.reuse_policy != "same_value":
                 raise ValueError("preserve_source binding requires reuse_policy=same_value")
+        if self.value_source == "setup_output" and self.generator is not None:
+            raise ValueError("setup_output binding must not declare generator")
+        return self
+
+
+class NetworkResponseJsonSetupOutput(StrictModel):
+    binding_id: str = Field(pattern=r"^[a-zA-Z0-9_.-]+$", min_length=1, max_length=128)
+    source: Literal["network_response_json"]
+    selector: RequestMatcher
+    pointer: str = Field(min_length=2, max_length=512)
+    occurrence: int | Literal["first", "last"] = "last"
+
+    @model_validator(mode="after")
+    def validate_pointer(self) -> NetworkResponseJsonSetupOutput:
+        _validate_json_pointer(self.pointer)
+        return self
+
+
+SetupOutput = Annotated[
+    NetworkResponseJsonSetupOutput,
+    Field(discriminator="source"),
+]
+
+
+class EnvironmentComparisonPolicy(StrictModel):
+    required_dimensions: list[
+        Literal[
+            "page_id",
+            "page_url",
+            "page_origin",
+            "request_origin",
+            "request_path",
+            "request_context_sha256",
+            "conversation_current_node",
+            "critical_bundle_sha256",
+        ]
+    ] = Field(
+        default_factory=lambda: ["page_origin", "request_context_sha256"],
+        max_length=8,
+    )
+    advisory_dimensions: list[
+        Literal[
+            "page_id",
+            "page_url",
+            "page_origin",
+            "request_origin",
+            "request_path",
+            "request_context_sha256",
+            "conversation_current_node",
+            "critical_bundle_sha256",
+        ]
+    ] = Field(
+        default_factory=lambda: [
+            "page_url",
+            "request_origin",
+            "request_path",
+            "conversation_current_node",
+            "critical_bundle_sha256",
+        ],
+        max_length=8,
+    )
+    context_header_names: list[str] = Field(
+        default_factory=lambda: [
+            "authorization",
+            "proxy-authorization",
+            "x-csrf-token",
+            "x-xsrf-token",
+        ],
+        max_length=64,
+    )
+
+    @model_validator(mode="after")
+    def normalize_policy(self) -> EnvironmentComparisonPolicy:
+        self.required_dimensions = list(dict.fromkeys(self.required_dimensions))
+        self.advisory_dimensions = [
+            item
+            for item in dict.fromkeys(self.advisory_dimensions)
+            if item not in self.required_dimensions
+        ]
+        self.context_header_names = sorted(
+            {item.strip().lower() for item in self.context_header_names if item.strip()}
+        )
+        return self
+
+
+class ReplayTransportOptions(StrictModel):
+    credentials: Literal["omit", "same-origin", "include"] = "include"
+    redirect: Literal["follow", "error", "manual"] = "follow"
+    cache: Literal[
+        "default",
+        "no-store",
+        "reload",
+        "no-cache",
+        "force-cache",
+        "only-if-cached",
+    ] = "default"
+    referrer_policy: Literal[
+        "",
+        "no-referrer",
+        "no-referrer-when-downgrade",
+        "origin",
+        "origin-when-cross-origin",
+        "same-origin",
+        "strict-origin",
+        "strict-origin-when-cross-origin",
+        "unsafe-url",
+    ] = ""
+    keepalive: bool = False
+    mode: Literal["cors", "no-cors", "same-origin"] = "cors"
+    priority: Literal["high", "low", "auto"] = "auto"
+
+
+class ReplayTerminalCondition(StrictModel):
+    type: Literal[
+        "exact_sse_data",
+        "byte_pattern",
+        "network_close",
+        "idle_window",
+    ]
+    value: str | None = Field(default=None, max_length=4096)
+    event_name: str | None = Field(default=None, max_length=128)
+
+    @model_validator(mode="after")
+    def validate_terminal_condition(self) -> ReplayTerminalCondition:
+        if self.type in {"exact_sse_data", "byte_pattern"} and self.value is None:
+            raise ValueError(f"{self.type} requires value")
+        if self.type != "exact_sse_data" and self.event_name is not None:
+            raise ValueError("event_name is only valid for exact_sse_data")
         return self
 
 
 class ReplayControlPayload(StrictModel):
     session_id: str = Field(pattern=r"^[a-zA-Z0-9_.-]+$", max_length=128)
     objective: str = Field(min_length=1, max_length=2048)
-    source_experiment_id: str = Field(
-        pattern=r"^[a-zA-Z0-9_.-]+$", max_length=128
-    )
-    source_evidence_id: str = Field(
-        pattern=r"^[a-zA-Z0-9_.-]+$", max_length=256
-    )
+    source_experiment_id: str = Field(pattern=r"^[a-zA-Z0-9_.-]+$", max_length=128)
+    source_evidence_id: str = Field(pattern=r"^[a-zA-Z0-9_.-]+$", max_length=256)
     mode: Literal["browser_context"] = "browser_context"
     replay_mode: Literal["control"]
     mutations: list[ReplayMutation] = Field(default_factory=list, max_length=0)
     volatile_bindings: list[VolatileBinding] = Field(default_factory=list, max_length=32)
     target: BrowserTarget = Field(default_factory=BrowserTarget)
     setup_flow: list[FlowStep] = Field(default_factory=list, max_length=20)
+    setup_outputs: list[SetupOutput] = Field(default_factory=list, max_length=32)
     wait_for: WaitCondition | None = None
     verification_flow: list[FlowStep] = Field(default_factory=list, max_length=20)
     execution_mode: Literal["job", "sync"] = "job"
@@ -575,14 +737,22 @@ class ReplayControlPayload(StrictModel):
         le=64 * 1024 * 1024,
     )
     stream_idle_timeout_ms: int = Field(default=15_000, ge=1_000, le=120_000)
-    default_done_marker: str | None = Field(default="[DONE]", max_length=512)
+    response_mode: Literal["auto", "ordinary", "sse", "ndjson", "raw_stream"] = "auto"
+    terminal_conditions: list[ReplayTerminalCondition] = Field(
+        default_factory=lambda: [ReplayTerminalCondition(type="network_close")],
+        max_length=8,
+    )
+    default_done_marker: str | None = Field(default=None, max_length=512)
     default_done_event_name: str | None = Field(default=None, max_length=128)
     raw_only: bool = False
     ignored_cookie_names: list[str] = Field(default_factory=list, max_length=64)
     ignored_context_headers: list[str] = Field(default_factory=list, max_length=64)
-    capture: CaptureOptions = Field(
-        default_factory=lambda: CaptureOptions(stream=False)
+    normalize_wire_order: bool = False
+    environment_comparison: EnvironmentComparisonPolicy = Field(
+        default_factory=EnvironmentComparisonPolicy
     )
+    transport: ReplayTransportOptions = Field(default_factory=ReplayTransportOptions)
+    capture: CaptureOptions = Field(default_factory=lambda: CaptureOptions(stream=False))
     requirements: ObjectiveRequirements = Field(
         default_factory=lambda: ObjectiveRequirements(
             require_raw_capture=False,
@@ -590,47 +760,54 @@ class ReplayControlPayload(StrictModel):
             require_artifacts=True,
         )
     )
-    network_evidence: list[NetworkEvidenceSelector] = Field(
-        default_factory=list, max_length=20
-    )
+    network_evidence: list[NetworkEvidenceSelector] = Field(default_factory=list, max_length=20)
     series: ExperimentSeries = Field(default_factory=ExperimentSeries)
 
     @model_validator(mode="after")
     def validate_replay(self) -> ReplayControlPayload:
         if self.target.start_url is not None:
             raise ValueError("replay_request does not allow target.start_url")
-        if self.mutations:
+        if self.replay_mode == "control" and self.mutations:
             raise ValueError("control replay requires mutations=[]")
         step_ids = [step.step_id for step in [*self.setup_flow, *self.verification_flow]]
         if len(step_ids) != len(set(step_ids)):
             raise ValueError("setup_flow and verification_flow step_id values must be unique")
+        output_ids = [item.binding_id for item in self.setup_outputs]
+        if len(output_ids) != len(set(output_ids)):
+            raise ValueError("setup_outputs binding_id values must be unique")
+        if self.setup_outputs and not self.setup_flow:
+            raise ValueError("setup_outputs requires a non-empty setup_flow")
+        declared_setup_bindings = {
+            item.binding_id
+            for item in self.volatile_bindings
+            if item.value_source == "setup_output"
+        }
+        if declared_setup_bindings != set(output_ids):
+            raise ValueError(
+                "setup_output volatile bindings and setup_outputs must declare the same binding IDs"
+            )
         self.ignored_cookie_names = sorted(
-            {
-                item.strip().lower()
-                for item in self.ignored_cookie_names
-                if item.strip()
-            }
+            {item.strip().lower() for item in self.ignored_cookie_names if item.strip()}
         )
         self.ignored_context_headers = sorted(
-            {
-                item.strip().lower()
-                for item in self.ignored_context_headers
-                if item.strip()
-            }
+            {item.strip().lower() for item in self.ignored_context_headers if item.strip()}
         )
         return self
 
 
+class ReplayExploratoryPayload(ReplayControlPayload):
+    replay_mode: Literal["exploratory"]
+    mutations: list[ReplayMutation] = Field(default_factory=list, max_length=32)
+
+
 class ReplayTreatmentPayload(StrictModel):
     replay_mode: Literal["treatment"]
-    control_experiment_id: str = Field(
-        pattern=r"^[a-zA-Z0-9_.-]+$", max_length=128
-    )
+    control_experiment_id: str = Field(pattern=r"^[a-zA-Z0-9_.-]+$", max_length=128)
     mutation: ReplayMutation
 
 
 ReplayRequestPayload = Annotated[
-    ReplayControlPayload | ReplayTreatmentPayload,
+    ReplayControlPayload | ReplayExploratoryPayload | ReplayTreatmentPayload,
     Field(discriminator="replay_mode"),
 ]
 
@@ -774,9 +951,7 @@ class GetScriptSourcePayload(StrictModel):
 
 
 class SaveScriptSourcePayload(GetScriptSourcePayload):
-    target_experiment_id: str = Field(
-        pattern=r"^[a-zA-Z0-9_.-]+$", max_length=128
-    )
+    target_experiment_id: str = Field(pattern=r"^[a-zA-Z0-9_.-]+$", max_length=128)
     initiator_evidence_id: str | None = Field(
         default=None, pattern=r"^[a-zA-Z0-9_.-]+$", max_length=256
     )
