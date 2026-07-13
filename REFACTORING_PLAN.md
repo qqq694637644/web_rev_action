@@ -325,7 +325,8 @@ missing_evidence[]
 
 ### 7.6 响应分类、inference hints 与 inference eligibility
 
-`classify_replay_response()` 当前包含对 validation、field rejection、conflict、redirect/cache 等固定分类。
+历史实现中的固定 response classifier 包含 validation、field rejection、conflict、
+redirect/cache 等分类。
 
 分类作为提示可以保留，但当前还有：
 
@@ -336,7 +337,7 @@ missing_evidence[]
 - evidence integrity；
 - causal comparability。
 
-这些层次部分重复，而且 `inference_eligibility` 仍然在替分析者决定是否可以推断。
+这些层次部分重复，而且历史 `inference_eligibility` 会替分析者决定是否可以推断。
 
 判断：**过度派生。**
 
@@ -347,6 +348,10 @@ missing_evidence[]
 - hints 明确标记 analyzer 名称和版本；
 - 删除核心 manifest 的 `inference_eligibility`；
 - 不再把 response category 与字段必要性绑定。
+
+当前状态：classifier 已改为显式 `response_analyzer`，默认不运行；输出带 analyzer
+name/version，且不参与实验状态计算。核心 manifest 不再生成
+`inference_eligibility` 或 `protocol_rejection_observed`。
 
 ### 7.7 环境比较默认维度
 
@@ -569,8 +574,8 @@ capture 时，阶段 B 的事实确认项仍保持未完成。
 
 - [ ] 将 `capture_baseline` 变为 `capture_flow` preset/alias。
 - [ ] 统一 flow/setup/verification step executor。
-- [ ] 删除 `inference_eligibility`。
-- [ ] 将固定 response classifier 降级为可选 analyzer。
+- [x] 删除 `inference_eligibility`。
+- [x] 将固定 response classifier 降级为可选 analyzer。
 - [ ] 合并完整性和 completeness 字段。
 - [ ] 建立 canonical network observation，删除重复 summary 计算。
 

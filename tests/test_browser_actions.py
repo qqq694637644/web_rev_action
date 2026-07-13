@@ -878,6 +878,7 @@ class BrowserActionTests(unittest.TestCase):
         root: Path,
         *,
         volatile_bindings: list[dict[str, Any]] | None = None,
+        response_analyzer: bool = False,
     ) -> tuple[str, dict[str, Any], str, dict[str, Any]]:
         capture = self.capture_request()
         capture["payload"]["network_evidence"] = [
@@ -910,6 +911,16 @@ class BrowserActionTests(unittest.TestCase):
                     "source_evidence_id": source_evidence["evidence_id"],
                     "replay_mode": "control",
                     "mutations": [],
+                    **(
+                        {
+                            "response_analyzer": {
+                                "name": "http_response_classifier",
+                                "version": "1",
+                            }
+                        }
+                        if response_analyzer
+                        else {}
+                    ),
                     "volatile_bindings": volatile_bindings
                     or [
                         {
@@ -981,6 +992,7 @@ class BrowserActionTests(unittest.TestCase):
         self.assertEqual(control_payload["properties"]["mutations"]["maxItems"], 0)
         self.assertIn("setup_flow", control_payload["properties"])
         self.assertIn("verification_flow", control_payload["properties"])
+        self.assertIn("response_analyzer", control_payload["properties"])
         for field in [
             "max_response_bytes",
             "stream_idle_timeout_ms",
@@ -1230,9 +1242,7 @@ class BrowserActionTests(unittest.TestCase):
                 manifest["cancellation_classifications"][0]["classification"],
                 "unclassified_network_cancel",
             )
-            self.assertFalse(
-                manifest["cancellation_classifications"][0]["same_request_observed"]
-            )
+            self.assertFalse(manifest["cancellation_classifications"][0]["same_request_observed"])
 
     def test_job_mode_returns_running_then_completes_via_inspect(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3824,7 +3834,8 @@ class BrowserActionTests(unittest.TestCase):
                 replay_manifest["causal_comparability"],
                 "observed_equivalent",
             )
-            self.assertEqual(replay_manifest["inference_eligibility"], "eligible")
+            self.assertNotIn("inference_eligibility", replay_manifest)
+            self.assertNotIn("replay_response_analysis", replay_manifest)
             self.assertEqual(
                 [item["reqid"] for item in replay_manifest["network_summary"]["requests"]],
                 [4],
@@ -4332,7 +4343,7 @@ class BrowserActionTests(unittest.TestCase):
                 "page_url",
                 treatment_manifest["pair_environment_comparison"]["advisory_differences"],
             )
-            self.assertEqual(treatment_manifest["inference_eligibility"], "eligible")
+            self.assertNotIn("inference_eligibility", treatment_manifest)
 
     def test_setup_flow_is_inherited_and_runs_before_each_replay(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -4572,6 +4583,10 @@ class BrowserActionTests(unittest.TestCase):
                             "source_evidence_id": source_evidence["evidence_id"],
                             "replay_mode": "control",
                             "mutations": [],
+                            "response_analyzer": {
+                                "name": "http_response_classifier",
+                                "version": "1",
+                            },
                             "execution_mode": "sync",
                             "deadline_ms": 10_000,
                         },
@@ -4602,7 +4617,7 @@ class BrowserActionTests(unittest.TestCase):
                     root / "experiments" / treatment.json()["experiment_id"] / "manifest.json"
                 ).read_text(encoding="utf-8")
             )
-            self.assertTrue(manifest["protocol_rejection_observed"])
+            self.assertNotIn("protocol_rejection_observed", manifest)
             self.assertEqual(manifest["replay_http_status"], 422)
             self.assertEqual(
                 manifest["primary_integrity_dimensions"]["raw_capture"],
@@ -4613,7 +4628,11 @@ class BrowserActionTests(unittest.TestCase):
             self.assertNotIn("objective_integrity", manifest)
             self.assertIn(
                 "field_required",
-                manifest["replay_response_classification"]["inference_hints"],
+                manifest["replay_response_analysis"]["hints"],
+            )
+            self.assertEqual(
+                manifest["replay_response_analysis"]["analyzer"],
+                {"name": "http_response_classifier", "version": "1"},
             )
 
     def test_control_fails_when_volatile_binding_is_not_observed_on_wire(self) -> None:
@@ -4678,7 +4697,7 @@ class BrowserActionTests(unittest.TestCase):
             self.assertFalse(manifest["mutation_assessment"]["volatile_bindings_effective"])
             self.assertIn("volatile bindings", " ".join(manifest["errors"]).lower())
 
-    def test_control_rejects_unexpected_redirect_response_contract(self) -> None:
+    def test_optional_response_analyzer_does_not_fail_redirected_control(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             client, _, js = self.make_client(root, include_supporting_failure=False)
@@ -4719,20 +4738,24 @@ class BrowserActionTests(unittest.TestCase):
                             "source_evidence_id": source_evidence["evidence_id"],
                             "replay_mode": "control",
                             "mutations": [],
+                            "response_analyzer": {
+                                "name": "http_response_classifier",
+                                "version": "1",
+                            },
                             "execution_mode": "sync",
                             "deadline_ms": 10_000,
                         },
                     },
                 )
             self.assertEqual(control.status_code, 200, control.text)
-            self.assertEqual(control.json()["status"], "failed")
+            self.assertEqual(control.json()["status"], "completed")
             manifest = json.loads(
                 (
                     root / "experiments" / control.json()["experiment_id"] / "manifest.json"
                 ).read_text(encoding="utf-8")
             )
             self.assertEqual(
-                manifest["replay_response_classification"]["classification"],
+                manifest["replay_response_analysis"]["classification"],
                 "unexpected_redirect",
             )
 
@@ -4967,6 +4990,10 @@ class BrowserActionTests(unittest.TestCase):
                             "source_evidence_id": source_evidence["evidence_id"],
                             "replay_mode": "control",
                             "mutations": [],
+                            "response_analyzer": {
+                                "name": "http_response_classifier",
+                                "version": "1",
+                            },
                             "execution_mode": "sync",
                             "deadline_ms": 10_000,
                         },
@@ -4998,14 +5025,14 @@ class BrowserActionTests(unittest.TestCase):
                     root / "experiments" / treatment.json()["experiment_id"] / "manifest.json"
                 ).read_text(encoding="utf-8")
             )
-            classification = manifest["replay_response_classification"]
-            self.assertEqual(classification["classification"], "validation_rejection")
-            self.assertFalse(classification["evidence_sufficient"])
+            analysis = manifest["replay_response_analysis"]
+            self.assertEqual(analysis["classification"], "validation_rejection")
+            self.assertFalse(analysis["evidence_sufficient"])
             self.assertEqual(
                 manifest["response_evidence_source"],
                 "replay_preview_fallback",
             )
-            self.assertTrue(manifest["protocol_rejection_observed"])
+            self.assertNotIn("protocol_rejection_observed", manifest)
             self.assertEqual(
                 manifest["primary_integrity_dimensions"]["request_snapshot"],
                 "complete",
@@ -5036,7 +5063,11 @@ class BrowserActionTests(unittest.TestCase):
                 )
                 with client:
                     self.open_session(client)
-                    _, _, control_id, _ = self.capture_source_and_control(client, root)
+                    _, _, control_id, _ = self.capture_source_and_control(
+                        client,
+                        root,
+                        response_analyzer=True,
+                    )
                     js.replay_response_status = status
                     js.replay_body_preview = preview
                     treatment = client.post(
@@ -5054,16 +5085,16 @@ class BrowserActionTests(unittest.TestCase):
                         },
                     )
                 self.assertEqual(treatment.status_code, 200, treatment.text)
-                self.assertEqual(treatment.json()["status"], "partial")
+                self.assertEqual(treatment.json()["status"], "completed")
                 manifest = json.loads(
                     (
                         root / "experiments" / treatment.json()["experiment_id"] / "manifest.json"
                     ).read_text(encoding="utf-8")
                 )
                 self.assertTrue(manifest["mutation_assessment"]["mutation_effective"])
-                self.assertFalse(manifest["protocol_rejection_observed"])
+                self.assertNotIn("protocol_rejection_observed", manifest)
                 self.assertEqual(
-                    manifest["replay_response_classification"]["classification"],
+                    manifest["replay_response_analysis"]["classification"],
                     expected,
                 )
 
@@ -5416,6 +5447,10 @@ async function runCase(chunks, responseControl, contentType = 'text/event-stream
                             "source_evidence_id": source_evidence["evidence_id"],
                             "replay_mode": "control",
                             "mutations": [],
+                            "response_analyzer": {
+                                "name": "http_response_classifier",
+                                "version": "1",
+                            },
                             "execution_mode": "sync",
                             "deadline_ms": 10_000,
                         },
@@ -5432,7 +5467,7 @@ async function runCase(chunks, responseControl, contentType = 'text/event-stream
             self.assertIsNone(manifest["replay"]["source_content_type"])
             self.assertIsNone(manifest["replay_response_content_type"])
             self.assertEqual(
-                manifest["replay_response_classification"]["classification"],
+                manifest["replay_response_analysis"]["classification"],
                 "success",
             )
 
@@ -5503,7 +5538,7 @@ async function runCase(chunks, responseControl, contentType = 'text/event-stream
             self.assertNotIn("tracking_id", body)
             self.assertTrue(body["experimental_flag"])
             self.assertEqual(manifest["replay"]["replay_mode"], "exploratory")
-            self.assertEqual(manifest["inference_eligibility"], "ineligible")
+            self.assertNotIn("inference_eligibility", manifest)
             self.assertTrue(manifest["mutation_assessment"]["all_mutations_effective"])
 
     def test_setup_network_response_output_is_injected_into_replay_binding(self) -> None:

@@ -141,9 +141,26 @@ GPT 不直接协调 start、click、wait、stop。
 → 保存 request diff 与 response artifact
 ```
 
+response category 不再是 replay 的固定后端 verdict。默认只保存 HTTP status、
+Content-Type、response artifact、wire mutation assessment 和环境比较事实。需要旧式
+HTTP response 分类提示时，Control 显式声明：
+
+```json
+{
+  "response_analyzer": {
+    "name": "http_response_classifier",
+    "version": "1"
+  }
+}
+```
+
+analyzer 配置会写入 immutable pair protocol 并由 Treatment 继承。输出保存在
+`replay_response_analysis`，带 analyzer name/version；它不会把实验自动改成 failed、
+partial 或“可推断”。
+
 公开 payload 不接受任意本地路径，也不返回 Cookie、Authorization 或 CSRF。JSON mutation 使用 RFC 6901 Pointer，例如 `/messages/0/content/parts/0`；不支持 wildcard。JSON Pointer 和 query 参数名严格区分大小写，header 名不区分大小写。Cookie、Origin、Referer、Host、Content-Length 和 `Sec-*` 等 browser-managed header mutation 会被拒绝。
 
-Control 必须 `mutations=[]`、HTTP 2xx，并在 actual wire snapshot 中观察到所有 volatile bindings。HTTP 3xx（包括未自动跟随的 304）属于 `redirect_or_cache_response`，不能证明字段 optional。每个 binding 选择：
+Control 必须 `mutations=[]`、HTTP 2xx，并在 actual wire snapshot 中观察到所有 volatile bindings。HTTP 3xx（包括未自动跟随的 304）本身不能证明字段 optional；启用 analyzer 时可以附加 `redirect_or_cache_response` 提示。每个 binding 选择：
 
 ```text
 value_source=generated + fresh_equivalent

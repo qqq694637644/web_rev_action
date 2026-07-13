@@ -660,6 +660,11 @@ class ReplayTerminalCondition(StrictModel):
         return self
 
 
+class ReplayResponseAnalyzer(StrictModel):
+    name: Literal["http_response_classifier"] = "http_response_classifier"
+    version: Literal["1"] = "1"
+
+
 class ReplayControlPayload(StrictModel):
     session_id: str = Field(pattern=r"^[a-zA-Z0-9_.-]+$", max_length=128)
     objective: str = Field(min_length=1, max_length=2048)
@@ -684,6 +689,7 @@ class ReplayControlPayload(StrictModel):
     )
     stream_idle_timeout_ms: int = Field(default=15_000, ge=1_000, le=120_000)
     response_mode: Literal["auto", "ordinary", "sse", "ndjson", "raw_stream"] = "auto"
+    response_analyzer: ReplayResponseAnalyzer | None = None
     terminal_conditions: list[ReplayTerminalCondition] = Field(
         default_factory=lambda: [ReplayTerminalCondition(type="network_close")],
         max_length=8,

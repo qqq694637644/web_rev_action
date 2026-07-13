@@ -64,13 +64,13 @@ from .browser_models import (
     WaitCondition,
 )
 from .protocol_evidence import (
+    analyze_replay_response,
     assess_control_wire_baseline,
     assess_mutation_effectiveness,
     assess_paired_mutation_effectiveness,
     binding_value_from_snapshot,
     build_replay_spec,
     canonical_json_sha256,
-    classify_replay_response,
     evidence_id,
     json_pointer_value,
     load_snapshot,
@@ -855,6 +855,11 @@ class BrowserActionService:
             "default_done_marker": control.default_done_marker,
             "default_done_event_name": control.default_done_event_name,
             "response_mode": control.response_mode,
+            "response_analyzer": (
+                control.response_analyzer.model_dump(mode="json")
+                if control.response_analyzer
+                else None
+            ),
             "terminal_conditions": [
                 item.model_dump(mode="json", exclude_none=True)
                 for item in control.terminal_conditions
@@ -919,22 +924,6 @@ class BrowserActionService:
             raise BrowserServiceError(
                 "control_replay_http_failed",
                 "Treatment replay requires a control replay with a successful HTTP status.",
-                409,
-            )
-        control_response_classification = control.get("replay_response_classification")
-        control_observations = (
-            control_response_classification.get("observations")
-            if isinstance(control_response_classification, dict)
-            else None
-        )
-        if not isinstance(control_response_classification, dict) or not (
-            control_response_classification.get("classification") == "success"
-            or isinstance(control_observations, dict)
-            and control_observations.get("success_like") is True
-        ):
-            raise BrowserServiceError(
-                "control_replay_response_contract_failed",
-                "Treatment replay requires a control with a successful response contract.",
                 409,
             )
         replay = control.get("replay")
@@ -1083,9 +1072,7 @@ class BrowserActionService:
                     "source": output.source,
                     "pointer": output.pointer,
                     "request_id": reqid,
-                    "request_url_sha256": canonical_json_sha256(
-                        str(selected.get("url") or "")
-                    ),
+                    "request_url_sha256": canonical_json_sha256(str(selected.get("url") or "")),
                     "value_sha256": canonical_json_sha256(value),
                     "snapshot_relative_path": self.experiments.relative_path(snapshot_path),
                 }
@@ -2440,6 +2427,11 @@ class BrowserActionService:
             "environment_comparison": control_payload.environment_comparison.model_dump(
                 mode="json"
             ),
+            "response_analyzer": (
+                control_payload.response_analyzer.model_dump(mode="json")
+                if control_payload.response_analyzer
+                else None
+            ),
             "transport": control_payload.transport.model_dump(mode="json"),
             "mutations": mutations,
             "mutation": mutation,
@@ -2482,7 +2474,6 @@ class BrowserActionService:
             "execution_integrity": manifest.get("execution_integrity"),
             "evidence_integrity": manifest.get("evidence_integrity"),
             "causal_comparability": manifest.get("causal_comparability"),
-            "inference_eligibility": manifest.get("inference_eligibility"),
             "collector_integrity": manifest.get("collector_integrity"),
             "primary_request_integrity": manifest.get("primary_request_integrity"),
             "primary_integrity_dimensions": manifest.get("primary_integrity_dimensions"),
@@ -4704,7 +4695,7 @@ class BrowserActionService:
                 evidence_artifacts.extend(console_artifacts)
                 warnings.extend(console_warnings)
             mutation_assessment: dict[str, Any] | None = None
-            response_classification: dict[str, Any] | None = None
+            response_analysis: dict[str, Any] | None = None
             stream_response_contract: dict[str, Any] | None = None
             response_evidence_source: str | None = None
             replay_network_evidence_id: str | None = None
@@ -4848,38 +4839,42 @@ class BrowserActionService:
                     if exact_replay_response_value is not None
                     else "replay_preview_fallback"
                 )
-                response_classification = classify_replay_response(
-                    status=replay_http_status,
-                    content_type=replay_response_content_type,
-                    response_value=response_value,
-                    mutation=mutation,
-                    redirected=bool(self._extract_response_field(replay_response, "redirected")),
-                    final_url=(
-                        str(value)
-                        if (
-                            value := self._extract_response_field(
-                                replay_response,
-                                "url",
+                response_analyzer = replay_plan.get("response_analyzer")
+                if isinstance(response_analyzer, dict):
+                    response_analysis = analyze_replay_response(
+                        status=replay_http_status,
+                        content_type=replay_response_content_type,
+                        response_value=response_value,
+                        mutation=mutation,
+                        redirected=bool(
+                            self._extract_response_field(replay_response, "redirected")
+                        ),
+                        final_url=(
+                            str(value)
+                            if (
+                                value := self._extract_response_field(
+                                    replay_response,
+                                    "url",
+                                )
                             )
-                        )
-                        else None
-                    ),
-                    source_url=str(replay_plan["spec"].get("url", "")),
-                    source_content_type=replay_plan.get("source_content_type"),
-                )
-                response_classification["evidence_source"] = response_evidence_source
-                response_classification["evidence_sufficient"] = response_evidence_source in {
-                    "exact_network_response_body",
-                    "complete_replay_response_body",
-                }
-                observations = response_classification.get("observations")
-                if isinstance(observations, dict) and isinstance(
-                    mutation_assessment,
-                    dict,
-                ):
-                    observations["mutation_effective"] = mutation_assessment.get(
-                        "mutation_effective"
+                            else None
+                        ),
+                        source_url=str(replay_plan["spec"].get("url", "")),
+                        source_content_type=replay_plan.get("source_content_type"),
                     )
+                    response_analysis["evidence_source"] = response_evidence_source
+                    response_analysis["evidence_sufficient"] = response_evidence_source in {
+                        "exact_network_response_body",
+                        "complete_replay_response_body",
+                    }
+                    observations = response_analysis.get("observations")
+                    if isinstance(observations, dict) and isinstance(
+                        mutation_assessment,
+                        dict,
+                    ):
+                        observations["mutation_effective"] = mutation_assessment.get(
+                            "mutation_effective"
+                        )
                 stream_response_contract = self._stream_response_contract(
                     replay_plan,
                     replay_response,
@@ -4902,23 +4897,6 @@ class BrowserActionService:
                         "Requested treatment mutation was not observed on the "
                         "outbound wire request."
                     )
-                classification = response_classification.get("classification")
-                if replay_plan.get("replay_mode") == "control":
-                    if classification != "success":
-                        errors.append(
-                            "Control replay response contract was not successful: "
-                            f"{classification}."
-                        )
-                elif classification not in {
-                    "success",
-                    "validation_rejection",
-                }:
-                    if replay_plan.get("replay_mode") == "treatment":
-                        replay_inconclusive = True
-                        warnings.append(
-                            "Treatment response is inconclusive for protocol inference: "
-                            f"{classification}."
-                        )
                 environment_policy = replay_plan.get("environment_comparison")
                 environment_policy = (
                     environment_policy if isinstance(environment_policy, dict) else {}
@@ -5032,13 +5010,6 @@ class BrowserActionService:
                 and mutation_assessment is not None
                 and mutation_assessment.get("mutation_effective") is True
             )
-            protocol_rejection_observed = bool(
-                non_stream_error_response_observed
-                and response_classification is not None
-                and isinstance(response_classification.get("observations"), dict)
-                and response_classification["observations"].get("validation_like") is True
-            )
-
             primary_status_payload = final_status_payload
             if (
                 replay_plan is not None
@@ -5124,10 +5095,7 @@ class BrowserActionService:
                 )
                 if any(value != "complete" for value in applicable):
                     replay_inconclusive = True
-                    warnings.append(
-                        "Non-stream error response evidence is incomplete; field "
-                        "classification is inconclusive."
-                    )
+                    warnings.append("Non-stream error response evidence is incomplete.")
             if payload.capture.stream:
                 network_evidence_entries = [
                     item for item in evidence_entries if item.get("kind") == "network_request"
@@ -5216,23 +5184,6 @@ class BrowserActionService:
                 if replay_plan is not None and replay_plan.get("replay_mode") == "treatment"
                 else "not_applicable"
             )
-            if replay_plan is None or replay_plan.get("replay_mode") != "treatment":
-                inference_eligibility = "ineligible"
-            elif execution_integrity == "failed" or (
-                isinstance(mutation_assessment, dict)
-                and mutation_assessment.get("mutation_effective") is False
-            ):
-                inference_eligibility = "ineligible"
-            elif (
-                execution_integrity == "complete"
-                and evidence_integrity == "complete"
-                and causal_comparability == "observed_equivalent"
-                and isinstance(mutation_assessment, dict)
-                and mutation_assessment.get("mutation_effective") is True
-            ):
-                inference_eligibility = "eligible"
-            else:
-                inference_eligibility = "supervised_only"
             response_status = (
                 "interrupted"
                 if cancelled_error is not None
@@ -5368,7 +5319,6 @@ class BrowserActionService:
                             "network_evidence_id": replay_network_evidence_id,
                             "dispatch_wall_time_ms": replay_plan.get("dispatch_wall_time_ms"),
                             "replay_http_status": replay_http_status,
-                            "response_classification": response_classification,
                             "mutation_assessment": mutation_assessment,
                             "stream_response_contract": stream_response_contract,
                             "response_evidence_source": response_evidence_source,
@@ -5377,6 +5327,11 @@ class BrowserActionService:
                             "post_verification_environment": (post_verification_environment),
                             "environment_comparison": environment_comparison,
                             "transport_semantics": replay_transport_semantics,
+                            **(
+                                {"response_analysis": response_analysis}
+                                if response_analysis is not None
+                                else {}
+                            ),
                         }
                     )
                 replay_artifact_ids = [
@@ -5400,7 +5355,6 @@ class BrowserActionService:
                         "control_experiment_id": replay_plan["control_experiment_id"],
                         "network_evidence_id": replay_network_evidence_id,
                         "mutation_assessment": mutation_assessment,
-                        "response_classification": response_classification,
                         "stream_response_contract": stream_response_contract,
                         "response_evidence_source": response_evidence_source,
                         "pre_dispatch_environment": pre_dispatch_environment,
@@ -5410,17 +5364,21 @@ class BrowserActionService:
                         "transport_semantics": replay_transport_semantics,
                         "artifact_ids": replay_artifact_ids,
                         "step_ids": ["replay_request"],
+                        **(
+                            {"response_analysis": response_analysis}
+                            if response_analysis is not None
+                            else {}
+                        ),
                         "summary": {
                             "http_status": replay_http_status,
                             "response_content_type": replay_response_content_type,
-                            "protocol_rejection_observed": (protocol_rejection_observed),
                             "non_stream_error_response_observed": (
                                 non_stream_error_response_observed
                             ),
-                            "response_classification": (
-                                response_classification.get("classification")
-                                if isinstance(response_classification, dict)
-                                else None
+                            **(
+                                {"response_analysis": response_analysis.get("classification")}
+                                if isinstance(response_analysis, dict)
+                                else {}
                             ),
                             "control_http_status": replay_plan.get("control_http_status"),
                             "http_status_differs_from_control": (
@@ -5465,7 +5423,6 @@ class BrowserActionService:
                     "execution_integrity": execution_integrity,
                     "evidence_integrity": evidence_integrity,
                     "causal_comparability": causal_comparability,
-                    "inference_eligibility": inference_eligibility,
                     "objective_requirements": payload.requirements.model_dump(mode="json"),
                     "primary_integrity_dimensions": primary_dimensions,
                     "primary_requests": primary_requests,
@@ -5481,7 +5438,6 @@ class BrowserActionService:
                     "replay_result": replay_result,
                     "replay_http_status": replay_http_status,
                     "replay_response_content_type": replay_response_content_type,
-                    "replay_response_classification": response_classification,
                     "stream_response_contract": stream_response_contract,
                     "response_evidence_source": response_evidence_source,
                     "replay_attempt_id": (
@@ -5497,8 +5453,12 @@ class BrowserActionService:
                     "replay_transport_semantics": (
                         replay_transport_semantics if replay_plan is not None else None
                     ),
-                    "protocol_rejection_observed": protocol_rejection_observed,
                     "non_stream_error_response_observed": (non_stream_error_response_observed),
+                    **(
+                        {"replay_response_analysis": response_analysis}
+                        if response_analysis is not None
+                        else {}
+                    ),
                     "replay_comparison": (
                         {
                             "replay_mode": replay_plan["replay_mode"],
@@ -5508,11 +5468,6 @@ class BrowserActionService:
                             "status_differs": (
                                 replay_http_status != replay_plan.get("control_http_status")
                                 if replay_plan["replay_mode"] == "treatment"
-                                else None
-                            ),
-                            "response_classification": (
-                                response_classification.get("classification")
-                                if isinstance(response_classification, dict)
                                 else None
                             ),
                             "pair_protocol_hash": replay_plan["pair_protocol_hash"],
