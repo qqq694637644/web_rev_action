@@ -870,7 +870,7 @@ def assess_control_wire_baseline(
     }
 
 
-def classify_replay_response(
+def analyze_replay_response(
     *,
     status: int | None,
     content_type: str | None,
@@ -964,19 +964,23 @@ def classify_replay_response(
         "success_like": success_like,
         "signals_conflict": bool(reference.get("signals_conflict")),
     }
-    inference_hints: list[str] = []
+    hints: list[str] = []
     semantic = reference.get("semantic")
     if validation_like and semantic and semantic != "none":
-        inference_hints.append(str(semantic))
+        hints.append(str(semantic))
     if success_like and mutation is not None:
-        inference_hints.append("mutation_accepted_by_response")
+        hints.append("mutation_accepted_by_response")
     if observations["signals_conflict"]:
-        inference_hints.append("conflicting_validation_signals")
+        hints.append("conflicting_validation_signals")
     return {
+        "analyzer": {
+            "name": "http_response_classifier",
+            "version": "1",
+        },
         "classification": classification,
         "validation_evidence": reference,
         "observations": observations,
-        "inference_hints": inference_hints,
+        "hints": hints,
         "status": status,
         "content_type": content_type,
         "source_content_type": source_content_type,
