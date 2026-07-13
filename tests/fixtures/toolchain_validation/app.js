@@ -8,21 +8,21 @@ function stage0RequestBuilder() {
   };
 }
 
-function buildPandoraConversationRequest() {
+function buildStatefulStreamRequest() {
   return {
-    conversation_id: "conversation-fixture",
-    model: "fixture-model",
-    messages: [
+    stream_id: "stateful-stream-fixture",
+    variant: "fixture-variant",
+    events: [
       {
-        id: "user-message-1",
-        author: { role: "user" },
-        content: {
-          content_type: "text",
+        id: "client-event-1",
+        actor: { kind: "client" },
+        payload: {
+          type: "text",
           parts: ["hello fixture"],
         },
       },
     ],
-    parent_message_id: "root-message",
+    parent_event_id: "root-event",
     timezone_offset_min: 0,
     tracking_id: "tracking-only-value",
   };
@@ -42,22 +42,22 @@ function parseSseText(text) {
   return events;
 }
 
-async function sendPandoraConversation() {
-  const response = await fetch("/api/pandora/conversation", {
+async function sendStatefulStream() {
+  const response = await fetch("/api/stateful-stream", {
     method: "POST",
     headers: {
       "Authorization": "Bearer fixture-token",
       "Content-Type": "application/json",
     },
     credentials: "include",
-    body: JSON.stringify(buildPandoraConversationRequest()),
+    body: JSON.stringify(buildStatefulStreamRequest()),
   });
   const contentType = response.headers.get("content-type") || "";
   const payload = contentType.includes("text/event-stream")
     ? parseSseText(await response.text())
     : await response.json();
   document.querySelector("#result").textContent = JSON.stringify(payload, null, 2);
-  document.querySelector("#status").textContent = `pandora-${response.status}`;
+  document.querySelector("#status").textContent = `stateful-stream-${response.status}`;
   return payload;
 }
 
@@ -111,4 +111,4 @@ async function runCapture() {
 
 document.querySelector("#run-capture").addEventListener("click", runCapture);
 document.querySelector("#send-echo").addEventListener("click", sendEcho);
-document.querySelector("#send-pandora").addEventListener("click", sendPandoraConversation);
+document.querySelector("#send-stateful-stream").addEventListener("click", sendStatefulStream);

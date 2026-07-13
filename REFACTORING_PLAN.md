@@ -163,7 +163,7 @@ evals/skill_queries.jsonl 中的 idapython 用例
 tests/test_runtime.py 中只验证 idapython 示例的测试
 ```
 
-判断：**明确无关，优先删除。**
+判断：**明确无关，已删除。**
 
 它是通用 Skill 模板遗留，不参与网页分析，却增加 runtime、eval 和测试维护成本。
 
@@ -177,11 +177,11 @@ tests/test_runtime.py 中只验证 idapython 示例的测试
 - 删除仅用于展示“多 Skill 平台”的示例逻辑；
 - 不把本项目继续发展成通用 Skill 托管服务。
 
-状态：**需要在删除 IDAPython 后继续确认。**
+状态：**IDAPython 删除后，默认发行物只剩项目分析 Skill；通用 catalog runtime 是否继续保留，留待单独审计。**
 
 ### 6.3 Pandora 专有命名的 smoke fixture 和报告名
 
-例如：
+此前存在：
 
 ```text
 tools/toolchain_validation_server.py 中的 /api/pandora/conversation
@@ -189,7 +189,7 @@ tools/browser_action_smoke.py 中大量 pandora_* 变量
 reports/pandora-comparison.md
 ```
 
-这些测试能力本身有价值，但命名和断言会让维护者误以为旧 Pandora 行为就是产品契约。
+这些测试能力本身有价值，但命名和断言会让维护者误以为旧 Pandora 行为就是产品契约。当前分支已将 fixture endpoint、页面控件、变量和输出键改为通用 stateful stream 命名；历史对照报告名仍留待后续 Skill/文档清理。
 
 方向：
 
@@ -533,9 +533,9 @@ reports/open-questions.md
 - [x] 删除 replay response 中无信息的 `conclusion` 和 `usable_for_required_classification`。
 - [x] 停止生成 `objective_integrity`。
 - [x] 移除固定 Stop 顺序拒绝。
-- [ ] 删除 IDAPython 示例 Skill、docs、eval 和专用测试。
-- [ ] 清理仍引用 `objective_integrity` 的 smoke 输出和旧文档。
-- [ ] 将 Pandora 专有 fixture 命名改为通用 stateful stream fixture。
+- [x] 删除 IDAPython 示例 Skill、docs、eval 和专用测试。
+- [x] 清理仍引用 `objective_integrity` 的 smoke 输出和旧文档。
+- [x] 将 Pandora 专有 fixture 命名改为通用 stateful stream fixture。
 
 ### 阶段 B：当前网页无假设侦察
 
@@ -594,14 +594,13 @@ workspace             人工分析工具
 
 顺序可以根据当前网页侦察调整，但默认如下：
 
-1. **PR #6：** 写入本计划，删除第一批死结论和固定 Stop 校验。
-2. **清理 PR：** 删除 IDAPython 示例和通用模板遗留，genericize smoke fixture。
-3. **侦察 PR/报告：** 加入当前网页 inventory 与 evidence gaps，不改核心架构。
-4. **入口合并 PR：** `capture_baseline` 兼容 alias，统一 flow executor。
-5. **结论删减 PR：** 删除 `inference_eligibility` 和固定后端 response verdict。
-6. **证据模型 PR：** canonical network observation，合并完整性字段。
-7. **Replay 简化 PR：** 通用 replay + 可选 comparison/extractor。
-8. **结构 PR：** 在功能已经减少后拆分 service、adapter 和测试。
+1. **PR #6：** 写入本计划，删除第一批死结论、固定 Stop 校验、IDAPython 示例和专有 smoke fixture 命名。
+2. **侦察 PR/报告：** 加入当前网页 inventory 与 evidence gaps，不改核心架构。
+3. **入口合并 PR：** `capture_baseline` 兼容 alias，统一 flow executor。
+4. **结论删减 PR：** 删除 `inference_eligibility` 和固定后端 response verdict。
+5. **证据模型 PR：** canonical network observation，合并完整性字段。
+6. **Replay 简化 PR：** 通用 replay + 可选 comparison/extractor。
+7. **结构 PR：** 在功能已经减少后拆分 service、adapter 和测试。
 
 每个 PR 应满足：
 

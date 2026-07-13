@@ -368,14 +368,14 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
         if f"sha256={expected_sha}" not in binary.stdout:
             raise AssertionError(binary.stdout)
 
-        pandora_capture = await service.run(
+        stateful_capture = await service.run(
             CaptureFlowRequest(
                 operation="capture_flow",
                 payload={
                     "session_id": SESSION_ID,
-                    "objective": "capture one authenticated Pandora-like request",
+                    "objective": "capture one authenticated stateful stream request",
                     "primary_request": {
-                        "url_contains": "/api/pandora/conversation",
+                        "url_contains": "/api/stateful-stream",
                         "method": "POST",
                         "resource_types": ["fetch"],
                         "mime_types": ["text/event-stream"],
@@ -386,17 +386,17 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
                     },
                     "flow": [
                         {
-                            "step_id": "send_pandora_request",
+                            "step_id": "send_stateful_stream_request",
                             "action": "click",
-                            "locator": {"css": "#send-pandora"},
+                            "locator": {"css": "#send-stateful-stream"},
                             "timeout_ms": 10_000,
                         },
                         {
-                            "step_id": "wait_pandora_200",
+                            "step_id": "wait_stateful_stream_200",
                             "action": "wait",
                             "condition": {
                                 "type": "selector_visible",
-                                "locator": {"text": "pandora-200"},
+                                "locator": {"text": "stateful-stream-200"},
                                 "timeout_ms": 10_000,
                             },
                         },
@@ -419,9 +419,9 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
                     },
                     "network_evidence": [
                         {
-                            "selector_id": "pandora_conversation",
+                            "selector_id": "stateful_stream",
                             "matcher": {
-                                "url_contains": "/api/pandora/conversation",
+                                "url_contains": "/api/stateful-stream",
                                 "method": "POST",
                                 "resource_types": ["fetch"],
                             },
@@ -431,30 +431,30 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
                         }
                     ],
                     "series": {
-                        "analysis_series_id": "pandora-fixture-series",
-                        "scenario_type": "first_message",
+                        "analysis_series_id": "stateful-stream-fixture-series",
+                        "scenario_type": "initial_stream_event",
                         "sequence_index": 1,
-                        "conversation_key": "conversation-fixture",
+                        "conversation_key": "stateful-stream-fixture",
                     },
                 },
             )
         )
-        if pandora_capture.status != "completed":
-            raise AssertionError(pandora_capture.model_dump())
-        pandora_manifest_path = (
+        if stateful_capture.status != "completed":
+            raise AssertionError(stateful_capture.model_dump())
+        stateful_manifest_path = (
             evidence_root
             / "experiments"
-            / str(pandora_capture.experiment_id)
+            / str(stateful_capture.experiment_id)
             / "manifest.json"
         )
-        pandora_manifest = json.loads(
-            pandora_manifest_path.read_text(encoding="utf-8")
+        stateful_manifest = json.loads(
+            stateful_manifest_path.read_text(encoding="utf-8")
         )
         source_evidence = next(
             item
-            for item in pandora_manifest.get("evidence", [])
+            for item in stateful_manifest.get("evidence", [])
             if item.get("kind") == "network_request"
-            and item.get("selector_id") == "pandora_conversation"
+            and item.get("selector_id") == "stateful_stream"
         )
         if source_evidence.get("request_ids", {}).get("reqid") in {
             None,
@@ -469,7 +469,7 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
             GetRequestShapeRequest(
                 operation="get_request_shape",
                 payload={
-                    "experiment_id": pandora_capture.experiment_id,
+                    "experiment_id": stateful_capture.experiment_id,
                     "evidence_id": source_evidence["evidence_id"],
                 },
             )
@@ -480,9 +480,9 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
             else {}
         )
         for expected_pointer in [
-            "/messages/0/id",
-            "/messages/0/content/parts/0",
-            "/parent_message_id",
+            "/events/0/id",
+            "/events/0/payload/parts/0",
+            "/parent_event_id",
             "/tracking_id",
         ]:
             if expected_pointer not in shape_paths:
@@ -493,16 +493,16 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
                 operation="replay_request",
                 payload={
                     "session_id": SESSION_ID,
-                    "objective": "Pandora-like control replay",
-                    "source_experiment_id": pandora_capture.experiment_id,
+                    "objective": "stateful stream control replay",
+                    "source_experiment_id": stateful_capture.experiment_id,
                     "source_evidence_id": source_evidence["evidence_id"],
                     "replay_mode": "control",
                     "mutations": [],
                     "volatile_bindings": [
                         {
-                            "binding_id": "message_id",
+                            "binding_id": "event_id",
                             "target": "json_pointer",
-                            "path": "/messages/0/id",
+                            "path": "/events/0/id",
                             "generator": "uuid4",
                         }
                     ],
@@ -524,11 +524,11 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
                         "console_errors": True,
                     },
                     "series": {
-                        "analysis_series_id": "pandora-fixture-series",
+                        "analysis_series_id": "stateful-stream-fixture-series",
                         "scenario_type": "control_replay",
-                        "predecessor_experiment_id": pandora_capture.experiment_id,
+                        "predecessor_experiment_id": stateful_capture.experiment_id,
                         "sequence_index": 2,
-                        "conversation_key": "conversation-fixture",
+                        "conversation_key": "stateful-stream-fixture",
                     },
                 },
             )
@@ -580,7 +580,7 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
         control_preview = str(find_field(control_response_value, "bodyPreview") or "")
         if "literal [DONE] text" not in control_preview:
             raise AssertionError(control_response_value)
-        if "conversation_state" not in control_preview:
+        if "stream_state" not in control_preview:
             raise AssertionError(
                 "Replay reader stopped at [DONE] text inside a normal SSE event"
             )
@@ -634,7 +634,7 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
         required_manifest, required_status, required_response = await run_replay(
             mutation={
                 "type": "remove_json_path",
-                "path": "/messages/0/id",
+                "path": "/events/0/id",
             },
         )
         if required_status != 422:
@@ -705,13 +705,6 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
             != "validation_rejection"
         ):
             raise AssertionError(required_manifest)
-        if (
-            required_manifest.get("replay_response_classification", {}).get(
-                "conclusion"
-            )
-            != "required"
-        ):
-            raise AssertionError(required_manifest)
         control_spec = json.loads(
             (
                 evidence_root
@@ -730,30 +723,26 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
                 / "request-spec.json"
             ).read_text(encoding="utf-8")
         )
-        control_message_id = json.loads(control_spec["body"]["text"])["messages"][0][
-            "id"
-        ]
-        tracking_message_id = json.loads(tracking_spec["body"]["text"])["messages"][0][
-            "id"
-        ]
-        if control_message_id == tracking_message_id:
-            raise AssertionError("fresh_equivalent message IDs were reused")
+        control_event_id = json.loads(control_spec["body"]["text"])["events"][0]["id"]
+        tracking_event_id = json.loads(tracking_spec["body"]["text"])["events"][0]["id"]
+        if control_event_id == tracking_event_id:
+            raise AssertionError("fresh_equivalent event IDs were reused")
 
         same_value_control = await service.run(
             ReplayRequestRequest(
                 operation="replay_request",
                 payload={
                     "session_id": SESSION_ID,
-                    "objective": "prove duplicate message IDs invalidate a pair",
-                    "source_experiment_id": pandora_capture.experiment_id,
+                    "objective": "prove duplicate event IDs invalidate a pair",
+                    "source_experiment_id": stateful_capture.experiment_id,
                     "source_evidence_id": source_evidence["evidence_id"],
                     "replay_mode": "control",
                     "mutations": [],
                     "volatile_bindings": [
                         {
-                            "binding_id": "message_id",
+                            "binding_id": "event_id",
                             "target": "json_pointer",
-                            "path": "/messages/0/id",
+                            "path": "/events/0/id",
                             "generator": "uuid4",
                             "reuse_policy": "same_value",
                         }
@@ -920,7 +909,8 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
             "status": "passed",
             "experiment_id": captured.experiment_id,
             "manifest_relative_path": manifest_relative,
-            "objective_integrity": manifest.get("objective_integrity"),
+            "execution_integrity": manifest.get("execution_integrity"),
+            "evidence_integrity": manifest.get("evidence_integrity"),
             "raw_bytes": len(expected_raw),
             "raw_sha256": expected_sha,
             "trace_count": len(manifest.get("trace_paths") or []),
@@ -930,58 +920,53 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
             ),
             "collector_stopped": health.get("collector_stopped"),
             "sequential_request_ids": matched_ids[-2:],
-            "pandora_source_experiment_id": pandora_capture.experiment_id,
-            "pandora_source_evidence_id": source_evidence["evidence_id"],
-            "pandora_control_experiment_id": control.experiment_id,
-            "pandora_control_status": control_manifest.get("replay_http_status"),
-            "pandora_control_done_marker_observed": find_field(
+            "stateful_source_experiment_id": stateful_capture.experiment_id,
+            "stateful_source_evidence_id": source_evidence["evidence_id"],
+            "stateful_control_experiment_id": control.experiment_id,
+            "stateful_control_status": control_manifest.get("replay_http_status"),
+            "stateful_control_done_marker_observed": find_field(
                 control_response_value,
                 "doneMarkerObserved",
             ),
-            "pandora_control_termination_reason": find_field(
+            "stateful_control_termination_reason": find_field(
                 control_response_value,
                 "terminationReason",
             ),
-            "pandora_setup_flow_inherited": True,
-            "pandora_tracking_replay_status": tracking_status,
-            "pandora_tracking_mutation_effective": tracking_manifest.get(
+            "stateful_setup_flow_inherited": True,
+            "stateful_tracking_replay_status": tracking_status,
+            "stateful_tracking_mutation_effective": tracking_manifest.get(
                 "mutation_assessment", {}
             ).get("mutation_effective"),
-            "pandora_tracking_non_target_equivalent": tracking_manifest.get(
+            "stateful_tracking_non_target_equivalent": tracking_manifest.get(
                 "mutation_assessment", {}
             ).get("non_target_fields_equivalent"),
-            "pandora_tracking_environment_status": tracking_manifest.get(
+            "stateful_tracking_environment_status": tracking_manifest.get(
                 "pair_environment_comparison", {}
             ).get("status"),
-            "pandora_tracking_observed_environment_equivalent": tracking_manifest.get(
+            "stateful_tracking_observed_environment_equivalent": tracking_manifest.get(
                 "pair_environment_comparison", {}
             ).get("observed_dimensions_equivalent"),
-            "pandora_tracking_done_marker_observed": find_field(
+            "stateful_tracking_done_marker_observed": find_field(
                 tracking_response,
                 "doneMarkerObserved",
             ),
-            "pandora_fresh_message_ids_differ": (
-                control_message_id != tracking_message_id
-            ),
-            "pandora_required_replay_status": required_status,
-            "pandora_required_mutation_effective": required_manifest.get(
+            "stateful_fresh_event_ids_differ": control_event_id != tracking_event_id,
+            "stateful_required_replay_status": required_status,
+            "stateful_required_mutation_effective": required_manifest.get(
                 "mutation_assessment", {}
             ).get("mutation_effective"),
-            "pandora_required_protocol_rejection": required_manifest.get(
+            "stateful_required_protocol_rejection": required_manifest.get(
                 "protocol_rejection_observed"
             ),
-            "pandora_required_response_classification": required_manifest.get(
+            "stateful_required_response_classification": required_manifest.get(
                 "replay_response_classification", {}
             ).get("classification"),
-            "pandora_same_value_duplicate_status": same_value_manifest.get(
+            "stateful_same_value_duplicate_status": same_value_manifest.get(
                 "replay_http_status"
             ),
-            "pandora_same_value_duplicate_classification": same_value_manifest.get(
+            "stateful_same_value_duplicate_classification": same_value_manifest.get(
                 "replay_response_classification", {}
             ).get("classification"),
-            "pandora_same_value_duplicate_objective": same_value_manifest.get(
-                "objective_integrity"
-            ),
             "cancellation_status": cancellation_manifest.get("status"),
             "cancellation_step_status": cancellation_steps[0].get("status"),
             "cancellation_collector_cleanup": cancellation_health.get(

@@ -20,8 +20,8 @@ class ToolchainValidationHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     fixture_root: Path
     slow_started_event: threading.Event
-    conversation_lock: threading.Lock
-    conversation_states: dict[str, dict[str, object]]
+    stream_state_lock: threading.Lock
+    stream_states: dict[str, dict[str, object]]
 
     def handle(self) -> None:
         try:
@@ -37,7 +37,7 @@ class ToolchainValidationHandler(BaseHTTPRequestHandler):
                 "text/html; charset=utf-8",
                 extra_headers={
                     "Set-Cookie": (
-                        "pandora_session=fixture-session; Path=/; HttpOnly; SameSite=Lax"
+                        "fixture_session=fixture-session; Path=/; HttpOnly; SameSite=Lax"
                     )
                 },
             )
@@ -75,8 +75,8 @@ class ToolchainValidationHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         path = urlsplit(self.path).path
-        if path == "/api/pandora/conversation":
-            self._handle_pandora_conversation()
+        if path == "/api/stateful-stream":
+            self._handle_stateful_stream()
             return
         if path != "/api/echo":
             self.send_error(HTTPStatus.NOT_FOUND)
@@ -98,11 +98,11 @@ class ToolchainValidationHandler(BaseHTTPRequestHandler):
             }
         )
 
-    def _handle_pandora_conversation(self) -> None:
+    def _handle_stateful_stream(self) -> None:
         cookie = self.headers.get("Cookie", "")
         authorization = self.headers.get("Authorization", "")
         if (
-            "pandora_session=fixture-session" not in cookie
+            "fixture_session=fixture-session" not in cookie
             and authorization != "Bearer fixture-token"
         ):
             self._send_json(
@@ -120,28 +120,28 @@ class ToolchainValidationHandler(BaseHTTPRequestHandler):
                 HTTPStatus.BAD_REQUEST,
             )
             return
-        messages = payload.get("messages") if isinstance(payload, dict) else None
-        message = (
-            messages[0]
-            if isinstance(messages, list) and messages and isinstance(messages[0], dict)
+        events = payload.get("events") if isinstance(payload, dict) else None
+        event = (
+            events[0]
+            if isinstance(events, list) and events and isinstance(events[0], dict)
             else None
         )
-        author = message.get("author") if isinstance(message, dict) else None
-        content = message.get("content") if isinstance(message, dict) else None
-        parts = content.get("parts") if isinstance(content, dict) else None
+        actor = event.get("actor") if isinstance(event, dict) else None
+        event_payload = event.get("payload") if isinstance(event, dict) else None
+        parts = event_payload.get("parts") if isinstance(event_payload, dict) else None
         required = {
-            "conversation_id": payload.get("conversation_id")
+            "stream_id": payload.get("stream_id")
             if isinstance(payload, dict)
             else None,
-            "model": payload.get("model") if isinstance(payload, dict) else None,
-            "messages[0].id": message.get("id") if isinstance(message, dict) else None,
-            "messages[0].author.role": (
-                author.get("role") if isinstance(author, dict) else None
+            "variant": payload.get("variant") if isinstance(payload, dict) else None,
+            "events[0].id": event.get("id") if isinstance(event, dict) else None,
+            "events[0].actor.kind": (
+                actor.get("kind") if isinstance(actor, dict) else None
             ),
-            "messages[0].content.parts[0]": (
+            "events[0].payload.parts[0]": (
                 parts[0] if isinstance(parts, list) and parts else None
             ),
-            "parent_message_id": payload.get("parent_message_id")
+            "parent_event_id": payload.get("parent_event_id")
             if isinstance(payload, dict)
             else None,
         }
@@ -156,66 +156,66 @@ class ToolchainValidationHandler(BaseHTTPRequestHandler):
                 HTTPStatus.UNPROCESSABLE_ENTITY,
             )
             return
-        conversation_id = str(payload["conversation_id"])
-        user_message_id = str(message["id"])
-        parent_message_id = str(payload["parent_message_id"])
-        assistant_message_id = f"assistant-{user_message_id}"
-        with self.conversation_lock:
-            state = self.conversation_states.setdefault(
-                conversation_id,
+        stream_id = str(payload["stream_id"])
+        client_event_id = str(event["id"])
+        parent_event_id = str(payload["parent_event_id"])
+        server_event_id = f"server-{client_event_id}"
+        with self.stream_state_lock:
+            state = self.stream_states.setdefault(
+                stream_id,
                 {
-                    "conversation_id": conversation_id,
-                    "mapping": {},
-                    "current_node": parent_message_id,
+                    "stream_id": stream_id,
+                    "nodes": {},
+                    "current_node": parent_event_id,
                 },
             )
-            mapping = state["mapping"]
-            assert isinstance(mapping, dict)
-            if user_message_id in mapping:
+            nodes = state["nodes"]
+            assert isinstance(nodes, dict)
+            if client_event_id in nodes:
                 self._send_json(
                     {
                         "ok": False,
-                        "error": "duplicate-message-id",
-                        "field": "messages[0].id",
+                        "error": "duplicate-event-id",
+                        "field": "events[0].id",
                     },
                     HTTPStatus.CONFLICT,
                 )
                 return
-            mapping[user_message_id] = {
-                "id": user_message_id,
-                "parent": parent_message_id,
-                "role": author["role"],
-                "content": parts,
+            nodes[client_event_id] = {
+                "id": client_event_id,
+                "parent": parent_event_id,
+                "kind": actor["kind"],
+                "parts": parts,
             }
-            mapping[assistant_message_id] = {
-                "id": assistant_message_id,
-                "parent": user_message_id,
-                "role": "assistant",
-                "content": ["fixture answer"],
+            nodes[server_event_id] = {
+                "id": server_event_id,
+                "parent": client_event_id,
+                "kind": "server",
+                "parts": ["fixture answer"],
             }
-            state["current_node"] = assistant_message_id
+            state["current_node"] = server_event_id
             state_snapshot = json.loads(json.dumps(state))
         events = (
             {
-                "type": "message_start",
-                "conversation_id": conversation_id,
-                "message": {
-                    "id": assistant_message_id,
-                    "parent_id": user_message_id,
-                    "author": {"role": "assistant"},
+                "type": "item_start",
+                "stream_id": stream_id,
+                "item": {
+                    "id": server_event_id,
+                    "parent_id": client_event_id,
+                    "actor": {"kind": "server"},
                 },
             },
             {
-                "type": "message_delta",
-                "message_id": assistant_message_id,
+                "type": "item_delta",
+                "event_id": server_event_id,
                 "delta": "fixture answer contains literal [DONE] text",
             },
             {
-                "type": "conversation_state",
-                "conversation_id": conversation_id,
-                "current_node": assistant_message_id,
-                "mapping": state_snapshot["mapping"],
-                "model": payload["model"],
+                "type": "stream_state",
+                "stream_id": stream_id,
+                "current_node": server_event_id,
+                "nodes": state_snapshot["nodes"],
+                "variant": payload["variant"],
                 "optional_timezone_seen": "timezone_offset_min" in payload,
                 "tracking_seen": "tracking_id" in payload,
             },
@@ -301,8 +301,8 @@ def start_server(
         {
             "fixture_root": fixture_root,
             "slow_started_event": threading.Event(),
-            "conversation_lock": threading.Lock(),
-            "conversation_states": {},
+            "stream_state_lock": threading.Lock(),
+            "stream_states": {},
         },
     )
     server = ThreadingHTTPServer((host, port), handler_type)
