@@ -1,103 +1,118 @@
-# web_rev_action 设计与演进计划
+# web_rev_action 项目设计与演进计划
 
 ## 1. 文档定位
 
-`web_rev_action` 是面向网页版 GPT Action 的单用户、Windows 优先网页协议实验后端。它把浏览器操作、网络取证、请求重放和本地证据分析组织成结构化 Action，使 GPT 能在人工监督下研究持续变化的网页协议。
+`web_rev_action` 是面向网页版 GPT Action 的网页协议实验后端。它把浏览器操作、网络证据采集、请求重放和本地分析组织为结构化 Action，使 GPT 能在人工监督下完成可重复、可审计的网页协议研究。
 
-本文只回答四个问题：
+本文只描述：
 
-1. 产品长期保持哪些不变量；
-2. 当前系统已经提供什么；
-3. 下一版通用协议实验契约应是什么；
-4. 实现应按什么顺序演进。
+- 产品目标与边界；
+- 系统架构与职责；
+- 实验、证据和 workspace 的核心模型；
+- 安全原则、验证要求和演进方向。
 
-文档优先级如下：
+文档关系：
 
 ```text
-PANDORA_REPRODUCTION.md  项目目的、实验方法和报告完成标准
-PLAN.md                 系统设计、边界和演进路线
-README.md               当前公开 Action 的使用说明
+PANDORA_REPRODUCTION.md  项目目的、实验方法和报告标准
+PLAN.md                 系统设计与演进方向
+README.md               当前使用说明
 代码、OpenAPI、测试      当前实现事实
 ```
 
-若文档与代码不一致，当前行为以代码和测试为准；设计目标以本文标注的“目标契约”为准。本文不会把尚未实现的能力写成现状。
-
-`PANDORA_REPRODUCTION.md` 描述的是一种可复用的研究方法，不是要求后端永久绑定 Pandora 的 endpoint、字段名、SSE 结束标记或错误码。
+具体缺陷、修复方案和实现细节应记录在 issue 或 PR 中，不进入本计划。
 
 ---
 
-## 2. 产品目标与边界
-
-### 2.1 产品目标
+## 2. 产品定义
 
 系统服务于以下闭环：
 
 ```text
-GPT / Skill 提出实验假设
-→ Browser Action 原子执行 capture 或 replay
-→ 后端保存可审计原始证据
-→ GPT 使用 workspace Action 分析证据
-→ Skill 综合多轮实验形成结论和报告
+GPT / Skill 提出实验目标
+→ Browser Action 执行 capture 或 replay
+→ 后端保存 manifest、evidence 和 artifact
+→ Workspace Action 读取和分析证据
+→ GPT 形成结论、报告和下一轮实验
 ```
 
-核心能力是：
+核心目标：
 
-- 在正常登录的浏览器上下文中捕获页面、网络、流、console、脚本和 initiator 证据；
-- 从受信任的 source evidence 构造 browser-context replay；
-- 支持探索性重放和严格成对单变量实验；
-- 保存稳定的 `experiment_id + evidence_id + artifact_id` 证据链；
-- 让 GPT 看到结构化事实、完整性状态和提示，而不是未经证明的协议结论；
-- 对凭据、大型正文和原始字节执行默认隐藏与有界访问。
+1. 让 GPT 通过稳定、有限、结构化的 Action 操作浏览器实验环境；
+2. 在正常浏览器上下文中采集页面、网络、流、console、脚本和 initiator 证据；
+3. 支持基线捕获、流程捕获、请求重放和成对实验；
+4. 保存稳定、可追溯的实验与证据关系；
+5. 对凭据、原始证据和大型数据执行默认保护；
+6. 如实表达成功、失败、部分完成和证据不足；
+7. 为不同站点和持续变化的网页协议保留扩展空间。
 
-### 2.2 非目标
+当前实现已经具备人工监督下的 JSON/SSE 协议实验能力。后续工作以提高通用性、证据质量、运行可靠性和 GPT 分析效率为主。
+
+### 非目标
 
 本项目不负责：
 
-- 新造浏览器自动化框架或 CDP collector；
-- 让 GPT 直接控制私有 MCP 的 start/status/stop 生命周期；
-- 绕过登录、验证码、访问控制或站点授权；
-- Git、branch、commit、PR、CI 或远程 workspace 同步；
-- 把完整 Cookie、Token、Authorization、原始二进制或大型 Base64 放入 Action JSON；
-- 在后端硬编码某个站点的 required/optional 业务结论；
-- 在证据不足时伪装成自动因果证明。
-
-### 2.3 部署边界
-
-当前部署模型保持简单：
-
-```text
-一个 analysis workspace
-一个 web_rev_action 服务进程
-一个共享 Chrome CDP endpoint
-一个 Playwright CLI 环境
-一个长期运行的私有 js-reverse-mcp
-一个活动 browser operation
-```
-
-同一 workspace 由 OS 文件锁保证单进程持有。进程内由 `RuntimeCoordinator` 原子互斥 browser operation 与受保护的 workspace mutation。系统不通过排队掩盖竞争；冲突立即返回 busy。
-
-只有需要并行实验时，才升级为每 session 独立浏览器和 collector。现阶段不通过放宽全局锁模拟并发。
+- 新造浏览器、CDP 或网络采集底层；
+- 让 GPT 直接控制私有 collector 生命周期；
+- 绕过登录、验证码、授权或站点访问控制；
+- 代替 Skill 决定具体站点的业务语义；
+- 在证据不足时生成确定性结论；
+- 管理 Git、PR、CI 或远程代码仓库；
+- 返回完整凭据、无限制正文或大型二进制；
+- 提供任意脚本执行环境；
+- 为多用户和分布式调度做过早设计。
 
 ---
 
-## 3. 分层架构
+## 3. 设计原则
+
+### 3.1 结构化 Action
+
+GPT 只调用公开 Action，不直接拼接 collector 命令、浏览器内部脚本或私有协议调用。复杂生命周期由后端原子执行。
+
+### 3.2 证据优先
+
+后端优先保存实际请求、响应、页面状态、完整性和 artifact。站点级结论由 Skill 和 GPT 综合多轮实验形成。
+
+### 3.3 当前事实与未来设计分开
+
+尚未实现的能力不能写成现状。公开行为必须能在 OpenAPI、代码、测试或真实运行结果中找到依据。
+
+### 3.4 原子实验
+
+一次 capture 或 replay 是一个完整实验事务：
+
+```text
+创建 manifest
+→ 占用资源
+→ 启动采集
+→ 执行流程
+→ 等待条件
+→ 停止采集
+→ 保存证据
+→ 写入终态 manifest
+→ 释放资源
+```
+
+失败时也应尽可能留下终态和已获得证据。
+
+### 3.5 有界输出
+
+Action 返回适合 GPT 消费的摘要。完整内容保存为 workspace artifact，通过后续读取、搜索和分页访问。
+
+### 3.6 默认安全
+
+凭据默认隐藏，原始证据默认只读，危险操作默认禁止，外部副作用不自动重试。
+
+---
+
+## 4. 系统架构
 
 ```text
 GPT
 ├── Skill Actions
-│   ├── retrieveSkillContext
-│   ├── readSkillContent
-│   └── searchSkillDocs
 ├── Browser Actions
-│   ├── inspectBrowserEvidence
-│   └── runBrowserExperiment
 └── Analysis Workspace Actions
-    ├── workspaceInspect
-    ├── workspaceSearch
-    ├── workspaceReadFiles
-    ├── workspaceWriteFile
-    ├── workspaceApplyPatch
-    └── workspaceExecPwsh
 
 web_rev_action
 ├── FastAPI / OpenAPI
@@ -110,43 +125,38 @@ web_rev_action
 
 private runtime
 ├── Chrome CDP endpoint
-├── playwright-cli subprocesses
-├── js-reverse-mcp stdio process
-└── data/analysis-workspace/
+├── Playwright CLI
+├── js-reverse-mcp
+└── analysis workspace
 ```
-
-职责必须保持分离：
 
 | 层 | 负责 | 不负责 |
 | --- | --- | --- |
-| Skill | 实验序列、研究假设、站点知识、证据解释、报告 | 拼接任意脚本、读取凭据后自行发请求 |
-| Browser Actions | 原子执行、生命周期、证据采集、通用比较和完整性 | 决定站点字段必需性、写死 Pandora 协议 |
-| Workspace Actions | 有界读取、搜索、派生分析、报告和脚本 | 控制浏览器生命周期、改写原始证据 |
-| Adapters | 调用 Playwright 与 js-reverse-mcp，转换上游结构 | 解释用户业务意图 |
-
-后端应尽量返回中性观察。Skill 可以结合多个实验、站点上下文和用户目标形成推断。
+| Skill | 实验顺序、研究目标、站点知识、证据解释、报告 | 控制 collector、读取凭据后自行发请求 |
+| Browser Actions | session、capture/replay、证据持久化、timeout/cancel/cleanup | 决定站点业务结论 |
+| Workspace Actions | 读取、搜索、派生分析、报告和辅助脚本 | 控制浏览器生命周期、改写原始证据 |
+| Adapters | 调用 Playwright 与 js-reverse-mcp，规范化结果 | 解释研究目标 |
 
 ---
 
-## 4. 当前公开契约
+## 5. 公开 Action
 
-当前系统公开 11 个 operationId：
+### Skill Actions
 
-| operationId | 类型 | 作用 |
-| --- | --- | --- |
-| `retrieveSkillContext` | read-only | 发现或加载 Skill |
-| `readSkillContent` | read-only | 读取 Skill 文件 |
-| `searchSkillDocs` | read-only | 搜索 Skill 文档 |
-| `inspectBrowserEvidence` | read-only | 查询 session、experiment 和证据摘要 |
-| `runBrowserExperiment` | consequential | 打开/关闭 session，执行或取消实验 |
-| `workspaceInspect` | read-only | 返回目录树、搜索结果和片段 |
-| `workspaceSearch` | read-only | 使用 ripgrep 搜索文本 |
-| `workspaceReadFiles` | read-only | 按行读取 UTF-8 文件 |
-| `workspaceWriteFile` | consequential | 创建或替换文本文件 |
-| `workspaceApplyPatch` | consequential | 应用受控文本补丁 |
-| `workspaceExecPwsh` | consequential | 在分析目录运行 PowerShell 7 |
+```text
+retrieveSkillContext
+readSkillContent
+searchSkillDocs
+```
 
-`runBrowserExperiment` 当前支持：
+### Browser Actions
+
+```text
+inspectBrowserEvidence
+runBrowserExperiment
+```
+
+`runBrowserExperiment` 当前包含：
 
 ```text
 open_session
@@ -158,107 +168,142 @@ close_session
 cancel_experiment
 ```
 
-`inspectBrowserEvidence` 当前支持：
+`inspectBrowserEvidence` 用于读取 session、experiment、network、stream、script、initiator 和 console 证据摘要。
+
+### Workspace Actions
 
 ```text
-get_session
-list_experiments
-get_experiment
-get_stream_status
-list_evidence
-get_network_evidence
-get_request_shape
-get_request_initiator
-search_scripts
-get_script_source
-list_console_errors
+workspaceInspect
+workspaceSearch
+workspaceReadFiles
+workspaceWriteFile
+workspaceApplyPatch
+workspaceExecPwsh
 ```
 
-OpenAPI 使用 discriminated union。每个 operation 和 flow action 只能接受自己的字段组合。
+OpenAPI 使用严格模型和 discriminated union：
 
-当前 replay 只支持 `control` 与 `treatment`，mutation 只支持 remove/replace，且 stream 逻辑带有 SSE 和 `[DONE]` 默认值。这些是当前实现事实，不是长期设计不变量。
+- 每个 operation 只接受自己的 payload；
+- 每种 flow step 只接受相关字段；
+- read-only 与 consequential Action 明确区分；
+- 新能力先定义输入、边界和失败语义，再加入公开契约。
 
 ---
 
-## 5. 原子实验模型
+## 6. 运行模型
 
-### 5.1 Session
+当前部署目标是单用户、Windows 优先、本地运行：
 
-Session 保存浏览器 endpoint、Playwright page、js-reverse stable page ID 和服务实例之间的稳定关联。状态为：
+```text
+一个 web_rev_action 进程
+一个 analysis workspace
+一个共享 Chrome CDP endpoint
+一个 Playwright CLI 环境
+一个长期运行的 js-reverse-mcp
+一个活动 browser operation
+```
+
+`RuntimeCoordinator` 负责 browser operation 互斥、session 与 experiment reservation、workspace mutation 冲突控制，以及 shutdown 和取消协调。
+
+同一 workspace 由单个服务实例持有，并通过 OS 文件锁阻止多个进程同时写入。资源被占用时返回明确 busy 状态，不使用隐式排队掩盖竞争。
+
+Playwright、PowerShell、ripgrep 和 MCP 子进程必须在 timeout、cancel 与 shutdown 时清理完整 Windows 进程树。外部副作用发生超时后，不假设其未执行，也不自动重试。
+
+未来只有在明确需要并行实验时，才考虑每 session 独立浏览器和 collector。
+
+---
+
+## 7. Session 与 Experiment
+
+### Session
+
+Session 保存浏览器 endpoint、Playwright page、collector page identity 和 service instance 之间的稳定关联。
+
+状态：
 
 ```text
 open | closed | stale
 ```
 
-服务重启后，旧实例创建的 open session 变为 stale。每次 capture、replay 和 Stop 后都重新检查页面对齐。
+服务重启后，旧实例创建的活动 session 不能继续作为有效 session 使用。
 
-### 5.2 Experiment
+### Experiment
 
-Experiment 生命周期为：
+Experiment 是最小可审计运行单元。
+
+状态：
 
 ```text
 running | completed | partial | failed | interrupted
 ```
 
-`running` manifest 必须在第一条浏览器副作用之前写入。后台 job 是默认模式；短实验可显式使用 sync，但两者共享同一原子实现和 reservation。
-
-一次 capture 的基本顺序：
+每个 experiment 至少记录：
 
 ```text
-reserve runtime
-→ write running manifest
-→ align page
-→ start Trace / collector
-→ execute flow
-→ wait for causal condition
-→ stop collector / Trace
-→ persist bounded evidence
-→ write terminal manifest
-→ release reservation
+experiment_id
+session_id
+operation
+objective
+input summary
+steps
+capture metadata
+evidence
+artifacts
+warnings
+errors
+terminal status
 ```
 
-需要捕获页面初始化行为时，`navigate` 必须是 flow 的第一条显式动作，不能在 collector 启动前通过 `target.start_url` 隐式导航。
+长实验默认使用后台 job；同步和后台模式共享同一原子实现、reservation 和终态规则。
 
-一次 replay 的基本顺序：
-
-```text
-validate source experiment and evidence
-→ build replay plan from exact snapshot
-→ start experiment capture
-→ run setup_flow
-→ align page and record pre-dispatch environment
-→ dispatch browser-context request
-→ correlate exact outbound request
-→ collect response and verification evidence
-→ write comparison and terminal manifest
-```
-
-GPT 不直接协调 collector 生命周期，也不能让 replay 接受任意本地文件路径。
-
-### 5.3 Deadline、取消与清理
-
-每个实验只有一个绝对执行 deadline。Adapter 不能在每个阶段重新获得完整 timeout。
-
-清理优先级固定为：
-
-```text
-stop collector
-→ stop Trace
-→ write terminal manifest
-→ release reservation
-```
-
-Playwright、MCP、PowerShell 和 ripgrep 的 timeout、取消与 shutdown 都必须终止 Windows 进程树。已发送到浏览器或远端站点的副作用不保证可回滚；发生在执行型 step 内的取消应记录为 `canceled_outcome_unknown`，不得自动重试。
-
-MCP side-effect 调用发生 timeout 或 cancellation 时，旧 transport generation 必须失效，下一次调用建立新 generation；副作用调用不得自动重试。
+每个实验只有一个绝对 deadline。取消时应尽可能停止采集、保存已有证据、写入终态 manifest 并释放资源。已经发出的浏览器或网络副作用可能无法回滚，结果中必须保留这种不确定性。
 
 ---
 
-## 6. 证据与完整性模型
+## 8. Capture 与 Replay
 
-### 6.1 证据优先于摘要
+### Capture
 
-Action 返回有界摘要，完整内容保存在：
+Capture 用于记录页面和协议行为，可执行：
+
+- 基线采集；
+- 页面导航和交互；
+- 页面或网络条件等待；
+- 网络、流、脚本和 initiator 证据保存；
+- console、trace、snapshot 和 screenshot 记录。
+
+需要观察页面初始化行为时，采集必须在导航之前启动。
+
+### Replay
+
+Replay 从受信任的 source evidence 构建请求，在当前浏览器上下文中执行，并保存：
+
+- 重放计划；
+- 实际 outbound request；
+- response 与 stream 证据；
+- 页面前后状态；
+- 实验比较信息；
+- 验证流程结果。
+
+Replay 请求必须可追溯到已有 experiment 和 evidence，不能接受任意本地文件作为来源。
+
+### Primary evidence
+
+每次实验可以声明 primary request matcher 和预期数量。Supporting request 可用于诊断，但不能替代 primary objective。
+
+### 普通与流式响应
+
+系统应保存原始网络事实，并在此基础上提供协议解析。解析结果不能替代 raw evidence。
+
+### 成对实验
+
+成对实验用于比较 Control 与 Treatment。系统保存输入、目标变化、非目标变化和环境信息；是否足以形成站点级结论，由 Skill 根据实验目的和全部证据判断。
+
+---
+
+## 9. 证据与 Workspace
+
+目录结构：
 
 ```text
 data/analysis-workspace/
@@ -275,450 +320,210 @@ data/analysis-workspace/
   notes/
 ```
 
-原始证据路径由后端管理并视为只读：
+跨实验引用使用：
 
 ```text
-sessions/
-experiments/*/manifest.json
-experiments/*/js-reverse/
-experiments/*/playwright/
+experiment_id
+evidence_id
+artifact_id
 ```
 
-Workspace 写入只允许派生目录。实验运行期间，禁止修改该实验目录，并暂停会与 collector 竞争的 PowerShell mutation。
+临时请求编号、collector 内部 ID 和文件顺序不能作为长期主键。
 
-核心引用使用：
+原始 evidence、trace、network export 和 manifest 由后端写入并视为只读。Workspace Action 只能在允许目录创建派生分析、报告、笔记和辅助脚本。实验运行期间禁止修改该实验目录。
 
-```text
-experiment_id + evidence_id + artifact_id
-```
+Action 返回有界摘要，包括数量、状态、完整性、preview 和 artifact 引用。大型正文、raw stream、二进制和 Base64 内容保存在 artifact 中。
 
-临时 reqid、数字 capture ID 或目录顺序不能作为跨实验主键。
+Manifest 必须表达：
 
-### 6.2 目标完整性契约
+- 实验是否执行到预期阶段；
+- collector 是否正常；
+- primary request 是否捕获；
+- request/response/stream 证据是否完整；
+- artifact 是否持久化；
+- cleanup 是否完成；
+- 实验是否适合继续人工分析。
 
-下一版必须把“执行是否完整”和“是否足以做因果推断”拆开：
-
-```text
-execution_integrity:
-  complete | partial | failed
-
-evidence_integrity:
-  complete | partial | failed
-
-causal_comparability:
-  observed_equivalent | different | insufficient | not_applicable
-
-inference_eligibility:
-  eligible | supervised_only | ineligible
-```
-
-含义：
-
-- `execution_integrity`：请求是否实际发送，capture、cleanup 和 manifest 是否完成；
-- `evidence_integrity`：目标所需 request/response/stream/artifact 是否完整；
-- `causal_comparability`：Control 与 Treatment 的必需环境和非目标字段是否可比较；
-- `inference_eligibility`：后端是否具备自动因果推断资格。
-
-示例：请求、抓包和 artifact 全部完成，但站点当前节点不可观察：
-
-```text
-execution_integrity = complete
-evidence_integrity = complete
-causal_comparability = insufficient
-inference_eligibility = supervised_only
-```
-
-这不应再被压成整体 `partial`。
-
-当前 `objective_integrity` 在迁移期保留为兼容字段，但不再作为唯一真相。完成迁移后，它只可作为上述维度的摘要，不能反向覆盖具体维度。
-
-### 6.3 Primary 与 supporting evidence
-
-每次实验显式声明 primary matcher 和预期数量。Supporting request 可以用于诊断，但不能满足 primary objective。
-
-等待条件必须基于 request-state checkpoint，而不是只比较 collector version。Raw 与 semantic 事件使用独立游标。分页必须完整遍历后再锁定具体 request ID。
+完整性信息必须进入 manifest，不能只存在于日志。
 
 ---
 
-## 7. 通用 Capture 目标契约
+## 10. 安全与数据边界
 
-当前 capture 已能完成 JSON/SSE 人工监督实验。下一版需要去除 SSE 专用默认值，把响应方式建模为通用协议事实。
+### 凭据
 
-### 7.1 响应模式
+Cookie、Authorization、CSRF、Set-Cookie 和类似字段默认：
 
-目标模型：
+- 不进入普通 Action 响应；
+- 不写入公开报告；
+- 不允许通过 workspace 搜索直接泄露；
+- 只在后端内部完成必要处理；
+- 以 redacted、shape 或 hash 形式暴露。
 
-```text
-response_mode:
-  auto | ordinary | sse | ndjson | raw_stream | websocket
-```
+### 原始证据
 
-- `auto` 根据实际网络证据选择采集方式，但不能仅凭一个 Content-Type 推断全部语义；
-- `ordinary` 保存普通完整响应；
-- `sse` 解析 SSE event，同时保留 raw bytes；
-- `ndjson` 按换行 JSON 记录解析结果与原始边界；
-- `raw_stream` 只保证有界原始 chunk 和终态；
-- `websocket` 作为独立传输类型，不伪装成 fetch stream。
+原始证据不能被 workspace write/patch 改写。大型与二进制内容不能直接嵌入 Action JSON。
 
-当前尚未完整实现 NDJSON、通用 raw stream 和 WebSocket replay；它们属于目标契约。
+### 浏览器管理字段
 
-### 7.2 终止条件
+由浏览器管理或涉及安全边界的字段不默认开放修改。新增能力必须说明安全范围和审计方式。
 
-目标模型：
+### PowerShell
 
-```text
-terminal_conditions:
-  exact_sse_data
-  event_predicate
-  byte_pattern
-  network_close
-  idle_window
-  manual_stop
-```
+`workspaceExecPwsh` 是受控分析工具，不是安全沙箱。它只能在 analysis workspace 内运行，并受到命令、路径、timeout、输出和进程树限制。
 
-默认 marker 为 `null`。Pandora Skill 可以显式传 `[DONE]`，但后端不能把它当作所有 SSE 的永久约定。
+### 授权范围
 
-终止结果必须记录：
-
-```text
-condition type
-matched source
-matched request ID
-terminal reason
-truncated flag
-bytes observed
-event/chunk range
-```
-
-### 7.3 Primary request 过滤
-
-`mime_types=[]` 表示不使用 MIME 过滤。没有 Content-Type、204、下载、异常错误响应或旧接口都必须允许 capture/replay。
-
-URL、method、resource type、MIME 和 in-flight 过滤都是可选 selector，不应因为某个可观察维度缺失而产生模型校验错误。
+所有实验只针对用户有权访问和测试的账号、页面与服务。
 
 ---
 
-## 8. 通用 Replay 目标契约
+## 11. 可观测性与失败语义
 
-### 8.1 三种模式
+Manifest 是实验事实的主记录，应包含输入、生命周期、adapter 与 collector 状态、page alignment、step 结果、网络与流摘要、evidence、artifact、warning、error 和 cleanup 状态。
 
-目标模型：
-
-```text
-replay_mode = control
-  无 mutation，建立可工作的基线和不可变 pair protocol
-
-replay_mode = treatment
-  恰好一个 mutation，用于严格因果比较
-
-replay_mode = exploratory
-  允许 0..N mutations，用于寻找新版协议的可工作请求
-  inference_eligibility 固定为 ineligible
-```
-
-探索模式解决“新版同时增加字段、删除旧字段、更新 header 或 query 才能工作”的情况。找到可工作请求后，再建立严格 Control/Treatment 验证单变量。
-
-### 8.2 Mutation
-
-目标 mutation 使用受限 RFC 6902 风格语义：
+至少区分：
 
 ```text
-add | remove | replace
+输入或 schema 错误
+session 无效
+运行资源 busy
+页面对齐失败
+adapter 或 collector 失败
+实验条件未满足
+证据不完整
+timeout
+cancel
+cleanup 失败
 ```
 
-适用目标：
+以下情况不能报告为完整成功：
 
-```text
-JSON Pointer
-header occurrence
-query occurrence
-```
-
-JSON add 支持普通 pointer 和数组 `/-`，继续禁止 wildcard。严格 Treatment 只允许一个 operation；Exploratory 可允许多个 operation。
-
-重复 header/query 必须声明 occurrence：
-
-```text
-first | last | all | index
-```
-
-`all` 保留完整有序值列表。不能把重复值无声压缩成一个值。
-
-### 8.3 Setup 输出与动态绑定
-
-`setup_flow` 不能只制造页面副作用，还需要受控输出绑定：
-
-```text
-setup_outputs:
-  - binding_id
-    source: network_response_json | page_json | selector_value
-    selector
-    pointer
-```
-
-Replay binding 可以引用 setup 输出，将新 conversation ID、current node、CSRF 值或页面 nonce 注入请求。该能力必须通过声明式 selector 实现，不开放任意 JavaScript。
-
-现有 `generated` 与 `preserve_source` binding 继续保留，并扩展 occurrence 语义。
-
-### 8.4 Replay request 精确关联
-
-候选 outbound request 必须同时满足：
-
-```text
-actual method == replay spec method
-normalized actual URL == replay spec URL
-full mutated query matches
-body fingerprint matches（有 body 时）
-dispatch time is inside bounded window
-```
-
-零个或多个候选都 fail closed。GET、HEAD 或无 body 请求不能仅靠 selector ID 和时间窗口关联。
-
-URL normalization 只能处理明确等价的编码形式，不能丢弃 query 顺序或参数重复。
-
-### 8.5 非目标字段比较
-
-默认保留 wire 顺序：
-
-```text
-normalization:
-  query_order: preserve | ignore
-  header_order: preserve | ignore
-```
-
-默认值均为 `preserve`。只有 Skill 明确知道站点语义与顺序无关时才使用 `ignore`。
-
-比较结果必须分别记录：
-
-```text
-target delta
-volatile binding effectiveness
-non-target body equivalence
-non-target header equivalence
-non-target query equivalence
-transport semantics equivalence
-```
-
-### 8.6 环境要求
-
-Control 声明环境维度：
-
-```text
-environment_requirements:
-  required:
-    - page_origin
-    - request_context
-  advisory:
-    - page_url
-    - conversation_current_node
-    - critical_bundle_sha256
-```
-
-默认 required 只包含后端能稳定观察的维度。Current node、bundle hash 和站点新增状态标识不应永久硬编码为必需维度。Skill 可以按站点和实验目的提升某个维度。
-
-请求上下文 header 支持配置：
-
-```text
-context_header_names
-```
-
-默认覆盖 Cookie、Authorization、CSRF/XSRF；Skill 可增加 `X-API-Key`、设备 token、attestation 或 challenge header。Manifest 只保存本地 SHA-256 和完整性状态，不保存原值。
-
-### 8.7 Fetch 传输语义
-
-Replay 必须显式记录实际 transport 语义：
-
-```text
-replay_transport_semantics:
-  credentials
-  redirect
-  cache
-  referrer_policy
-  keepalive
-  mode
-  priority
-  source_fetch_options_known
-```
-
-当前固定 `credentials=include`、`redirect=follow` 的行为必须在 manifest 中如实说明。后续只开放少量安全、可验证的 fetch options。Wire 字段等价不能自动解释为前端请求行为完全等价。
-
-### 8.8 中性响应观察
-
-后端不再直接把单次响应定性为 `required`、`candidate_optional` 或 `constrained_value`。目标返回：
-
-```text
-observations:
-  http_status
-  response_content_type
-  mutation_effective
-  target_reference_strength
-  raw_validation_path
-  normalized_validation_path
-  structured_error_code
-  response_contract_match
-  stream_terminal_reason
-
-inference_hints:
-  validation_like
-  conflict_like
-  authentication_like
-  rate_limit_like
-  server_failure_like
-  redirect_like
-  success_like
-  signals_conflict
-```
-
-固定 HTTP 状态或 validation code 集可以作为可替换 hint profile，但不是后端最终事实。
-
-精确 JSON Pointer 按原样保留。只有框架式 location 数组才允许按可配置规则去掉 transport wrapper。`missing` 与 `not_required` 等相反信号同时出现时，必须记录 `signals_conflict=true`，交给 GPT/Skill 判断。
+- 目标请求未实际发出；
+- primary evidence 缺失；
+- artifact 保存失败；
+- cleanup 未完成；
+- 只得到 supporting request；
+- 只有截断 preview；
+- 外部副作用结果未知。
 
 ---
 
-## 9. 凭据、安全与数据边界
+## 12. 演进路线
 
-完整 request/response headers 可能包含 Cookie、Authorization、CSRF 和 Set-Cookie。系统遵守：
+### 阶段 A：巩固现有闭环
 
-- 默认只返回 redacted summary、shape 和 hash；
-- credential artifact 正文默认对 inspect/search/read 隐藏；
-- replay 可在后端内部使用凭据，但不把凭据放入 Skill、Action 响应或报告；
-- 原始 evidence 不允许被 workspace write/patch 改写；
-- 大型 binary、Base64、raw stream 不通过 Action JSON 返回；
-- PowerShell 网络和危险命令检查是本地策略，不宣称为安全沙箱；
-- 所有实验只针对用户有权访问的账号和站点。
+保持当前 JSON/SSE 人工监督实验稳定可用：
 
-Browser-managed Cookie、Origin、Referer、Host、Content-Length 和 `Sec-*` header 默认禁止 mutation。若未来开放例外，必须是明确、受控且可审计的专用能力。
+- session 和 page alignment 稳定；
+- capture/replay 生命周期一致；
+- terminal manifest 完整；
+- 原始证据与派生文件边界清楚；
+- timeout、cancel 和 shutdown 可验证；
+- OpenAPI、README 与实现一致。
 
----
+### 阶段 B：提高协议通用性
 
-## 10. 实施路线
+减少站点专用假设：
 
-### P0：解除旧协议假设，修正事实模型
+- 扩展请求、响应和流式协议表达；
+- 增强请求修改与动态状态处理；
+- 提高重放关联和实验比较可信度；
+- 完整保存网络顺序、重复值和传输信息；
+- 允许 Skill 声明站点特有实验需求。
 
-1. 拆分 `execution_integrity`、`evidence_integrity`、`causal_comparability`、`inference_eligibility`，保留 `objective_integrity` 兼容映射。
-2. 将环境 required/advisory 变为 Control 可声明配置，不再永久要求 current node 和 bundle hash。
-3. 将 replay response 改为 observations + inference hints，移除后端固定 required/optional 结论。
-4. 引入通用 `response_mode` 与 `terminal_conditions`；默认 done marker 改为 `null`。
-5. 允许 `PrimaryRequest.mime_types=[]`，修复无 Content-Type source replay。
-6. Replay request 关联强制比较实际 method、完整 URL/query、body fingerprint 和 dispatch window。
+### 阶段 C：提高 GPT 分析效率
 
-P0 完成后，现有 JSON/SSE 能力必须保持兼容，且“完整执行但证据不足”不再被误报为执行失败。
+减少获取有效上下文所需的 Action 数量：
 
-### P1：增强未知协议探索与成对实验可信度
+- 更好的实验摘要和证据索引；
+- 面向协议字段和事件的搜索；
+- 自动生成有界差异报告；
+- 更清楚的不确定性表达；
+- 可复用的实验模板。
 
-1. 非目标比较默认保留 header/query wire 顺序，并提供显式 normalization。
-2. 增加 `setup_outputs`，允许 setup 产生动态 binding。
-3. 增加 `exploratory` replay。
-4. Mutation 增加结构化 `add`。
-5. JSON Pointer 与框架 location 分开规范化，同时保存 raw/normalized path。
-6. 冲突 validation 信号不再强制覆盖为 required。
-7. 重复 header/query binding 与 mutation 支持 occurrence。
-8. Manifest 明确保存 fetch transport semantics，并开放受限安全配置。
+### 阶段 D：扩展运行能力
 
-### P2：扩展协议覆盖与回归门禁
+在核心闭环稳定后评估：
 
-1. 增加 `context_header_names`。
-2. 完成 NDJSON、raw chunked 和无 marker/仅 network close 的 stream 场景。
-3. 评估 WebSocket capture/replay 的独立契约，不复用 fetch/SSE 模型。
-4. 增加以下回归测试：
+- 更多流式协议；
+- WebSocket 证据采集；
+- 多页面流程；
+- 独立 session runtime；
+- 可选并行实验；
+- 更细粒度的 artifact 分析。
 
-```text
-source response 无 Content-Type
-GET replay 与同窗口后台 GET 共存
-header/query 顺序变化但值相同
-top-level JSON 字段名为 body
-missing 与 not_required 冲突
-setup 创建 conversation 并注入 ID
-NDJSON/raw chunked response
-SSE 无 [DONE]、仅 network close
-重复 header/query preserve_source
-exploratory replay 同时 add/remove
-```
-
-P2 不要求一次完成所有站点类型。每个新增传输模式必须先定义证据、终态、完整性和取消语义，再进入公开 OpenAPI。
+新增能力必须先定义证据、终态、取消、安全和测试语义。
 
 ---
 
-## 11. 验证策略
+## 13. 验证策略
 
-### 11.1 自动测试
+### 自动测试
 
-每次修改至少运行：
+每次修改至少运行相关测试，合理时运行完整测试集：
 
 ```text
 python -m pytest
 ```
 
-涉及模型或 OpenAPI 时增加 schema 断言；涉及比较、路径和响应分类时运行 protocol evidence 定向测试；涉及 browser lifecycle 时运行 browser action 测试。
+涉及公开模型时验证 OpenAPI；涉及生命周期时验证 Browser Action；涉及 workspace 时验证路径与只读边界；涉及证据时验证完整性与脱敏。
 
-测试数量会随实现变化，文档不固定某个永久计数。PR 应报告实际执行命令和当次结果。
+测试数量随实现变化，不在本文固定永久计数。
 
-### 11.2 真实运行门禁
-
-真实 Windows smoke 应覆盖：
+### 静态检查
 
 ```text
-session open / page alignment
-capture before first navigation
-ordinary JSON request/response evidence
-stream raw bytes and parsed events
-initiator and source persistence
-control replay baseline
-single-mutation treatment
-exploratory replay（实现后）
-exact outbound request correlation
-cancellation and cleanup
-workspace evidence inspection
-session close and residual process check
+ruff
+类型或语法检查
+OpenAPI schema 检查
+文档结构检查
 ```
 
-每个新增响应模式都要验证：
+### Windows 真实运行
+
+真实 smoke test 应覆盖：
 
 ```text
-正常终止
-idle timeout
-byte limit
-network close
-manual cancel
-collector/adapter failure
-terminal manifest 可读
+open session
+page alignment
+baseline capture
+flow capture
+network and stream evidence
+request replay
+control/treatment experiment
+script and initiator evidence
+cancel and cleanup
+workspace inspection
+close session
+residual process check
 ```
 
-### 11.3 结论门禁
+任何新增公开能力必须具备：
 
-自动因果推断只在以下条件同时满足时允许：
-
-```text
-execution_integrity = complete
-evidence_integrity = complete
-causal_comparability = observed_equivalent
-mutation_effective = true
-Control baseline valid
-Treatment target delta observed
-non-target comparison passed
-```
-
-否则保留证据并标记 `supervised_only` 或 `ineligible`，不得丢弃实验，也不得伪装成自动结论。
+1. 明确输入模型；
+2. 明确失败与取消语义；
+3. manifest 记录；
+4. 凭据和大型数据边界；
+5. 自动测试；
+6. 真实运行验证方案；
+7. README 或 Skill 使用说明。
 
 ---
 
-## 12. 完成标准
+## 14. 完成标准
 
-本轮设计演进完成时应满足：
+项目达到稳定可维护状态时，应满足：
 
-1. 后端不依赖 Pandora endpoint、字段名、固定错误码或 `[DONE]` 才能工作；
-2. GPT 只能调用结构化公开 Action，不能直接控制私有 collector lifecycle；
-3. Capture 与 replay 仍由后端原子执行并留下 terminal manifest；
-4. 执行完整性、证据完整性、环境可比性和推断资格分别表达；
-5. 无 Content-Type、普通响应和非 SSE 流不会在模型层被拒绝；
-6. Replay outbound request 以 method、完整 URL/query、body 和时间窗口唯一关联；
-7. Control/Treatment 保持严格单变量，Exploratory 明确不具备自动推断资格；
-8. Backend 返回观察与提示，Skill 负责跨实验业务结论；
-9. Header/query 顺序和重复值默认按 wire 保留；
-10. Setup 可通过受控 binding 把动态状态传入 replay；
-11. Fetch transport semantics 在 manifest 中可见；
-12. 原始证据只读，凭据默认隐藏，大型数据不进入 Action JSON；
-13. 所有新增能力都有模型、回归测试和真实运行门禁；
-14. README、PANDORA_REPRODUCTION.md、OpenAPI 与实现不存在互相矛盾的现状声明。
+1. GPT 只通过结构化 Action 操作浏览器实验和 workspace；
+2. Browser Action 原子管理 capture/replay 生命周期；
+3. 每次实验都有可读 terminal manifest；
+4. 原始证据可追溯、只读且有稳定 ID；
+5. 凭据默认隐藏，大型数据通过 artifact 访问；
+6. 当前行为与 OpenAPI、README 和测试一致；
+7. 失败、部分完成、取消和证据不足不会被伪装成成功；
+8. Skill 能组织多轮实验而不直接控制私有 collector；
+9. 后端不依赖单一站点才能执行基本实验；
+10. 扩展能力遵守统一的证据、安全、取消和验证规则。
 
-达到这些标准后，`web_rev_action` 才是一个适合网页版 GPT Action 持续分析未知新版协议的通用实验后端，而不是带有旧 Pandora 假设的专用复刻工具。
+`web_rev_action` 的最终定位不是某个站点的专用脚本，而是网页版 GPT Action 可调用的通用网页协议实验基础设施。
