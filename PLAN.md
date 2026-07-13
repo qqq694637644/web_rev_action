@@ -1,197 +1,86 @@
-# web_rev_action 系统设计
+# web_rev_action 设计与演进计划
 
-## 1. 设计目标
+## 1. 文档定位
 
-`web_rev_action` 是一个单用户、Windows 优先的网页协议分析后端。它把浏览器交互、网络流取证和本地证据分析组织成一次可审计的实验，而不是让 GPT 手工串联多个低层工具。
+`web_rev_action` 是面向网页版 GPT Action 的单用户、Windows 优先网页协议实验后端。它把浏览器操作、网络取证、请求重放和本地证据分析组织成结构化 Action，使 GPT 能在人工监督下研究持续变化的网页协议。
 
-系统复用三个已有能力：
+本文只回答四个问题：
 
-- `playwright-cli`：页面导航、定位器动作、截图和 Trace。
-- `js-reverse-mcp`：CDP 页面映射、网络请求、SSE/EventSource、脚本、initiator 和断点证据。
-- 从 `github-gpt-actions-gateway` 移植的本地 workspace inspect/search/read/write/patch/PowerShell 能力。
+1. 产品长期保持哪些不变量；
+2. 当前系统已经提供什么；
+3. 下一版通用协议实验契约应是什么；
+4. 实现应按什么顺序演进。
 
-系统不实现：
-
-- 新的浏览器自动化框架或 CDP collector。
-- GPT 可见的 stream start/status/stop 生命周期工具。
-- Git、branch、commit、PR、CI 或远程 workspace 同步。
-- ZIP 导出层或第二套 artifact 查询 API。
-- 在 Action JSON 中返回大型正文、原始字节、Base64、Cookie 或 Token。
-
-所有浏览器证据与派生分析位于一个普通 Windows 目录：
+文档优先级如下：
 
 ```text
-data/analysis-workspace/
+PANDORA_REPRODUCTION.md  项目目的、实验方法和报告完成标准
+PLAN.md                 系统设计、边界和演进路线
+README.md               当前公开 Action 的使用说明
+代码、OpenAPI、测试      当前实现事实
 ```
 
-## 2. 全局设计不变量
+若文档与代码不一致，当前行为以代码和测试为准；设计目标以本文标注的“目标契约”为准。本文不会把尚未实现的能力写成现状。
 
-以下规则优先于具体 API 和实现细节。
+`PANDORA_REPRODUCTION.md` 描述的是一种可复用的研究方法，不是要求后端永久绑定 Pandora 的 endpoint、字段名、SSE 结束标记或错误码。
 
-### 2.0 Skill、执行接口与证据分层
+---
 
-系统分成三个职责面：
+## 2. 产品目标与边界
+
+### 2.1 产品目标
+
+系统服务于以下闭环：
 
 ```text
-Skill
-  定义实验序列、单变量策略、证据解释、报告和完成标准
-
-Browser Actions
-  原子执行 capture、browser-context replay、取消和受控查询
-
-analysis workspace
-  保存原始事实、稳定 evidence index、artifact 和派生报告
+GPT / Skill 提出实验假设
+→ Browser Action 原子执行 capture 或 replay
+→ 后端保存可审计原始证据
+→ GPT 使用 workspace Action 分析证据
+→ Skill 综合多轮实验形成结论和报告
 ```
 
-Skill 不能自行拼接任意 JavaScript、读取 credential artifact 后再发请求，或手工协调 MCP 生命周期。执行接口不负责决定 Pandora 六组实验顺序或 required/optional/tracking-only 结论。
+核心能力是：
 
-### 2.1 一个 workspace、一个服务进程
+- 在正常登录的浏览器上下文中捕获页面、网络、流、console、脚本和 initiator 证据；
+- 从受信任的 source evidence 构造 browser-context replay；
+- 支持探索性重放和严格成对单变量实验；
+- 保存稳定的 `experiment_id + evidence_id + artifact_id` 证据链；
+- 让 GPT 看到结构化事实、完整性状态和提示，而不是未经证明的协议结论；
+- 对凭据、大型正文和原始字节执行默认隐藏与有界访问。
 
-同一个 analysis workspace 只能由一个 `web_rev_action` 进程持有：
+### 2.2 非目标
 
-- 内置 CLI 固定 `workers=1`。
-- 启动顺序固定为：解析 workspace root → 获取 OS 文件锁 → 创建 `ExperimentStore` → 恢复遗留 `running` experiment → 创建 BrowserService。
-- 第二个进程或 Uvicorn worker 使用同一目录时启动失败。
+本项目不负责：
 
-进程锁必须早于 experiment 恢复。第二个进程不能在发现锁冲突前把第一个进程正在运行的 experiment 改成 `interrupted`。
+- 新造浏览器自动化框架或 CDP collector；
+- 让 GPT 直接控制私有 MCP 的 start/status/stop 生命周期；
+- 绕过登录、验证码、访问控制或站点授权；
+- Git、branch、commit、PR、CI 或远程 workspace 同步；
+- 把完整 Cookie、Token、Authorization、原始二进制或大型 Base64 放入 Action JSON；
+- 在后端硬编码某个站点的 required/optional 业务结论；
+- 在证据不足时伪装成自动因果证明。
 
-### 2.2 一个共享浏览器、一个活动实验
+### 2.3 部署边界
 
-当前部署共享一个 Chrome CDP endpoint、一个 Playwright CLI 环境和一个长期运行的私有 `js-reverse-mcp`。
-
-`RuntimeCoordinator` 原子管理两类互斥 owner：
+当前部署模型保持简单：
 
 ```text
-browser operation owner
-  open_session | close_session | capture_baseline | capture_flow
-  replay_request | save_script_source
-
-protected workspace mutation owner
-  workspaceWriteFile | workspaceApplyPatch | workspaceExecPwsh
+一个 analysis workspace
+一个 web_rev_action 服务进程
+一个共享 Chrome CDP endpoint
+一个 Playwright CLI 环境
+一个长期运行的私有 js-reverse-mcp
+一个活动 browser operation
 ```
 
-两类 owner 互斥，普通 inspect/search/read 不受影响。Browser operation 必须先取得 reservation，再 attach、创建 experiment 目录或写 `running` manifest。
+同一 workspace 由 OS 文件锁保证单进程持有。进程内由 `RuntimeCoordinator` 原子互斥 browser operation 与受保护的 workspace mutation。系统不通过排队掩盖竞争；冲突立即返回 busy。
 
-全局同时只允许一个 browser operation，系统不排队：
+只有需要并行实验时，才升级为每 session 独立浏览器和 collector。现阶段不通过放宽全局锁模拟并发。
 
-- 同一 session 已有后台实验时返回 `409 session_busy`。
-- 其他 session 或同步请求遇到活动实验时返回 `409 browser_busy`。
-- `open_session` 和 `close_session` 在活动实验期间同样被拒绝。
-- Protected workspace mutation 活跃时，browser operation 返回 `409 workspace_busy`。
-- Browser operation 活跃时，workspace mutation 返回 `409 browser_busy`。
+---
 
-这比等待进程锁更可靠：不会生成长期 `running` manifest，也不会在排队期间耗尽 deadline。
-
-### 2.3 浏览器实验由后端原子拥有
-
-GPT 只调用结构化原子 operation：
-
-```text
-runBrowserExperiment(capture_flow)
-runBrowserExperiment(replay_request)
-```
-
-后端完整执行：
-
-```text
-create running manifest
-→ align page
-→ start Trace
-→ start stream collector
-→ execute all Playwright steps
-→ wait for causal condition
-→ stop collector
-→ stop Trace
-→ collect bounded summaries
-→ write terminal manifest
-```
-
-GPT 看不到内部 stream primitive，也不能在多个 HTTP 请求之间手工协调 start、click、wait 和 stop。
-
-`replay_request` 同样由后端原子执行：从 source experiment 的 exact network evidence 读取请求，先执行无 mutation 的 Control，再让 Treatment 只提交 `control_experiment_id + mutation`。Target、capture、wait、verification、deadline、source 和 selector 全部从 Control 的 immutable `pair_protocol_hash` 继承。
-
-Control 还可以声明不可变 `setup_flow`，Treatment自动继承：
-
-```text
-start collector
-→ setup_flow
-→ align page
-→ record pre_dispatch_environment
-→ replay fetch
-→ verification_flow
-```
-
-Setup负责恢复发送前状态；verification只验证响应后的状态。
-
-每个 volatile binding 声明：
-
-```text
-generated + fresh_equivalent
-  Control/Treatment分别生成新值，比较时规范化
-
-generated + same_value
-  一组新生成值供Control/Treatment共用
-
-preserve_source + same_value
-  保留source中的conversation ID、parent node或固定上下文
-```
-
-`same_value` 不等于保留source原值。JSON Pointer binding若是mutation路径祖先，
-schema/准备阶段拒绝该组合；mutation是binding祖先时，Treatment可以删除整个子树。
-
-Treatment 通过当前页面上下文发起 fetch，并捕获新 network/stream/page/console evidence。Cookie、Authorization 和 CSRF 不进入 Action JSON。
-
-JSON body mutation 使用无 wildcard 的 RFC 6901 JSON Pointer，支持对象属性和数组索引。JSON Pointer和query参数严格区分大小写；header名不区分大小写。Browser-managed Cookie、Origin、Referer、Host、Content-Length 和 `Sec-*` header mutation 在 schema 层直接拒绝。重复header/query按完整有序值列表比较，并记录数量变化。
-
-### 2.4 证据以文件为主，Action 返回摘要
-
-原始响应、事件、headers、Trace、页面 snapshot、console、普通 network snapshot 和 replay 结果写入 analysis workspace。Action 只返回：
-
-```text
-experiment_id
-status
-objective_integrity
-primary request summary
-capture health summary
-manifest_relative_path
-evidence_id / artifact_id metadata
-```
-
-完整内容通过现有 workspace 工具读取。
-
-Manifest 的 `evidence` 数组为语义索引。核心结论使用：
-
-```text
-experiment_id + evidence_id + artifact_id
-```
-
-而不是临时 reqid 或目录排序。
-
-### 2.5 原始证据不可由分析工具改写
-
-以下路径由后端管理并视为原始证据：
-
-```text
-sessions/
-experiments/*/manifest.json
-experiments/*/js-reverse/
-experiments/*/playwright/
-```
-
-Workspace write/patch 不允许修改这些路径。派生内容写入：
-
-```text
-experiments/*/reports/
-experiments/*/derived/
-experiments/*/replay/
-reports/
-scripts/
-notes/
-```
-
-实验为 `running` 时，禁止 workspace 写入该实验，并暂停 PowerShell 执行，避免与 collector 竞争文件。
-
-## 3. 总体架构
+## 3. 分层架构
 
 ```text
 GPT
@@ -199,12 +88,10 @@ GPT
 │   ├── retrieveSkillContext
 │   ├── readSkillContent
 │   └── searchSkillDocs
-│
 ├── Browser Actions
 │   ├── inspectBrowserEvidence
 │   └── runBrowserExperiment
-│
-└── Workspace Actions
+└── Analysis Workspace Actions
     ├── workspaceInspect
     ├── workspaceSearch
     ├── workspaceReadFiles
@@ -215,15 +102,7 @@ GPT
 web_rev_action
 ├── FastAPI / OpenAPI
 ├── RuntimeCoordinator
-│   ├── browser operation reservation
-│   └── protected workspace mutation reservation
 ├── BrowserActionService
-│   ├── global experiment reservation
-│   ├── session registry
-│   ├── deadline and cleanup manager
-│   ├── page alignment
-│   ├── causal wait engine
-│   └── objective integrity evaluation
 ├── ExperimentStore
 ├── AnalysisWorkspaceService
 ├── PlaywrightCliAdapter
@@ -232,66 +111,54 @@ web_rev_action
 private runtime
 ├── Chrome CDP endpoint
 ├── playwright-cli subprocesses
-├── long-lived js-reverse-mcp stdio process
+├── js-reverse-mcp stdio process
 └── data/analysis-workspace/
 ```
 
-### 3.1 组件职责
+职责必须保持分离：
 
-`BrowserActionService` 负责实验语义：
+| 层 | 负责 | 不负责 |
+| --- | --- | --- |
+| Skill | 实验序列、研究假设、站点知识、证据解释、报告 | 拼接任意脚本、读取凭据后自行发请求 |
+| Browser Actions | 原子执行、生命周期、证据采集、通用比较和完整性 | 决定站点字段必需性、写死 Pandora 协议 |
+| Workspace Actions | 有界读取、搜索、派生分析、报告和脚本 | 控制浏览器生命周期、改写原始证据 |
+| Adapters | 调用 Playwright 与 js-reverse-mcp，转换上游结构 | 解释用户业务意图 |
 
-- 全局单实验约束。
-- session 和 page 对齐。
-- 原子 flow 编排。
-- checkpoint 与因果等待。
-- Stop cancellation 归因。
-- complete/partial/failed 判定。
-- cleanup 和 terminal manifest。
-- 普通 network high-water checkpoint、精确导出和 evidence index。
-- browser-context replay 与 source evidence 绑定。
-- control/treatment replay、volatile binding 复用和 wire mutation effectiveness。
-- immutable pair protocol hash、value source/reuse policy 和三阶段环境证据。
-- replay attempt dispatch time + canonical request body fingerprint 唯一关联。
-- validation/auth/rate/server/redirect/response-contract 分类。
-- JSON request shape/redacted body、stream request/event-range evidence。
-- bounded source region 持久化及 SHA-256。
-- experiment series/predecessor 校验。
+后端应尽量返回中性观察。Skill 可以结合多个实验、站点上下文和用户目标形成推断。
 
-`ExperimentStore` 只负责生命周期持久化：
+---
 
-- session JSON。
-- experiment ID 和目录分配。
-- running/terminal manifest 原子写入。
-- 服务启动时把遗留 `running` 标记为 `interrupted`。
+## 4. 当前公开契约
 
-`RuntimeCoordinator` 只负责当前进程的原子 reservation，不保存业务 manifest。OS 文件锁负责跨进程单实例，Coordinator 负责进程内 browser/workspace TOCTOU。
+当前系统公开 11 个 operationId：
 
-`PlaywrightCliAdapter` 负责页面动作，不解释网络语义。
+| operationId | 类型 | 作用 |
+| --- | --- | --- |
+| `retrieveSkillContext` | read-only | 发现或加载 Skill |
+| `readSkillContent` | read-only | 读取 Skill 文件 |
+| `searchSkillDocs` | read-only | 搜索 Skill 文档 |
+| `inspectBrowserEvidence` | read-only | 查询 session、experiment 和证据摘要 |
+| `runBrowserExperiment` | consequential | 打开/关闭 session，执行或取消实验 |
+| `workspaceInspect` | read-only | 返回目录树、搜索结果和片段 |
+| `workspaceSearch` | read-only | 使用 ripgrep 搜索文本 |
+| `workspaceReadFiles` | read-only | 按行读取 UTF-8 文件 |
+| `workspaceWriteFile` | consequential | 创建或替换文本文件 |
+| `workspaceApplyPatch` | consequential | 应用受控文本补丁 |
+| `workspaceExecPwsh` | consequential | 在分析目录运行 PowerShell 7 |
 
-`JsReverseMcpAdapter` 负责把上游 MCP 的分页、稳定 request ID、source-specific event predicate、精确 network 导出、initiator、source search、console 和受控 evaluate 转换为内部结构，不解释用户业务意图。
-
-`AnalysisWorkspaceService` 负责本地文件分析，不参与浏览器生命周期。
-
-## 4. 公开 Action 契约
-
-系统公开 11 个 operationId。
-
-### 4.1 Skill Actions
+`runBrowserExperiment` 当前支持：
 
 ```text
-retrieveSkillContext       read-only
-readSkillContent           read-only
-searchSkillDocs            read-only
+open_session
+capture_baseline
+capture_flow
+replay_request
+save_script_source
+close_session
+cancel_experiment
 ```
 
-### 4.2 Browser Actions
-
-```text
-inspectBrowserEvidence     read-only
-runBrowserExperiment       consequential
-```
-
-`inspectBrowserEvidence` 当前 operation：
+`inspectBrowserEvidence` 当前支持：
 
 ```text
 get_session
@@ -307,884 +174,551 @@ get_script_source
 list_console_errors
 ```
 
-`runBrowserExperiment` 当前 operation：
-
-```text
-open_session
-capture_baseline
-capture_flow
-replay_request
-save_script_source
-close_session
-cancel_experiment
-```
-
 OpenAPI 使用 discriminated union。每个 operation 和 flow action 只能接受自己的字段组合。
 
-### 4.3 Workspace Actions
+当前 replay 只支持 `control` 与 `treatment`，mutation 只支持 remove/replace，且 stream 逻辑带有 SSE 和 `[DONE]` 默认值。这些是当前实现事实，不是长期设计不变量。
+
+---
+
+## 5. 原子实验模型
+
+### 5.1 Session
+
+Session 保存浏览器 endpoint、Playwright page、js-reverse stable page ID 和服务实例之间的稳定关联。状态为：
 
 ```text
-workspaceInspect           read-only
-workspaceSearch            read-only
-workspaceReadFiles         read-only
-workspaceWriteFile         consequential
-workspaceApplyPatch        consequential
-workspaceExecPwsh          consequential
+open | closed | stale
 ```
 
-没有 `list_artifacts`、`read_artifact`、`search_artifacts`、`export_experiment` 或 ZIP endpoint。
+服务重启后，旧实例创建的 open session 变为 stale。每次 capture、replay 和 Stop 后都重新检查页面对齐。
 
-`workspaceInspect`、`workspaceSearch` 和 `workspaceReadFiles` 默认隐藏 manifest 标记为 `credential` 或 `containsCredentials=true` 的 artifact 正文。只有显式 `include_credentials=true` 才允许本机专家读取；自然语言 Action 摘要永远不返回完整凭据。
+### 5.2 Experiment
 
-## 5. Session 模型
-
-Session 保存稳定的运行时关联：
+Experiment 生命周期为：
 
 ```text
-session_id
-status
-browser_endpoint_ref
-playwright_session_ref
-playwright_page_index
-playwright_page_url
-playwright_page_title
-js_reverse_page_id
-js_reverse_page_index
-js_reverse_page_url
-page_alignment_status
-service_instance_id
-process_started_at
-created_at
-updated_at
+running | completed | partial | failed | interrupted
 ```
 
-状态：
+`running` manifest 必须在第一条浏览器副作用之前写入。后台 job 是默认模式；短实验可显式使用 sync，但两者共享同一原子实现和 reservation。
+
+一次 capture 的基本顺序：
 
 ```text
-open
-closed
-stale
-```
-
-规则：
-
-- `open_session` attach Playwright，并将当前 page 与 js-reverse stable `pageId` 对齐。
-- `page_index=null` 表示复用 session 已保存的 tab；数值表示显式切换。
-- 服务重启后，旧 instance 创建的 `open` session 自动变为 `stale`。
-- 服务 shutdown 会 best-effort detach 本实例仍为 `open` 的 Playwright session；成功标记 `closed`，失败标记 `stale`。
-- 捕获前和 Stop 后都重新验证 Playwright URL 与 js-reverse pageId。
-
-## 6. Experiment 模型
-
-### 6.1 状态
-
-```text
-running
-completed
-partial
-failed
-interrupted
-```
-
-`running` manifest 在第一条浏览器动作之前写入。
-
-### 6.2 执行模式
-
-后台模式是默认值：
-
-```text
-runBrowserExperiment
-→ reserve global experiment
+reserve runtime
 → write running manifest
-→ start background task
-→ immediately return experiment_id
+→ align page
+→ start Trace / collector
+→ execute flow
+→ wait for causal condition
+→ stop collector / Trace
+→ persist bounded evidence
+→ write terminal manifest
+→ release reservation
 ```
 
-GPT 使用 `inspectBrowserEvidence.get_experiment` 查询终态。
+需要捕获页面初始化行为时，`navigate` 必须是 flow 的第一条显式动作，不能在 collector 启动前通过 `target.start_url` 隐式导航。
 
-错误提交的长 job 可通过 consequential operation 主动取消：
+一次 replay 的基本顺序：
 
 ```text
-cancel_experiment {
-  experiment_id
-  session_id
-}
+validate source experiment and evidence
+→ build replay plan from exact snapshot
+→ start experiment capture
+→ run setup_flow
+→ align page and record pre-dispatch environment
+→ dispatch browser-context request
+→ correlate exact outbound request
+→ collect response and verification evidence
+→ write comparison and terminal manifest
 ```
 
-它只取消对应后台 task，等待 collector/Trace cleanup 和 terminal manifest 完成后返回；不通过 `close_session` 间接取消。
+GPT 不直接协调 collector 生命周期，也不能让 replay 接受任意本地文件路径。
 
-同步模式只用于明确能在一个 Action round trip 内完成的短实验：
+### 5.3 Deadline、取消与清理
 
-```json
-{
-  "execution_mode": "sync",
-  "deadline_ms": 42000
-}
-```
+每个实验只有一个绝对执行 deadline。Adapter 不能在每个阶段重新获得完整 timeout。
 
-无论 job 或 sync，都使用同一原子实现和同一全局单实验约束。
-
-### 6.3 capture_flow 顺序
-
-Capture payload 禁止 `target.start_url`。需要捕获页面初始化请求时，导航必须是 flow 的第一条显式 `navigate` step：
-
-```text
-running manifest
-→ page alignment
-→ Trace start
-→ stream start
-→ navigate
-```
-
-否则首屏请求、redirect、脚本和自动 SSE 可能发生在 collector 之前。
-
-## 7. Deadline 与取消
-
-### 7.1 Deadline 分层
-
-每个实验只有一个 absolute execution deadline。Adapter 不重新获得完整 timeout。
-
-后端保留：
-
-```text
-5 seconds finalize reserve
-8 seconds independent cleanup grace
-```
-
-进入 reserve 后不再执行非关键工作：
-
-- 最终截图。
-- network summary。
-- Trace 文件扫描。
-
-优先级始终是：
+清理优先级固定为：
 
 ```text
 stop collector
 → stop Trace
 → write terminal manifest
+→ release reservation
 ```
 
-### 7.2 Playwright subprocess
+Playwright、MCP、PowerShell 和 ripgrep 的 timeout、取消与 shutdown 都必须终止 Windows 进程树。已发送到浏览器或远端站点的副作用不保证可回滚；发生在执行型 step 内的取消应记录为 `canceled_outcome_unknown`，不得自动重试。
 
-Playwright、PowerShell 和 ripgrep subprocess 都必须处理：
+MCP side-effect 调用发生 timeout 或 cancellation 时，旧 transport generation 必须失效，下一次调用建立新 generation；副作用调用不得自动重试。
 
-```text
-normal completion
-timeout
-asyncio cancellation
-service shutdown
-```
+---
 
-Windows 下使用进程树终止，而不是只 kill 包装进程。取消中的 cleanup 使用 `asyncio.shield`，完成后重新抛出 `CancelledError`。
+## 6. 证据与完整性模型
 
-进程树终止只能保证本地命令不再继续发送后续操作，不能通用回滚已经送达浏览器或远端服务的 click、navigate、upload 等副作用。取消发生在执行型 step 内时，step 记录为：
+### 6.1 证据优先于摘要
 
-```text
-canceled_outcome_unknown
-```
-
-系统不重试该 step，由证据和页面终态判断副作用是否已经发生。
-
-### 7.3 MCP side effects
-
-MCP 队列项保存：
-
-```text
-absolute monotonic deadline
-transport generation
-future cancellation state
-```
-
-Worker 执行前丢弃：
-
-- 已取消调用。
-- 已过期调用。
-- 旧 generation 调用。
-
-对于 `start_stream_capture`、`stop_stream_capture`、`select_page`、断点和 resume 等副作用调用：
-
-- timeout 或调用方 cancellation 都会中止整个私有 MCP worker。
-- transport generation 增加。
-- 下一次调用启动全新 MCP process/session。
-- 副作用调用绝不自动重试。
-
-旧 worker 只能更新自己的 generation；退出时不能污染新 worker 的 ready/error 状态。
-
-MCP 异常分为两类：
-
-- Tool 业务错误：当前调用失败，worker 可以继续。
-- stdio/session/connection closed、EOF、子进程退出：当前 generation stale，worker 退出；调用方等待清理完成后收到错误，下一次调用自动启动新 generation。
-
-## 8. Stream checkpoint 与因果等待
-
-仅比较 capture version 不足以证明事件或终态来自本轮动作。系统为每个匹配 request 保存状态快照。
-
-### 8.1 Checkpoint 结构
-
-```text
-capture_version
-requests[request_id]
-  response_observed
-  status
-  terminal_wall_time_ms
-  raw_event_index
-  semantic_event_index
-  primary_event_source
-```
-
-Checkpoint 在每条可能改变页面或网络状态的 flow step 之前创建。
-
-### 8.2 Request 身份
-
-稳定引用同时保留：
-
-```text
-cdpRequestId
-persistentRequestId
-networkRequestId / reqid
-collectorGeneration
-target/session identity
-```
-
-等待返回的 `matched_request_ids` 只能包含真正满足条件的 request，而不是 matcher 命中的全部 request。
-
-### 8.3 条件判定矩阵
-
-`request_observed`：
-
-- request ID 不存在于 checkpoint。
-- 当前 status 中首次出现。
-
-`response_observed`：
-
-- checkpoint 中不存在该 request，或 `response_observed=false`。
-- 当前变为 `true`。
-
-`network_finished`、`network_canceled`、`failed`：
-
-- 当前 status 是目标终态。
-- checkpoint 中 status 不同，或 terminal wall time 更新。
-
-`network_terminal`：
-
-- 使用同样的终态转换规则。
-- 返回实际转换的 request 集合和对应 terminal status。
-
-`first_event`：
-
-- raw event index 或 semantic event index 在 checkpoint 后增加。
-
-`event_predicate` / `default_done_marker`：
-
-- 先确定 matcher 命中的具体 request ID。
-- 分别检查 raw 和 semantic source 是否前进。
-- 使用各自的 source-specific `afterEventIndex` 查询上游 collector。
-- 校验 `eventMatch.matchedRequestId` 属于该 request。
-- 返回唯一实际命中的 request 和 `matchedSource`。
-
-旧终态、旧 `[DONE]` 或 supporting stream 的事件不能因为无关 capture version 增长而满足新等待。
-
-### 8.4 Raw 与 semantic 双游标
-
-Raw parser 与 EventSource semantic mirror 是两个独立序列：
-
-```text
-raw_event_index
-semantic_event_index
-```
-
-不能使用 `max(rawCount, semanticCount)` 合并。Raw heartbeat 数量可能远大于 semantic message；只有双游标才能发现新的 semantic event。
-
-上游 `get_stream_status` 支持：
-
-```text
-requestId
-eventPredicate
-afterEventIndex
-eventSource = raw-stream | eventsource
-```
-
-它只返回匹配元数据，不返回正文。
-
-Collector 在成功写入事件 JSONL 时维护 source-specific：
-
-```text
-event index → JSONL byte offset
-```
-
-`findEventMatch()` 从第一个大于 `afterEventIndex` 的 offset 直接 seek，不从文件头反复解析旧事件，避免长流轮询退化为 O(n²)。
-
-## 9. Request 分页与 primary 归属
-
-`get_stream_status` 和 `list_network_requests` 都必须完整遍历 pagination，不能固定读取前 100 条。
-
-流程：
-
-```text
-fetch all bounded pages
-→ filter primary matcher
-→ lock concrete request ID
-→ subsequent predicate query by request ID
-```
-
-Supporting request 可作为诊断，但不能满足 primary objective。
-
-Primary matcher 映射到 collector filter：
-
-```text
-urlFilter       ← url_contains
-methods         ← method
-resourceTypes   ← resource_types
-mimeTypes       ← mime_types
-includeInFlight ← include_in_flight
-```
-
-## 10. 完整性模型
-
-一个 `integrityStatus` 无法表达所有证据维度。每个 primary request 分开记录：
-
-```text
-rawCaptureIntegrity
-semanticParseIntegrity
-requestSnapshotIntegrity
-artifactIntegrity
-networkSnapshotIntegrity
-requestBodyCompleteness
-requestHeadersCompleteness
-```
-
-Experiment requirements 声明哪些维度必须 complete：
-
-```text
-require_raw_capture
-require_semantic_parse
-require_request_snapshot
-require_artifacts
-```
-
-Objective 结果：
-
-```text
-complete
-partial
-failed
-```
-
-规则：
-
-- stream=true 时，普通 network summary 只能作为诊断，不能替代 stream evidence。
-- ordinary exact snapshot 只能补充 network snapshot/body/header 完整性，不能升级 raw stream artifact integrity。
-- supporting request 失败是否影响 objective 由 `allow_supporting_failures` 控制。
-- `expected_min_matches=0` 且没有 primary request 是有效 baseline。
-- partial、semantic-only 或 artifact error 不得被压成 complete。
-
-## 11. Collector cleanup 与持久身份
-
-MCP process 内的数字 `captureId` 只适合作为短期 handle。Manifest 同时保存：
-
-```text
-capture_id
-capture_uuid
-capture_relative_dir
-capture_metadata_artifact_id
-collector_cleanup
-orphan_capture_id
-transport_generation
-stream_start_status
-```
-
-`stream_start_status`：
-
-```text
-not_attempted
-failed_before_send
-confirmed
-outcome_unknown
-```
-
-若 start 已 dispatch 但结果未知：
-
-- `collector_cleanup=unknown`
-- `collector_stopped=false`
-- 保存 artifact namespace 和 transport generation
-- 扫描 `experiments/<id>/js-reverse/capture-*/capture.json` 恢复 UUID、相对目录和 metadata artifact
-- 不把发现的旧数字 capture ID 当作新 generation 中可查询的 live handle
-
-`collector_cleanup`：
-
-```text
-not_required
-completed
-timed_out
-unknown
-```
-
-即使 MCP worker 被重建，`capture_uuid`、相对目录和 metadata artifact ID 仍可用于 workspace 检查未完成证据。`orphan_capture_id` 只作为原进程诊断值，不是跨进程恢复主键。
-
-`stop_stream_capture` 与 post-stop status 查询是两个独立阶段。Stop 已确认成功时，后续 status 超时只产生 warning，不覆盖 `collector_cleanup=completed`，也不产生 orphan。
-
-公开 `inspectBrowserEvidence.get_stream_status` 输入为：
-
-```text
-experiment_id
-capture_uuid (optional validation)
-```
-
-只有 manifest 为 running、Coordinator owner 匹配 experiment、UUID 匹配且 transport generation 未变化时才查询 live MCP。Experiment 已结束或 MCP 已重启时直接返回持久 manifest，不接受裸数字 capture ID。
-
-## 12. Stop-generation 语义
-
-底层 collector 只报告中性事实：
-
-```text
-status = canceled
-terminalReason = network_canceled
-```
-
-只有 experiment 层同时满足以下条件时，才标记 `expected_user_cancel`：
-
-- flow 中实际完成 `intent=stop_generation` 的 click。
-- Stop 前已经观察到同一 primary request 的事件。
-- Stop 后等待命中同一 request 的新 canceled transition。
-- cancellation 位于 Stop 时间窗口。
-- Stop 后 Playwright page 与稳定 js-reverse pageId 仍对齐。
-- 该 cancellation 关联最近的已完成 Stop step。
-- 没有 navigation、reload、新 tab 或 page close 等更合理原因。
-
-多个匹配 request 中只有实际 canceled 的 request 参与分类。
-
-## 13. Evidence 目录与 manifest
+Action 返回有界摘要，完整内容保存在：
 
 ```text
 data/analysis-workspace/
   sessions/
-  experiments/
-    exp_<timestamp>_<id>/
-      manifest.json
-      playwright/
-        screenshots/
-        snapshots/
-        traces/
-      js-reverse/
-        network/
-          ev_<experiment>_network_request_<selector>_<reqid>/
-            all.json
-            request-shape.json
-            request-body.redacted.json
-            initiator.json
-            cookie-*.json
-        sources/
-          ev_<experiment>_script_source_<label>_<hash>.js
-          ev_<experiment>_script_source_<label>_<hash>.metadata.json
-        console/
-          console.jsonl
-        capture-<uuid>/
-          capture.json
-          request-0001/
-            metadata.json
-            raw.bin
-            decoded.sse
-            chunks.jsonl
-            events.jsonl
-            eventsource.jsonl
-            request-headers.json
-            request-headers.redacted.json
-            response-headers.json
-            response-headers.redacted.json
-            payloads/
-      reports/
-      derived/
-      replay/
-        request-spec.json
-        request-diff.json
-        response.json
+  experiments/<experiment_id>/
+    manifest.json
+    playwright/
+    js-reverse/
+    replay/
+    reports/
+    derived/
   reports/
   scripts/
   notes/
 ```
 
-所有 manifest 路径都是 workspace 相对路径，不返回操作系统绝对路径。
-
-Manifest 至少包含：
+原始证据路径由后端管理并视为只读：
 
 ```text
-experiment_id
-session_id
-service_instance_id
-operation
-status
-execution_mode
-objective
-deadline
-page_alignment
-steps
-primary_request_matcher
-primary_requests
-stream_wait_result
-collector_integrity
-primary_request_integrity
-objective_integrity
-objective_requirements
-primary_integrity_dimensions
-capture_health
-network_checkpoint
-console_checkpoint
-series
-replay_source
-replay
-replay_http_status
-mutation_assessment
-evidence
-capture_uuid
-capture_relative_dir
-capture_metadata_artifact_id
-artifacts
-warnings
-errors
-created_at
-updated_at
+sessions/
+experiments/*/manifest.json
+experiments/*/js-reverse/
+experiments/*/playwright/
 ```
 
-每个 evidence entry 至少包含：
+Workspace 写入只允许派生目录。实验运行期间，禁止修改该实验目录，并暂停会与 collector 竞争的 PowerShell mutation。
+
+核心引用使用：
 
 ```text
-evidence_id
-kind
-artifact_ids
-artifact_paths
-step_ids / request_ids（按 kind）
-redacted summary
-source_experiment_id / source_evidence_id（replay）
+experiment_id + evidence_id + artifact_id
 ```
 
-当前 evidence kind：`network_request`、`stream_request`、`stream_event_range`、`console_message`、`page_screenshot`、`page_snapshot`、`replay_attempt`、`script_source`。
+临时 reqid、数字 capture ID 或目录顺序不能作为跨实验主键。
 
-每个 JSON network evidence 自动生成 public `request-shape.json` 和 `request-body.redacted.json`。Shape 使用 JSON Pointer 显示对象、数组长度、scalar 类型和安全 placeholder，不返回原始字符串值。
+### 6.2 目标完整性契约
 
-公开 `get_request_shape` 默认只返回路径页：
+下一版必须把“执行是否完整”和“是否足以做因果推断”拆开：
 
 ```text
-path_prefix
-page_idx / page_size
-max_depth
-max_array_items
-include_redacted_body = false
+execution_integrity:
+  complete | partial | failed
+
+evidence_integrity:
+  complete | partial | failed
+
+causal_comparability:
+  observed_equivalent | different | insufficient | not_applicable
+
+inference_eligibility:
+  eligible | supervised_only | ineligible
 ```
 
-只有显式请求时才返回受深度和数组上限裁剪的 redacted subtree。
+含义：
 
-每个 replay classification 使用：
+- `execution_integrity`：请求是否实际发送，capture、cleanup 和 manifest 是否完成；
+- `evidence_integrity`：目标所需 request/response/stream/artifact 是否完整；
+- `causal_comparability`：Control 与 Treatment 的必需环境和非目标字段是否可比较；
+- `inference_eligibility`：后端是否具备自动因果推断资格。
+
+示例：请求、抓包和 artifact 全部完成，但站点当前节点不可观察：
 
 ```text
-control replay
-  mutations = []
-  generates volatile bindings according to reuse_policy
-  must complete with HTTP 2xx
-  exact wire snapshot confirms bindings
-
-treatment replay
-  control_experiment_id = control
-  mutation = exactly one
-  accepts no other execution parameters
-  fresh_equivalent values are regenerated; same_value is reused
-  requires target_delta + non_target equivalence + mutation_effective
+execution_integrity = complete
+evidence_integrity = complete
+causal_comparability = insufficient
+inference_eligibility = supervised_only
 ```
 
-Replay 保存：
+这不应再被压成整体 `partial`。
+
+当前 `objective_integrity` 在迁移期保留为兼容字段，但不再作为唯一真相。完成迁移后，它只可作为上述维度的摘要，不能反向覆盖具体维度。
+
+### 6.3 Primary 与 supporting evidence
+
+每次实验显式声明 primary matcher 和预期数量。Supporting request 可以用于诊断，但不能满足 primary objective。
+
+等待条件必须基于 request-state checkpoint，而不是只比较 collector version。Raw 与 semantic 事件使用独立游标。分页必须完整遍历后再锁定具体 request ID。
+
+---
+
+## 7. 通用 Capture 目标契约
+
+当前 capture 已能完成 JSON/SSE 人工监督实验。下一版需要去除 SSE 专用默认值，把响应方式建模为通用协议事实。
+
+### 7.1 响应模式
+
+目标模型：
 
 ```text
-replay_attempt_id
-dispatch_wall_time_ms
-expected_request_body_canonical_sha256
-control/treatment network evidence IDs
-pair_protocol_hash
-pre_dispatch_environment
-post_response_environment
-post_verification_environment
-environment comparison status/missing dimensions
+response_mode:
+  auto | ordinary | sse | ndjson | raw_stream | websocket
 ```
 
-因果比较只使用 `pre_dispatch_environment`。`post_response_environment` 和
-`post_verification_environment` 是实验结果。比较结果固定为：
+- `auto` 根据实际网络证据选择采集方式，但不能仅凭一个 Content-Type 推断全部语义；
+- `ordinary` 保存普通完整响应；
+- `sse` 解析 SSE event，同时保留 raw bytes；
+- `ndjson` 按换行 JSON 记录解析结果与原始边界；
+- `raw_stream` 只保证有界原始 chunk 和终态；
+- `websocket` 作为独立传输类型，不伪装成 fetch stream。
+
+当前尚未完整实现 NDJSON、通用 raw stream 和 WebSocket replay；它们属于目标契约。
+
+### 7.2 终止条件
+
+目标模型：
 
 ```text
-observed_equivalent  所有必需维度都已观察且相等
-different            至少一个已观察维度不同
-insufficient         必需维度缺失，不能把 None == None 当作相等
+terminal_conditions:
+  exact_sse_data
+  event_predicate
+  byte_pattern
+  network_close
+  idle_window
+  manual_stop
 ```
 
-环境中的浏览器凭据只用于本机变化检测。系统不加密 Cookie，不引入 KMS、vault、
-主密钥或企业级 secret 管理；只在本机计算 Cookie名值、Authorization、CSRF及组合
-请求上下文的 SHA-256摘要，manifest不保存这些原值。
+默认 marker 为 `null`。Pandora Skill 可以显式传 `[DONE]`，但后端不能把它当作所有 SSE 的永久约定。
 
-`request_context_sha256` 只有在headers明确完整时才生成：显式完整性标志，或同一稳定请求具有写入成功的request headers与ExtraInfo/associatedCookies evidence。Cookie hash保留实际发送顺序。`ignored_cookie_names`和`ignored_context_headers`默认空数组。Post-response/post-verification不复用pre-dispatch请求上下文。
-
-Replay primary stream必须锁定到已关联 ordinary evidence 的 `networkRequestId + collectorGeneration`；同endpoint其他stream为supporting evidence。
-
-候选必须同时满足有上下界的 dispatch window、numeric observed timestamp、
-URL/method selector 和 canonical body fingerprint；零个或多个候选都 fail closed。
-
-若 source response 为 `text/event-stream`，后端默认要求 raw、semantic 和artifact
-完整；`raw_only=true`才允许只看raw。Evaluate 使用 `response.body.getReader()`和
-增量SSE event parser支持 LF、CRLF、CR、混合换行和EOF flush，只在完整event的data精确命中marker时终止。终止原因、marker、
-event name和truncation组成`stream_response_contract`并参与objective判定。
-
-达到 `max_response_bytes` 恰好边界时继续读一次：EOF表示完整，额外字节才表示截断。
-
-有效 Treatment 得到明确非流错误响应时，raw/semantic 维度为 `not_applicable_non_stream_response`，由 ordinary exact response终结实验。仅以下分类可支持 required：
+终止结果必须记录：
 
 ```text
-validation_rejection = remove + HTTP 400/422 + structured field_required
-value_constraint = replace + invalid enum/type/format
-conflict = HTTP 409
-redirect_or_cache_response = HTTP 3xx
+condition type
+matched source
+matched request ID
+terminal reason
+truncated flag
+bytes observed
+event/chunk range
 ```
 
-Required证据优先读取exact network response body；若上游body已驱逐，只在bounded
-replay response确认未截断且UTF-8字节长度等于完整body长度时使用。Preview fallback、
-weak text match、authentication、rate limit、server failure、unknown rejection、
-redirect和contract mismatch都是partial/inconclusive。
+### 7.3 Primary request 过滤
 
-## 14. Workspace 服务
+`mime_types=[]` 表示不使用 MIME 过滤。没有 Content-Type、204、下载、异常错误响应或旧接口都必须允许 capture/replay。
 
-### 14.1 workspaceInspect
+URL、method、resource type、MIME 和 in-flight 过滤都是可选 selector，不应因为某个可观察维度缺失而产生模型校验错误。
 
-一次返回：
+---
+
+## 8. 通用 Replay 目标契约
+
+### 8.1 三种模式
+
+目标模型：
 
 ```text
-bounded tree
-multiple ripgrep searches
-related UTF-8 snippets
-truncation metadata
+replay_mode = control
+  无 mutation，建立可工作的基线和不可变 pair protocol
+
+replay_mode = treatment
+  恰好一个 mutation，用于严格因果比较
+
+replay_mode = exploratory
+  允许 0..N mutations，用于寻找新版协议的可工作请求
+  inference_eligibility 固定为 ineligible
 ```
 
-`max_depth` 相对于每个 requested base path 计算。
+探索模式解决“新版同时增加字段、删除旧字段、更新 header 或 query 才能工作”的情况。找到可工作请求后，再建立严格 Control/Treatment 验证单变量。
 
-默认 `include_credentials=false`。Tree 可以显示 credential artifact 路径和大小，但 search/related snippet 不返回正文。即使 running manifest尚未写入 descriptor，固定 raw 路径如 `all.json`、`requestBody.bin`、`responseBody.bin`、完整 headers、cookie provenance 和 replay `request-spec.json` 也按路径规则隐藏。
+### 8.2 Mutation
 
-### 14.2 workspaceSearch
-
-使用 `rg --json`，逐行消费 stdout：
-
-- 达到 match limit 后终止进程。
-- 达到 byte budget 后终止进程。
-- 达到 timeout 或 Action cancellation 后终止进程树。
-- 不使用无界 `communicate()`。
-- 默认过滤 manifest 标记为 credential 的 artifact match；显式 `include_credentials=true` 才返回。
-
-### 14.3 workspaceReadFiles
-
-文本读取只打开文件一次，在同一流式遍历中完成：
+目标 mutation 使用受限 RFC 6902 风格语义：
 
 ```text
-incremental UTF-8 decode
-byte count
-total line count
-requested line range
-optional incremental SHA-256
+add | remove | replace
 ```
 
-请求可设置 `include_sha256=false`，查看少量行时不计算全文件 hash。读取前后比较 size、mtime 和 file identity；文件增长或替换时返回 `changed_during_read=true`，不宣称稳定 SHA。二进制文件返回 per-file error，使用 PowerShell 定向读取。
-
-Credential artifact 默认返回明确的 hidden error，不返回内容。`include_credentials=true` 只用于本机专家验证；Skill 和自然语言报告不得复制其值。
-
-### 14.4 workspaceWriteFile / workspaceApplyPatch
-
-支持：
+适用目标：
 
 ```text
-create_only
-overwrite
-overwrite_if_sha256_matches
-line-ending policy
-dry-run
-Codex patch
-changed-file limits
-rollback
+JSON Pointer
+header occurrence
+query occurrence
 ```
 
-写入遵守原始证据只读边界和 patch snapshot 总内存上限。
+JSON add 支持普通 pointer 和数组 `/-`，继续禁止 wildcard。严格 Treatment 只允许一个 operation；Exploratory 可允许多个 operation。
 
-### 14.5 workspaceExecPwsh
-
-用于：
-
-- raw.bin offset、hex 和 Base64。
-- SHA-256。
-- JSONL/CSV 处理。
-- schema、diff 和 replay 脚本。
-- 本地压缩文件分析。
-
-stdout/stderr 并发流式消费，只保留 byte budget 内内容。Timeout、Action cancellation 和 shutdown 都终止 Windows 进程树。
-
-`workspaceWriteFile`、`workspaceApplyPatch` 和 `workspaceExecPwsh` 先通过共享 RuntimeCoordinator 取得 mutation reservation，避免“检查没有 running experiment 后，browser job 立即开始”的 TOCTOU。
-
-网络和危险命令检查是 best-effort 本地策略，不是安全沙箱。真正离线需要 Windows Firewall、隔离账户或 VM。
-
-## 15. 凭据与大型数据
-
-完整 request/response headers 可能包含 Cookie、Authorization、CSRF 和 Set-Cookie。
-
-默认分析使用 redacted summaries。完整 credential 文件只用于后端 `replay_request` 或显式本机专家读取，不复制到自然语言回复、summary 或 diff。`workspaceInspect/Search/ReadFiles` 默认执行该策略，而不是只依赖文档约定。
-
-大型 Base64、binary payload 和 raw stream 不通过 Action JSON 返回：
+重复 header/query 必须声明 occurrence：
 
 ```text
-workspaceInspect/Search/ReadFiles 处理文本索引
-workspaceExecPwsh 处理 binary/Base64/compressed/offset
+first | last | all | index
 ```
 
-## 16. 真实运行验证
+`all` 保留完整有序值列表。不能把重复值无声压缩成一个值。
 
-### 16.1 Stage 0 工具链
+### 8.3 Setup 输出与动态绑定
 
-固定本地 fixture 验证：
+`setup_flow` 不能只制造页面副作用，还需要受控输出绑定：
 
 ```text
-page alignment
-network request/response
-request and response body
-exact raw SSE bytes
-initiator
-script read/search
-XHR/fetch breakpoint
-analysis workspace write
+setup_outputs:
+  - binding_id
+    source: network_response_json | page_json | selector_value
+    selector
+    pointer
 ```
 
-要求 `8/8 passed`。
+Replay binding 可以引用 setup 输出，将新 conversation ID、current node、CSRF 值或页面 nonce 注入请求。该能力必须通过声明式 selector 实现，不开放任意 JavaScript。
 
-### 16.2 BrowserAction success smoke
+现有 `generated` 与 `preserve_source` binding 继续保留，并扩展 occurrence 语义。
 
-真实 Windows 路径：
+### 8.4 Replay request 精确关联
+
+候选 outbound request 必须同时满足：
 
 ```text
-start Chrome remote debugging
-→ start private js-reverse-mcp
-→ open_session
-→ explicit navigate
-→ click
-→ source-specific SSE predicate
-→ stop/finalize
-→ inspect raw/events/headers
-→ capture authenticated Pandora-like messages[] request with SSE response
-→ export exact network evidence with evidence_id
-→ inspect request shape and array JSON Pointer paths
-→ control replay with fresh volatile message ID (SSE 200)
-→ treatment removing tracking field (SSE 200)
-→ treatment removing required message ID (JSON 422)
-→ verify fresh IDs differ but normalized non-target fields are equivalent
-→ verify mutation_effective on paired exact outbound snapshots
-→ explicit same_value message ID pair produces duplicate 409 and inconclusive result
-→ incremental reader terminates successful SSE at done marker
-→ verify stream_request / stream_event_range evidence IDs
-→ workspace PowerShell SHA verification
-→ close_session
-→ residual process check
+actual method == replay spec method
+normalized actual URL == replay spec URL
+full mutated query matches
+body fingerprint matches（有 body 时）
+dispatch time is inside bounded window
 ```
 
-### 16.3 Cancellation 与因果门禁
+零个或多个候选都 fail closed。GET、HEAD 或无 body 请求不能仅靠 selector ID 和时间窗口关联。
 
-必须覆盖：
+URL normalization 只能处理明确等价的编码形式，不能丢弃 query 顺序或参数重复。
+
+### 8.5 非目标字段比较
+
+默认保留 wire 顺序：
 
 ```text
-cancel during Playwright navigate/click
-cancel during start_stream_capture
-old finished request plus unrelated version change
-two matching requests with one terminal transition
-raw heartbeat count greater than semantic message count
-two sequential message actions with independent checkpoints
-more than 100 stream/network requests
-shutdown with open Playwright session
+normalization:
+  query_order: preserve | ignore
+  header_order: preserve | ignore
 ```
 
-测试必须确认：
+默认值均为 `preserve`。只有 Skill 明确知道站点语义与顺序无关时才使用 `ignore`。
 
-- 无残留 Playwright/Node/MCP/PowerShell/ripgrep 子进程。
-- 被取消的本地进程树已终止，后续 step 未执行，当前 step 的外部结果明确标记为 unknown。
-- matched request ID 精确。
-- raw/semantic source 和 offset 精确。
-- terminal manifest 可读取。
-- MCP read-only call 中进程崩溃后，下一次调用启动新 generation。
-- start outcome unknown 不会报告 collector stopped。
-- stop 成功不会被 post-stop status 失败覆盖。
-- `cancel_experiment` 返回时 browser reservation 已释放。
-- growing file 返回 `changed_during_read` 或稳定单次快照。
-
-## 17. 当前边界与演进方向
-
-当前 collector scope 明确为：
+比较结果必须分别记录：
 
 ```text
-captureScope = page-target-only
-workerCoverage = false
+target delta
+volatile binding effectiveness
+non-target body equivalence
+non-target header equivalence
+non-target query equivalence
+transport semantics equivalence
 ```
 
-Worker / Service Worker auto-attach 不属于当前完成契约。
+### 8.6 环境要求
 
-当前已实现 paired browser-context replay、JSON Pointer array mutation、request shape/redacted body、ordinary/stream evidence、initiator/source persistence、console/page snapshots、verification flow、series 和 packaged Pandora Skill。尚未完成：
+Control 声明环境维度：
 
 ```text
-trace_request atomic breakpoint lifecycle
-automatic six-scenario Pandora-like fixture series
-external HTTP replay
+environment_requirements:
+  required:
+    - page_origin
+    - request_context
+  advisory:
+    - page_url
+    - conversation_current_node
+    - critical_bundle_sha256
 ```
 
-未来扩展必须保持现有不变量，可增加：
+默认 required 只包含后端能稳定观察的维度。Current node、bundle hash 和站点新增状态标识不应永久硬编码为必需维度。Skill 可以按站点和实验目的提升某个维度。
+
+请求上下文 header 支持配置：
 
 ```text
-trace_request
-external HTTP replay
-capture diff
-Worker / Service Worker target coverage
+context_header_names
 ```
 
-只有在需要并行实验时，才把运行模型升级为“每个 session 独立 Chrome/MCP 实例”。在此之前，不通过放宽全局锁或增加队列来模拟并发。
+默认覆盖 Cookie、Authorization、CSRF/XSRF；Skill 可增加 `X-API-Key`、设备 token、attestation 或 challenge header。Manifest 只保存本地 SHA-256 和完整性状态，不保存原值。
 
-## 18. 验收标准
+### 8.7 Fetch 传输语义
 
-1. GPT 看不到内部 MCP lifecycle 工具。
-2. Capture flow 与 browser-context replay 由后端原子完成。
-3. 全局只允许一个活动实验，第二个实验立即返回 busy。
-4. Running manifest、Trace 和 collector 早于第一条页面变更动作。
-5. Playwright、MCP、PowerShell 和 ripgrep cancellation 都完成进程树 cleanup。
-6. Side-effect MCP timeout/cancel 后 generation 重建且不自动重试。
-7. MCP transport crash 结束旧 generation，下一次调用自动恢复。
-8. 每个 wait 使用 request-state checkpoint，而非只有 capture version。
-9. Raw 与 semantic event 使用独立 cursor、source-specific predicate 和 byte-offset seek。
-10. Wait 只返回真正满足条件的 request IDs。
-11. Stream 和 network status 完整分页。
-12. Primary、supporting 和 objective integrity 分开；stream=false 使用 not_required。
-13. Capture UUID、relative directory、metadata artifact、namespace 和 generation 持久化。
-14. Public stream status 以 experiment/UUID 身份查询，不接受裸 capture ID。
-15. Start outcome unknown 不声明 stopped；stop/status 结果互不覆盖。
-16. `cancel_experiment` 等待 cleanup 并释放 runtime reservation。
-17. Stop cancellation 只在完整实验上下文满足时解释为用户取消。
-18. 原始证据只读，派生内容写入指定目录。
-19. Browser operation 与 protected workspace mutation 原子互斥。
-20. Workspace 大型 I/O 流式有界；文件读取为单次快照并报告 changed_during_read。
-21. 服务 shutdown detach 本实例的 open Playwright sessions。
-22. OS 进程锁早于 ExperimentStore recovery。
-23. Stage 0、BrowserAction success、cancellation 和 causal multi-stream gates 全部通过。
-24. 产品不包含 Git、PR、CI、ZIP 或第二套 artifact 文件 API。
-25. Ordinary network evidence 使用 experiment high-water checkpoint，只导出窗口内 reqid。
-26. 每个核心证据拥有稳定 evidence_id，并链接 artifact_id。
-27. Replay 只能从 source experiment/evidence 读取 exact snapshot，不能接受任意本地路径。
-28. Credential artifact 默认不被 workspace inspect/search/read 返回。
-29. Packaged Pandora Skill 负责六组实验、单变量矩阵和报告完成标准。
-30. JSON replay path 使用无 wildcard JSON Pointer，支持数组索引。
-31. Treatment 必须引用成功 control、复用 volatile bindings 且恰好一个 mutation。
-32. Browser-managed header mutation 在 schema 层拒绝。
-33. 每个 treatment 必须由 exact outbound request 证明 mutation_effective=true。
-34. JSON request 自动生成 request shape/redacted body public artifacts。
-35. SSE source replay 自动启用 raw stream capture，并生成 stream evidence IDs。
-36. 保存的源码片段包含 URL/script ID、范围、SHA-256 和 initiator evidence 关联。
-37. Treatment payload 只能包含 control_experiment_id 和 mutation；其余参数继承 pair protocol hash。
-38. Volatile binding 默认 fresh_equivalent，same_value 必须显式声明。
-39. Mutation 结论同时要求 Control baseline、target delta、volatile effectiveness 和 non-target equivalence。
-40. Replay request 使用 dispatch time + canonical body fingerprint 唯一关联，候选歧义时失败。
-41. Stream 与 ordinary evidence 优先按 network ID/generation、CDP ID、persistent ID关联；URL/method仅作唯一 fallback。
-42. Ordinary snapshot 不升级 stream raw/event/metadata artifact integrity。
-43. 只有明确引用 target 的 validation rejection 可支持 required；其他错误分类为 inconclusive。
-44. Replay response 通过增量 reader有界消费，支持 done marker、byte limit 和 idle timeout。
-45. Request shape Action分页有界，完整 redacted body不默认返回。
+Replay 必须显式记录实际 transport 语义：
+
+```text
+replay_transport_semantics:
+  credentials
+  redirect
+  cache
+  referrer_policy
+  keepalive
+  mode
+  priority
+  source_fetch_options_known
+```
+
+当前固定 `credentials=include`、`redirect=follow` 的行为必须在 manifest 中如实说明。后续只开放少量安全、可验证的 fetch options。Wire 字段等价不能自动解释为前端请求行为完全等价。
+
+### 8.8 中性响应观察
+
+后端不再直接把单次响应定性为 `required`、`candidate_optional` 或 `constrained_value`。目标返回：
+
+```text
+observations:
+  http_status
+  response_content_type
+  mutation_effective
+  target_reference_strength
+  raw_validation_path
+  normalized_validation_path
+  structured_error_code
+  response_contract_match
+  stream_terminal_reason
+
+inference_hints:
+  validation_like
+  conflict_like
+  authentication_like
+  rate_limit_like
+  server_failure_like
+  redirect_like
+  success_like
+  signals_conflict
+```
+
+固定 HTTP 状态或 validation code 集可以作为可替换 hint profile，但不是后端最终事实。
+
+精确 JSON Pointer 按原样保留。只有框架式 location 数组才允许按可配置规则去掉 transport wrapper。`missing` 与 `not_required` 等相反信号同时出现时，必须记录 `signals_conflict=true`，交给 GPT/Skill 判断。
+
+---
+
+## 9. 凭据、安全与数据边界
+
+完整 request/response headers 可能包含 Cookie、Authorization、CSRF 和 Set-Cookie。系统遵守：
+
+- 默认只返回 redacted summary、shape 和 hash；
+- credential artifact 正文默认对 inspect/search/read 隐藏；
+- replay 可在后端内部使用凭据，但不把凭据放入 Skill、Action 响应或报告；
+- 原始 evidence 不允许被 workspace write/patch 改写；
+- 大型 binary、Base64、raw stream 不通过 Action JSON 返回；
+- PowerShell 网络和危险命令检查是本地策略，不宣称为安全沙箱；
+- 所有实验只针对用户有权访问的账号和站点。
+
+Browser-managed Cookie、Origin、Referer、Host、Content-Length 和 `Sec-*` header 默认禁止 mutation。若未来开放例外，必须是明确、受控且可审计的专用能力。
+
+---
+
+## 10. 实施路线
+
+### P0：解除旧协议假设，修正事实模型
+
+1. 拆分 `execution_integrity`、`evidence_integrity`、`causal_comparability`、`inference_eligibility`，保留 `objective_integrity` 兼容映射。
+2. 将环境 required/advisory 变为 Control 可声明配置，不再永久要求 current node 和 bundle hash。
+3. 将 replay response 改为 observations + inference hints，移除后端固定 required/optional 结论。
+4. 引入通用 `response_mode` 与 `terminal_conditions`；默认 done marker 改为 `null`。
+5. 允许 `PrimaryRequest.mime_types=[]`，修复无 Content-Type source replay。
+6. Replay request 关联强制比较实际 method、完整 URL/query、body fingerprint 和 dispatch window。
+
+P0 完成后，现有 JSON/SSE 能力必须保持兼容，且“完整执行但证据不足”不再被误报为执行失败。
+
+### P1：增强未知协议探索与成对实验可信度
+
+1. 非目标比较默认保留 header/query wire 顺序，并提供显式 normalization。
+2. 增加 `setup_outputs`，允许 setup 产生动态 binding。
+3. 增加 `exploratory` replay。
+4. Mutation 增加结构化 `add`。
+5. JSON Pointer 与框架 location 分开规范化，同时保存 raw/normalized path。
+6. 冲突 validation 信号不再强制覆盖为 required。
+7. 重复 header/query binding 与 mutation 支持 occurrence。
+8. Manifest 明确保存 fetch transport semantics，并开放受限安全配置。
+
+### P2：扩展协议覆盖与回归门禁
+
+1. 增加 `context_header_names`。
+2. 完成 NDJSON、raw chunked 和无 marker/仅 network close 的 stream 场景。
+3. 评估 WebSocket capture/replay 的独立契约，不复用 fetch/SSE 模型。
+4. 增加以下回归测试：
+
+```text
+source response 无 Content-Type
+GET replay 与同窗口后台 GET 共存
+header/query 顺序变化但值相同
+top-level JSON 字段名为 body
+missing 与 not_required 冲突
+setup 创建 conversation 并注入 ID
+NDJSON/raw chunked response
+SSE 无 [DONE]、仅 network close
+重复 header/query preserve_source
+exploratory replay 同时 add/remove
+```
+
+P2 不要求一次完成所有站点类型。每个新增传输模式必须先定义证据、终态、完整性和取消语义，再进入公开 OpenAPI。
+
+---
+
+## 11. 验证策略
+
+### 11.1 自动测试
+
+每次修改至少运行：
+
+```text
+python -m pytest
+```
+
+涉及模型或 OpenAPI 时增加 schema 断言；涉及比较、路径和响应分类时运行 protocol evidence 定向测试；涉及 browser lifecycle 时运行 browser action 测试。
+
+测试数量会随实现变化，文档不固定某个永久计数。PR 应报告实际执行命令和当次结果。
+
+### 11.2 真实运行门禁
+
+真实 Windows smoke 应覆盖：
+
+```text
+session open / page alignment
+capture before first navigation
+ordinary JSON request/response evidence
+stream raw bytes and parsed events
+initiator and source persistence
+control replay baseline
+single-mutation treatment
+exploratory replay（实现后）
+exact outbound request correlation
+cancellation and cleanup
+workspace evidence inspection
+session close and residual process check
+```
+
+每个新增响应模式都要验证：
+
+```text
+正常终止
+idle timeout
+byte limit
+network close
+manual cancel
+collector/adapter failure
+terminal manifest 可读
+```
+
+### 11.3 结论门禁
+
+自动因果推断只在以下条件同时满足时允许：
+
+```text
+execution_integrity = complete
+evidence_integrity = complete
+causal_comparability = observed_equivalent
+mutation_effective = true
+Control baseline valid
+Treatment target delta observed
+non-target comparison passed
+```
+
+否则保留证据并标记 `supervised_only` 或 `ineligible`，不得丢弃实验，也不得伪装成自动结论。
+
+---
+
+## 12. 完成标准
+
+本轮设计演进完成时应满足：
+
+1. 后端不依赖 Pandora endpoint、字段名、固定错误码或 `[DONE]` 才能工作；
+2. GPT 只能调用结构化公开 Action，不能直接控制私有 collector lifecycle；
+3. Capture 与 replay 仍由后端原子执行并留下 terminal manifest；
+4. 执行完整性、证据完整性、环境可比性和推断资格分别表达；
+5. 无 Content-Type、普通响应和非 SSE 流不会在模型层被拒绝；
+6. Replay outbound request 以 method、完整 URL/query、body 和时间窗口唯一关联；
+7. Control/Treatment 保持严格单变量，Exploratory 明确不具备自动推断资格；
+8. Backend 返回观察与提示，Skill 负责跨实验业务结论；
+9. Header/query 顺序和重复值默认按 wire 保留；
+10. Setup 可通过受控 binding 把动态状态传入 replay；
+11. Fetch transport semantics 在 manifest 中可见；
+12. 原始证据只读，凭据默认隐藏，大型数据不进入 Action JSON；
+13. 所有新增能力都有模型、回归测试和真实运行门禁；
+14. README、PANDORA_REPRODUCTION.md、OpenAPI 与实现不存在互相矛盾的现状声明。
+
+达到这些标准后，`web_rev_action` 才是一个适合网页版 GPT Action 持续分析未知新版协议的通用实验后端，而不是带有旧 Pandora 假设的专用复刻工具。
