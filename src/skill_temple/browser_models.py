@@ -563,6 +563,7 @@ class ReplayControlPayload(StrictModel):
     mutations: list[ReplayMutation] = Field(default_factory=list, max_length=0)
     volatile_bindings: list[VolatileBinding] = Field(default_factory=list, max_length=32)
     target: BrowserTarget = Field(default_factory=BrowserTarget)
+    setup_flow: list[FlowStep] = Field(default_factory=list, max_length=20)
     wait_for: WaitCondition | None = None
     verification_flow: list[FlowStep] = Field(default_factory=list, max_length=20)
     execution_mode: Literal["job", "sync"] = "job"
@@ -577,6 +578,8 @@ class ReplayControlPayload(StrictModel):
     default_done_marker: str | None = Field(default="[DONE]", max_length=512)
     default_done_event_name: str | None = Field(default=None, max_length=128)
     raw_only: bool = False
+    ignored_cookie_names: list[str] = Field(default_factory=list, max_length=64)
+    ignored_context_headers: list[str] = Field(default_factory=list, max_length=64)
     capture: CaptureOptions = Field(
         default_factory=lambda: CaptureOptions(stream=False)
     )
@@ -598,6 +601,23 @@ class ReplayControlPayload(StrictModel):
             raise ValueError("replay_request does not allow target.start_url")
         if self.mutations:
             raise ValueError("control replay requires mutations=[]")
+        step_ids = [step.step_id for step in [*self.setup_flow, *self.verification_flow]]
+        if len(step_ids) != len(set(step_ids)):
+            raise ValueError("setup_flow and verification_flow step_id values must be unique")
+        self.ignored_cookie_names = sorted(
+            {
+                item.strip().lower()
+                for item in self.ignored_cookie_names
+                if item.strip()
+            }
+        )
+        self.ignored_context_headers = sorted(
+            {
+                item.strip().lower()
+                for item in self.ignored_context_headers
+                if item.strip()
+            }
+        )
         return self
 
 

@@ -79,6 +79,7 @@ control replay
   replay_mode = control
   mutations = []
   volatile_bindings declare generator and reuse_policy
+  setup_flow restores the pre-dispatch state when needed
 
 treatment replay
   replay_mode = treatment
@@ -127,6 +128,8 @@ remove_query_parameter
 replace_query_parameter
 ```
 
+JSON Pointer and query parameter names are case-sensitive. Header names are case-insensitive. Duplicate header/query values are compared as complete ordered lists, including multiplicity.
+
 Browser-managed headers such as Cookie, Origin, Referer, Host, Content-Length, and `Sec-*` cannot be mutated through browser-context fetch and must be rejected rather than classified. Classify a field only when the paired assessment proves:
 
 ```text
@@ -146,14 +149,18 @@ Then compare:
 - conversation persistence or subsequent retrieval;
 - console errors.
 
+For stateful endpoints, define `setup_flow` on the Control. Treatment inherits it. Execution order is collector → setup → pre-dispatch environment → fetch → verification. Do not use `verification_flow` to restore the precondition.
+
 If the source response is `text/event-stream`, replay automatically requires raw
 capture, semantic parse, and stream artifacts. `raw_only=true` is the explicit
-exception. The reader parses complete SSE events and terminates only when an
+exception. The reader supports LF, CRLF, CR, mixed line endings, and EOF flush. It parses complete SSE events and terminates only when an
 event's combined `data` exactly equals the configured marker and the optional
 event name matches. A literal `[DONE]` inside JSON, model text, or tool arguments
 is not terminal. Missing marker, idle timeout, byte-limit truncation, malformed
 semantic evidence, or unexpected Content-Type makes the result partial or
 failed even when HTTP status is 200.
+
+Reaching the byte limit exactly is not truncation until a later read produces an extra byte. HTTP 3xx is `redirect_or_cache_response`, not success.
 
 An exact non-stream error response terminates the stream requirement without being treated as a collector failure. Interpret it by classification:
 
@@ -249,6 +256,9 @@ The generated HTTP replay script must use placeholders or environment variables 
   SHA-256 digests for Cookie name/value pairs, Authorization, CSRF, and the
   combined request context. This is change detection, not encryption or key
   management.
+- Treat request context as observed only when exact request headers are proven complete, including ExtraInfo/associatedCookies or an explicit completeness marker. Preserve Cookie wire order in the hash. Ignore lists default to empty.
+- Post-response and post-verification environments contain page state only unless a new probe is captured; they must not reuse pre-dispatch request credentials.
+- Lock replay primary stream evidence to the exact ordinary replay request. Same-endpoint streams remain supporting evidence.
 - Replay correlation requires a numeric observed timestamp inside the bounded
   dispatch window. Missing timestamps do not participate in automatic matching.
 - If an experiment is submitted incorrectly, call `cancel_experiment`; do not close the session or restart the service.

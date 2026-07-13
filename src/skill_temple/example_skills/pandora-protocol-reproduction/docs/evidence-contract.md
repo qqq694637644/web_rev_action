@@ -78,6 +78,7 @@ mutation list
 control_experiment_id
 volatile binding metadata
 pair_protocol_hash
+setup_flow and setup step results
 replay_attempt_id and dispatch time
 control/treatment exact network evidence IDs
 control_wire_value / treatment_wire_value
@@ -94,6 +95,10 @@ new network evidence IDs
 stream request/event-range evidence IDs
 page and console evidence IDs
 ```
+
+Request context is `observed` only when exact header completeness is proven by an explicit marker or associated request headers + ExtraInfo/associatedCookies evidence. Empty or ordinary header arrays are insufficient. Post environments do not reuse the pre-dispatch request context.
+
+Replay primary stream evidence must reference the exact replay ordinary evidence ID. Same-URL streams without that stable association are supporting evidence.
 
 A replay response status alone is insufficient to determine field necessity.
 Causal comparison uses only pre-dispatch data and returns

@@ -1547,35 +1547,83 @@ class JsReverseMcpAdapter:
           let doneEventNameObserved = null;
           let truncated = false;
           let terminationReason = reader ? 'network_close' : 'no_response_body';
-          let sseBuffer = '';
-          const consumeSseEvents = (text) => {
-            sseBuffer += text;
-            while (true) {
-              const match = /\r?\n\r?\n/.exec(sseBuffer);
-              if (!match) return false;
-              const block = sseBuffer.slice(0, match.index);
-              sseBuffer = sseBuffer.slice(match.index + match[0].length);
-              let eventName = 'message';
-              const dataLines = [];
-              for (const line of block.split(/\r?\n/)) {
-                if (!line || line.startsWith(':')) continue;
-                const colon = line.indexOf(':');
-                const field = colon < 0 ? line : line.slice(0, colon);
-                let fieldValue = colon < 0 ? '' : line.slice(colon + 1);
-                if (fieldValue.startsWith(' ')) fieldValue = fieldValue.slice(1);
-                if (field === 'event') eventName = fieldValue;
-                if (field === 'data') dataLines.push(fieldValue);
+          let sseLineBuffer = '';
+          let sseEventName = 'message';
+          let sseDataLines = [];
+          const dispatchSseEvent = () => {
+            const data = sseDataLines.join('\n');
+            const eventName = sseEventName;
+            sseEventName = 'message';
+            sseDataLines = [];
+            if (
+              doneMarker &&
+              data === doneMarker &&
+              (!doneEventName || eventName === doneEventName)
+            ) {
+              doneEventNameObserved = eventName;
+              return true;
+            }
+            return false;
+          };
+          const consumeSseLine = (line) => {
+            if (line === '') return dispatchSseEvent();
+            if (line.startsWith(':')) return false;
+            const colon = line.indexOf(':');
+            const field = colon < 0 ? line : line.slice(0, colon);
+            let fieldValue = colon < 0 ? '' : line.slice(colon + 1);
+            if (fieldValue.startsWith(' ')) fieldValue = fieldValue.slice(1);
+            if (field === 'event') sseEventName = fieldValue;
+            if (field === 'data') sseDataLines.push(fieldValue);
+            return false;
+          };
+          const consumeSseEvents = (text, eof = false) => {
+            sseLineBuffer += text;
+            let offset = 0;
+            while (offset < sseLineBuffer.length) {
+              let separator = -1;
+              for (let i = offset; i < sseLineBuffer.length; i++) {
+                const code = sseLineBuffer.charCodeAt(i);
+                if (code === 10 || code === 13) {
+                  separator = i;
+                  break;
+                }
               }
-              const data = dataLines.join('\n');
+              if (separator < 0) break;
               if (
-                doneMarker &&
-                data === doneMarker &&
-                (!doneEventName || eventName === doneEventName)
+                sseLineBuffer.charCodeAt(separator) === 13 &&
+                separator + 1 === sseLineBuffer.length &&
+                !eof
               ) {
-                doneEventNameObserved = eventName;
+                break;
+              }
+              const line = sseLineBuffer.slice(offset, separator);
+              let next = separator + 1;
+              if (
+                sseLineBuffer.charCodeAt(separator) === 13 &&
+                sseLineBuffer.charCodeAt(separator + 1) === 10
+              ) {
+                next += 1;
+              }
+              offset = next;
+              if (consumeSseLine(line)) {
+                sseLineBuffer = sseLineBuffer.slice(offset);
                 return true;
               }
             }
+            sseLineBuffer = sseLineBuffer.slice(offset);
+            if (eof) {
+              if (sseLineBuffer.length > 0) {
+                if (consumeSseLine(sseLineBuffer)) {
+                  sseLineBuffer = '';
+                  return true;
+                }
+                sseLineBuffer = '';
+              }
+              if (sseDataLines.length > 0 || sseEventName !== 'message') {
+                return dispatchSseEvent();
+              }
+            }
+            return false;
           };
           const readWithIdleTimeout = async () => {
             let timer;
@@ -1605,19 +1653,21 @@ class JsReverseMcpAdapter:
                 break;
               }
               if (readResult.done) {
-                if (doneMarker) consumeSseEvents(decoder.decode());
-                terminationReason = 'network_close';
+                if (doneMarker && consumeSseEvents(decoder.decode(), true)) {
+                  doneMarkerObserved = true;
+                  terminationReason = 'done_marker';
+                } else {
+                  terminationReason = 'network_close';
+                }
                 break;
               }
               const chunk = readResult.value || new Uint8Array();
               const remaining = maxResponseBytes - bodyByteLength;
-              if (remaining <= 0) {
-                truncated = true;
-                terminationReason = 'max_response_bytes';
-                await reader.cancel('max_response_bytes').catch(() => {});
-                break;
-              }
-              const accepted = chunk.subarray(0, Math.min(chunk.byteLength, remaining));
+              const overflow = chunk.byteLength > remaining;
+              const accepted = chunk.subarray(
+                0,
+                Math.min(chunk.byteLength, Math.max(0, remaining)),
+              );
               bodyByteLength += accepted.byteLength;
               if (previewByteLength < 8192) {
                 const previewPart = accepted.subarray(
@@ -1628,14 +1678,14 @@ class JsReverseMcpAdapter:
                 previewByteLength += previewPart.byteLength;
               }
               if (doneMarker) {
-                if (consumeSseEvents(decoder.decode(accepted, {stream: true}))) {
+                if (consumeSseEvents(decoder.decode(accepted, {stream: true}), false)) {
                   doneMarkerObserved = true;
                   terminationReason = 'done_marker';
                   await reader.cancel('done_marker').catch(() => {});
                   break;
                 }
               }
-              if (accepted.byteLength < chunk.byteLength || bodyByteLength >= maxResponseBytes) {
+              if (overflow) {
                 truncated = true;
                 terminationReason = 'max_response_bytes';
                 await reader.cancel('max_response_bytes').catch(() => {});

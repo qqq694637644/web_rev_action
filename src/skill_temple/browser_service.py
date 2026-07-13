@@ -73,6 +73,7 @@ from .protocol_evidence import (
     load_snapshot,
     network_checkpoint,
     network_request_matches,
+    network_snapshot_dimensions,
     public_network_summary,
     redacted_request_body_from_snapshot,
     request_body_canonical_sha256_from_snapshot,
@@ -856,6 +857,10 @@ class BrowserActionService:
             "source_evidence_id": control.source_evidence_id,
             "mode": control.mode,
             "target": control.target.model_dump(mode="json", exclude_none=True),
+            "setup_flow": [
+                step.model_dump(mode="json", exclude_none=True)
+                for step in control.setup_flow
+            ],
             "wait_for": (
                 control.wait_for.model_dump(mode="json", exclude_none=True)
                 if control.wait_for
@@ -873,6 +878,8 @@ class BrowserActionService:
             "default_done_marker": control.default_done_marker,
             "default_done_event_name": control.default_done_event_name,
             "raw_only": control.raw_only,
+            "ignored_cookie_names": control.ignored_cookie_names,
+            "ignored_context_headers": control.ignored_context_headers,
             "capture": control.capture.model_dump(mode="json"),
             "requirements": control.requirements.model_dump(mode="json"),
             "network_evidence": [
@@ -1492,6 +1499,43 @@ class BrowserActionService:
         }
 
     @staticmethod
+    def _stream_request_has_complete_request_headers(
+        request: dict[str, Any],
+    ) -> bool:
+        artifacts = request.get("coreArtifacts")
+        if not isinstance(artifacts, list):
+            return False
+        by_kind = {
+            str(item.get("kind")): item
+            for item in artifacts
+            if isinstance(item, dict) and item.get("kind")
+        }
+        request_headers = by_kind.get("request_headers")
+        request_headers_extra = by_kind.get("request_headers_extra")
+        if not isinstance(request_headers, dict) or not isinstance(
+            request_headers_extra,
+            dict,
+        ):
+            return False
+        for descriptor in (request_headers, request_headers_extra):
+            if descriptor.get("writeStatus") not in {None, "written"}:
+                return False
+            if isinstance(descriptor.get("bytes"), int) and descriptor["bytes"] <= 0:
+                return False
+        return True
+
+    @classmethod
+    def _mark_snapshot_headers_complete_from_stream(
+        cls,
+        snapshot: dict[str, Any] | None,
+        stream_request: dict[str, Any] | None,
+    ) -> None:
+        if not isinstance(snapshot, dict) or not isinstance(stream_request, dict):
+            return
+        if cls._stream_request_has_complete_request_headers(stream_request):
+            snapshot["requestHeadersCompleteness"] = "complete"
+
+    @staticmethod
     def _augment_network_request_with_evidence(
         request: dict[str, Any],
         evidence_entries: list[dict[str, Any]],
@@ -1705,15 +1749,26 @@ class BrowserActionService:
 
     @staticmethod
     def _sha256_lines(values: list[str]) -> str:
-        return hashlib.sha256("\n".join(sorted(values)).encode("utf-8")).hexdigest()
+        return hashlib.sha256("\n".join(values).encode("utf-8")).hexdigest()
 
     @classmethod
     def _request_context_hashes(
         cls,
         snapshot: dict[str, Any] | None,
+        *,
+        ignored_cookie_names: list[str] | None = None,
+        ignored_context_headers: list[str] | None = None,
     ) -> dict[str, Any]:
         headers = snapshot.get("requestHeadersArray") if isinstance(snapshot, dict) else None
-        if not isinstance(headers, list):
+        dimensions = (
+            network_snapshot_dimensions(snapshot)
+            if isinstance(snapshot, dict)
+            else {}
+        )
+        if (
+            not isinstance(headers, list)
+            or dimensions.get("request_headers_completeness") != "complete"
+        ):
             return {
                 "status": "unavailable",
                 "cookie_name_value_sha256": None,
@@ -1721,24 +1776,41 @@ class BrowserActionService:
                 "csrf_header_sha256": None,
                 "request_context_sha256": None,
             }
+        ignored_cookies = {
+            item.strip().lower()
+            for item in (ignored_cookie_names or [])
+            if item.strip()
+        }
+        ignored_headers = {
+            item.strip().lower()
+            for item in (ignored_context_headers or [])
+            if item.strip()
+        }
         cookies: list[str] = []
         authorization: list[str] = []
         csrf: list[str] = []
-        for item in headers:
+        for header_index, item in enumerate(headers):
             if not isinstance(item, dict):
                 continue
             name = str(item.get("name", "")).strip().lower()
             value = str(item.get("value", ""))
+            if name in ignored_headers:
+                continue
             if name == "cookie":
-                cookies.extend(
-                    segment.strip()
-                    for segment in value.split(";")
-                    if segment.strip()
-                )
+                for segment_index, segment in enumerate(value.split(";")):
+                    normalized_segment = segment.strip()
+                    if not normalized_segment:
+                        continue
+                    cookie_name = normalized_segment.split("=", 1)[0].strip().lower()
+                    if cookie_name in ignored_cookies:
+                        continue
+                    cookies.append(
+                        f"{header_index}:{segment_index}:{normalized_segment}"
+                    )
             elif name in {"authorization", "proxy-authorization"}:
-                authorization.append(f"{name}:{value}")
+                authorization.append(f"{header_index}:{name}:{value}")
             elif "csrf" in name or "xsrf" in name:
-                csrf.append(f"{name}:{value}")
+                csrf.append(f"{header_index}:{name}:{value}")
         cookie_hash = cls._sha256_lines(cookies)
         authorization_hash = cls._sha256_lines(authorization)
         csrf_hash = cls._sha256_lines(csrf)
@@ -1748,8 +1820,14 @@ class BrowserActionService:
             "authorization_sha256": authorization_hash,
             "csrf_header_sha256": csrf_hash,
             "request_context_sha256": cls._sha256_lines(
-                [cookie_hash, authorization_hash, csrf_hash]
+                [
+                    f"cookie:{cookie_hash}",
+                    f"authorization:{authorization_hash}",
+                    f"csrf:{csrf_hash}",
+                ]
             ),
+            "ignored_cookie_names": sorted(ignored_cookies),
+            "ignored_context_headers": sorted(ignored_headers),
         }
 
     @classmethod
@@ -1759,6 +1837,9 @@ class BrowserActionService:
         wire_snapshot: dict[str, Any] | None,
         *,
         phase: str,
+        include_request_context: bool = True,
+        ignored_cookie_names: list[str] | None = None,
+        ignored_context_headers: list[str] | None = None,
     ) -> dict[str, Any]:
         page_id = alignment.js_reverse_page_id if alignment is not None else None
         page_url = (
@@ -1773,14 +1854,30 @@ class BrowserActionService:
             else ""
         )
         request_split = urlsplit(request_url)
-        request_context = cls._request_context_hashes(wire_snapshot)
+        request_context = (
+            cls._request_context_hashes(
+                wire_snapshot,
+                ignored_cookie_names=ignored_cookie_names,
+                ignored_context_headers=ignored_context_headers,
+            )
+            if include_request_context
+            else {
+                "status": "not_applicable",
+                "cookie_name_value_sha256": None,
+                "authorization_sha256": None,
+                "csrf_header_sha256": None,
+                "request_context_sha256": None,
+                "ignored_cookie_names": sorted(ignored_cookie_names or []),
+                "ignored_context_headers": sorted(ignored_context_headers or []),
+            }
+        )
         unavailable = [
             "conversation_current_node",
             "critical_bundle_sha256",
         ]
         if alignment is None or alignment.status != "aligned":
             unavailable.extend(["page_id", "page_url", "page_origin"])
-        if request_context["status"] != "observed":
+        if include_request_context and request_context["status"] != "observed":
             unavailable.append("request_context_sha256")
         return {
             "phase": phase,
@@ -2209,6 +2306,13 @@ class BrowserActionService:
             "current_volatile_binding_values": current_binding_values,
             "pair_protocol": pair_protocol,
             "pair_protocol_hash": pair_protocol_hash,
+            "setup_flow": [
+                step.model_dump(mode="json", exclude_none=True)
+                for step in control_payload.setup_flow
+            ],
+            "_setup_flow_steps": list(control_payload.setup_flow),
+            "ignored_cookie_names": list(control_payload.ignored_cookie_names),
+            "ignored_context_headers": list(control_payload.ignored_context_headers),
             "mutation": mutation,
             "replay_attempt_id": replay_attempt_id,
             "expected_request_body_canonical_sha256": (
@@ -3702,6 +3806,7 @@ class BrowserActionService:
             replay_http_status: int | None = None
             replay_response_content_type: str | None = None
             post_response_alignment: AlignmentResult | None = None
+            pre_dispatch_alignment: AlignmentResult = alignment
             replay_artifacts: list[dict[str, Any]] = []
             step_results: list[FlowStepResult] = []
             wait_observations: list[dict[str, Any]] = []
@@ -3908,6 +4013,156 @@ class BrowserActionService:
                         capture_metadata_artifact_id=capture_metadata_artifact_id,
                         transport_generation=capture_transport_generation,
                     )
+                if replay_plan is not None:
+                    setup_steps = replay_plan.get("_setup_flow_steps")
+                    if isinstance(setup_steps, list) and setup_steps:
+                        for setup_index, step in enumerate(setup_steps):
+                            self._ensure_finalize_reserve(
+                                deadline,
+                                f"setup step {step.step_id}",
+                            )
+                            started = utc_now()
+                            try:
+                                if step.action not in {"wait", "assert", "snapshot"}:
+                                    if capture_id is not None:
+                                        stream_checkpoint = await self._stream_checkpoint(
+                                            capture_id,
+                                            request_matcher,
+                                            self._operation_deadline(
+                                                deadline,
+                                                1_500,
+                                                f"checkpoint before setup {step.step_id}",
+                                            ),
+                                        )
+                                    if first_mutation_wall_time_ms is None:
+                                        first_mutation_wall_time_ms = int(
+                                            time.time() * 1000
+                                        )
+                                step_deadline = self._operation_deadline(
+                                    deadline,
+                                    step.timeout_ms,
+                                    f"setup step {step.step_id}",
+                                )
+                                if step.action in {"wait", "assert"}:
+                                    result = await self._wait_condition(
+                                        session_ref=session_id,
+                                        capture_id=capture_id,
+                                        condition=step.condition,
+                                        checkpoint=stream_checkpoint,
+                                        deadline=step_deadline,
+                                    )
+                                    stream_checkpoint = self._checkpoint_from_wait_result(
+                                        result,
+                                        stream_checkpoint,
+                                    )
+                                    wait_observations.append(
+                                        {
+                                            "phase": "setup",
+                                            "step_id": step.step_id,
+                                            "step_index": setup_index,
+                                            "condition_type": step.condition.type,
+                                            "capture_version": result.get(
+                                                "capture_version"
+                                            ),
+                                            "matched_request_ids": result.get(
+                                                "matched_request_ids", []
+                                            ),
+                                            "matched_event": result.get(
+                                                "matched_event"
+                                            ),
+                                            "terminal_status": result.get(
+                                                "terminal_status"
+                                            ),
+                                        }
+                                    )
+                                    if not result.get("condition_met", True):
+                                        raise BrowserServiceError(
+                                            (
+                                                "assertion_failed"
+                                                if step.action == "assert"
+                                                else "wait_condition_timeout"
+                                            ),
+                                            f"Setup condition failed: {step.step_id}",
+                                            409,
+                                        )
+                                    snapshot_ref = None
+                                else:
+                                    result = await self.playwright.execute_step(
+                                        session_id,
+                                        step,
+                                        experiment_dir,
+                                        step_deadline,
+                                    )
+                                    raw_snapshot_ref = result.get("snapshot_ref")
+                                    snapshot_ref = (
+                                        self.experiments.relative_path(
+                                            str(raw_snapshot_ref)
+                                        )
+                                        if raw_snapshot_ref
+                                        else None
+                                    )
+                                step_results.append(
+                                    FlowStepResult(
+                                        step_id=step.step_id,
+                                        status="completed",
+                                        started_at=started,
+                                        ended_at=utc_now(),
+                                        snapshot_ref=snapshot_ref,
+                                    )
+                                )
+                            except asyncio.CancelledError:
+                                canceled_status = (
+                                    "canceled"
+                                    if step.action in {"wait", "assert", "snapshot"}
+                                    else "canceled_outcome_unknown"
+                                )
+                                step_results.append(
+                                    FlowStepResult(
+                                        step_id=step.step_id,
+                                        status=canceled_status,
+                                        started_at=started,
+                                        ended_at=utc_now(),
+                                        error="The replay setup step was canceled.",
+                                    )
+                                )
+                                raise
+                            except Exception as exc:
+                                step_results.append(
+                                    FlowStepResult(
+                                        step_id=step.step_id,
+                                        status="failed",
+                                        started_at=started,
+                                        ended_at=utc_now(),
+                                        error=str(exc)[:4000],
+                                    )
+                                )
+                                raise
+                        try:
+                            setup_page = await self.playwright.current_page(
+                                session_id,
+                                self._operation_deadline(
+                                    deadline,
+                                    2_500,
+                                    "pre-dispatch current page",
+                                ),
+                            )
+                            pre_dispatch_alignment = await self.js_reverse.align_page(
+                                setup_page,
+                                self._operation_deadline(
+                                    deadline,
+                                    2_500,
+                                    "pre-dispatch page alignment",
+                                ),
+                                page_id=(
+                                    str(session["js_reverse_page_id"])
+                                    if session.get("js_reverse_page_id")
+                                    else None
+                                ),
+                            )
+                        except Exception as exc:
+                            warnings.append(
+                                f"pre-dispatch alignment: {str(exc)[:1000]}"
+                            )
                 if payload.capture.screenshots:
                     try:
                         screenshot_paths.append(
@@ -4032,7 +4287,7 @@ class BrowserActionService:
                             and (
                                 replay_http_status is None
                                 or replay_http_status < 200
-                                or replay_http_status >= 400
+                                or replay_http_status >= 300
                             )
                         ):
                             errors.append(
@@ -4430,6 +4685,30 @@ class BrowserActionService:
                     self.experiments.root,
                     replay_network_entry,
                 )
+                associated_replay_streams: list[dict[str, Any]] = []
+                if replay_network_evidence_id:
+                    for stream_request in final_status_payload.get("requests", []):
+                        if not isinstance(stream_request, dict):
+                            continue
+                        exact_evidence, _ = self._associate_stream_network_evidence(
+                            stream_request,
+                            [
+                                item
+                                for item in evidence_entries
+                                if item.get("kind") == "network_request"
+                            ],
+                        )
+                        if (
+                            isinstance(exact_evidence, dict)
+                            and exact_evidence.get("evidence_id")
+                            == replay_network_evidence_id
+                        ):
+                            associated_replay_streams.append(stream_request)
+                if len(associated_replay_streams) == 1:
+                    self._mark_snapshot_headers_complete_from_stream(
+                        wire_snapshot,
+                        associated_replay_streams[0],
+                    )
                 if isinstance(wire_snapshot, dict):
                     exact_status = wire_snapshot.get("status")
                     if isinstance(exact_status, int):
@@ -4610,19 +4889,33 @@ class BrowserActionService:
                         f"{classification}."
                     )
                 pre_dispatch_environment = self._environment_fingerprint(
-                    alignment,
+                    pre_dispatch_alignment,
                     wire_snapshot,
                     phase="pre_dispatch",
+                    ignored_cookie_names=replay_plan.get("ignored_cookie_names"),
+                    ignored_context_headers=replay_plan.get(
+                        "ignored_context_headers"
+                    ),
                 )
                 post_response_environment = self._environment_fingerprint(
                     post_response_alignment,
-                    wire_snapshot,
+                    None,
                     phase="post_response",
+                    include_request_context=False,
+                    ignored_cookie_names=replay_plan.get("ignored_cookie_names"),
+                    ignored_context_headers=replay_plan.get(
+                        "ignored_context_headers"
+                    ),
                 )
                 post_verification_environment = self._environment_fingerprint(
                     post_alignment,
-                    wire_snapshot,
+                    None,
                     phase="post_verification",
+                    include_request_context=False,
+                    ignored_cookie_names=replay_plan.get("ignored_cookie_names"),
+                    ignored_context_headers=replay_plan.get(
+                        "ignored_context_headers"
+                    ),
                 )
                 if replay_plan.get("replay_mode") == "treatment":
                     control_manifest_for_environment = self.experiments.load_manifest(
@@ -4670,18 +4963,37 @@ class BrowserActionService:
                         if isinstance(snapshot_integrity, dict)
                         else {}
                     )
+                    request_headers_completeness = str(
+                        snapshot_integrity.get("request_headers_completeness")
+                        or "partial"
+                    )
+                    if self._stream_request_has_complete_request_headers(
+                        stream_request
+                    ):
+                        request_headers_completeness = "complete"
+                    request_body_completeness = str(
+                        snapshot_integrity.get("request_body_completeness")
+                        or "unknown"
+                    )
+                    network_snapshot_integrity = (
+                        "complete"
+                        if request_headers_completeness == "complete"
+                        and request_body_completeness
+                        in {"complete", "not_required"}
+                        else "partial"
+                    )
                     stream_request["networkEvidenceId"] = exact_evidence.get(
                         "evidence_id"
                     )
                     stream_request["networkEvidenceAssociation"] = association
                     stream_request["networkSnapshotIntegrity"] = (
-                        snapshot_integrity.get("network_snapshot_integrity")
+                        network_snapshot_integrity
                     )
                     stream_request["requestBodyCompleteness"] = (
-                        snapshot_integrity.get("request_body_completeness")
+                        request_body_completeness
                     )
                     stream_request["requestHeadersCompleteness"] = (
-                        snapshot_integrity.get("request_headers_completeness")
+                        request_headers_completeness
                     )
                     stream_request["responseBodyCompleteness"] = (
                         snapshot_integrity.get("response_body_completeness")
@@ -4711,6 +5023,30 @@ class BrowserActionService:
                 is True
             )
 
+            primary_status_payload = final_status_payload
+            if (
+                replay_plan is not None
+                and replay_plan.get("source_is_stream") is True
+                and replay_network_evidence_id
+                and not non_stream_error_response_observed
+            ):
+                locked_stream_requests = [
+                    item
+                    for item in final_status_payload.get("requests", [])
+                    if isinstance(item, dict)
+                    and item.get("networkEvidenceId")
+                    == replay_network_evidence_id
+                ]
+                primary_status_payload = {
+                    **final_status_payload,
+                    "requests": locked_stream_requests,
+                }
+                if len(locked_stream_requests) != 1:
+                    errors.append(
+                        "Replay primary stream could not be locked to exactly one "
+                        "networkRequestId + collectorGeneration association."
+                    )
+
             (
                 primary_requests,
                 primary_integrity,
@@ -4718,7 +5054,7 @@ class BrowserActionService:
                 primary_dimensions,
             ) = self._primary_result(
                 payload,
-                final_status_payload,
+                primary_status_payload,
                 primary_network_payload,
             )
             if non_stream_error_response_observed:

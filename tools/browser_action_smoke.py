@@ -506,6 +506,13 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
                             "generator": "uuid4",
                         }
                     ],
+                    "setup_flow": [
+                        {
+                            "step_id": "setup_reload_fixture",
+                            "action": "navigate",
+                            "value": fixture_url,
+                        }
+                    ],
                     "execution_mode": "sync",
                     "deadline_ms": 30_000,
                     "capture": {
@@ -539,6 +546,13 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
         if control_manifest.get("replay_http_status") != 200:
             raise AssertionError(control_manifest)
         if not control_manifest.get("replay", {}).get("source_is_stream"):
+            raise AssertionError(control_manifest)
+        control_setup = (
+            control_manifest.get("replay", {})
+            .get("pair_protocol", {})
+            .get("setup_flow", [])
+        )
+        if not control_setup or control_setup[0].get("step_id") != "setup_reload_fixture":
             raise AssertionError(control_manifest)
         control_stream = next(
             (
@@ -656,6 +670,13 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
                 raise AssertionError(environment)
             if environment.get("observed_dimensions_equivalent") is not True:
                 raise AssertionError(environment)
+            setup_steps = [
+                step
+                for step in replay_manifest.get("steps", [])
+                if step.get("step_id") == "setup_reload_fixture"
+            ]
+            if len(setup_steps) != 1 or setup_steps[0].get("status") != "completed":
+                raise AssertionError(replay_manifest)
             diff_artifact = artifact_by_kind(
                 replay_manifest,
                 "replay_request_diff",
@@ -921,6 +942,7 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
                 control_response_value,
                 "terminationReason",
             ),
+            "pandora_setup_flow_inherited": True,
             "pandora_tracking_replay_status": tracking_status,
             "pandora_tracking_mutation_effective": tracking_manifest.get(
                 "mutation_assessment", {}

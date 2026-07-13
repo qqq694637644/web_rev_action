@@ -8,7 +8,10 @@ from pydantic import TypeAdapter, ValidationError
 from skill_temple.browser_models import (
     RemoveHeaderMutation,
     RemoveJsonPathMutation,
+    RemoveQueryParameterMutation,
+    ReplaceHeaderMutation,
     ReplaceJsonPathMutation,
+    ReplaceQueryParameterMutation,
     ReplayRequestPayload,
     RequestMatcher,
     VolatileBinding,
@@ -41,6 +44,7 @@ class ProtocolEvidenceTests(unittest.TestCase):
                 {"name": "Content-Type", "value": "application/json"},
                 {"name": "X-Tracking", "value": "track-me"},
             ],
+            "requestHeadersCompleteness": "complete",
             "responseHeadersArray": [
                 {"name": "Set-Cookie", "value": "session=new-secret"},
                 {"name": "Content-Type", "value": "application/json"},
@@ -471,6 +475,139 @@ class ProtocolEvidenceTests(unittest.TestCase):
             missing_content_type["classification"],
             "response_contract_mismatch",
         )
+
+    def test_validation_paths_respect_json_and_query_case_but_not_header_case(self) -> None:
+        json_case_mismatch = classify_replay_response(
+            status=422,
+            content_type="application/json",
+            response_value={"field": "/messages/0/id", "code": "field_required"},
+            mutation=RemoveJsonPathMutation(
+                type="remove_json_path",
+                path="/messages/0/ID",
+            ),
+        )
+        query_case_mismatch = classify_replay_response(
+            status=422,
+            content_type="application/json",
+            response_value={"field": "requestId", "code": "field_required"},
+            mutation=RemoveQueryParameterMutation(
+                type="remove_query_parameter",
+                name="requestID",
+            ),
+        )
+        header_case_match = classify_replay_response(
+            status=422,
+            content_type="application/json",
+            response_value={"field": "x-csrf-token", "code": "field_required"},
+            mutation=RemoveHeaderMutation(
+                type="remove_header",
+                name="X-CSRF-Token",
+            ),
+        )
+
+        self.assertEqual(json_case_mismatch["classification"], "unknown_rejection")
+        self.assertEqual(query_case_mismatch["classification"], "unknown_rejection")
+        self.assertEqual(header_case_match["classification"], "validation_rejection")
+
+    def test_unrecognized_validation_codes_remain_inconclusive(self) -> None:
+        result = classify_replay_response(
+            status=422,
+            content_type="application/json",
+            response_value={"field": "/id", "code": "not_required"},
+            mutation=RemoveJsonPathMutation(type="remove_json_path", path="/id"),
+        )
+
+        self.assertEqual(result["classification"], "field_rejection")
+        self.assertEqual(result["conclusion"], "inconclusive")
+        self.assertEqual(
+            result["validation_evidence"]["semantic"],
+            "field_reference",
+        )
+
+    def test_request_shape_does_not_treat_arbitrary_id_suffix_as_identifier(self) -> None:
+        snapshot = self.snapshot()
+        snapshot["requestBody"]["text"] = json.dumps(
+            {
+                "id": "real-id",
+                "message_id": "message-id",
+                "requestId": "request-id",
+                "valid": "yes",
+                "grid": "dense",
+                "hybrid": "mode",
+                "solid": "state",
+            }
+        )
+        shape = request_shape_from_snapshot(snapshot)
+
+        self.assertEqual(shape["paths"]["/id"]["value"], "<identifier>")
+        self.assertEqual(shape["paths"]["/message_id"]["value"], "<identifier>")
+        self.assertEqual(shape["paths"]["/requestId"]["value"], "<identifier>")
+        for path in ["/valid", "/grid", "/hybrid", "/solid"]:
+            self.assertEqual(shape["paths"][path]["value"], "<string>")
+
+    def test_duplicate_header_and_query_values_use_ordered_multiplicity(self) -> None:
+        control = self.snapshot()
+        treatment = self.snapshot()
+        control["requestHeadersArray"].extend(
+            [
+                {"name": "X-Debug", "value": "one"},
+                {"name": "x-debug", "value": "two"},
+            ]
+        )
+        treatment["requestHeadersArray"] = [
+            item
+            for item in treatment["requestHeadersArray"]
+            if item["name"].lower() != "x-debug"
+        ] + [{"name": "X-Debug", "value": "replacement"}]
+        header_result = assess_paired_mutation_effectiveness(
+            ReplaceHeaderMutation(
+                type="replace_header",
+                name="X-Debug",
+                value="replacement",
+            ),
+            control,
+            treatment,
+            volatile_bindings=[],
+            control_binding_values={},
+            treatment_binding_values={},
+        )
+
+        query_control = self.snapshot()
+        query_treatment = self.snapshot()
+        query_control["url"] = "https://example.test/path?k=one&k=two&keep=yes"
+        query_treatment["url"] = "https://example.test/path?keep=yes&k=replacement"
+        query_result = assess_paired_mutation_effectiveness(
+            ReplaceQueryParameterMutation(
+                type="replace_query_parameter",
+                name="k",
+                value="replacement",
+            ),
+            query_control,
+            query_treatment,
+            volatile_bindings=[],
+            control_binding_values={},
+            treatment_binding_values={},
+        )
+
+        self.assertEqual(header_result["control_value_count"], 2)
+        self.assertEqual(header_result["treatment_value_count"], 1)
+        self.assertTrue(header_result["multiplicity_changed"])
+        self.assertTrue(header_result["target_delta_observed"])
+        self.assertEqual(query_result["control_wire_value"], ["<string>", "<string>"])
+        self.assertEqual(query_result["treatment_value_count"], 1)
+        self.assertTrue(query_result["target_delta_observed"])
+
+    def test_http_304_is_inconclusive_not_success(self) -> None:
+        result = classify_replay_response(
+            status=304,
+            content_type="application/json",
+            response_value=None,
+            mutation=RemoveJsonPathMutation(type="remove_json_path", path="/tracking_id"),
+            source_content_type="application/json",
+        )
+
+        self.assertEqual(result["classification"], "redirect_or_cache_response")
+        self.assertEqual(result["conclusion"], "inconclusive")
 
     def test_non_json_body_is_part_of_non_target_equivalence(self) -> None:
         mutation = RemoveHeaderMutation(type="remove_header", name="X-Tracking")

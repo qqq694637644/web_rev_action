@@ -53,8 +53,8 @@ Use these sections:
 
 The field necessity matrix should contain:
 
-| Field or header | JSON Pointer/header/query | Classification | Control experiment | Treatment experiment | Pair hash | Target delta | Non-target equivalent | Response class | State verification | Notes |
-|---|---|---|---|---|---|---|---|---|---|---|
+| Field or header | Exact case-sensitive path/name | Classification | Control experiment | Treatment experiment | Setup flow | Pair hash | Target delta/multiplicity | Non-target equivalent | Response class | State verification | Notes |
+|---|---|---|---|---|---|---|---|---|---|---|---|
 
 Never include credential values. Header names are allowed.
 

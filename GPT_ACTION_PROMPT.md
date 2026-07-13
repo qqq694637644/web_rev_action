@@ -80,6 +80,9 @@ conversation ID或parent node时使用`value_source=preserve_source + same_value
 `generated + same_value`只表示共用一个新生成值，不表示保留source值。Control必须
 成功，且wire snapshot必须观察到所有bindings。
 
+有状态请求在Control中声明`setup_flow`，Treatment会自动继承。顺序固定为setup →
+记录pre-dispatch环境 → fetch → verification。不要用verification_flow恢复发送前状态。
+
 Treatment payload只能包含 `replay_mode=treatment`、`control_experiment_id` 和一个 `mutation`；不要重传 session、source、target、capture、wait、verification、deadline或network selector。后端继承并校验 Control 的 `pair_protocol_hash`。只有以下全部满足时才能解释 Treatment：
 
 ```text
@@ -94,9 +97,12 @@ replay request候选唯一
 
 Cookie、Origin、Referer、Host、Content-Length 和 `Sec-*` 属于 browser-managed header，不能通过 browser-context header mutation测试。
 
+JSON Pointer和query参数名严格区分大小写；header名不区分大小写。同名重复header/query必须比较完整有序值列表和multiplicity，不能只看第一项。
+
 Source response为`text/event-stream`时，后端默认要求raw、semantic和artifacts；仅在
 明确只分析raw时设置`raw_only=true`。Reader解析完整SSE event，只有data精确等于
-marker且可选event name匹配才结束。检查`stream_response_contract`；idle timeout、
+marker且可选event name匹配才结束。Parser支持LF、CRLF、CR、混合换行与EOF flush。
+恰好达到byte limit时要等下一次read判断EOF或overflow。检查`stream_response_contract`；idle timeout、
 byte limit、truncated、缺marker或semantic失败不能报告complete。
 
 不要把任意4xx解释为required。只有remove mutation得到HTTP 400/422，且exact response
@@ -105,10 +111,16 @@ Replace校验失败是`constrained_value`；409一律是`conflict`。Preview-onl
 401/403、429、5xx、通用4xx、任意redirect、缺失或错误Content-Type都必须
 partial/inconclusive。
 
+HTTP 300–399即使`redirected=false`也属于`redirect_or_cache_response`，不能证明optional。Validation path对JSON/query区分大小写，header不区分；错误code只接受明确白名单，`not_required`等未知code保持inconclusive。
+
 环境只用`pre_dispatch_environment`做因果比较；post-response和post-verification是
 结果。比较状态是observed_equivalent、different或insufficient。缺失current node、
 bundle、page或auth context时不能声称等价。后端只保存本机Cookie名值、Authorization、
 CSRF和组合请求上下文的SHA-256摘要；不做Cookie加密或密钥管理。
+
+只有request headers完整性已证明时auth context才是observed。仅有headers数组或空列表时必须unavailable。Cookie hash保留发送顺序；`ignored_cookie_names`和`ignored_context_headers`默认空，仅在用户明确知道某项无关轮换时使用。Post-response/post-verification不应携带旧request context。
+
+Replay stream objective只使用与exact replay ordinary evidence稳定关联的唯一stream；同URL的其他流是supporting evidence。
 
 相关实验使用同一个 analysis_series_id，并显式设置 scenario_type、predecessor_experiment_id、sequence_index 和已知的 conversation_key。不要用创建时间猜 predecessor。
 

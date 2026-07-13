@@ -186,7 +186,30 @@ def public_network_summary(snapshot: dict[str, Any]) -> dict[str, Any]:
 
 def network_snapshot_dimensions(snapshot: dict[str, Any]) -> dict[str, str]:
     method = str(snapshot.get("method", "GET")).upper()
-    headers_complete = isinstance(snapshot.get("requestHeadersArray"), list)
+    request_headers = snapshot.get("requestHeadersArray")
+    explicit_headers_complete = snapshot.get("requestHeadersCompleteness") == "complete"
+    extra_info = (
+        snapshot.get("requestHeadersExtraInfo")
+        or snapshot.get("requestExtraInfo")
+        or snapshot.get("requestWillBeSentExtraInfo")
+    )
+    extra_headers = (
+        snapshot.get("requestHeadersExtraArray")
+        or snapshot.get("requestHeadersExtra")
+    )
+    associated_cookies = snapshot.get("associatedCookies")
+    extra_info_complete = bool(
+        isinstance(extra_info, dict)
+        and isinstance(associated_cookies, list)
+        and (
+            isinstance(extra_headers, list)
+            or isinstance(extra_info.get("headers"), (dict, list))
+        )
+    )
+    headers_complete = bool(
+        isinstance(request_headers, list)
+        and (explicit_headers_complete or extra_info_complete)
+    )
     request_body = snapshot.get("requestBody")
     if method in {"GET", "HEAD"} and not (
         isinstance(request_body, dict) and request_body.get("available")
@@ -430,7 +453,8 @@ def _redact_json_value(value: Any, *, key_hint: str | None) -> Any:
 
 
 def _redact_scalar(value: Any, *, key_hint: str | None) -> Any:
-    normalized = (key_hint or "").lower()
+    raw_hint = key_hint or ""
+    normalized = raw_hint.lower()
     if any(
         fragment in normalized
         for fragment in (
@@ -448,7 +472,12 @@ def _redact_scalar(value: Any, *, key_hint: str | None) -> Any:
         )
     ):
         return "<redacted>"
-    if normalized == "id" or normalized.endswith("_id") or normalized.endswith("id"):
+    identifier_key = bool(
+        raw_hint == "id"
+        or normalized.endswith("_id")
+        or re.search(r"(?:Id|ID)$", raw_hint)
+    )
+    if identifier_key:
         return "<identifier>"
     if not isinstance(value, str):
         return value
@@ -692,14 +721,33 @@ def assess_paired_mutation_effectiveness(
             treatment_snapshot,
             mutation,
         )
+        control_count = (
+            len(control_value)
+            if isinstance(control_value, list)
+            else 1
+            if control_exists
+            else 0
+        )
+        treatment_count = (
+            len(treatment_value)
+            if isinstance(treatment_value, list)
+            else 1
+            if treatment_exists
+            else 0
+        )
         if mutation.type.startswith("remove_"):
             target_delta = control_exists and not treatment_exists
         else:
+            expected_treatment = (
+                [mutation.value]
+                if mutation.type in {"replace_header", "replace_query_parameter"}
+                else mutation.value
+            )
             target_delta = (
                 control_exists
                 and treatment_exists
                 and control_value != treatment_value
-                and treatment_value == mutation.value
+                and treatment_value == expected_treatment
             )
         control_bindings_ok = _bindings_match_snapshot(
             control_snapshot,
@@ -755,6 +803,9 @@ def assess_paired_mutation_effectiveness(
                 mutation,
             ),
             "target_delta_observed": target_delta,
+            "control_value_count": control_count,
+            "treatment_value_count": treatment_count,
+            "multiplicity_changed": control_count != treatment_count,
             "non_target_fields_equivalent": non_target_equivalent,
             "volatile_bindings_effective": (
                 control_bindings_ok and treatment_bindings_ok
@@ -871,6 +922,9 @@ def classify_replay_response(
     elif status >= 500:
         classification = "server_failure"
         conclusion = "inconclusive"
+    elif 300 <= status < 400:
+        classification = "redirect_or_cache_response"
+        conclusion = "inconclusive"
     elif status == 409:
         classification = "conflict"
         conclusion = "conflict"
@@ -937,7 +991,7 @@ def _observe_mutation_target(
             for item in _normalized_headers(snapshot.get("requestHeadersArray"))
             if item["name"].lower() == mutation.name.lower()
         ]
-        return bool(values), values[0] if values else None
+        return bool(values), values
     values = [
         value
         for name, value in parse_qsl(
@@ -946,7 +1000,7 @@ def _observe_mutation_target(
         )
         if name == mutation.name
     ]
-    return bool(values), values[0] if values else None
+    return bool(values), values
 
 
 def _public_target_value(
@@ -989,8 +1043,8 @@ def _bindings_match_snapshot(
                 for item in _normalized_headers(snapshot.get("requestHeadersArray"))
                 if item["name"].lower() == str(binding.name).lower()
             ]
-            exists, observed = bool(values), values[0] if values else None
-            expected = str(expected)
+            exists, observed = bool(values), values
+            expected = [str(expected)]
         else:
             values = [
                 value
@@ -1000,8 +1054,8 @@ def _bindings_match_snapshot(
                 )
                 if name == binding.name
             ]
-            exists, observed = bool(values), values[0] if values else None
-            expected = str(expected)
+            exists, observed = bool(values), values
+            expected = [str(expected)]
         if not exists or observed != expected:
             return False
     return True
@@ -1121,23 +1175,34 @@ def _mutation_reference_evidence(
         if mutation.type in {"remove_json_path", "replace_json_path"}
         else [mutation.name]
     )
+    case_sensitive = mutation.type not in {"remove_header", "replace_header"}
     structured = _structured_validation_references(response_value)
     for item in structured:
         path_tokens = item.get("path_tokens")
         if isinstance(path_tokens, list) and _validation_path_matches(
             path_tokens,
             target_tokens,
+            case_sensitive=case_sensitive,
         ):
-            code = str(item.get("code") or "").lower()
+            code = _normalize_validation_code(item.get("code"))
             source_key = str(item.get("source_key") or "").lower()
-            if source_key == "missing" or any(
-                token in code for token in ("required", "missing", "field_required")
-            ):
+            if source_key == "missing" or code in {
+                "field_required",
+                "missing",
+                "value_error.missing",
+            }:
                 semantic = "field_required"
-            elif any(
-                token in code
-                for token in ("enum", "type", "format", "invalid", "constraint", "value")
-            ):
+            elif code in {
+                "enum",
+                "invalid_enum",
+                "value_error.enum",
+                "type_error",
+                "value_error.type",
+                "format_error",
+                "value_error.format",
+                "invalid_type",
+                "invalid_format",
+            }:
                 semantic = "value_constraint"
             else:
                 semantic = "field_reference"
@@ -1160,7 +1225,7 @@ def _mutation_reference_evidence(
             if candidate and re.search(
                 rf"(?<![A-Za-z0-9_]){re.escape(candidate)}(?![A-Za-z0-9_])",
                 text,
-                flags=re.IGNORECASE,
+                flags=0 if case_sensitive else re.IGNORECASE,
             ):
                 return {
                     "strength": "weak_text_match",
@@ -1235,9 +1300,22 @@ def _validation_path_tokens(value: Any) -> list[str]:
     return tokens
 
 
-def _validation_path_matches(observed: list[str], expected: list[str]) -> bool:
-    return [str(item).lower() for item in observed] == [
-        str(item).lower() for item in expected
+def _normalize_validation_code(value: Any) -> str:
+    return str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def _validation_path_matches(
+    observed: list[str],
+    expected: list[str],
+    *,
+    case_sensitive: bool,
+) -> bool:
+    observed_values = [str(item) for item in observed]
+    expected_values = [str(item) for item in expected]
+    if case_sensitive:
+        return observed_values == expected_values
+    return [item.lower() for item in observed_values] == [
+        item.lower() for item in expected_values
     ]
 
 

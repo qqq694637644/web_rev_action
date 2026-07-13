@@ -36,12 +36,15 @@ Create one Control replay followed by one Treatment replay per row. Treatment su
 
 Declare volatile bindings on the Control:
 
-| Value class | Default policy | Reason |
-|---|---|---|
-| message/request ID, nonce, timestamp | `fresh_equivalent` | Avoid duplicate or expired values |
-| conversation ID, fixed parent/context | explicit `same_value` when required | Preserve shared test context |
+| Value class | value_source | reuse_policy | Reason |
+|---|---|---|---|
+| message/request ID, nonce, timestamp | `generated` | `fresh_equivalent` | Avoid duplicate or expired values |
+| newly generated shared value | `generated` | `same_value` | Share one fresh pair value |
+| existing conversation ID or parent | `preserve_source` | `same_value` | Preserve real source context |
 
 `fresh_equivalent` values differ physically but are normalized before non-target request comparison.
+
+For stateful rows, define one Control `setup_flow`; Treatment inherits it. Setup must restore the same branch/conversation before pre-dispatch evidence is recorded.
 
 Use JSON Pointer rather than dotted JSONPath:
 
@@ -50,6 +53,8 @@ Use JSON Pointer rather than dotted JSONPath:
 /messages/0/content/parts/0
 /parent_message_id
 ```
+
+JSON/query names are case-sensitive. Header names are case-insensitive. Preserve duplicate value order and multiplicity.
 
 | Candidate | Mutation | Validation beyond HTTP status |
 |---|---|---|

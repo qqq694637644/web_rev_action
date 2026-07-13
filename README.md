@@ -131,6 +131,8 @@ GPT 不直接协调 start、click、wait、stop。
 → generated+fresh_equivalent 重新生成一次性值
 → preserve_source+same_value 复用真实 source 上下文
 → 启动新 experiment 和 capture/checkpoint
+→ 执行 Control 定义且 Treatment 自动继承的 setup_flow
+→ 重新对齐并记录 pre_dispatch_environment
 → 在当前页面上下文执行 fetch(credentials=include)
 → 导出新 network/page/console evidence
 → 唯一锁定 Control/Treatment exact outbound request
@@ -139,9 +141,9 @@ GPT 不直接协调 start、click、wait、stop。
 → 保存 request diff 与 response artifact
 ```
 
-公开 payload 不接受任意本地路径，也不返回 Cookie、Authorization 或 CSRF。JSON mutation 使用 RFC 6901 Pointer，例如 `/messages/0/content/parts/0`；不支持 wildcard。Cookie、Origin、Referer、Host、Content-Length 和 `Sec-*` 等 browser-managed header mutation 会被拒绝。
+公开 payload 不接受任意本地路径，也不返回 Cookie、Authorization 或 CSRF。JSON mutation 使用 RFC 6901 Pointer，例如 `/messages/0/content/parts/0`；不支持 wildcard。JSON Pointer 和 query 参数名严格区分大小写，header 名不区分大小写。Cookie、Origin、Referer、Host、Content-Length 和 `Sec-*` 等 browser-managed header mutation 会被拒绝。
 
-Control 必须 `mutations=[]`、HTTP 2xx/3xx，并在 actual wire snapshot 中观察到所有 volatile bindings。每个 binding 选择：
+Control 必须 `mutations=[]`、HTTP 2xx，并在 actual wire snapshot 中观察到所有 volatile bindings。HTTP 3xx（包括未自动跟随的 304）属于 `redirect_or_cache_response`，不能证明字段 optional。每个 binding 选择：
 
 ```text
 value_source=generated + fresh_equivalent
@@ -160,12 +162,26 @@ value_source=preserve_source + same_value
 
 Treatment 的公开 payload 只能包含 `control_experiment_id` 和一个 `mutation`；target、capture、wait、verification、deadline、source 和 network selector全部从 Control 的 `pair_protocol_hash` 继承。Fresh 值不要求物理相同，而是在成对比较时规范化为同一逻辑 placeholder。若 Control 中没有 target、Treatment 没有产生预期 delta、volatile binding未上 wire、非目标字段不等价或 replay request候选不唯一，实验直接失败。
 
+有状态请求可以在 Control 中声明不可变 `setup_flow`。Treatment 自动继承并按固定顺序执行：
+
+```text
+start collector
+→ setup_flow
+→ 重新对齐页面并记录 pre_dispatch_environment
+→ replay fetch
+→ verification_flow
+```
+
+`setup_flow` 用于 reload、重新打开同一 conversation、选中同一分支或创建隔离测试状态；`verification_flow` 只描述响应后的验证，不能拿来伪造发送前环境等价。
+
 若 source response 是 `text/event-stream`，replay 默认要求 raw capture、
 semantic parse 和 stream artifacts；只有显式 `raw_only=true` 才跳过 semantic
-要求。Evaluate 使用增量 `ReadableStream` reader和小型 SSE parser，只在完整
-event的合并 `data` 精确等于 marker、且可选 event name匹配时终止。正文、JSON
+要求。Evaluate 使用增量 `ReadableStream` reader和小型 SSE parser，支持 LF、
+CRLF、CR、混合换行和 EOF 最终 event；只在完整 event的合并 `data` 精确等于 marker、且可选 event name匹配时终止。正文、JSON
 或工具参数中的字面量 `[DONE]` 不会提前结束。`idle_timeout`、字节上限截断、
 缺失 marker、semantic失败或Content-Type不符都会进入 partial/failed。
+
+响应恰好等于 `max_response_bytes` 时会再读一次：下一次 EOF 才判完整，只有出现额外字节才标记 truncated。
 
 有效 Treatment 返回非流错误响应时，ordinary exact response 可以终结本轮实验而不误报 collector 故障，但只有以下情况能支持 required：
 
@@ -231,9 +247,9 @@ experiment_id + evidence_id + artifact_id
 
 `capture_flow.network_evidence` 在第一条页面 mutation 前记录 reqid high-water mark，finalize 时只选择本 experiment 窗口中的请求，并在 MCP generation 仍有效时导出 exact headers/body/initiator。`series` 字段保存 analysis series、scenario、predecessor、sequence 和 conversation key。
 
-每个 JSON request evidence 还生成 public `request-shape.json` 和 `request-body.redacted.json`。`get_request_shape` 默认只返回有界路径页，支持 `path_prefix`、`page_idx`、`page_size`、`max_depth` 和 `max_array_items`；只有显式 `include_redacted_body=true` 才返回裁剪后的 redacted subtree。这样 Skill 无需读取 credential artifact 即可选择 `/messages/0/id` 等 mutation path，也不会把大型 messages/tool schema 整体塞进 Action 响应。
+每个 JSON request evidence 还生成 public `request-shape.json` 和 `request-body.redacted.json`。`get_request_shape` 默认只返回有界路径页，支持 `path_prefix`、`page_idx`、`page_size`、`max_depth` 和 `max_array_items`；只有显式 `include_redacted_body=true` 才返回裁剪后的 redacted subtree。Identifier 脱敏只匹配 `id`、`*_id` 和 camelCase `*Id/*ID`，不会把 `valid`、`grid`、`hybrid` 或 `solid` 误标为 identifier。
 
-流请求生成 `stream_request` 和按 source 分开的 `stream_event_range` evidence。Stream 与 ordinary network evidence 优先按 `networkRequestId + collectorGeneration`、CDP ID、persistent ID关联；URL+method只允许作为唯一候选 fallback。Ordinary snapshot 只补充 `networkSnapshotIntegrity`、request body/header完整性，不能升级缺失的 raw/events/metadata stream artifact。源码搜索结果可通过 consequential `save_script_source` 持久化到目标 experiment，并保存 script URL/ID、范围、SHA-256 和 initiator evidence 关联。
+流请求生成 `stream_request` 和按 source 分开的 `stream_event_range` evidence。Stream 与 ordinary network evidence 优先按 `networkRequestId + collectorGeneration`、CDP ID、persistent ID关联；URL+method只允许作为唯一候选 fallback。Replay 找到唯一 ordinary evidence 后，primary stream再锁定到同一稳定请求；同 URL 的其他流只作为 supporting evidence，不能拖低 replay objective。Ordinary snapshot只补充request body/header完整性，不能升级缺失的raw/events/metadata stream artifact。
 
 Replay 使用 `replay_attempt_id + 有上下界的dispatch window + canonical request
 body SHA-256` 锁定唯一 outbound request。缺少 numeric `observedAt` 的请求不参与
@@ -247,6 +263,10 @@ page或认证上下文时不能用 `None == None` 冒充相等。
 这是个人本机工具，不加密 Cookie，也不引入 KMS、vault 或密钥管理。后端只在
 本机对实际 outbound Cookie名值、Authorization和CSRF计算 SHA-256摘要，用于发现
 身份/session轮换；manifest不保存这些原值。该摘要是变化检测，不是加密。
+
+认证上下文只有在 exact request headers明确完整时才标为 `observed`：显式完整性标志，或与同一稳定请求关联且写入成功的 request headers + ExtraInfo（包含 associatedCookies）证据。仅有空数组或普通 headers列表时返回 `unavailable`。Cookie按实际header/segment顺序计算hash；`ignored_cookie_names` 和 `ignored_context_headers` 默认空数组，只在用户确认某项会无关轮换时显式忽略。Post-response和post-verification环境只记录页面信息，不复用旧请求凭据。
+
+Header和query mutation比较完整有序值列表并记录 multiplicity；不会只取第一个同名值。
 
 Stream 和普通 network status 都会读取全部分页，并在执行 event predicate 前锁定具体 primary request ID；`matchedRequestId` 不属于该 request 时不会满足等待。同一 session 重复提交返回 `409 session_busy`，其他 browser operation 返回 `409 browser_busy`。Protected workspace mutation 与 browser operation 通过同一 RuntimeCoordinator 双向互斥，避免 TOCTOU。
 
