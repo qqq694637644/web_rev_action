@@ -13,15 +13,25 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
+import os
 import secrets
+import tempfile
+import threading
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, BinaryIO, Literal
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from .browser_routes import register_browser_actions
+from .browser_service import (
+    BrowserActionService,
+    analysis_workspace_root_from_environment,
+    build_browser_service_from_environment,
+)
 from .runtime import (
     DEFAULT_MAX_SKILLS,
     SkillNotFoundError,
@@ -29,8 +39,71 @@ from .runtime import (
     env_value_from_environment_or_dotenv,
     load_runtime,
 )
+from .runtime_coordinator import RuntimeCoordinator
+from .workspace_routes import register_workspace_actions
+from .workspace_service import AnalysisWorkspaceService
 
 BEARER_TOKEN_ENV_VAR = "SKILL_TEMPLE_BEARER_TOKEN"
+_PROCESS_GUARDS: dict[str, tuple[BinaryIO, int]] = {}
+_PROCESS_GUARD_LOCK = threading.Lock()
+
+
+def _acquire_single_process_guard(root: Path) -> str:
+    resolved = str(root.expanduser().resolve())
+    with _PROCESS_GUARD_LOCK:
+        current = _PROCESS_GUARDS.get(resolved)
+        if current is not None:
+            _PROCESS_GUARDS[resolved] = (current[0], current[1] + 1)
+            return resolved
+        digest = hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:24]
+        lock_path = Path(tempfile.gettempdir()) / f"web-rev-action-{digest}.lock"
+        handle = lock_path.open("a+b")
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"0")
+            handle.flush()
+        handle.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:  # pragma: no cover - Windows is the supported deployment
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            handle.close()
+            raise RuntimeError(
+                "Another web_rev_action process already owns this analysis workspace. "
+                "Run the service with exactly one worker."
+            ) from exc
+        _PROCESS_GUARDS[resolved] = (handle, 1)
+        return resolved
+
+
+def _release_single_process_guard(key: str) -> None:
+    with _PROCESS_GUARD_LOCK:
+        current = _PROCESS_GUARDS.get(key)
+        if current is None:
+            return
+        handle, references = current
+        if references > 1:
+            _PROCESS_GUARDS[key] = (handle, references - 1)
+            return
+        try:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:  # pragma: no cover - Windows is the supported deployment
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+            _PROCESS_GUARDS.pop(key, None)
 
 
 class StrictRequest(BaseModel):
@@ -252,7 +325,12 @@ def _add_bearer_auth_security(schema: dict[str, Any]) -> dict[str, Any]:
     return schema
 
 
-def create_app(skills_dir: str | Path | None = None, server_url: str | None = None) -> FastAPI:
+def create_app(
+    skills_dir: str | Path | None = None,
+    server_url: str | None = None,
+    browser_service: BrowserActionService | None = None,
+    workspace_service: AnalysisWorkspaceService | None = None,
+) -> FastAPI:
     runtime = load_runtime(skills_dir)
     configured_server_url = _normalize_server_url(
         server_url or env_value_from_environment_or_dotenv("SKILL_TEMPLE_SERVER_URL")
@@ -262,12 +340,11 @@ def create_app(skills_dir: str | Path | None = None, server_url: str | None = No
     )
 
     app = FastAPI(
-        title="Skill Temple Gateway",
-        version="0.2.0",
+        title="Web Reverse Action Gateway",
+        version="0.3.0",
         description=(
-            "Codex-style model-driven skill selection adapted to Custom GPT Actions. "
-            "The model chooses from a bounded catalog, then the gateway loads explicit "
-            "SKILL.md entrypoints and supports progressive disclosure."
+            "Codex-style Skill retrieval plus two browser-analysis Actions. Browser experiments "
+            "atomically coordinate playwright-cli, private js-reverse-mcp, and workspace evidence."
         ),
         openapi_url=None,
         servers=([{"url": configured_server_url}] if configured_server_url else None),
@@ -439,6 +516,47 @@ def create_app(skills_dir: str | Path | None = None, server_url: str | None = No
             detail = structured_error("unsafe_or_missing_path", str(exc), "check_path")
             raise HTTPException(status_code=404, detail=detail) from exc
 
+    guard_key: str | None = None
+    coordinator = (
+        browser_service.coordinator if browser_service is not None else RuntimeCoordinator()
+    )
+    if browser_service is None:
+        evidence_root = analysis_workspace_root_from_environment()
+        guard_key = _acquire_single_process_guard(evidence_root)
+        app.state.single_process_guard_key = guard_key
+        try:
+            resolved_browser_service = build_browser_service_from_environment(
+                evidence_root=evidence_root,
+                coordinator=coordinator,
+            )
+        except Exception:
+            _release_single_process_guard(guard_key)
+            raise
+    else:
+        resolved_browser_service = browser_service
+    register_browser_actions(app, resolved_browser_service)
+    resolved_workspace_service = workspace_service or AnalysisWorkspaceService(
+        resolved_browser_service.experiments.root,
+        shell=(
+            env_value_from_environment_or_dotenv("WEB_REV_WORKSPACE_SHELL") or "pwsh"
+        ),
+        allow_network=(
+            env_value_from_environment_or_dotenv("WEB_REV_WORKSPACE_ALLOW_NETWORK")
+            or "false"
+        ).lower()
+        in {"1", "true", "yes", "on"},
+        coordinator=coordinator,
+    )
+    register_workspace_actions(app, resolved_workspace_service)
+
+    async def close_browser_service() -> None:
+        try:
+            await resolved_browser_service.close()
+        finally:
+            if guard_key is not None:
+                _release_single_process_guard(guard_key)
+
+    app.router.add_event_handler("shutdown", close_browser_service)
     return app
 
 
@@ -535,6 +653,7 @@ def main() -> None:
         create_app(args.skills_dir, server_url=args.server_url),
         host=args.host,
         port=args.port,
+        workers=1,
     )
 
 

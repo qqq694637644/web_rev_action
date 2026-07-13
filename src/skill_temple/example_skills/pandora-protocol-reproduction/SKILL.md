@@ -1,0 +1,285 @@
+---
+name: pandora-protocol-reproduction
+description: Use to reverse engineer and reproduce Pandora-like conversational web protocols through atomic browser experiments, stable evidence IDs, source tracing, browser-context request replay, state-machine experiments, schemas, and auditable reports. 中文：用于通过原子浏览器实验、稳定证据 ID、源码追踪、浏览器上下文请求重放和状态机实验复刻 Pandora 类对话协议。
+---
+
+# Pandora protocol reproduction
+
+Use this Skill when the user wants to understand, reproduce, compare, or document a modern conversational web protocol, including first message, second message, regenerate, edit, stop, conversation state, authentication, request construction, and streaming events.
+
+## Architecture boundary
+
+Follow this separation throughout the task:
+
+- This Skill decides the experiment sequence, one-variable mutations, evidence interpretation, and report contents.
+- `runBrowserExperiment` performs atomic browser operations such as `capture_flow`, paired `replay_request`, `save_script_source`, and `cancel_experiment`.
+- `inspectBrowserEvidence` reads bounded experiment, evidence, initiator, script, console, and stream summaries.
+- Workspace tools read evidence files and write only derived reports, schemas, notes, and replay scripts.
+- Never reconstruct browser fetches with arbitrary PowerShell or JavaScript when `replay_request` can perform the operation.
+- Never copy Cookie, Authorization, CSRF, or other credential values into chat, reports, diffs, or generated scripts.
+
+## Required references
+
+Read these files when the corresponding stage begins:
+
+- `docs/experiment-matrix.md` for the six scenario sequence and mutation matrix.
+- `docs/evidence-contract.md` before interpreting or citing evidence.
+- `docs/report-templates.md` before generating final reports and schemas.
+
+## Workflow
+
+### 1. Establish the analysis series
+
+Open or reuse one browser session. Choose one `analysis_series_id` and keep all related experiments in the same session.
+
+Each experiment should set:
+
+```text
+analysis_series_id
+scenario_type
+predecessor_experiment_id
+sequence_index
+conversation_key, when known
+```
+
+Do not infer a predecessor from timestamps. Use the explicit experiment chain.
+
+### 2. Capture a baseline
+
+Run `capture_baseline` with no mutation and record page snapshots, console errors, and relevant ordinary network selectors. Confirm that the page is aligned and the experiment reaches a terminal manifest.
+
+### 3. Capture the first message
+
+Run `capture_flow` for one message submission. Configure:
+
+- the primary streaming request matcher;
+- `network_evidence` selectors for conversation creation, account/session, configuration, message submission, and any stop/control endpoint;
+- before/after page snapshots;
+- console errors;
+- a stream predicate or network terminal observation.
+
+After completion:
+
+1. Call `list_evidence`.
+2. Select the primary `network_request` evidence.
+3. Call `get_network_evidence` for its redacted summary.
+4. Call `get_request_shape` before choosing a JSON mutation path. Use
+   `path_prefix`, pagination, depth, and array-item limits; request a bounded
+   redacted subtree only when necessary.
+5. Call `get_request_initiator`.
+6. Use `search_scripts` and `get_script_source` for the identified request builder.
+7. Persist the bounded source region with `save_script_source`, linked to the network evidence ID.
+
+### 4. Determine field necessity with browser-context replay
+
+Replay classification is always a pair:
+
+```text
+control replay
+  replay_mode = control
+  mutations = []
+  volatile_bindings declare generator and reuse_policy
+  setup_flow restores the pre-dispatch state when needed
+
+treatment replay
+  replay_mode = treatment
+  control_experiment_id = <control>
+  mutation = exactly one
+  no target/capture/wait/deadline/source overrides
+```
+
+The backend inherits an immutable `pair_protocol` from the Control. Value origin
+and pair reuse are separate:
+
+```text
+value_source=generated + fresh_equivalent
+  message IDs, request IDs, nonce, timestamp
+
+value_source=generated + same_value
+  one newly generated value shared by the pair
+
+value_source=preserve_source + same_value
+  existing conversation ID, parent node, or fixed source context
+```
+
+Fresh values may differ on wire. The backend normalizes both values to the same
+logical placeholder before comparing non-target fields. `same_value` does not
+mean “keep the source value”; use `preserve_source` for that. A binding that is
+an ancestor of the mutation path is rejected because it would erase the field
+under test during normalization.
+
+Use RFC 6901 JSON Pointer paths, including array indices:
+
+```text
+/messages/0/id
+/messages/0/author/role
+/messages/0/content/parts/0
+/parent_message_id
+```
+
+Wildcards and bracket expressions are not allowed. The single treatment mutation may be:
+
+```text
+remove_json_path
+replace_json_path
+remove_header
+replace_header
+remove_query_parameter
+replace_query_parameter
+```
+
+JSON Pointer and query parameter names are case-sensitive. Header names are case-insensitive. Duplicate header/query values are compared as complete ordered lists, including multiplicity.
+
+Browser-managed headers such as Cookie, Origin, Referer, Host, Content-Length, and `Sec-*` cannot be mutated through browser-context fetch and must be rejected rather than classified. Classify a field only when the paired assessment proves:
+
+```text
+Control contains the target baseline
+Treatment contains the requested target delta
+volatile bindings are effective on wire
+non-target fields are equivalent after normalization
+mutation_effective = true
+pre-dispatch environment status is observed_equivalent
+```
+
+Then compare:
+
+- replay HTTP status and response evidence;
+- stream or network terminal behavior;
+- page snapshot/state effects;
+- conversation persistence or subsequent retrieval;
+- console errors.
+
+For stateful endpoints, define `setup_flow` on the Control. Treatment inherits it. Execution order is collector → setup → pre-dispatch environment → fetch → verification. Do not use `verification_flow` to restore the precondition.
+
+If the source response is `text/event-stream`, replay automatically requires raw
+capture, semantic parse, and stream artifacts. `raw_only=true` is the explicit
+exception. The reader supports LF, CRLF, CR, mixed line endings, and EOF flush. It parses complete SSE events and terminates only when an
+event's combined `data` exactly equals the configured marker and the optional
+event name matches. A literal `[DONE]` inside JSON, model text, or tool arguments
+is not terminal. Missing marker, idle timeout, byte-limit truncation, malformed
+semantic evidence, or unexpected Content-Type makes the result partial or
+failed even when HTTP status is 200.
+
+Reaching the byte limit exactly is not truncation until a later read produces an extra byte. HTTP 3xx is `redirect_or_cache_response`, not success.
+
+An exact non-stream error response terminates the stream requirement without being treated as a collector failure. Interpret it by classification:
+
+```text
+validation_rejection      remove + HTTP 400/422 + structured field_required
+value_constraint          replace + invalid enum/type/format
+conflict                  HTTP 409, including duplicate ID/version conflict
+authentication_failure    401/403
+rate_limited              429
+server_failure            5xx
+unknown_rejection
+unexpected_redirect
+response_contract_mismatch
+```
+
+Only the strict remove-field `validation_rejection` can support a required-field
+conclusion. A replace rejection proves a value constraint, not requiredness.
+Natural-language field mentions are weak hints only. Required evidence must come
+from an exact bounded response body artifact, not an incomplete preview.
+
+Use `verification_flow` for reload, conversation detail retrieval, or reopening the conversation after fetch. Without persistent-state verification, do not classify a 2xx result beyond `partial` or `unknown`.
+
+Use these classifications:
+
+```text
+required
+conditionally_required
+optional
+tracking_only
+unknown
+```
+
+Do not call a field optional merely because the HTTP request returned 2xx. Confirm the resulting conversation state.
+
+### 5. Capture the state-machine sequence
+
+Follow `docs/experiment-matrix.md` for:
+
+1. first message;
+2. second message;
+3. regenerate;
+4. edit an earlier user message;
+5. stop generation;
+6. retrieval or reload verification.
+
+For Stop, observe facts instead of assuming cancellation. Accept and classify:
+
+```text
+expected_user_cancel
+stop_followed_by_finished
+stop_control_request_observed
+stop_page_state_only
+stop_outcome_unknown
+```
+
+### 6. Maintain evidence-backed conclusions
+
+Every core conclusion must cite all available identifiers:
+
+```text
+experiment_id
+evidence_id
+artifact_id
+```
+
+Use `list_evidence` to discover stable IDs. Use workspace tools only when the actual artifact content is needed. Prefer redacted summaries and redacted artifacts. Do not read credential artifacts into model context.
+
+### 7. Produce the reproduction package
+
+Create the outputs in `docs/report-templates.md`. Reports and scripts belong under `reports/`, `schemas/`, `scripts/`, or `notes/`; never modify original evidence.
+
+The generated HTTP replay script must use placeholders or environment variables for credentials. Browser-context replay remains the source of truth for authenticated behavior.
+
+## Decision rules
+
+- If no exact full network snapshot exists, capture a new experiment with `export_parts=["all"]`; do not approximate the request from a summary.
+- If `get_request_shape` is unavailable, recapture the request; do not guess array paths from source text alone.
+- If initiator evidence is absent, reproduce the request in a new experiment and capture it again before broad source searching.
+- If a source match is minified, use bounded source offsets and persist it with `save_script_source`; document the loaded script URL/hash and initiator evidence ID.
+- If a treatment reports `mutation_effective=false`, discard it as inconclusive and fix the matcher or mutation path.
+- If a source request is stateful, require a successful control replay before running a treatment.
+- Use `generated + fresh_equivalent` for one-time IDs, timestamps, and nonce
+  values. Use `preserve_source + same_value` for existing parent/conversation
+  context. Generated `same_value` shares one new value; it does not preserve the
+  source value.
+- If replay request correlation is ambiguous, do not choose a candidate manually; recapture with a narrower source request.
+- Compare only `pre_dispatch_environment`. `post_response_environment` and
+  `post_verification_environment` are outcomes, not causal prerequisites.
+- Environment comparison is `observed_equivalent`, `different`, or
+  `insufficient`. Missing current-node, bundle, page, or auth-context evidence
+  is never treated as equality.
+- Browser-managed credential values stay local. The manifest stores only
+  SHA-256 digests for Cookie name/value pairs, Authorization, CSRF, and the
+  combined request context. This is change detection, not encryption or key
+  management.
+- Treat request context as observed only when exact request headers are proven complete, including ExtraInfo/associatedCookies or an explicit completeness marker. Preserve Cookie wire order in the hash. Ignore lists default to empty.
+- Post-response and post-verification environments contain page state only unless a new probe is captured; they must not reuse pre-dispatch request credentials.
+- Lock replay primary stream evidence to the exact ordinary replay request. Same-endpoint streams remain supporting evidence.
+- Replay correlation requires a numeric observed timestamp inside the bounded
+  dispatch window. Missing timestamps do not participate in automatic matching.
+- If an experiment is submitted incorrectly, call `cancel_experiment`; do not close the session or restart the service.
+- If `changed_during_read=true`, do not cite the file hash as stable. Re-read after the experiment reaches a terminal state.
+- If an evidence or replay result is partial, preserve the uncertainty in reports and `notes/open-questions.md`.
+
+## Completion criteria
+
+The protocol reproduction is complete only when:
+
+- all six scenarios have an explicit experiment chain;
+- primary ordinary and streaming requests have stable evidence IDs;
+- request shapes and redacted request bodies expose mutation paths without exposing values;
+- request construction has initiator and source evidence;
+- important fields have successful control plus one-variable treatment results;
+- every treatment verifies Control baseline, target delta, normalized non-target equivalence, and mutation effectiveness on exact outbound requests;
+- Control and Treatment use the same immutable pair protocol hash;
+- pre-dispatch environment is observed-equivalent or the conclusion is explicitly partial;
+- streaming requests have `stream_request` and `stream_event_range` evidence;
+- stream events and conversation state transitions are documented;
+- Stop behavior is observed rather than assumed;
+- every core report conclusion is traceable to experiment, evidence, and artifact IDs;
+- credentials are absent from natural-language outputs and generated source files;
+- unresolved behavior is listed explicitly rather than guessed.

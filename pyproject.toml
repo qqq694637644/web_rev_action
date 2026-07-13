@@ -1,7 +1,7 @@
 [project]
 name = "skill-temple"
-version = "0.2.0"
-description = "Codex-style model-driven Skills adapted to Custom GPT Actions"
+version = "0.3.0"
+description = "GPT Action gateway for atomic browser protocol experiments and Skills"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -13,6 +13,7 @@ dependencies = [
     "uvicorn>=0.30.0",
     "pydantic>=2.0.0",
     "PyYAML>=6.0.0",
+    "mcp>=1.20,<2",
 ]
 
 [project.optional-dependencies]
@@ -24,6 +25,7 @@ dev = [
 
 [project.scripts]
 skill-temple = "skill_temple.app:main"
+web-rev-action = "skill_temple.app:main"
 skill-temple-eval = "skill_temple.evals:main"
 
 [build-system]
