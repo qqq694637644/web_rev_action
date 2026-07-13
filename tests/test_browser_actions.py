@@ -831,6 +831,17 @@ class BrowserActionTests(unittest.TestCase):
         assert response.status_code == 200, response.text
 
     @staticmethod
+    def replay_response_analysis(manifest: dict[str, Any]) -> dict[str, Any]:
+        replay_attempt = next(
+            item
+            for item in manifest["evidence"]
+            if item.get("kind") == "replay_attempt"
+        )
+        analysis = replay_attempt.get("response_analysis")
+        assert isinstance(analysis, dict)
+        return analysis
+
+    @staticmethod
     def capture_request(*, include_in_flight: bool = False) -> dict[str, Any]:
         return {
             "operation": "capture_flow",
@@ -3836,6 +3847,7 @@ class BrowserActionTests(unittest.TestCase):
             )
             self.assertNotIn("inference_eligibility", replay_manifest)
             self.assertNotIn("replay_response_analysis", replay_manifest)
+            self.assertNotIn("response_analysis_summary", replay_manifest)
             self.assertEqual(
                 [item["reqid"] for item in replay_manifest["network_summary"]["requests"]],
                 [4],
@@ -4628,11 +4640,18 @@ class BrowserActionTests(unittest.TestCase):
             self.assertNotIn("objective_integrity", manifest)
             self.assertIn(
                 "field_required",
-                manifest["replay_response_analysis"]["hints"],
+                self.replay_response_analysis(manifest)["hints"],
             )
             self.assertEqual(
-                manifest["replay_response_analysis"]["analyzer"],
+                self.replay_response_analysis(manifest)["analyzer"],
                 {"name": "http_response_classifier", "version": "1"},
+            )
+            summary = manifest["response_analysis_summary"]
+            self.assertEqual(summary["analyzer"], "http_response_classifier@1")
+            self.assertEqual(summary["classification"], "validation_rejection")
+            self.assertEqual(
+                summary["evidence_id"],
+                manifest["replay"]["response_analysis_evidence_id"],
             )
 
     def test_control_fails_when_volatile_binding_is_not_observed_on_wire(self) -> None:
@@ -4755,7 +4774,7 @@ class BrowserActionTests(unittest.TestCase):
                 ).read_text(encoding="utf-8")
             )
             self.assertEqual(
-                manifest["replay_response_analysis"]["classification"],
+                self.replay_response_analysis(manifest)["classification"],
                 "unexpected_redirect",
             )
 
@@ -4792,6 +4811,45 @@ class BrowserActionTests(unittest.TestCase):
                 treatment.json()["detail"]["error"]["code"],
                 "control_pair_protocol_invalid",
             )
+
+    def test_treatment_accepts_completed_control_with_http_422(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            client, _, _ = self.make_client(root, include_supporting_failure=False)
+            with client:
+                self.open_session(client)
+                _, _, control_id, control_manifest = self.capture_source_and_control(
+                    client,
+                    root,
+                )
+                control_manifest["replay_http_status"] = 422
+                (root / "experiments" / control_id / "manifest.json").write_text(
+                    json.dumps(control_manifest), encoding="utf-8"
+                )
+                treatment = client.post(
+                    "/v1/browser/run",
+                    json={
+                        "operation": "replay_request",
+                        "payload": {
+                            "replay_mode": "treatment",
+                            "control_experiment_id": control_id,
+                            "mutation": {
+                                "type": "remove_json_path",
+                                "path": "/tracking_id",
+                            },
+                        },
+                    },
+                )
+            self.assertEqual(treatment.status_code, 200, treatment.text)
+            manifest = json.loads(
+                (
+                    root / "experiments" / treatment.json()["experiment_id"] / "manifest.json"
+                ).read_text(encoding="utf-8")
+            )
+            comparison = manifest["replay_comparison"]
+            self.assertEqual(comparison["control_http_status"], 422)
+            self.assertEqual(comparison["treatment_http_status"], 200)
+            self.assertTrue(comparison["http_status_changed"])
 
     def test_treatment_rejects_legacy_objective_integrity_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -5025,7 +5083,7 @@ class BrowserActionTests(unittest.TestCase):
                     root / "experiments" / treatment.json()["experiment_id"] / "manifest.json"
                 ).read_text(encoding="utf-8")
             )
-            analysis = manifest["replay_response_analysis"]
+            analysis = self.replay_response_analysis(manifest)
             self.assertEqual(analysis["classification"], "validation_rejection")
             self.assertFalse(analysis["evidence_sufficient"])
             self.assertEqual(
@@ -5094,7 +5152,7 @@ class BrowserActionTests(unittest.TestCase):
                 self.assertTrue(manifest["mutation_assessment"]["mutation_effective"])
                 self.assertNotIn("protocol_rejection_observed", manifest)
                 self.assertEqual(
-                    manifest["replay_response_analysis"]["classification"],
+                    self.replay_response_analysis(manifest)["classification"],
                     expected,
                 )
 
@@ -5467,7 +5525,7 @@ async function runCase(chunks, responseControl, contentType = 'text/event-stream
             self.assertIsNone(manifest["replay"]["source_content_type"])
             self.assertIsNone(manifest["replay_response_content_type"])
             self.assertEqual(
-                manifest["replay_response_analysis"]["classification"],
+                self.replay_response_analysis(manifest)["classification"],
                 "success",
             )
 

@@ -351,7 +351,9 @@ redirect/cache 等分类。
 
 当前状态：classifier 已改为显式 `response_analyzer`，默认不运行；输出带 analyzer
 name/version，且不参与实验状态计算。核心 manifest 不再生成
-`inference_eligibility` 或 `protocol_rejection_observed`。
+`inference_eligibility` 或 `protocol_rejection_observed`。HTTP status 只作为 Control/
+Treatment comparison fact，不再作为 Treatment 入口条件。完整 analyzer 输出只保存在
+`replay_attempt` evidence；manifest 仅保存 evidence ID 和有限摘要。
 
 ### 7.7 环境比较默认维度
 

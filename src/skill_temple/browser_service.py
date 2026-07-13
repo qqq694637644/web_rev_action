@@ -915,17 +915,6 @@ class BrowserActionService:
                 "and evidence integrity.",
                 409,
             )
-        control_http_status = control.get("replay_http_status")
-        if (
-            not isinstance(control_http_status, int)
-            or control_http_status < 200
-            or control_http_status >= 400
-        ):
-            raise BrowserServiceError(
-                "control_replay_http_failed",
-                "Treatment replay requires a control replay with a successful HTTP status.",
-                409,
-            )
         replay = control.get("replay")
         replay = replay if isinstance(replay, dict) else {}
         if replay.get("replay_mode") != "control":
@@ -4334,14 +4323,6 @@ class BrowserActionService:
                             )
                         except Exception as exc:
                             warnings.append(f"post-response alignment: {str(exc)[:1000]}")
-                        if replay_plan.get("replay_mode") == "control" and (
-                            replay_http_status is None
-                            or replay_http_status < 200
-                            or replay_http_status >= 300
-                        ):
-                            errors.append(
-                                "Control replay did not produce a successful HTTP response."
-                            )
                         step_results.append(
                             FlowStepResult(
                                 step_id="replay_request",
@@ -4696,6 +4677,7 @@ class BrowserActionService:
                 warnings.extend(console_warnings)
             mutation_assessment: dict[str, Any] | None = None
             response_analysis: dict[str, Any] | None = None
+            response_analysis_summary: dict[str, Any] | None = None
             stream_response_contract: dict[str, Any] | None = None
             response_evidence_source: str | None = None
             replay_network_evidence_id: str | None = None
@@ -5304,6 +5286,25 @@ class BrowserActionService:
                 if (relative := self.experiments.relative_path(path)) is not None
             ]
             if replay_plan is not None:
+                replay_attempt_evidence_id = evidence_id(
+                    experiment_id,
+                    "replay_attempt",
+                    stable_id=replay_plan["replay_attempt_id"],
+                )
+                if isinstance(response_analysis, dict):
+                    analyzer = response_analysis.get("analyzer")
+                    analyzer = analyzer if isinstance(analyzer, dict) else {}
+                    name = analyzer.get("name")
+                    version = analyzer.get("version")
+                    response_analysis_summary = {
+                        "analyzer": (
+                            f"{name}@{version}"
+                            if name is not None and version is not None
+                            else None
+                        ),
+                        "classification": response_analysis.get("classification"),
+                        "evidence_id": replay_attempt_evidence_id,
+                    }
                 replay_transport_semantics = {
                     **(
                         replay_plan.get("transport")
@@ -5328,7 +5329,9 @@ class BrowserActionService:
                             "environment_comparison": environment_comparison,
                             "transport_semantics": replay_transport_semantics,
                             **(
-                                {"response_analysis": response_analysis}
+                                {
+                                    "response_analysis_evidence_id": replay_attempt_evidence_id
+                                }
                                 if response_analysis is not None
                                 else {}
                             ),
@@ -5341,11 +5344,7 @@ class BrowserActionService:
                 ]
                 evidence_entries.append(
                     {
-                        "evidence_id": evidence_id(
-                            experiment_id,
-                            "replay_attempt",
-                            stable_id=replay_plan["replay_attempt_id"],
-                        ),
+                        "evidence_id": replay_attempt_evidence_id,
                         "kind": "replay_attempt",
                         "replay_attempt_id": replay_plan["replay_attempt_id"],
                         "pair_protocol_hash": replay_plan["pair_protocol_hash"],
@@ -5375,13 +5374,8 @@ class BrowserActionService:
                             "non_stream_error_response_observed": (
                                 non_stream_error_response_observed
                             ),
-                            **(
-                                {"response_analysis": response_analysis.get("classification")}
-                                if isinstance(response_analysis, dict)
-                                else {}
-                            ),
                             "control_http_status": replay_plan.get("control_http_status"),
-                            "http_status_differs_from_control": (
+                            "http_status_changed": (
                                 replay_http_status != replay_plan.get("control_http_status")
                                 if replay_plan.get("replay_mode") == "treatment"
                                 else None
@@ -5455,8 +5449,8 @@ class BrowserActionService:
                     ),
                     "non_stream_error_response_observed": (non_stream_error_response_observed),
                     **(
-                        {"replay_response_analysis": response_analysis}
-                        if response_analysis is not None
+                        {"response_analysis_summary": response_analysis_summary}
+                        if response_analysis_summary is not None
                         else {}
                     ),
                     "replay_comparison": (
@@ -5465,7 +5459,7 @@ class BrowserActionService:
                             "control_experiment_id": replay_plan["control_experiment_id"],
                             "control_http_status": replay_plan.get("control_http_status"),
                             "treatment_http_status": replay_http_status,
-                            "status_differs": (
+                            "http_status_changed": (
                                 replay_http_status != replay_plan.get("control_http_status")
                                 if replay_plan["replay_mode"] == "treatment"
                                 else None
