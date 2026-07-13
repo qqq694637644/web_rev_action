@@ -17,24 +17,8 @@ from .browser_models import (
     RequestMatcher,
     VolatileBinding,
 )
+from .evidence_name_rules import is_sensitive_header
 
-_SENSITIVE_HEADER_NAMES = {
-    "authorization",
-    "cookie",
-    "proxy-authorization",
-    "set-cookie",
-    "x-api-key",
-}
-_SENSITIVE_HEADER_FRAGMENTS = (
-    "token",
-    "secret",
-    "password",
-    "api-key",
-    "apikey",
-    "session",
-    "csrf",
-    "xsrf",
-)
 _BROWSER_MANAGED_HEADERS = {
     "accept-encoding",
     "connection",
@@ -128,13 +112,6 @@ def select_network_evidence(
     return [item for item in requests if network_request_matches(item, selector.matcher)][
         : selector.max_matches
     ]
-
-
-def is_sensitive_header(name: str) -> bool:
-    normalized = name.lower()
-    return normalized in _SENSITIVE_HEADER_NAMES or any(
-        fragment in normalized for fragment in _SENSITIVE_HEADER_FRAGMENTS
-    )
 
 
 def redact_header_entries(entries: list[dict[str, Any]]) -> list[dict[str, str]]:

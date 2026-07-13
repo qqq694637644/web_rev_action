@@ -501,6 +501,21 @@ reports/open-questions.md
 
 不要求立即生成完整协议 clone，也不要求套用历史六组实验。
 
+### 10.5 报告生成工具
+
+`tools/current_site_inventory.py` 从选定 session 或 analysis series 的 experiment
+manifest 生成上述四份报告。它只整理已有事实：
+
+- page alignment 和 step result；
+- network endpoint、method、resource type、Content-Type 和 status；
+- stream event source、终止原因、事件数量和 artifact integrity；
+- credential 相关 header 名、query 名和 identifier-like request shape 路径；
+- 当前 manifest 无法回答的 UI、认证来源、worker、WebSocket、ID 来源和刷新差异。
+
+工具不会读取 raw body、raw header、stream payload 或 credential artifact，也不会把
+未观察到的 transport、worker 或认证方式写成“不存在”。真实目标网页尚未运行现场
+capture 时，阶段 B 的事实确认项仍保持未完成。
+
 侦察结果将决定：
 
 - WebSocket 支持是否需要优先实现；
@@ -542,6 +557,7 @@ reports/open-questions.md
 
 目标：获得 2026 年当前页面事实，而不是继续围绕历史接口重构。
 
+- [x] 提供从 experiment manifest 生成四份侦察报告和 evidence gaps 的工具。
 - [ ] 建立 current-site inventory。
 - [ ] 确认 transport 类型和流终止方式。
 - [ ] 确认认证与动态状态来源。
