@@ -592,38 +592,329 @@ capture 时，阶段 B 的事实确认项仍保持未完成。
 - [x] 合并完整性和 completeness 字段。
 - [x] 建立 canonical network observation，删除重复 summary 计算。
 
-### 阶段 D：简化 replay 模型
+### 阶段 D：统一通用 replay 实验模型
 
-- [ ] 合并 Control/Exploratory/Treatment payload。
-- [ ] 将 pair comparison 改为可选配置。
-- [ ] 将 environment comparison 改为显式选择维度。
-- [ ] 将 setup output 改为通用 extractor/binding。
-- [ ] 保持 wire、transport 和 response reader 的通用能力。
+目标：让核心框架表达“重放一个已观察请求并保存事实”，而不是强制分析者先选择 Control、Exploratory 或 Treatment 研究范式。
 
-### 阶段 E：结构重构
-
-在删减完成前，不做大规模搬文件。
-
-删减后再形成：
+Control、Exploratory 和 Treatment 描述的是分析者如何解释一次实验，不是底层执行器真正不同的操作。核心 replay 请求只需要回答：
 
 ```text
-browser/application   实验编排
-browser/domain        typed facts 和通用规则
-browser/infrastructure Playwright、MCP、artifact
-protocol/analyzers    可选匹配、mutation、response hints
-workspace             人工分析工具
+请求来源是什么
+需要怎样修改
+动态值从哪里取得
+使用什么传输语义
+怎样读取响应
+何时停止读取
+是否需要与其他实验比较
 ```
 
-`BrowserActionService` 最终只保留兼容 facade 或完全移除。
+#### D1. 合并 replay payload
 
-### 阶段 F：测试重组
+- [ ] 将 Control、Exploratory、Treatment 收敛为一个通用 replay payload。
+- [ ] 将现有三种模式保留为 Skill、CLI 或客户端 preset，而不是核心 API 的独立类型。
+- [ ] replay 在没有 mutation、没有 comparison、没有完整历史 pair 的情况下也可以执行。
+- [ ] source request、mutations、bindings、transport、response reader 和 termination 都由请求显式表达。
+- [ ] 核心服务不再根据 replay mode 决定实验是否合法或应得出什么结论。
 
-- [ ] 按 capture、replay、evidence、stream、workspace 拆分测试。
-- [ ] fake adapter 独立到 `tests/fakes/`。
-- [ ] 纯 analyzer 使用参数化单元测试。
-- [ ] 浏览器 runtime JavaScript 使用独立 JS 测试。
-- [ ] 保留少量端到端 current-site-agnostic smoke。
-- [ ] 删除只证明旧 Pandora 结论的测试。
+目标形态示例：
+
+```json
+{
+  "source": {
+    "experiment_id": "exp_source",
+    "request_id": "request_1"
+  },
+  "mutations": [],
+  "extractors": [],
+  "bindings": [],
+  "transport": {},
+  "response_reader": {},
+  "termination": {},
+  "comparison": null
+}
+```
+
+#### D2. comparison 成为可选分析能力
+
+- [ ] 未提供 comparison 时，只执行 replay、保存 observation 和 artifact。
+- [ ] comparison 可以引用原始请求、任意历史实验或多个参考实验。
+- [ ] comparison 只输出选择维度上的事实差异，不输出最终因果资格。
+- [ ] HTTP 2xx、4xx、5xx 都可以成为比较基线，不由核心服务按状态码拒绝。
+- [ ] Control/Treatment pair 是一种可选 preset，不是 replay 的唯一执行道路。
+
+建议的 comparison 形态：
+
+```json
+{
+  "comparison": {
+    "references": ["exp_control"],
+    "dimensions": [
+      "request_body",
+      "response_status",
+      "response_headers",
+      "stream_events"
+    ]
+  }
+}
+```
+
+#### D3. environment comparison 显式选择
+
+不同网页真正重要的环境因素不同。核心框架不应默认要求固定的 page origin、conversation node、bundle hash 或其他历史维度完全一致。
+
+- [ ] 尽可能记录可观察的环境事实，但不自动将所有事实升级为比较要求。
+- [ ] environment dimensions 由请求或 Skill 显式选择。
+- [ ] 未配置 environment comparison 时，不生成 comparability verdict，也不阻止实验。
+- [ ] 比较结果只描述 equivalent、different、missing 或 unknown 等事实。
+- [ ] 可以提供 `none`、`minimal`、`browser_context` 和 `explicit` 等宽松 preset，避免每次重复配置。
+
+候选环境事实包括但不限于：
+
+```text
+page origin
+cookie 名称集合
+localStorage/sessionStorage key 集合
+Service Worker registration/version
+Worker 使用情况
+bundle/version hash
+account/session 状态提示
+feature flag
+请求前置步骤和时间窗口
+```
+
+是否使用这些维度由具体实验决定，核心框架不预设哪一项必然重要。
+
+#### D4. setup output 通用化为 extractor/binding
+
+当前 `setup_outputs` 的能力应保留，但不应永久绑定为：
+
+```text
+network_response_json + RequestMatcher + JSON Pointer
+```
+
+统一模型应区分：
+
+- extractor：从某个已观察来源提取值；
+- binding：将 literal、人工输入或 extractor 输出注入 replay target。
+
+- [ ] 将现有 network JSON 提取迁移到通用 extractor 接口。
+- [ ] 第一版只实现当前已有来源以及 `literal`、`manual_input`，不一次支持所有可能来源。
+- [ ] extractor 结果可以独立保存和检查，不必立刻绑定到 replay。
+- [ ] binding 可以引用 extractor output，也可以直接使用人工或调用方提供的值。
+- [ ] extractor 失败默认保存为 observation，不因缺少理想动态值模型而拒绝整个探索实验。
+- [ ] 后续只在真实网页需要时增加 DOM、storage、cookie metadata、response header、WebSocket message 或 JavaScript expression 等来源。
+
+#### D5. 必须保持通用的底层能力
+
+阶段 D 是模型收敛，不是删除 transport 能力。以下行为必须保持：
+
+- [ ] header/query wire order 和重复 occurrence；
+- [ ] raw body、结构化 body 和 body fingerprint；
+- [ ] Fetch、XHR、EventSource 以及未知 delivery 的事实记录；
+- [ ] SSE、NDJSON、raw stream 和无 Content-Type；
+- [ ] 可配置 response reader、byte/event limit 和 termination condition；
+- [ ] browser-context replay；
+- [ ] add/remove/replace mutation；
+- [ ] request source 的 method、完整 URL/query、body 指纹和时间窗口关联；
+- [ ] credential、browser-managed header、artifact 大小、deadline 和取消等安全边界。
+
+阶段 D 的完成标准不是“类名更统一”，而是新增网页或新研究方法时，可以通过组合 source、mutation、extractor、binding、transport、reader、termination 和 comparison 表达，而不需要再增加一种专属 replay mode。
+
+### 阶段 E：按变化原因拆分职责
+
+目标：缩小巨型 service 和 adapter，使实验编排、外部传输、证据事实和可选分析能够独立变化。阶段 E 不追求教科书式 Clean Architecture，也不以创建更多目录、类或接口为完成标准。
+
+#### E1. 重构原则
+
+- [ ] 在阶段 D 的通用 replay 模型稳定后再做大范围拆分。
+- [ ] 每次只提取一个具有明确输入、输出和失败边界的职责。
+- [ ] 提取模块时同步迁移对应测试，避免先搬代码、后补验证。
+- [ ] 不创建通用 `BaseService`、`Manager`、`Coordinator`、`Factory` 或 `Repository` 层次来包装旧复杂度。
+- [ ] 只有 Playwright、MCP、文件系统、时钟、进程和 artifact 等真实外部边界需要 Protocol 或 adapter。
+- [ ] 先减少分支和重复状态，再决定最终目录名称。
+
+#### E2. 推荐的实际职责边界
+
+初始结构可以保持务实，不强制一次形成完整 `application/domain/infrastructure` 三层：
+
+```text
+browser/
+  capture.py          capture 实验编排
+  replay.py           replay 实验编排
+  steps.py            setup/action/verification step 执行
+  finalization.py     trace、collector、截图、快照和取消收尾
+  evidence.py         evidence 收集、关联和 manifest facts
+  models.py           稳定 typed facts 和请求模型
+  adapters/
+    playwright.py
+    js_reverse.py
+    artifacts.py
+
+protocol/
+  mutations.py
+  matching.py
+  analyzers/
+    response.py
+    differences.py
+
+workspace/
+  inspect.py
+  search.py
+  write.py
+  powershell.py
+```
+
+职责稳定后，再判断是否值得整理为：
+
+```text
+browser/application
+browser/domain
+browser/infrastructure
+```
+
+`browser/domain` 不是必选目录。只有 `ExperimentContext`、`NetworkObservation`、`ArtifactReference`、`ReplayRequest`、`Mutation`、`Extractor`、`Binding`、`ExecutionStatus` 和 `Completeness` 等对象已经稳定，并且确实被多个用例共享时，才放入独立 domain 层。
+
+#### E3. 推荐提取顺序
+
+- [ ] 提取 browser replay runtime JavaScript，停止把大段 JS 内嵌在 Python 字符串中。
+- [ ] 提取 finalization，统一成功、失败、超时和取消后的 collector、trace、截图、快照与 artifact 收尾。
+- [ ] 提取 evidence collection，集中处理 network、stream、console、script 和 artifact facts。
+- [ ] 提取 replay execution，隔离 source resolution、mutation、binding、transport dispatch 和 response reading。
+- [ ] 提取可选 analyzers，使其只消费事实并返回 observations/hints。
+- [ ] 最后缩小 `BrowserActionService`，使其只负责 dispatch 或保留为兼容 facade。
+
+#### E4. BrowserActionService 的目标
+
+`BrowserActionService` 不必为了架构纯度被强制删除。可以保留一个薄 facade：
+
+```python
+class BrowserActionService:
+    async def run(self, request):
+        return await self.dispatcher.run(request)
+
+    async def inspect(self, request):
+        return await self.inspector.run(request)
+```
+
+但它不应继续拥有：
+
+```text
+巨型实验状态
+数百次裸 manifest/replay dict 访问
+Playwright/MCP 传输实现
+stream parser
+artifact 文件格式实现
+response 语义结论
+上千行 capture/replay 主流程
+```
+
+#### E5. Workspace 的定位
+
+Workspace 不是可有可无的附属模块，而是人机协同分析框架的一部分。它应继续支持：
+
+```text
+inspect
+search
+bounded read
+write notes and reports
+run focused analysis scripts
+inspect synced artifacts
+```
+
+PowerShell 是否保留在核心中，根据真实分析用例决定。常用 hash、binary summary、archive inspection 等能力可以逐步内建；只有复杂高级分析才需要通用 shell。不要为了抽象一致性删除人工和 LLM 实际需要的分析能力。
+
+阶段 E 的完成标准是：新 transport、新证据来源或新 analyzer 不再要求修改同一个巨型 service，而不是代码必须符合某种固定目录模板。
+
+### 阶段 F：让测试跟随能力边界
+
+目标：测试直接证明 capture、replay、transport、evidence、analyzer 和 workspace 的通用能力，不再把一个历史网页的业务结论当作框架契约。
+
+阶段 F 不应等阶段 E 全部完成后再一次性搬迁。每提取一个模块，就同步移动、补充或删除对应测试。
+
+#### F1. 按能力拆分测试
+
+- [ ] 将数千行浏览器测试按 capture、replay、steps、finalization、evidence、stream 和 inspection 拆分。
+- [ ] 将 protocol mutation、request matching、response analyzer 和 difference comparison 分开测试。
+- [ ] 将 workspace read/search/write/PowerShell 测试与 browser tests 分离。
+- [ ] 保持目录层次浅，优先让维护者能快速找到能力对应的测试。
+
+建议形态：
+
+```text
+tests/
+  browser/
+    test_capture.py
+    test_replay.py
+    test_steps.py
+    test_finalization.py
+  evidence/
+    test_network_observations.py
+    test_streams.py
+  protocol/
+    test_mutations.py
+    test_matching.py
+    test_response_analyzers.py
+  workspace/
+    test_inspect.py
+    test_search.py
+  fakes/
+```
+
+#### F2. 复用 fake 和 scenario builder
+
+- [ ] 将 Playwright、js-reverse、stream capture 等 fake 从巨型测试文件中移到 `tests/fakes/`。
+- [ ] fake 应模拟外部 adapter 合同，不复制业务判断。
+- [ ] 使用少量可组合 scenario builder 表达 network request、stream、artifact failure、timeout 和 cancellation。
+- [ ] 增加 adapter contract tests，防止 fake 与真实 adapter 响应结构漂移。
+
+#### F3. 纯 analyzer 使用参数化测试
+
+- [ ] analyzer 测试只提供结构化输入并断言 observations/hints。
+- [ ] 明确验证 analyzer 不改变 execution status，不决定实验是否合法。
+- [ ] unknown 或证据不足是正常输出。
+- [ ] 防止字段名子串、模糊自然语言或 HTTP status 被升级为最终协议结论。
+
+#### F4. browser replay runtime JavaScript 独立测试
+
+- [ ] 将浏览器内 replay runtime 提取为独立 `.js` 文件。
+- [ ] 使用 Node 测试 SSE、NDJSON、raw stream、abort、byte/event limit 和 termination。
+- [ ] 覆盖 LF/CRLF、多字节 UTF-8 chunk、不完整最后一行、SSE multiline data 和无固定终止标记。
+- [ ] Python 测试只验证 runtime 的加载、参数传递和结构化结果映射。
+
+#### F5. 保留少量通用端到端 smoke
+
+- [ ] 保留一个明确标注为 synthetic fixture 的 authenticated stateful streaming 页面。
+- [ ] smoke 覆盖页面操作、cookie/session、capture、stream、replay、mutation、setup binding、取消和 artifact。
+- [ ] fixture 可以返回 2xx、4xx、5xx，用于验证框架记录事实，而不是证明某个真实网页协议。
+- [ ] smoke 不使用 Pandora、conversation、message、parent 或固定 `[DONE]` 作为通用框架契约。
+
+#### F6. 删除产品专属结论测试
+
+应删除只证明以下历史结论的测试：
+
+```text
+必须完成固定六场景
+某个历史字段必然 required
+conversation/message/parent 是通用协议结构
+[DONE] 是唯一终止条件
+Stop 必须产生固定网络状态
+Control/Treatment 是所有 replay 的唯一合法流程
+```
+
+应保留证明以下通用能力的测试：
+
+```text
+mutation 是否真实出现在 wire
+原始 response body 是否被有界保存
+422、409、429、500 等状态是否被准确记录
+stream parser 是否正确
+extractor/binding 是否按配置工作
+关联不确定性是否明确保存
+取消、deadline 和失败是否完成资源清理
+artifact 是否可审计
+```
+
+阶段 F 的完成标准是：新增一个 transport、extractor 或 analyzer 时，可以在对应能力目录添加小型测试，不需要继续扩展一个数千行测试文件，也不需要把某个真实网页的业务语义写进核心测试。
 
 ## 13. 推荐后续 PR 顺序
 
@@ -634,8 +925,10 @@ workspace             人工分析工具
 3. **入口合并 PR：** `capture_baseline` 兼容 alias，统一 flow executor。
 4. **结论删减 PR：** 删除 `inference_eligibility` 和固定后端 response verdict。
 5. **证据模型 PR：** canonical network observation，合并完整性字段。
-6. **Replay 简化 PR：** 通用 replay + 可选 comparison/extractor。
-7. **结构 PR：** 在功能已经减少后拆分 service、adapter 和测试。
+6. **Replay 模型 PR：** 合并 replay payload，使 comparison、environment dimensions、extractor 和 binding 都成为可选组合能力。
+7. **Replay runtime PR：** 提取浏览器 JavaScript runtime，并增加独立 SSE、NDJSON、raw stream 和 termination 测试。
+8. **职责拆分 PR：** 依次提取 finalization、evidence collection 和 replay execution；同步迁移对应测试。
+9. **测试与目录收尾 PR：** 拆分剩余巨型测试和 fake，最后再整理稳定后的目录边界。
 
 每个 PR 应满足：
 
