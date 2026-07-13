@@ -413,8 +413,6 @@ class ProtocolEvidenceTests(unittest.TestCase):
         )
 
         self.assertEqual(validation["classification"], "validation_rejection")
-        self.assertFalse(validation["usable_for_required_classification"])
-        self.assertEqual(validation["conclusion"], "inconclusive")
         self.assertTrue(validation["observations"]["validation_like"])
         self.assertIn("field_required", validation["inference_hints"])
         self.assertEqual(unknown["classification"], "unknown_rejection")
@@ -472,11 +470,8 @@ class ProtocolEvidenceTests(unittest.TestCase):
             "none",
         )
         self.assertEqual(constrained["classification"], "value_constraint")
-        self.assertEqual(constrained["conclusion"], "inconclusive")
         self.assertIn("value_constraint", constrained["inference_hints"])
-        self.assertFalse(constrained["usable_for_required_classification"])
         self.assertEqual(conflict["classification"], "conflict")
-        self.assertFalse(conflict["usable_for_required_classification"])
         self.assertEqual(
             missing_content_type["classification"],
             "response_contract_mismatch",
@@ -524,7 +519,6 @@ class ProtocolEvidenceTests(unittest.TestCase):
         )
 
         self.assertEqual(result["classification"], "field_rejection")
-        self.assertEqual(result["conclusion"], "inconclusive")
         self.assertEqual(
             result["validation_evidence"]["semantic"],
             "not_required",
@@ -611,7 +605,6 @@ class ProtocolEvidenceTests(unittest.TestCase):
         )
 
         self.assertEqual(result["classification"], "redirect_or_cache_response")
-        self.assertEqual(result["conclusion"], "inconclusive")
 
     def test_non_json_body_is_part_of_non_target_equivalence(self) -> None:
         mutation = RemoveHeaderMutation(type="remove_header", name="X-Tracking")

@@ -383,66 +383,12 @@ class CaptureFlowPayload(StrictModel):
     series: ExperimentSeries = Field(default_factory=ExperimentSeries)
 
     @model_validator(mode="after")
-    def validate_stop_sequence(self) -> CaptureFlowPayload:
+    def validate_capture_target(self) -> CaptureFlowPayload:
         if self.target.start_url is not None:
             raise ValueError(
                 "capture target.start_url is not allowed; add an explicit navigate flow step "
                 "so Trace and stream capture start before navigation"
             )
-        stop_indexes = [
-            index
-            for index, step in enumerate(self.flow)
-            if getattr(step, "intent", None) == "stop_generation"
-        ]
-        for stop_index in stop_indexes:
-            before = self.flow[:stop_index]
-            after = self.flow[stop_index + 1 :]
-            has_started_stream = any(
-                step.action in {"wait", "assert"}
-                and step.condition is not None
-                and step.condition.type in {"first_event", "event_predicate"}
-                for step in before
-            )
-            has_terminal_observation = any(
-                step.action in {"wait", "assert"}
-                and step.condition is not None
-                and step.condition.type
-                in {
-                    "network_canceled",
-                    "network_finished",
-                    "event_predicate",
-                    "request_observed",
-                    "response_observed",
-                    "selector_visible",
-                    "selector_hidden",
-                    "timeout",
-                    "failed",
-                }
-                for step in after
-            ) or (
-                self.wait_for is not None
-                and self.wait_for.type
-                in {
-                    "network_canceled",
-                    "network_finished",
-                    "event_predicate",
-                    "request_observed",
-                    "response_observed",
-                    "selector_visible",
-                    "selector_hidden",
-                    "timeout",
-                    "failed",
-                }
-            )
-            if not has_started_stream:
-                raise ValueError(
-                    "stop_generation requires an earlier first_event or event_predicate wait"
-                )
-            if not has_terminal_observation:
-                raise ValueError(
-                    "stop_generation requires a later network, event, selector, "
-                    "or timeout observation"
-                )
         return self
 
 

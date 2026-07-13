@@ -110,6 +110,10 @@ network response body, then a complete bounded replay response body, then previe
 as an inconclusive fallback. Remove + field-required can support required;
 replace rejection supports a value constraint; 409 is conflict evidence.
 
+These are evidence interpretations, not backend verdicts. The Action must not emit
+final field-necessity conclusions; the Skill and analyst combine response facts,
+wire mutation evidence, environment context, and persisted UI/server state.
+
 Ordinary network snapshot integrity and stream artifact integrity are separate. An exact request snapshot may prove request headers/body completeness, but it cannot upgrade missing `raw.bin`, event JSONL, or stream metadata.
 
 For non-stream errors, record response header/body completeness separately. A

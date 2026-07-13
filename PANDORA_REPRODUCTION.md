@@ -27,7 +27,7 @@ message / parent message 如何关联
 pandora-protocol-reproduction Skill 负责六组实验、单变量 mutation、证据解释和报告模板
 playwright-cli 负责制造和重放页面行为
 js-reverse-mcp 负责解释网络、流、脚本、调用栈和运行时证据
-web_rev_action 负责原子 capture/replay、证据索引、deadline 和实验 manifest
+web_rev_action 负责原子 capture/replay、证据索引、deadline 和实验 manifest；只记录事实、完整性和提示，不替分析者输出最终协议结论
 workspaceInspect/Search/ReadFiles 负责实验后的浏览和文本分析
 workspaceWriteFile/ApplyPatch/ExecPwsh 负责 schema、报告、二进制、diff 和重放脚本
 ```
@@ -75,10 +75,10 @@ preserve_source + same_value
 
 Treatment 只传 `control_experiment_id + mutation`，其余参数从 Control 的
 immutable `pair_protocol_hash` 继承。Fresh值可不同，后端规范化后比较非目标
-字段。只有Control target baseline存在、Treatment target delta正确、volatile
-bindings实际出现在wire、非目标字段等价且pre-dispatch环境为
-`observed_equivalent`时，才可形成自动因果结论；环境为`insufficient`时保留证据，
-但整体结论必须partial。凭据不进入Skill、Action响应或报告。
+字段。Control target baseline、Treatment target delta、volatile bindings wire命中、
+非目标字段等价和pre-dispatch环境比较都是供分析者判断因果性的证据维度。
+后端不直接输出required/optional等字段结论；环境为`insufficient`时仍保留全部证据，
+由Skill和人工分析决定下一轮实验。凭据不进入Skill、Action响应或报告。
 
 对于有状态接口，Control应声明不可变 `setup_flow`，Treatment自动继承：
 
@@ -271,10 +271,11 @@ unexpected_redirect
 response_contract_mismatch
 ```
 
-只有严格的remove-field `validation_rejection`可支持required。结构化path/loc/field
+后端只输出响应分类、结构化匹配事实、observations和inference hints，不输出
+required/optional结论。严格的remove-field `validation_rejection`可以成为required
+假设的强证据，但仍应由Skill或人工结合持久状态验证决定。结构化path/loc/field
 必须与目标精确相等；`invalid request`之类文本不能因包含`id`子串而命中。自然语言
-单词边界匹配只能是weak hint。Exact response body优先；preview-only不能生成最终
-required结论。
+单词边界匹配只能是weak hint。Exact response body优先；preview-only只能作为待复核提示。
 
 环境分为pre-dispatch、post-response和post-verification。因果等价只比较
 pre-dispatch，结果为`observed_equivalent | different | insufficient`。通用后端无法
@@ -518,6 +519,9 @@ Stop 后重新获取的实际页面仍与同一稳定 pageId 对齐
 该 request 关联最近的已完成 Stop step
 没有导航或 page close 等更合理原因
 ```
+
+这些条件只控制归因强度，不限制实验能否执行。缺少Stop前事件或Stop后终态观察时，
+实验仍然运行并保存证据，取消只标记为`unclassified_network_cancel`或保持未知，供人工补充实验。
 
 分析时同时保存：
 

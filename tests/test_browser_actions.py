@@ -1022,9 +1022,10 @@ class BrowserActionTests(unittest.TestCase):
             summary = body["result"]["experiment"]
             manifest = root / body["result"]["manifest_relative_path"]
             experiment = json.loads(manifest.read_text(encoding="utf-8"))
-            self.assertEqual(summary["objective_integrity"], "complete")
+            self.assertEqual(summary["execution_integrity"], "complete")
+            self.assertEqual(summary["evidence_integrity"], "complete")
             self.assertEqual(experiment["primary_request_integrity"], "complete")
-            self.assertEqual(experiment["objective_integrity"], "complete")
+            self.assertNotIn("objective_integrity", experiment)
             self.assertEqual(experiment["collector_integrity"], "failed")
             self.assertTrue(experiment["capture_health"]["collector_stopped"])
             self.assertFalse(experiment["capture_health"]["worker_coverage"])
@@ -1119,7 +1120,8 @@ class BrowserActionTests(unittest.TestCase):
             self.assertEqual(experiment["primary_request_matcher"]["expected_min_matches"], 0)
             self.assertEqual(experiment["steps"], [])
             self.assertEqual(response.json()["status"], "completed")
-            self.assertEqual(experiment["objective_integrity"], "complete")
+            self.assertEqual(experiment["execution_integrity"], "complete")
+            self.assertEqual(experiment["evidence_integrity"], "complete")
 
     def test_supporting_failure_can_be_made_objective_fatal(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1138,7 +1140,8 @@ class BrowserActionTests(unittest.TestCase):
             )
             self.assertEqual(experiment["primary_request_integrity"], "complete")
             self.assertEqual(experiment["collector_integrity"], "failed")
-            self.assertEqual(experiment["objective_integrity"], "failed")
+            self.assertEqual(experiment["execution_integrity"], "complete")
+            self.assertEqual(experiment["evidence_integrity"], "failed")
 
     def test_stop_intent_correlates_only_the_primary_network_cancellation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1193,9 +1196,14 @@ class BrowserActionTests(unittest.TestCase):
             )
             self.assertIsNotNone(classification["stream_before_stop"])
 
-    def test_stop_intent_requires_stream_start_observation(self) -> None:
+    def test_stop_intent_without_stream_start_is_recorded_without_preclassification(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
-            client, _, _ = self.make_client(Path(temp_dir))
+            root = Path(temp_dir)
+            client, _, _ = self.make_client(
+                root,
+                include_supporting_failure=False,
+                primary_status="canceled",
+            )
             request = self.capture_request()
             request["payload"]["flow"] = [
                 {
@@ -1212,8 +1220,19 @@ class BrowserActionTests(unittest.TestCase):
             with client:
                 self.open_session(client)
                 response = client.post("/v1/browser/run", json=request)
-            self.assertEqual(response.status_code, 422)
-            self.assertIn("requires an earlier first_event", response.text)
+            self.assertEqual(response.status_code, 200, response.text)
+            manifest = json.loads(
+                (root / response.json()["result"]["manifest_relative_path"]).read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                manifest["cancellation_classifications"][0]["classification"],
+                "unclassified_network_cancel",
+            )
+            self.assertFalse(
+                manifest["cancellation_classifications"][0]["same_request_observed"]
+            )
 
     def test_job_mode_returns_running_then_completes_via_inspect(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1360,7 +1379,8 @@ class BrowserActionTests(unittest.TestCase):
                     encoding="utf-8"
                 )
             )
-            self.assertEqual(manifest["objective_integrity"], "partial")
+            self.assertEqual(manifest["execution_integrity"], "complete")
+            self.assertEqual(manifest["evidence_integrity"], "partial")
             self.assertEqual(
                 manifest["primary_integrity_dimensions"]["raw_capture"],
                 "partial",
@@ -3799,7 +3819,7 @@ class BrowserActionTests(unittest.TestCase):
             self.assertEqual(replay_manifest["series"]["sequence_index"], 3)
             self.assertEqual(replay_manifest["execution_integrity"], "complete")
             self.assertEqual(replay_manifest["evidence_integrity"], "complete")
-            self.assertEqual(replay_manifest["objective_integrity"], "complete")
+            self.assertNotIn("objective_integrity", replay_manifest)
             self.assertEqual(
                 replay_manifest["causal_comparability"],
                 "observed_equivalent",
@@ -3940,7 +3960,8 @@ class BrowserActionTests(unittest.TestCase):
                 replay_manifest["replay_response_content_type"],
                 "text/event-stream",
             )
-            self.assertEqual(replay_manifest["objective_integrity"], "complete")
+            self.assertEqual(replay_manifest["execution_integrity"], "complete")
+            self.assertEqual(replay_manifest["evidence_integrity"], "complete")
             self.assertEqual(
                 replay_manifest["primary_integrity_dimensions"]["raw_capture"],
                 "complete",
@@ -4510,7 +4531,7 @@ class BrowserActionTests(unittest.TestCase):
                 ).read_text(encoding="utf-8")
             )
             self.assertFalse(manifest["mutation_assessment"]["mutation_effective"])
-            self.assertEqual(manifest["objective_integrity"], "failed")
+            self.assertEqual(manifest["evidence_integrity"], "failed")
 
     def test_sse_treatment_json_rejection_remains_protocol_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -4589,13 +4610,10 @@ class BrowserActionTests(unittest.TestCase):
             )
             self.assertEqual(manifest["execution_integrity"], "complete")
             self.assertEqual(manifest["evidence_integrity"], "complete")
-            self.assertEqual(manifest["objective_integrity"], "complete")
-            self.assertEqual(
-                manifest["replay_response_classification"]["conclusion"],
-                "inconclusive",
-            )
-            self.assertFalse(
-                manifest["replay_response_classification"]["usable_for_required_classification"]
+            self.assertNotIn("objective_integrity", manifest)
+            self.assertIn(
+                "field_required",
+                manifest["replay_response_classification"]["inference_hints"],
             )
 
     def test_control_fails_when_volatile_binding_is_not_observed_on_wire(self) -> None:
@@ -4946,8 +4964,6 @@ class BrowserActionTests(unittest.TestCase):
             )
             classification = manifest["replay_response_classification"]
             self.assertEqual(classification["classification"], "validation_rejection")
-            self.assertEqual(classification["conclusion"], "inconclusive")
-            self.assertFalse(classification["usable_for_required_classification"])
             self.assertFalse(classification["evidence_sufficient"])
             self.assertEqual(
                 manifest["response_evidence_source"],
@@ -5602,7 +5618,8 @@ async function runCase(chunks, responseControl, contentType = 'text/event-stream
             "experiment_id": "exp_many",
             "session_id": "session_many",
             "status": "completed",
-            "objective_integrity": "complete",
+            "execution_integrity": "complete",
+            "evidence_integrity": "complete",
             "primary_requests": [
                 {
                     "cdpRequestId": f"request-{index}",

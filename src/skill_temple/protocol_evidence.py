@@ -997,10 +997,6 @@ def classify_replay_response(
         inference_hints.append("conflicting_validation_signals")
     return {
         "classification": classification,
-        "conclusion": (
-            "success" if mutation is None and classification == "success" else "inconclusive"
-        ),
-        "usable_for_required_classification": False,
         "validation_evidence": reference,
         "observations": observations,
         "inference_hints": inference_hints,

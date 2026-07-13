@@ -257,7 +257,8 @@ class ExperimentStore:
                     "objective": manifest.get("objective"),
                     "status": manifest.get("status"),
                     "created_at": manifest.get("created_at"),
-                    "objective_integrity": manifest.get("objective_integrity"),
+                    "execution_integrity": manifest.get("execution_integrity"),
+                    "evidence_integrity": manifest.get("evidence_integrity"),
                 }
             )
             if len(items) >= limit:
@@ -2412,11 +2413,6 @@ class BrowserActionService:
                 if isinstance(request_payload, ReplayTreatmentPayload)
                 else None
             ),
-            "control_objective_integrity": (
-                control_manifest.get("objective_integrity")
-                if isinstance(control_manifest, dict)
-                else None
-            ),
             "control_http_status": (
                 control_manifest.get("replay_http_status")
                 if isinstance(control_manifest, dict)
@@ -2490,7 +2486,6 @@ class BrowserActionService:
             "evidence_integrity": manifest.get("evidence_integrity"),
             "causal_comparability": manifest.get("causal_comparability"),
             "inference_eligibility": manifest.get("inference_eligibility"),
-            "objective_integrity": manifest.get("objective_integrity"),
             "collector_integrity": manifest.get("collector_integrity"),
             "primary_request_integrity": manifest.get("primary_request_integrity"),
             "primary_integrity_dimensions": manifest.get("primary_integrity_dimensions"),
@@ -5241,20 +5236,13 @@ class BrowserActionService:
                 inference_eligibility = "eligible"
             else:
                 inference_eligibility = "supervised_only"
-            objective_integrity = (
-                "failed"
-                if "failed" in {execution_integrity, evidence_integrity}
-                else "partial"
-                if "partial" in {execution_integrity, evidence_integrity}
-                else "complete"
-            )
             response_status = (
                 "interrupted"
                 if cancelled_error is not None
                 else "failed"
-                if objective_integrity == "failed"
+                if "failed" in {execution_integrity, evidence_integrity}
                 else "partial"
-                if objective_integrity == "partial"
+                if "partial" in {execution_integrity, evidence_integrity}
                 else "completed"
             )
             pre_arm_request_count = sum(
@@ -5481,7 +5469,6 @@ class BrowserActionService:
                     "evidence_integrity": evidence_integrity,
                     "causal_comparability": causal_comparability,
                     "inference_eligibility": inference_eligibility,
-                    "objective_integrity": objective_integrity,
                     "objective_requirements": payload.requirements.model_dump(mode="json"),
                     "primary_integrity_dimensions": primary_dimensions,
                     "primary_requests": primary_requests,

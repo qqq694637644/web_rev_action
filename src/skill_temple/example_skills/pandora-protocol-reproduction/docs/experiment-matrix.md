@@ -68,7 +68,7 @@ JSON/query names are case-sensitive. Header names are case-insensitive. Preserve
 | custom CSRF header | remove header | Session/CSRF failure mode |
 | query feature flag | remove/replace query parameter | Feature behavior and response schema |
 
-Classify each result as `required`, `conditionally_required`, `optional`, `tracking_only`, or `unknown`.
+The Skill and analyst may classify each result as `required`, `conditionally_required`, `optional`, `tracking_only`, or `unknown`. The Action should expose evidence and hints, not make this final classification.
 
 Before classification require:
 
@@ -92,7 +92,7 @@ Do not test browser-managed Cookie, Origin, Referer, Host, Content-Length, or `S
 
 ## Stop observation template
 
-The Stop scenario should follow:
+The preferred Stop scenario follows:
 
 ```text
 submit message
@@ -105,3 +105,6 @@ submit message
 ```
 
 Do not require `network_canceled`. Record the observed classification.
+If the current UI does not expose these checkpoints, run a weaker exploratory
+sequence instead of rejecting it. Preserve the missing observations explicitly and
+use the result to design the next run.

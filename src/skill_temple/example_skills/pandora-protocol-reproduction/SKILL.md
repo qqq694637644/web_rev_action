@@ -14,6 +14,7 @@ Follow this separation throughout the task:
 - This Skill decides the experiment sequence, one-variable mutations, evidence interpretation, and report contents.
 - `runBrowserExperiment` performs atomic browser operations such as `capture_flow`, paired `replay_request`, `save_script_source`, and `cancel_experiment`.
 - `inspectBrowserEvidence` reads bounded experiment, evidence, initiator, script, console, and stream summaries.
+- The Action records observations, integrity, comparability, and hints. It does not decide final `required`, `optional`, or protocol semantics for the analyst.
 - Workspace tools read evidence files and write only derived reports, schemas, notes, and replay scripts.
 - Never reconstruct browser fetches with arbitrary PowerShell or JavaScript when `replay_request` can perform the operation.
 - Never copy Cookie, Authorization, CSRF, or other credential values into chat, reports, diffs, or generated scripts.
@@ -130,7 +131,7 @@ replace_query_parameter
 
 JSON Pointer and query parameter names are case-sensitive. Header names are case-insensitive. Duplicate header/query values are compared as complete ordered lists, including multiplicity.
 
-Browser-managed headers such as Cookie, Origin, Referer, Host, Content-Length, and `Sec-*` cannot be mutated through browser-context fetch and must be rejected rather than classified. Classify a field only when the paired assessment proves:
+Browser-managed headers such as Cookie, Origin, Referer, Host, Content-Length, and `Sec-*` cannot be mutated through browser-context fetch and must be rejected rather than classified. Treat the following as evidence-quality checks before making a field hypothesis:
 
 ```text
 Control contains the target baseline
@@ -176,10 +177,12 @@ unexpected_redirect
 response_contract_mismatch
 ```
 
-Only the strict remove-field `validation_rejection` can support a required-field
-conclusion. A replace rejection proves a value constraint, not requiredness.
-Natural-language field mentions are weak hints only. Required evidence must come
-from an exact bounded response body artifact, not an incomplete preview.
+The backend response object contains classification, observations, validation
+evidence, and inference hints only. A strict remove-field `validation_rejection`
+can support a required-field hypothesis, but the Skill or analyst must combine it
+with persistent-state verification. A replace rejection supports a value-constraint
+hypothesis, not requiredness. Natural-language field mentions are weak hints only.
+Use an exact bounded response body artifact rather than an incomplete preview.
 
 Use `verification_flow` for reload, conversation detail retrieval, or reopening the conversation after fetch. Without persistent-state verification, do not classify a 2xx result beyond `partial` or `unknown`.
 
@@ -215,6 +218,10 @@ stop_control_request_observed
 stop_page_state_only
 stop_outcome_unknown
 ```
+
+Do not reject a Stop experiment merely because the ideal before/after observations
+are missing. Run it, preserve the evidence, mark cancellation attribution as
+unclassified, and design the next experiment with stronger checkpoints.
 
 ### 6. Maintain evidence-backed conclusions
 
