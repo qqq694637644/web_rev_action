@@ -156,7 +156,7 @@ class ProtocolEvidenceTests(unittest.TestCase):
             dimensions,
             {"request_body": "complete", "semantic_stream": "partial"},
         )
-        self.assertEqual(missing, ["response_body", "semantic_stream"])
+        self.assertEqual(missing, ["semantic_stream"])
 
     def test_network_checkpoint_excludes_old_requests_and_optionally_includes_inflight(
         self,

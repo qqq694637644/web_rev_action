@@ -305,6 +305,9 @@ missing_evidence[]
 当前状态：核心 manifest 已改为 `execution.status + quality_summary +
 network_observations[].completeness + artifacts[].completeness`。旧的 execution、
 evidence、collector、primary request 多套 integrity 字段不再生成，也不做兼容转换。
+执行错误、证据错误和分析提示分别保存在 `execution.errors`、
+`quality_summary.errors` 和 `analysis_warnings`。Quality summary 只提升请求要求的
+completeness 与明确的全局 evidence gap；observation 的未要求缺口只留在 observation。
 
 ### 7.5 network snapshot 与 stream request 的重复摘要
 
@@ -326,6 +329,10 @@ evidence、collector、primary request 多套 integrity 字段不再生成，也
 - stream 与 network 是来源，不是两套并列业务模型；
 - public response 通过 canonical observation 动态裁剪；
 - 删除重复 hash、完整性和关联状态计算。
+
+当前关联实现会对所有可用稳定 ID 的候选集取交集，不会因较弱 ID 首先出现多个
+候选就提前返回 ambiguous。只有稳定 ID 仍无法唯一定位时才使用 URL+method 的
+heuristic fallback。
 
 ### 7.6 响应分类、inference hints 与 inference eligibility
 

@@ -335,7 +335,8 @@ def build_network_observation(
     association_method = association.get("method")
     confidence = (
         "exact"
-        if association_status == "matched" and association_method != "url_method_fallback"
+        if association_status == "matched"
+        and "url_method_fallback" not in str(association_method or "")
         else "heuristic"
         if association_status == "matched"
         else "ambiguous"
@@ -405,10 +406,6 @@ def aggregate_observation_completeness(
         dimensions[name] = value
         if value not in {"complete", "not_required"}:
             missing.add(name)
-    for observation in observations:
-        values = observation.get("missing_evidence")
-        if isinstance(values, list):
-            missing.update(str(item) for item in values)
     return dimensions, sorted(missing)
 
 

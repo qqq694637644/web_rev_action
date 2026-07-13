@@ -246,10 +246,24 @@ execution.status
 quality_summary.status
 quality_summary.required_completeness
 quality_summary.missing_evidence
+quality_summary.errors
 network_observations[].completeness
 network_observations[].association.confidence
 artifacts[].completeness
 ```
+
+执行、证据质量和分析提示分别记录：
+
+```text
+execution.status + execution.errors
+quality_summary.status + quality_summary.errors
+analysis_warnings
+```
+
+普通 step、取消或 replay dispatch 失败只影响 execution。`quality_summary` 只聚合
+observation count、请求明确要求的 completeness、明确要求的 collector/artifact、
+association failure 和显式 stream terminal contract。Observation 自身可以列出全部
+`missing_evidence`，但 quality summary 不会提升未要求维度。
 
 不再生成顶层 `execution_integrity`、`evidence_integrity`、
 `collector_integrity`、`primary_request_integrity`、
@@ -293,7 +307,7 @@ manifest 时命令直接失败，不生成看似完整的空报告。
 
 每个 JSON request evidence 还生成 public `request-shape.json` 和 `request-body.redacted.json`。`get_request_shape` 默认只返回有界路径页，支持 `path_prefix`、`page_idx`、`page_size`、`max_depth` 和 `max_array_items`；只有显式 `include_redacted_body=true` 才返回裁剪后的 redacted subtree。Identifier 脱敏只匹配 `id`、`*_id` 和 camelCase `*Id/*ID`，不会把 `valid`、`grid`、`hybrid` 或 `solid` 误标为 identifier。
 
-流请求生成 `stream_request` 和按 source 分开的 `stream_event_range` evidence。Stream 与 ordinary network evidence 优先按 `networkRequestId + collectorGeneration`、CDP ID、persistent ID关联；URL+method只允许作为唯一候选 fallback。Replay 找到唯一 ordinary evidence 后，primary stream再锁定到同一稳定请求；同 URL 的其他流只作为 supporting evidence。
+流请求生成 `stream_request` 和按 source 分开的 `stream_event_range` evidence。Stream 与 ordinary network evidence 会收集所有可用稳定 ID，并对候选集取交集；重复 network request ID 可以由唯一 CDP ID 或 persistent ID继续消歧。URL+method只作为最后的 heuristic fallback。Replay 找到唯一 ordinary evidence 后，primary stream再锁定到同一稳定请求；同 URL 的其他流只作为 supporting evidence。
 
 每个选中的请求只生成一条 `network_observations[]` 派生视图。它引用 ordinary
 network evidence、stream source、artifact ID 和 association method，并集中保存 request/

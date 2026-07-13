@@ -1495,13 +1495,13 @@ class BrowserActionService:
             value = item.get("request_ids")
             return value if isinstance(value, dict) else {}
 
-        tiers: list[tuple[str, list[dict[str, Any]]]] = []
+        stable_constraints: list[tuple[str, list[dict[str, Any]]]] = []
         network_request_id = request.get("networkRequestId")
         collector_generation = request.get("collectorGeneration")
         if network_request_id is not None:
-            tiers.append(
+            stable_constraints.append(
                 (
-                    "network_request_id_and_generation",
+                    "network_request_id",
                     [
                         item
                         for item in network_entries
@@ -1515,7 +1515,7 @@ class BrowserActionService:
             )
         cdp_request_id = request.get("cdpRequestId")
         if cdp_request_id is not None:
-            tiers.append(
+            stable_constraints.append(
                 (
                     "cdp_request_id",
                     [
@@ -1527,7 +1527,7 @@ class BrowserActionService:
             )
         persistent_request_id = request.get("persistentRequestId")
         if persistent_request_id is not None:
-            tiers.append(
+            stable_constraints.append(
                 (
                     "persistent_request_id",
                     [
@@ -1537,31 +1537,76 @@ class BrowserActionService:
                     ],
                 )
             )
-        tiers.append(
-            (
-                "url_method_fallback",
-                [
-                    item
-                    for item in network_entries
-                    if isinstance(item.get("summary"), dict)
-                    and item["summary"].get("url") == request.get("url")
-                    and item["summary"].get("method") == request.get("method")
-                ],
-            )
-        )
-        for tier, candidates in tiers:
+        usable_constraints = [
+            (method, candidates)
+            for method, candidates in stable_constraints
+            if candidates
+        ]
+        if usable_constraints:
+            candidate_ids = {
+                id(item) for item in usable_constraints[0][1]
+            }
+            for _, candidates in usable_constraints[1:]:
+                candidate_ids.intersection_update(id(item) for item in candidates)
+            candidates = [
+                item for item in network_entries if id(item) in candidate_ids
+            ]
+            method = "+".join(item[0] for item in usable_constraints)
             if len(candidates) == 1:
                 return candidates[0], {
                     "status": "matched",
-                    "method": tier,
+                    "method": method,
                     "candidate_count": 1,
+                    "collector_generation_constrained": collector_generation is not None,
                 }
             if len(candidates) > 1:
+                fallback_candidates = [
+                    item
+                    for item in candidates
+                    if isinstance(item.get("summary"), dict)
+                    and item["summary"].get("url") == request.get("url")
+                    and item["summary"].get("method") == request.get("method")
+                ]
+                if len(fallback_candidates) == 1:
+                    return fallback_candidates[0], {
+                        "status": "matched",
+                        "method": f"{method}+url_method_fallback",
+                        "candidate_count": 1,
+                        "collector_generation_constrained": (
+                            collector_generation is not None
+                        ),
+                    }
                 return None, {
                     "status": "ambiguous",
-                    "method": tier,
+                    "method": method,
                     "candidate_count": len(candidates),
+                    "collector_generation_constrained": collector_generation is not None,
                 }
+            return None, {
+                "status": "ambiguous",
+                "method": method,
+                "candidate_count": sum(len(item[1]) for item in usable_constraints),
+                "collector_generation_constrained": collector_generation is not None,
+            }
+        fallback_candidates = [
+            item
+            for item in network_entries
+            if isinstance(item.get("summary"), dict)
+            and item["summary"].get("url") == request.get("url")
+            and item["summary"].get("method") == request.get("method")
+        ]
+        if len(fallback_candidates) == 1:
+            return fallback_candidates[0], {
+                "status": "matched",
+                "method": "url_method_fallback",
+                "candidate_count": 1,
+            }
+        if len(fallback_candidates) > 1:
+            return None, {
+                "status": "ambiguous",
+                "method": "url_method_fallback",
+                "candidate_count": len(fallback_candidates),
+            }
         return None, {
             "status": "not_found",
             "method": None,
@@ -4579,7 +4624,6 @@ class BrowserActionService:
             stream_response_contract: dict[str, Any] | None = None
             response_evidence_source: str | None = None
             replay_network_evidence_id: str | None = None
-            replay_inconclusive = False
             wire_snapshot: dict[str, Any] | None = None
             pre_dispatch_environment: dict[str, Any] | None = None
             post_response_environment: dict[str, Any] | None = None
@@ -4761,7 +4805,6 @@ class BrowserActionService:
                     isinstance(stream_response_contract, dict)
                     and stream_response_contract.get("status") == "partial"
                 ):
-                    replay_inconclusive = True
                     warnings.append(
                         "Streaming response did not satisfy the configured terminal contract."
                     )
@@ -4785,7 +4828,6 @@ class BrowserActionService:
                     "validation_rejection",
                 }:
                     if replay_plan.get("replay_mode") == "treatment":
-                        replay_inconclusive = True
                         warnings.append(
                             "Treatment response is inconclusive for protocol inference: "
                             f"{classification}."
@@ -4959,6 +5001,7 @@ class BrowserActionService:
                 or not steps_ok
                 or not wait_met
                 or (payload.capture.stream and not collector_stopped)
+                or bool(errors)
             )
             required_dimensions: set[str] = set()
             if payload.primary_request.expected_min_matches > 0:
@@ -4985,27 +5028,61 @@ class BrowserActionService:
                 network_observations,
                 required_dimensions=required_dimensions,
             )
+            if (
+                replay_plan is not None
+                and replay_plan.get("source_is_stream") is True
+                and not non_stream_error_response_observed
+                and isinstance(stream_response_contract, dict)
+            ):
+                terminal_status = str(
+                    stream_response_contract.get("status") or "partial"
+                )
+                observation_dimensions["stream_terminal_contract"] = terminal_status
+                if terminal_status != "complete":
+                    missing_evidence.append("stream_terminal_contract")
             required_values = list(observation_dimensions.values())
+            evidence_errors: list[str] = []
+            if not count_ok:
+                evidence_errors.append("observation_count_out_of_range")
+                missing_evidence.append("observation_count")
+            for name, value in observation_dimensions.items():
+                if value == "failed":
+                    evidence_errors.append(f"required_completeness_failed:{name}")
+            network_backed_dimensions = {
+                "request_headers",
+                "request_body",
+                "response_headers",
+                "response_body",
+                "network_artifacts",
+            }
+            if required_dimensions.intersection(network_backed_dimensions):
+                for observation in network_observations:
+                    association = observation.get("association")
+                    association = association if isinstance(association, dict) else {}
+                    if association.get("confidence") in {"ambiguous", "missing"}:
+                        observation_id = str(
+                            observation.get("observation_id") or "unknown"
+                        )
+                        evidence_errors.append(
+                            f"network_association_failed:{observation_id}"
+                        )
+                        missing_evidence.append(f"association:{observation_id}")
             if (
                 payload.capture.stream
                 and not payload.primary_request.allow_supporting_failures
                 and collector_integrity != "complete"
             ):
                 missing_evidence.append("collector")
-                missing_evidence = sorted(set(missing_evidence))
+                if collector_integrity == "failed":
+                    evidence_errors.append("collector_failed")
+            missing_evidence = sorted(set(missing_evidence))
+            evidence_errors = sorted(set(evidence_errors))
             evidence_failed = (
-                bool(errors)
-                or not count_ok
+                bool(evidence_errors)
                 or any(value == "failed" for value in required_values)
-                or (
-                    payload.capture.stream
-                    and not payload.primary_request.allow_supporting_failures
-                    and collector_integrity == "failed"
-                )
             )
             evidence_partial = not evidence_failed and (
-                replay_inconclusive
-                or any(value != "complete" for value in required_values)
+                any(value != "complete" for value in required_values)
                 or (
                     payload.capture.stream
                     and not payload.primary_request.allow_supporting_failures
@@ -5026,6 +5103,7 @@ class BrowserActionService:
                 "count_satisfied": count_ok,
                 "required_completeness": observation_dimensions,
                 "missing_evidence": missing_evidence,
+                "errors": evidence_errors,
             }
             causal_comparability = (
                 str(environment_comparison.get("status") or "insufficient")
@@ -5288,8 +5366,12 @@ class BrowserActionService:
                     },
                     "stream_wait_result": wait_result,
                     "wait_observations": wait_observations,
-                    "execution": {"status": execution_integrity},
+                    "execution": {
+                        "status": execution_integrity,
+                        "errors": errors,
+                    },
                     "quality_summary": quality_summary,
+                    "analysis_warnings": warnings,
                     "causal_comparability": causal_comparability,
                     "inference_eligibility": inference_eligibility,
                     "objective_requirements": payload.requirements.model_dump(mode="json"),

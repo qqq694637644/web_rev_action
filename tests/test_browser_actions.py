@@ -1024,6 +1024,7 @@ class BrowserActionTests(unittest.TestCase):
             experiment = json.loads(manifest.read_text(encoding="utf-8"))
             self.assertEqual(summary["execution"]["status"], "complete")
             self.assertEqual(summary["quality_summary"]["status"], "complete")
+            self.assertEqual(summary["quality_summary"]["missing_evidence"], [])
             self.assertEqual(len(experiment["network_observations"]), 1)
             self.assertNotIn("objective_integrity", experiment)
             self.assertNotIn("collector_integrity", experiment)
@@ -1130,6 +1131,72 @@ class BrowserActionTests(unittest.TestCase):
             self.assertEqual(response.json()["status"], "completed")
             self.assertEqual(experiment["execution"]["status"], "complete")
             self.assertEqual(experiment["quality_summary"]["status"], "complete")
+
+    def test_step_failure_does_not_pollute_empty_quality_requirements(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            client, _, _ = self.make_client(
+                root,
+                fail_step="snapshot_only",
+                include_supporting_failure=False,
+            )
+            request = {
+                "operation": "capture_flow",
+                "payload": {
+                    "session_id": "session_one",
+                    "objective": "separate execution failure from evidence quality",
+                    "primary_request": {
+                        "expected_min_matches": 0,
+                        "expected_max_matches": 100,
+                    },
+                    "capture": {
+                        "network": False,
+                        "stream": False,
+                        "trace": False,
+                        "screenshots": False,
+                        "page_snapshots": False,
+                        "console_errors": False,
+                    },
+                    "requirements": {
+                        "require_raw_capture": False,
+                        "require_semantic_parse": False,
+                        "require_request_snapshot": False,
+                        "require_artifacts": False,
+                    },
+                    "flow": [
+                        {
+                            "step_id": "snapshot_only",
+                            "action": "snapshot",
+                        }
+                    ],
+                    "execution_mode": "sync",
+                    "deadline_ms": 10_000,
+                },
+            }
+            with client:
+                self.open_session(client)
+                response = client.post("/v1/browser/run", json=request)
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json()["status"], "failed")
+            manifest = json.loads(
+                (root / response.json()["result"]["manifest_relative_path"]).read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(manifest["execution"]["status"], "failed")
+            self.assertTrue(manifest["execution"]["errors"])
+            self.assertEqual(
+                manifest["quality_summary"],
+                {
+                    "status": "complete",
+                    "observation_count": 0,
+                    "expected_observation_count": {"min": 0, "max": 100},
+                    "count_satisfied": True,
+                    "required_completeness": {},
+                    "missing_evidence": [],
+                    "errors": [],
+                },
+            )
 
     def test_supporting_failure_can_be_made_objective_fatal(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -4544,7 +4611,8 @@ class BrowserActionTests(unittest.TestCase):
                 ).read_text(encoding="utf-8")
             )
             self.assertFalse(manifest["mutation_assessment"]["mutation_effective"])
-            self.assertEqual(manifest["quality_summary"]["status"], "failed")
+            self.assertEqual(manifest["execution"]["status"], "failed")
+            self.assertEqual(manifest["quality_summary"]["status"], "complete")
 
     def test_sse_treatment_json_rejection_remains_protocol_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -5072,13 +5140,15 @@ class BrowserActionTests(unittest.TestCase):
                         },
                     )
                 self.assertEqual(treatment.status_code, 200, treatment.text)
-                self.assertEqual(treatment.json()["status"], "partial")
+                self.assertEqual(treatment.json()["status"], "completed")
                 manifest = json.loads(
                     (
                         root / "experiments" / treatment.json()["experiment_id"] / "manifest.json"
                     ).read_text(encoding="utf-8")
                 )
                 self.assertTrue(manifest["mutation_assessment"]["mutation_effective"])
+                self.assertEqual(manifest["execution"]["status"], "complete")
+                self.assertEqual(manifest["quality_summary"]["status"], "complete")
                 self.assertFalse(manifest["protocol_rejection_observed"])
                 self.assertEqual(
                     manifest["replay_response_classification"]["classification"],
@@ -5131,11 +5201,51 @@ class BrowserActionTests(unittest.TestCase):
         self.assertEqual(matched["evidence_id"], "ev_two")
         self.assertEqual(
             association["method"],
-            "network_request_id_and_generation",
+            "network_request_id+cdp_request_id",
         )
         self.assertIsNone(ambiguous)
         self.assertEqual(fallback["status"], "ambiguous")
         self.assertEqual(fallback["candidate_count"], 2)
+
+        duplicate_network_ids = [
+            {
+                "evidence_id": "ev_a",
+                "request_ids": {
+                    "network_request_id": "shared",
+                    "cdp_request_id": "cdp-a",
+                },
+                "summary": {
+                    "url": "https://example.test/conversation",
+                    "method": "POST",
+                },
+            },
+            {
+                "evidence_id": "ev_b",
+                "request_ids": {
+                    "network_request_id": "shared",
+                    "cdp_request_id": "cdp-b",
+                },
+                "summary": {
+                    "url": "https://example.test/conversation",
+                    "method": "POST",
+                },
+            },
+        ]
+        disambiguated, combined = BrowserActionService._associate_stream_network_evidence(
+            {
+                "networkRequestId": "shared",
+                "cdpRequestId": "cdp-b",
+                "url": "https://example.test/conversation",
+                "method": "POST",
+            },
+            duplicate_network_ids,
+        )
+        self.assertEqual(disambiguated["evidence_id"], "ev_b")
+        self.assertEqual(combined["status"], "matched")
+        self.assertEqual(
+            combined["method"],
+            "network_request_id+cdp_request_id",
+        )
 
     def test_network_snapshot_does_not_upgrade_stream_artifact_integrity(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
