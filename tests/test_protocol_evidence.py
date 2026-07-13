@@ -20,10 +20,12 @@ from skill_temple.browser_models import (
     VolatileBinding,
 )
 from skill_temple.protocol_evidence import (
+    aggregate_observation_completeness,
+    analyze_replay_response,
     assess_paired_mutation_effectiveness,
     binding_value_from_snapshot,
+    build_network_observation,
     build_replay_spec,
-    classify_replay_response,
     network_checkpoint,
     network_request_matches,
     public_network_summary,
@@ -79,6 +81,82 @@ class ProtocolEvidenceTests(unittest.TestCase):
                 "text": '{"ok":true}',
             },
         }
+
+    def test_network_observation_combines_sources_without_duplicate_verdicts(self) -> None:
+        observation = build_network_observation(
+            observation_id="obs_one",
+            network_evidence={
+                "evidence_id": "ev_network",
+                "request_ids": {"reqid": 7, "network_request_id": "network-7"},
+                "artifact_ids": ["art_network"],
+                "artifact_paths": {"all": "network/request.json"},
+                "summary": {
+                    "url": "https://example.test/conversation",
+                    "method": "POST",
+                    "status": 200,
+                    "snapshot_integrity": {
+                        "request_headers_completeness": "partial",
+                        "request_body_completeness": "complete",
+                        "response_headers_completeness": "complete",
+                        "response_body_completeness": "complete",
+                    },
+                },
+            },
+            stream_request={
+                "persistentRequestId": "persistent-7",
+                "rawCaptureIntegrity": "complete",
+                "semanticParseIntegrity": "partial",
+                "artifactIntegrity": "complete",
+                "coreArtifacts": [
+                    {
+                        "kind": "request_headers",
+                        "writeStatus": "written",
+                        "bytes": 10,
+                        "artifactId": "art_headers",
+                    },
+                    {
+                        "kind": "request_headers_extra",
+                        "writeStatus": "written",
+                        "bytes": 10,
+                        "artifactId": "art_headers_extra",
+                    },
+                ],
+            },
+            association={"status": "matched", "method": "network_request_id"},
+        )
+
+        self.assertEqual(observation["association"]["confidence"], "exact")
+        self.assertEqual(observation["completeness"]["request_headers"], "complete")
+        self.assertEqual(observation["completeness"]["request_body"], "complete")
+        self.assertEqual(observation["completeness"]["semantic_stream"], "partial")
+        self.assertEqual(
+            observation["artifact_ids"],
+            ["art_headers", "art_headers_extra", "art_network"],
+        )
+        self.assertNotIn("integrity_status", observation)
+
+    def test_observation_quality_aggregates_only_required_dimensions(self) -> None:
+        observations = [
+            {
+                "completeness": {
+                    "request_body": "complete",
+                    "semantic_stream": "partial",
+                    "response_body": "unknown",
+                },
+                "missing_evidence": ["semantic_stream", "response_body"],
+            }
+        ]
+
+        dimensions, missing = aggregate_observation_completeness(
+            observations,
+            required_dimensions={"request_body", "semantic_stream"},
+        )
+
+        self.assertEqual(
+            dimensions,
+            {"request_body": "complete", "semantic_stream": "partial"},
+        )
+        self.assertEqual(missing, ["semantic_stream"])
 
     def test_network_checkpoint_excludes_old_requests_and_optionally_includes_inflight(
         self,
@@ -362,37 +440,37 @@ class ProtocolEvidenceTests(unittest.TestCase):
             type="remove_json_path",
             path="/messages/0/id",
         )
-        validation = classify_replay_response(
+        validation = analyze_replay_response(
             status=422,
             content_type="application/json",
             response_value={"missing": ["messages[0].id"]},
             mutation=mutation,
         )
-        unknown = classify_replay_response(
+        unknown = analyze_replay_response(
             status=422,
             content_type="application/json",
             response_value={"error": "invalid request"},
             mutation=mutation,
         )
-        auth = classify_replay_response(
+        auth = analyze_replay_response(
             status=401,
             content_type="application/json",
             response_value={"error": "login required"},
             mutation=mutation,
         )
-        rate = classify_replay_response(
+        rate = analyze_replay_response(
             status=429,
             content_type="application/json",
             response_value={"error": "rate limited"},
             mutation=mutation,
         )
-        server = classify_replay_response(
+        server = analyze_replay_response(
             status=502,
             content_type="text/html",
             response_value="bad gateway",
             mutation=mutation,
         )
-        redirect = classify_replay_response(
+        redirect = analyze_replay_response(
             status=200,
             content_type="text/html",
             response_value="login",
@@ -402,7 +480,7 @@ class ProtocolEvidenceTests(unittest.TestCase):
             final_url="https://example.test/login",
             source_content_type="application/json",
         )
-        content_mismatch = classify_replay_response(
+        content_mismatch = analyze_replay_response(
             status=200,
             content_type="text/html",
             response_value="login",
@@ -414,7 +492,11 @@ class ProtocolEvidenceTests(unittest.TestCase):
 
         self.assertEqual(validation["classification"], "validation_rejection")
         self.assertTrue(validation["observations"]["validation_like"])
-        self.assertIn("field_required", validation["inference_hints"])
+        self.assertEqual(
+            validation["analyzer"],
+            {"name": "http_response_classifier", "version": "1"},
+        )
+        self.assertIn("field_required", validation["hints"])
         self.assertEqual(unknown["classification"], "unknown_rejection")
         self.assertEqual(auth["classification"], "authentication_failure")
         self.assertEqual(rate["classification"], "rate_limited")
@@ -427,7 +509,7 @@ class ProtocolEvidenceTests(unittest.TestCase):
 
     def test_validation_matching_avoids_substring_and_distinguishes_constraints(self) -> None:
         id_remove = RemoveJsonPathMutation(type="remove_json_path", path="/id")
-        false_positive = classify_replay_response(
+        false_positive = analyze_replay_response(
             status=422,
             content_type="application/json",
             response_value={"message": "invalid request"},
@@ -438,7 +520,7 @@ class ProtocolEvidenceTests(unittest.TestCase):
             path="/model",
             value="unsupported",
         )
-        constrained = classify_replay_response(
+        constrained = analyze_replay_response(
             status=422,
             content_type="application/json",
             response_value={
@@ -447,7 +529,7 @@ class ProtocolEvidenceTests(unittest.TestCase):
             },
             mutation=replace_model,
         )
-        conflict = classify_replay_response(
+        conflict = analyze_replay_response(
             status=409,
             content_type="application/json",
             response_value={
@@ -456,7 +538,7 @@ class ProtocolEvidenceTests(unittest.TestCase):
             },
             mutation=id_remove,
         )
-        missing_content_type = classify_replay_response(
+        missing_content_type = analyze_replay_response(
             status=204,
             content_type=None,
             response_value=None,
@@ -470,7 +552,7 @@ class ProtocolEvidenceTests(unittest.TestCase):
             "none",
         )
         self.assertEqual(constrained["classification"], "value_constraint")
-        self.assertIn("value_constraint", constrained["inference_hints"])
+        self.assertIn("value_constraint", constrained["hints"])
         self.assertEqual(conflict["classification"], "conflict")
         self.assertEqual(
             missing_content_type["classification"],
@@ -478,7 +560,7 @@ class ProtocolEvidenceTests(unittest.TestCase):
         )
 
     def test_validation_paths_respect_json_and_query_case_but_not_header_case(self) -> None:
-        json_case_mismatch = classify_replay_response(
+        json_case_mismatch = analyze_replay_response(
             status=422,
             content_type="application/json",
             response_value={"field": "/messages/0/id", "code": "field_required"},
@@ -487,7 +569,7 @@ class ProtocolEvidenceTests(unittest.TestCase):
                 path="/messages/0/ID",
             ),
         )
-        query_case_mismatch = classify_replay_response(
+        query_case_mismatch = analyze_replay_response(
             status=422,
             content_type="application/json",
             response_value={"field": "requestId", "code": "field_required"},
@@ -496,7 +578,7 @@ class ProtocolEvidenceTests(unittest.TestCase):
                 name="requestID",
             ),
         )
-        header_case_match = classify_replay_response(
+        header_case_match = analyze_replay_response(
             status=422,
             content_type="application/json",
             response_value={"field": "x-csrf-token", "code": "field_required"},
@@ -511,7 +593,7 @@ class ProtocolEvidenceTests(unittest.TestCase):
         self.assertEqual(header_case_match["classification"], "validation_rejection")
 
     def test_unrecognized_validation_codes_remain_inconclusive(self) -> None:
-        result = classify_replay_response(
+        result = analyze_replay_response(
             status=422,
             content_type="application/json",
             response_value={"field": "/id", "code": "not_required"},
@@ -596,7 +678,7 @@ class ProtocolEvidenceTests(unittest.TestCase):
         self.assertTrue(query_result["target_delta_observed"])
 
     def test_http_304_is_inconclusive_not_success(self) -> None:
-        result = classify_replay_response(
+        result = analyze_replay_response(
             status=304,
             content_type="application/json",
             response_value=None,
@@ -798,7 +880,7 @@ class ProtocolEvidenceTests(unittest.TestCase):
             type="remove_json_path",
             path="/body/id",
         )
-        result = classify_replay_response(
+        result = analyze_replay_response(
             status=422,
             content_type="application/json",
             response_value={
@@ -809,7 +891,7 @@ class ProtocolEvidenceTests(unittest.TestCase):
             },
             mutation=mutation,
         )
-        wrong_target = classify_replay_response(
+        wrong_target = analyze_replay_response(
             status=422,
             content_type="application/json",
             response_value={"field": "/body/id", "code": "field_required"},

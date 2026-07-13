@@ -209,6 +209,206 @@ def network_snapshot_dimensions(snapshot: dict[str, Any]) -> dict[str, str]:
     }
 
 
+def stream_request_has_complete_request_headers(request: dict[str, Any]) -> bool:
+    artifacts = request.get("coreArtifacts")
+    if not isinstance(artifacts, list):
+        return False
+    by_kind = {
+        str(item.get("kind")): item
+        for item in artifacts
+        if isinstance(item, dict) and item.get("kind")
+    }
+    request_headers = by_kind.get("request_headers")
+    request_headers_extra = by_kind.get("request_headers_extra")
+    if not isinstance(request_headers, dict) or not isinstance(
+        request_headers_extra,
+        dict,
+    ):
+        return False
+    for descriptor in (request_headers, request_headers_extra):
+        if descriptor.get("writeStatus") not in {None, "written"}:
+            return False
+        if isinstance(descriptor.get("bytes"), int) and descriptor["bytes"] <= 0:
+            return False
+    return True
+
+
+def build_network_observation(
+    *,
+    observation_id: str,
+    network_evidence: dict[str, Any] | None,
+    stream_request: dict[str, Any] | None,
+    association: dict[str, Any],
+) -> dict[str, Any]:
+    """Build one derived request view from network and stream source records."""
+
+    network_evidence = network_evidence if isinstance(network_evidence, dict) else {}
+    stream_request = stream_request if isinstance(stream_request, dict) else {}
+    summary = network_evidence.get("summary")
+    summary = summary if isinstance(summary, dict) else {}
+    snapshot = summary.get("snapshot_integrity")
+    snapshot = snapshot if isinstance(snapshot, dict) else {}
+
+    request_headers = str(snapshot.get("request_headers_completeness") or "unknown")
+    if stream_request_has_complete_request_headers(stream_request):
+        request_headers = "complete"
+    request_body = str(snapshot.get("request_body_completeness") or "unknown")
+    response_headers = str(snapshot.get("response_headers_completeness") or "unknown")
+    response_body = str(snapshot.get("response_body_completeness") or "unknown")
+    network_artifacts = (
+        "complete"
+        if isinstance(network_evidence.get("artifact_paths"), dict)
+        and network_evidence["artifact_paths"].get("all")
+        else "partial"
+        if network_evidence
+        else "unknown"
+    )
+    has_stream = bool(stream_request)
+    raw_stream = (
+        str(stream_request.get("rawCaptureIntegrity") or "unknown")
+        if has_stream
+        else "not_required"
+    )
+    semantic_stream = (
+        str(stream_request.get("semanticParseIntegrity") or "unknown")
+        if has_stream
+        else "not_required"
+    )
+    stream_artifacts = (
+        str(stream_request.get("artifactIntegrity") or "unknown")
+        if has_stream
+        else "not_required"
+    )
+    completeness = {
+        "request_headers": request_headers,
+        "request_body": request_body,
+        "response_headers": response_headers,
+        "response_body": response_body,
+        "network_artifacts": network_artifacts,
+        "raw_stream": raw_stream,
+        "semantic_stream": semantic_stream,
+        "stream_artifacts": stream_artifacts,
+    }
+    missing_evidence = sorted(
+        name
+        for name, value in completeness.items()
+        if value not in {"complete", "not_required"}
+    )
+
+    network_ids = network_evidence.get("request_ids")
+    network_ids = network_ids if isinstance(network_ids, dict) else {}
+    request_ids = {
+        "reqid": network_ids.get("reqid"),
+        "network_request_id": (
+            network_ids.get("network_request_id")
+            or stream_request.get("networkRequestId")
+        ),
+        "collector_generation": (
+            network_ids.get("collector_generation")
+            if network_ids.get("collector_generation") is not None
+            else stream_request.get("collectorGeneration")
+        ),
+        "cdp_request_id": (
+            network_ids.get("cdp_request_id") or stream_request.get("cdpRequestId")
+        ),
+        "persistent_request_id": (
+            network_ids.get("persistent_request_id")
+            or stream_request.get("persistentRequestId")
+        ),
+    }
+    network_artifact_ids = network_evidence.get("artifact_ids")
+    network_artifact_ids = (
+        [str(item) for item in network_artifact_ids]
+        if isinstance(network_artifact_ids, list)
+        else []
+    )
+    core_artifacts = stream_request.get("coreArtifacts")
+    core_artifacts = (
+        [item for item in core_artifacts if isinstance(item, dict)]
+        if isinstance(core_artifacts, list)
+        else []
+    )
+    stream_artifact_ids = [
+        str(item.get("artifactId")) for item in core_artifacts if item.get("artifactId")
+    ]
+    association_status = str(association.get("status") or "not_found")
+    association_method = association.get("method")
+    confidence = (
+        "exact"
+        if association_status == "matched"
+        and "url_method_fallback" not in str(association_method or "")
+        else "heuristic"
+        if association_status == "matched"
+        else "ambiguous"
+        if association_status == "ambiguous"
+        else "missing"
+    )
+    return {
+        "observation_id": observation_id,
+        "request_ids": request_ids,
+        "facts": {
+            "url": str(summary.get("url") or stream_request.get("url") or "")[:8192],
+            "method": summary.get("method") or stream_request.get("method"),
+            "resource_type": summary.get("resource_type"),
+            "status": summary.get("status") or stream_request.get("status"),
+            "status_text": summary.get("status_text"),
+            "failure": summary.get("failure"),
+            "observed_at": network_evidence.get("observed_at"),
+            "terminal_reason": stream_request.get("terminalReason"),
+            "primary_event_source": stream_request.get("primaryEventSource"),
+            "raw_event_count": stream_request.get("rawEventCount"),
+            "semantic_event_count": stream_request.get("semanticEventCount"),
+            "experiment_cancellation_classification": stream_request.get(
+                "experimentCancellationClassification"
+            ),
+            "request_body_canonical_sha256": network_evidence.get(
+                "request_body_canonical_sha256"
+            ),
+        },
+        "sources": {
+            "network_evidence_id": network_evidence.get("evidence_id"),
+            "stream_request_present": has_stream,
+        },
+        "artifact_ids": sorted(set(network_artifact_ids + stream_artifact_ids)),
+        "association": {
+            **association,
+            "confidence": confidence,
+        },
+        "completeness": completeness,
+        "missing_evidence": missing_evidence,
+    }
+
+
+def aggregate_observation_completeness(
+    observations: list[dict[str, Any]],
+    *,
+    required_dimensions: set[str],
+) -> tuple[dict[str, str], list[str]]:
+    """Aggregate canonical observation dimensions without creating extra verdict fields."""
+
+    severity = {
+        "complete": 0,
+        "not_required": 0,
+        "partial": 2,
+        "unknown": 2,
+        "failed": 3,
+    }
+    dimensions: dict[str, str] = {}
+    missing: set[str] = set()
+    for name in sorted(required_dimensions):
+        values = [
+            str(item.get("completeness", {}).get(name) or "unknown")
+            for item in observations
+            if isinstance(item, dict)
+            and isinstance(item.get("completeness"), dict)
+        ]
+        value = max(values, key=lambda item: severity.get(item, 2)) if values else "failed"
+        dimensions[name] = value
+        if value not in {"complete", "not_required"}:
+            missing.add(name)
+    return dimensions, sorted(missing)
+
+
 def _public_body_summary(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
@@ -870,7 +1070,7 @@ def assess_control_wire_baseline(
     }
 
 
-def classify_replay_response(
+def analyze_replay_response(
     *,
     status: int | None,
     content_type: str | None,
@@ -964,19 +1164,23 @@ def classify_replay_response(
         "success_like": success_like,
         "signals_conflict": bool(reference.get("signals_conflict")),
     }
-    inference_hints: list[str] = []
+    hints: list[str] = []
     semantic = reference.get("semantic")
     if validation_like and semantic and semantic != "none":
-        inference_hints.append(str(semantic))
+        hints.append(str(semantic))
     if success_like and mutation is not None:
-        inference_hints.append("mutation_accepted_by_response")
+        hints.append("mutation_accepted_by_response")
     if observations["signals_conflict"]:
-        inference_hints.append("conflicting_validation_signals")
+        hints.append("conflicting_validation_signals")
     return {
+        "analyzer": {
+            "name": "http_response_classifier",
+            "version": "1",
+        },
         "classification": classification,
         "validation_evidence": reference,
         "observations": observations,
-        "inference_hints": inference_hints,
+        "hints": hints,
         "status": status,
         "content_type": content_type,
         "source_content_type": source_content_type,

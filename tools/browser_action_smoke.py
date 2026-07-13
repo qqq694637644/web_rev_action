@@ -57,6 +57,18 @@ def artifact_by_kind(manifest: dict[str, Any], *kinds: str) -> dict[str, Any]:
     raise AssertionError(f"Missing artifact kinds {kinds}: {manifest.get('artifacts')}")
 
 
+def replay_response_analysis(manifest: dict[str, Any]) -> dict[str, Any]:
+    replay_attempt = next(
+        item
+        for item in manifest.get("evidence", [])
+        if isinstance(item, dict) and item.get("kind") == "replay_attempt"
+    )
+    analysis = replay_attempt.get("response_analysis")
+    if not isinstance(analysis, dict):
+        raise AssertionError(f"Replay attempt has no response analysis: {replay_attempt}")
+    return analysis
+
+
 def relative_path(descriptor: dict[str, Any]) -> str:
     value = descriptor.get("relativePath") or descriptor.get("relative_path")
     if not isinstance(value, str):
@@ -498,6 +510,10 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
                     "source_evidence_id": source_evidence["evidence_id"],
                     "replay_mode": "control",
                     "mutations": [],
+                    "response_analyzer": {
+                        "name": "http_response_classifier",
+                        "version": "1",
+                    },
                     "volatile_bindings": [
                         {
                             "binding_id": "event_id",
@@ -599,7 +615,7 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
                     },
                 )
             )
-            if replay.status != "partial":
+            if replay.status != "completed":
                 raise AssertionError(replay.model_dump())
             replay_manifest = json.loads(
                 (
@@ -696,14 +712,8 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
         )
         if not tracking_stream:
             raise AssertionError("Tracking treatment produced no stream evidence")
-        if not required_manifest.get("protocol_rejection_observed"):
-            raise AssertionError(required_manifest)
-        if (
-            required_manifest.get("replay_response_classification", {}).get(
-                "classification"
-            )
-            != "validation_rejection"
-        ):
+        required_analysis = replay_response_analysis(required_manifest)
+        if required_analysis.get("classification") != "validation_rejection":
             raise AssertionError(required_manifest)
         control_spec = json.loads(
             (
@@ -738,6 +748,10 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
                     "source_evidence_id": source_evidence["evidence_id"],
                     "replay_mode": "control",
                     "mutations": [],
+                    "response_analyzer": {
+                        "name": "http_response_classifier",
+                        "version": "1",
+                    },
                     "volatile_bindings": [
                         {
                             "binding_id": "event_id",
@@ -775,7 +789,7 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
                 },
             )
         )
-        if same_value_treatment.status != "partial":
+        if same_value_treatment.status != "completed":
             raise AssertionError(same_value_treatment.model_dump())
         same_value_manifest = json.loads(
             (
@@ -787,14 +801,8 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
         )
         if same_value_manifest.get("replay_http_status") != 409:
             raise AssertionError(same_value_manifest)
-        if (
-            same_value_manifest.get("replay_response_classification", {}).get(
-                "classification"
-            )
-            != "conflict"
-        ):
-            raise AssertionError(same_value_manifest)
-        if same_value_manifest.get("protocol_rejection_observed"):
+        same_value_analysis = replay_response_analysis(same_value_manifest)
+        if same_value_analysis.get("classification") != "conflict":
             raise AssertionError(same_value_manifest)
         if (
             same_value_manifest.get("mutation_assessment", {}).get(
@@ -909,8 +917,16 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
             "status": "passed",
             "experiment_id": captured.experiment_id,
             "manifest_relative_path": manifest_relative,
-            "execution_integrity": manifest.get("execution_integrity"),
-            "evidence_integrity": manifest.get("evidence_integrity"),
+            "execution_status": (
+                manifest.get("execution", {}).get("status")
+                if isinstance(manifest.get("execution"), dict)
+                else None
+            ),
+            "quality_status": (
+                manifest.get("quality_summary", {}).get("status")
+                if isinstance(manifest.get("quality_summary"), dict)
+                else None
+            ),
             "raw_bytes": len(expected_raw),
             "raw_sha256": expected_sha,
             "trace_count": len(manifest.get("trace_paths") or []),
@@ -955,18 +971,15 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
             "stateful_required_mutation_effective": required_manifest.get(
                 "mutation_assessment", {}
             ).get("mutation_effective"),
-            "stateful_required_protocol_rejection": required_manifest.get(
-                "protocol_rejection_observed"
+            "stateful_required_response_analysis": required_analysis.get(
+                "classification"
             ),
-            "stateful_required_response_classification": required_manifest.get(
-                "replay_response_classification", {}
-            ).get("classification"),
             "stateful_same_value_duplicate_status": same_value_manifest.get(
                 "replay_http_status"
             ),
-            "stateful_same_value_duplicate_classification": same_value_manifest.get(
-                "replay_response_classification", {}
-            ).get("classification"),
+            "stateful_same_value_duplicate_analysis": same_value_analysis.get(
+                "classification"
+            ),
             "cancellation_status": cancellation_manifest.get("status"),
             "cancellation_step_status": cancellation_steps[0].get("status"),
             "cancellation_collector_cleanup": cancellation_health.get(

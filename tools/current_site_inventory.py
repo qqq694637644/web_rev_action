@@ -220,6 +220,7 @@ def collect_facts(
         "steps": [],
         "network": [],
         "streams": [],
+        "observations": [],
         "evidence_kinds": Counter(),
         "query_names": set(),
         "credential_header_names": set(),
@@ -249,10 +250,36 @@ def collect_facts(
                 "objective": manifest.get("objective"),
                 "series_id": series_id,
                 "scenario_type": series.get("scenario_type"),
-                "execution_integrity": manifest.get("execution_integrity"),
-                "evidence_integrity": manifest.get("evidence_integrity"),
+                "execution_status": (
+                    manifest.get("execution", {}).get("status")
+                    if isinstance(manifest.get("execution"), dict)
+                    else None
+                ),
+                "quality_status": (
+                    manifest.get("quality_summary", {}).get("status")
+                    if isinstance(manifest.get("quality_summary"), dict)
+                    else None
+                ),
             }
         )
+
+        for observation in _dict_list(manifest.get("network_observations")):
+            observation_facts = observation.get("facts")
+            observation_facts = (
+                observation_facts if isinstance(observation_facts, dict) else {}
+            )
+            facts["observations"].append(
+                {
+                    "experiment_id": experiment_id,
+                    "observation_id": observation.get("observation_id"),
+                    "url": observation_facts.get("url"),
+                    "method": observation_facts.get("method"),
+                    "status": observation_facts.get("status"),
+                    "association": observation.get("association"),
+                    "completeness": observation.get("completeness"),
+                    "missing_evidence": observation.get("missing_evidence"),
+                }
+            )
 
         for alignment_name in ("page_alignment", "post_flow_alignment"):
             alignment = manifest.get(alignment_name)
@@ -342,11 +369,6 @@ def collect_facts(
                         "resource_type": summary.get("resource_type"),
                         "content_type": _content_type(summary),
                         "transport": _network_transport_label(summary, url_fact),
-                        "snapshot_integrity": (
-                            summary.get("snapshot_integrity")
-                            if isinstance(summary.get("snapshot_integrity"), dict)
-                            else {}
-                        ),
                         **safe_url_fact,
                     }
                 )
@@ -410,7 +432,7 @@ def render_current_site_inventory(facts: dict[str, Any]) -> str:
                 "Scenario",
                 "Status",
                 "Execution",
-                "Evidence",
+                "Quality",
             ],
             (
                 (
@@ -419,8 +441,8 @@ def render_current_site_inventory(facts: dict[str, Any]) -> str:
                     item["operation"],
                     item["scenario_type"],
                     item["status"],
-                    item["execution_integrity"],
-                    item["evidence_integrity"],
+                    item["execution_status"],
+                    item["quality_status"],
                 )
                 for item in facts["experiments"]
             ),
@@ -432,6 +454,7 @@ def render_current_site_inventory(facts: dict[str, Any]) -> str:
         f"- Transports represented by network or stream evidence: "
         f"{', '.join(transports) if transports else 'none'}.",
         f"- Stream request evidence entries: {len(facts['streams'])}.",
+        f"- Canonical network observations: {len(facts['observations'])}.",
         f"- Page observations: {len(facts['pages'])}; step results: {len(facts['steps'])}.",
         f"- Page snapshot paths: {facts['snapshot_path_count']}; "
         f"console message evidence: {facts['console_message_count']}.",
