@@ -245,6 +245,34 @@ capture_uuid (optional)
 experiment_id + evidence_id + artifact_id
 ```
 
+### Current-site 侦察报告
+
+完成一轮当前网页 capture 后，可以直接从 experiment manifest 生成阶段 B 的四份
+侦察报告：
+
+```powershell
+python tools/current_site_inventory.py data/analysis-workspace `
+  --output-dir reports `
+  --analysis-series-id current-site-2026-07
+```
+
+输出：
+
+```text
+reports/current-site-inventory.md
+reports/current-ui-map.md
+reports/current-network-map.md
+reports/open-questions.md
+```
+
+生成器只读取 `experiments/*/manifest.json` 中已经保存的结构事实，包括 page
+alignment、step result、network/stream evidence summary、header 名、query 名、request
+shape 路径和完整性状态。它不会读取 raw body、raw header、stream payload、截图或
+credential artifact，也不会用历史 Pandora 结构补全缺失事实。
+
+可以使用 `--session-id` 或 `--analysis-series-id` 限定一次明确的现场侦察。没有匹配
+manifest 时命令直接失败，不生成看似完整的空报告。
+
 `capture_flow.network_evidence` 在第一条页面 mutation 前记录 reqid high-water mark，finalize 时只选择本 experiment 窗口中的请求，并在 MCP generation 仍有效时导出 exact headers/body/initiator。`series` 字段保存 analysis series、scenario、predecessor、sequence 和 conversation key。
 
 每个 JSON request evidence 还生成 public `request-shape.json` 和 `request-body.redacted.json`。`get_request_shape` 默认只返回有界路径页，支持 `path_prefix`、`page_idx`、`page_size`、`max_depth` 和 `max_array_items`；只有显式 `include_redacted_body=true` 才返回裁剪后的 redacted subtree。Identifier 脱敏只匹配 `id`、`*_id` 和 camelCase `*Id/*ID`，不会把 `valid`、`grid`、`hybrid` 或 `solid` 误标为 identifier。
