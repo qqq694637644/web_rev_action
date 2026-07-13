@@ -155,12 +155,8 @@ class SubprocessCommandRunner:
             "stderr": [],
         }
         readers = [
-            asyncio.create_task(
-                self._read_bounded(process.stdout, state, "stdout")
-            ),
-            asyncio.create_task(
-                self._read_bounded(process.stderr, state, "stderr")
-            ),
+            asyncio.create_task(self._read_bounded(process.stdout, state, "stdout")),
+            asyncio.create_task(self._read_bounded(process.stderr, state, "stderr")),
         ]
         try:
             await asyncio.wait_for(process.wait(), timeout=timeout)
@@ -693,10 +689,7 @@ class StdioMcpToolTransport:
         if isinstance(exc, McpTransportError):
             return True
         if isinstance(exc, BaseExceptionGroup):
-            return any(
-                StdioMcpToolTransport._is_transport_failure(item)
-                for item in exc.exceptions
-            )
+            return any(StdioMcpToolTransport._is_transport_failure(item) for item in exc.exceptions)
         if isinstance(exc, (EOFError, BrokenPipeError, ConnectionResetError, OSError)):
             return True
         if exc.__class__.__name__ == "McpError":
@@ -719,13 +712,8 @@ class StdioMcpToolTransport:
 
     async def _ensure_started(self) -> None:
         async with self._start_lock:
-            stale_worker = (
-                self._worker_task is not None
-                and (
-                    self._worker_task.done()
-                    or self._ready is None
-                    or self._ready.cancelled()
-                )
+            stale_worker = self._worker_task is not None and (
+                self._worker_task.done() or self._ready is None or self._ready.cancelled()
             )
             if stale_worker:
                 if self._worker_task is not None and not self._worker_task.done():
@@ -773,9 +761,7 @@ class StdioMcpToolTransport:
                 read_stream, write_stream = await stack.enter_async_context(
                     stdio_client(parameters)
                 )
-                session = await stack.enter_async_context(
-                    ClientSession(read_stream, write_stream)
-                )
+                session = await stack.enter_async_context(ClientSession(read_stream, write_stream))
                 await session.initialize()
                 if not ready.done():
                     ready.set_result(None)
@@ -794,8 +780,7 @@ class StdioMcpToolTransport:
                     try:
                         remaining = max(
                             0.1,
-                            call.absolute_deadline
-                            - asyncio.get_running_loop().time(),
+                            call.absolute_deadline - asyncio.get_running_loop().time(),
                         )
                         call.sent = True
                         result = await session.call_tool(
@@ -862,9 +847,7 @@ class StdioMcpToolTransport:
         if isinstance(structured, dict):
             if structured.get("ok") is False:
                 error = structured.get("error") or {}
-                raise AdapterError(
-                    str(error.get("message") or f"MCP tool failed: {name}")
-                )
+                raise AdapterError(str(error.get("message") or f"MCP tool failed: {name}"))
             data = structured.get("data")
             return data if isinstance(data, dict) else structured
         for block in getattr(result, "content", []):
@@ -1006,9 +989,7 @@ class JsReverseAdapter(Protocol):
         deadline: DeadlineLike,
     ) -> dict[str, Any]: ...
 
-    async def get_request_initiator(
-        self, reqid: int, deadline: DeadlineLike
-    ) -> dict[str, Any]: ...
+    async def get_request_initiator(self, reqid: int, deadline: DeadlineLike) -> dict[str, Any]: ...
 
     async def search_scripts(
         self,
@@ -1142,12 +1123,15 @@ class JsReverseMcpAdapter:
             and str(item.get("url", "")) == page.url
         ]
         exact = [item for item in pages if str(item.get("url", "")) == page.url]
-        candidates = indexed or exact or [
-            item
-            for item in pages
-            if page.url
-            and page.url.rstrip("/") == str(item.get("url", "")).rstrip("/")
-        ]
+        candidates = (
+            indexed
+            or exact
+            or [
+                item
+                for item in pages
+                if page.url and page.url.rstrip("/") == str(item.get("url", "")).rstrip("/")
+            ]
+        )
         if not candidates:
             return AlignmentResult(
                 status="not_aligned",
@@ -1169,9 +1153,7 @@ class JsReverseMcpAdapter:
             js_reverse_page_id=selected_page_id,
             js_reverse_page_url=str(selected.get("url", "")),
             warnings=(
-                ["Multiple matching pages; selected the first."]
-                if len(candidates) > 1
-                else []
+                ["Multiple matching pages; selected the first."] if len(candidates) > 1 else []
             ),
         )
 
@@ -1265,14 +1247,8 @@ class JsReverseMcpAdapter:
                 }
             page_requests = page.get("requests")
             if isinstance(page_requests, list):
-                requests.extend(
-                    item for item in page_requests if isinstance(item, dict)
-                )
-            pagination = (
-                page.get("pagination")
-                if isinstance(page.get("pagination"), dict)
-                else {}
-            )
+                requests.extend(item for item in page_requests if isinstance(item, dict))
+            pagination = page.get("pagination") if isinstance(page.get("pagination"), dict) else {}
             if not pagination.get("hasNextPage"):
                 break
             page_idx += 1
@@ -1321,14 +1297,8 @@ class JsReverseMcpAdapter:
                 }
             page_requests = page.get("requests")
             if isinstance(page_requests, list):
-                requests.extend(
-                    item for item in page_requests if isinstance(item, dict)
-                )
-            pagination = (
-                page.get("pagination")
-                if isinstance(page.get("pagination"), dict)
-                else {}
-            )
+                requests.extend(item for item in page_requests if isinstance(item, dict))
+            pagination = page.get("pagination") if isinstance(page.get("pagination"), dict) else {}
             if not pagination.get("hasNextPage"):
                 break
             page_idx += 1
@@ -1363,9 +1333,7 @@ class JsReverseMcpAdapter:
             deadline,
         )
 
-    async def get_request_initiator(
-        self, reqid: int, deadline: DeadlineLike
-    ) -> dict[str, Any]:
+    async def get_request_initiator(self, reqid: int, deadline: DeadlineLike) -> dict[str, Any]:
         return await self._call(
             "get_request_initiator",
             {"requestId": reqid},
@@ -1444,11 +1412,7 @@ class JsReverseMcpAdapter:
             page_messages = page.get("messages")
             if isinstance(page_messages, list):
                 messages.extend(item for item in page_messages if isinstance(item, dict))
-            pagination = (
-                page.get("pagination")
-                if isinstance(page.get("pagination"), dict)
-                else {}
-            )
+            pagination = page.get("pagination") if isinstance(page.get("pagination"), dict) else {}
             if not pagination.get("hasNextPage"):
                 break
             page_idx += 1
@@ -1483,11 +1447,7 @@ class JsReverseMcpAdapter:
             values = page.get("cookieFlow")
             if isinstance(values, list):
                 entries.extend(item for item in values if isinstance(item, dict))
-            pagination = (
-                page.get("pagination")
-                if isinstance(page.get("pagination"), dict)
-                else {}
-            )
+            pagination = page.get("pagination") if isinstance(page.get("pagination"), dict) else {}
             if not pagination.get("hasNextPage"):
                 break
             page_idx += 1
@@ -1516,12 +1476,18 @@ class JsReverseMcpAdapter:
             for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
             body = bytes;
           }
+          const transport = spec.transport || {};
           const response = await fetch(spec.url, {
             method: spec.method,
             headers,
             body: ['GET', 'HEAD'].includes(String(spec.method).toUpperCase()) ? undefined : body,
-            credentials: 'include',
-            redirect: 'follow',
+            credentials: transport.credentials || 'include',
+            redirect: transport.redirect || 'follow',
+            cache: transport.cache || 'default',
+            referrerPolicy: transport.referrer_policy || '',
+            keepalive: Boolean(transport.keepalive),
+            mode: transport.mode || 'cors',
+            priority: transport.priority || 'auto',
           });
           const responseControl = spec.responseControl || {};
           const maxResponseBytes = Math.max(
@@ -1532,12 +1498,43 @@ class JsReverseMcpAdapter:
             1000,
             Number(responseControl.idleTimeoutMs || 15000),
           );
-          const doneMarker = responseControl.doneMarker == null
-            ? null
-            : String(responseControl.doneMarker);
-          const doneEventName = responseControl.doneEventName == null
-            ? null
-            : String(responseControl.doneEventName);
+          const configuredMode = String(responseControl.responseMode || 'auto');
+          const responseHeaderEntries = Array.from(response.headers.entries());
+          const contentTypeHeader = response.headers.get
+            ? response.headers.get('content-type')
+            : (responseHeaderEntries.find(
+                ([name]) => String(name).toLowerCase() === 'content-type',
+              ) || [null, ''])[1];
+          const contentType = String(contentTypeHeader || '')
+            .split(';', 1)[0]
+            .trim()
+            .toLowerCase();
+          const responseMode = configuredMode === 'auto'
+            ? contentType === 'text/event-stream'
+              ? 'sse'
+              : ['application/x-ndjson', 'application/ndjson'].includes(contentType)
+                ? 'ndjson'
+                : 'ordinary'
+            : configuredMode;
+          const terminalConditions = Array.isArray(responseControl.terminalConditions)
+            ? responseControl.terminalConditions
+            : [];
+          const exactSseCondition = terminalConditions.find(
+            (item) => item && item.type === 'exact_sse_data',
+          );
+          const bytePatternConditions = terminalConditions.filter(
+            (item) => item && item.type === 'byte_pattern' && item.value != null,
+          );
+          const doneMarker = exactSseCondition && exactSseCondition.value != null
+            ? String(exactSseCondition.value)
+            : responseControl.doneMarker == null
+              ? null
+              : String(responseControl.doneMarker);
+          const doneEventName = exactSseCondition && exactSseCondition.event_name != null
+            ? String(exactSseCondition.event_name)
+            : responseControl.doneEventName == null
+              ? null
+              : String(responseControl.doneEventName);
           const reader = response.body ? response.body.getReader() : null;
           const decoder = new TextDecoder('utf-8', {fatal: false});
           const previewChunks = [];
@@ -1545,11 +1542,39 @@ class JsReverseMcpAdapter:
           let bodyByteLength = 0;
           let doneMarkerObserved = false;
           let doneEventNameObserved = null;
+          let terminalConditionMatched = null;
           let truncated = false;
           let terminationReason = reader ? 'network_close' : 'no_response_body';
           let sseLineBuffer = '';
           let sseEventName = 'message';
           let sseDataLines = [];
+          let bytePatternBuffer = '';
+          let ndjsonLineBuffer = '';
+          let ndjsonRecordCount = 0;
+          let ndjsonParseErrorCount = 0;
+          const ndjsonRecordMetadata = [];
+          const chunkBoundaries = [];
+          const consumeNdjson = (text, eof) => {
+            ndjsonLineBuffer += text;
+            const lines = ndjsonLineBuffer.split('\n');
+            ndjsonLineBuffer = eof ? '' : lines.pop() || '';
+            if (eof && ndjsonLineBuffer) lines.push(ndjsonLineBuffer);
+            for (const rawLine of lines) {
+              const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
+              if (!line.trim()) continue;
+              let valid = true;
+              try { JSON.parse(line); }
+              catch { valid = false; ndjsonParseErrorCount += 1; }
+              if (ndjsonRecordMetadata.length < 256) {
+                ndjsonRecordMetadata.push({
+                  index: ndjsonRecordCount,
+                  valid,
+                  byteLength: new TextEncoder().encode(line).byteLength,
+                });
+              }
+              ndjsonRecordCount += 1;
+            }
+          };
           const dispatchSseEvent = () => {
             const data = sseDataLines.join('\n');
             const eventName = sseEventName;
@@ -1653,8 +1678,11 @@ class JsReverseMcpAdapter:
                 break;
               }
               if (readResult.done) {
-                if (doneMarker && consumeSseEvents(decoder.decode(), true)) {
+                const finalText = decoder.decode();
+                if (responseMode === 'ndjson') consumeNdjson(finalText, true);
+                if (doneMarker && consumeSseEvents(finalText, true)) {
                   doneMarkerObserved = true;
+                  terminalConditionMatched = 'exact_sse_data';
                   terminationReason = 'done_marker';
                 } else {
                   terminationReason = 'network_close';
@@ -1668,7 +1696,16 @@ class JsReverseMcpAdapter:
                 0,
                 Math.min(chunk.byteLength, Math.max(0, remaining)),
               );
+              const chunkStart = bodyByteLength;
               bodyByteLength += accepted.byteLength;
+              if (accepted.byteLength > 0 && chunkBoundaries.length < 4096) {
+                chunkBoundaries.push({
+                  index: chunkBoundaries.length,
+                  byteStart: chunkStart,
+                  byteEnd: bodyByteLength,
+                  byteLength: accepted.byteLength,
+                });
+              }
               if (previewByteLength < 8192) {
                 const previewPart = accepted.subarray(
                   0,
@@ -1677,11 +1714,26 @@ class JsReverseMcpAdapter:
                 previewChunks.push(previewPart);
                 previewByteLength += previewPart.byteLength;
               }
-              if (doneMarker) {
-                if (consumeSseEvents(decoder.decode(accepted, {stream: true}), false)) {
+              const decodedText = decoder.decode(accepted, {stream: true});
+              if (responseMode === 'ndjson') consumeNdjson(decodedText, false);
+              if (doneMarker && responseMode === 'sse') {
+                if (consumeSseEvents(decodedText, false)) {
                   doneMarkerObserved = true;
+                  terminalConditionMatched = 'exact_sse_data';
                   terminationReason = 'done_marker';
                   await reader.cancel('done_marker').catch(() => {});
+                  break;
+                }
+              }
+              if (bytePatternConditions.length > 0) {
+                bytePatternBuffer = (bytePatternBuffer + decodedText).slice(-65536);
+                const matchedPattern = bytePatternConditions.find(
+                  (item) => bytePatternBuffer.includes(String(item.value)),
+                );
+                if (matchedPattern) {
+                  terminalConditionMatched = 'byte_pattern';
+                  terminationReason = 'byte_pattern';
+                  await reader.cancel('byte_pattern').catch(() => {});
                   break;
                 }
               }
@@ -1708,11 +1760,17 @@ class JsReverseMcpAdapter:
             url: response.url,
             redirected: response.redirected,
             ok: response.ok,
-            headers: Array.from(response.headers.entries()),
+            headers: responseHeaderEntries,
             bodyByteLength,
             bodyPreview: preview,
             doneMarkerObserved,
             doneEventNameObserved,
+            responseMode,
+            chunkBoundaries,
+            ndjsonRecordCount,
+            ndjsonParseErrorCount,
+            ndjsonRecordMetadata,
+            terminalConditionMatched,
             terminationReason,
             truncated,
             maxResponseBytes,
@@ -1751,11 +1809,7 @@ class JsReverseMcpAdapter:
 
     @staticmethod
     def _request_id(request: dict[str, Any]) -> str:
-        return str(
-            request.get("cdpRequestId")
-            or request.get("persistentRequestId")
-            or ""
-        )
+        return str(request.get("cdpRequestId") or request.get("persistentRequestId") or "")
 
     @staticmethod
     def _request_checkpoint(request: dict[str, Any]) -> StreamRequestCheckpoint:
@@ -1763,9 +1817,7 @@ class JsReverseMcpAdapter:
         return StreamRequestCheckpoint(
             response_observed=bool(request.get("responseObserved")),
             status=(str(request.get("status")) if request.get("status") else None),
-            terminal_wall_time_ms=(
-                float(ended) if isinstance(ended, (int, float)) else None
-            ),
+            terminal_wall_time_ms=(float(ended) if isinstance(ended, (int, float)) else None),
             raw_event_index=int(request.get("rawEventCount", 0) or 0) - 1,
             semantic_event_index=int(request.get("semanticEventCount", 0) or 0) - 1,
             primary_event_source=str(request.get("primaryEventSource") or "none"),
@@ -1863,9 +1915,7 @@ class JsReverseMcpAdapter:
             ]
             current_checkpoint = self.checkpoint_from_status(payload, request_matcher)
             request_by_id = {
-                request_id: item
-                for item in requests
-                if (request_id := self._request_id(item))
+                request_id: item for item in requests if (request_id := self._request_id(item))
             }
             met = False
             matched_event: dict[str, Any] | None = None
@@ -1885,9 +1935,7 @@ class JsReverseMcpAdapter:
                 for request_id, request in request_by_id.items():
                     current = current_checkpoint.requests[request_id]
                     previous = checkpoint.requests.get(request_id)
-                    for source, prior_index in self._advanced_event_sources(
-                        current, previous
-                    ):
+                    for source, prior_index in self._advanced_event_sources(current, previous):
                         candidate_payload = await self.get_stream_status(
                             capture_id,
                             deadline,
@@ -1984,16 +2032,12 @@ class JsReverseMcpAdapter:
                         current_checkpoint.requests[request_id].status
                         for request_id in matched_request_ids
                     }
-                    terminal_status = (
-                        next(iter(statuses)) if len(statuses) == 1 else None
-                    )
+                    terminal_status = next(iter(statuses)) if len(statuses) == 1 else None
                 else:
                     for request_id, request in request_by_id.items():
                         current = current_checkpoint.requests[request_id]
                         previous = checkpoint.requests.get(request_id)
-                        for source, prior_index in self._advanced_event_sources(
-                            current, previous
-                        ):
+                        for source, prior_index in self._advanced_event_sources(current, previous):
                             candidate_payload = await self.get_stream_status(
                                 capture_id,
                                 deadline,
@@ -2032,9 +2076,7 @@ class JsReverseMcpAdapter:
             status_payload=last_payload,
         )
 
-    async def stop_stream_capture(
-        self, capture_id: int, deadline: DeadlineLike
-    ) -> dict[str, Any]:
+    async def stop_stream_capture(self, capture_id: int, deadline: DeadlineLike) -> dict[str, Any]:
         remaining_ms = max(100, min(34_000, int(deadline.remaining_seconds() * 1000)))
         return await self._call(
             "stop_stream_capture",

@@ -6,6 +6,9 @@ import unittest
 from pydantic import TypeAdapter, ValidationError
 
 from skill_temple.browser_models import (
+    AddHeaderMutation,
+    AddJsonPathMutation,
+    AddQueryParameterMutation,
     RemoveHeaderMutation,
     RemoveJsonPathMutation,
     RemoveQueryParameterMutation,
@@ -109,12 +112,10 @@ class ProtocolEvidenceTests(unittest.TestCase):
     def test_public_network_summary_redacts_credentials_and_omits_bodies(self) -> None:
         summary = public_network_summary(self.snapshot())
         request_headers = {
-            item["name"].lower(): item["value"]
-            for item in summary["request_headers"]
+            item["name"].lower(): item["value"] for item in summary["request_headers"]
         }
         response_headers = {
-            item["name"].lower(): item["value"]
-            for item in summary["response_headers"]
+            item["name"].lower(): item["value"] for item in summary["response_headers"]
         }
 
         self.assertEqual(request_headers["authorization"], "<redacted>")
@@ -191,9 +192,12 @@ class ProtocolEvidenceTests(unittest.TestCase):
 
     def test_browser_managed_header_mutations_are_rejected(self) -> None:
         for name in ["Cookie", "Origin", "Referer", "Content-Length", "Sec-Fetch-Site"]:
-            with self.subTest(name=name), self.assertRaisesRegex(
-                ValueError,
-                "browser-managed",
+            with (
+                self.subTest(name=name),
+                self.assertRaisesRegex(
+                    ValueError,
+                    "browser-managed",
+                ),
             ):
                 RemoveHeaderMutation(type="remove_header", name=name)
 
@@ -313,9 +317,7 @@ class ProtocolEvidenceTests(unittest.TestCase):
             "source_evidence_id": "ev_source",
         }
         adapter = TypeAdapter(ReplayRequestPayload)
-        control = adapter.validate_python(
-            {**base, "replay_mode": "control", "mutations": []}
-        )
+        control = adapter.validate_python({**base, "replay_mode": "control", "mutations": []})
         self.assertEqual(control.replay_mode, "control")
 
         with self.assertRaises(ValidationError):
@@ -411,7 +413,10 @@ class ProtocolEvidenceTests(unittest.TestCase):
         )
 
         self.assertEqual(validation["classification"], "validation_rejection")
-        self.assertTrue(validation["usable_for_required_classification"])
+        self.assertFalse(validation["usable_for_required_classification"])
+        self.assertEqual(validation["conclusion"], "inconclusive")
+        self.assertTrue(validation["observations"]["validation_like"])
+        self.assertIn("field_required", validation["inference_hints"])
         self.assertEqual(unknown["classification"], "unknown_rejection")
         self.assertEqual(auth["classification"], "authentication_failure")
         self.assertEqual(rate["classification"], "rate_limited")
@@ -467,7 +472,8 @@ class ProtocolEvidenceTests(unittest.TestCase):
             "none",
         )
         self.assertEqual(constrained["classification"], "value_constraint")
-        self.assertEqual(constrained["conclusion"], "constrained_value")
+        self.assertEqual(constrained["conclusion"], "inconclusive")
+        self.assertIn("value_constraint", constrained["inference_hints"])
         self.assertFalse(constrained["usable_for_required_classification"])
         self.assertEqual(conflict["classification"], "conflict")
         self.assertFalse(conflict["usable_for_required_classification"])
@@ -521,7 +527,7 @@ class ProtocolEvidenceTests(unittest.TestCase):
         self.assertEqual(result["conclusion"], "inconclusive")
         self.assertEqual(
             result["validation_evidence"]["semantic"],
-            "field_reference",
+            "not_required",
         )
 
     def test_request_shape_does_not_treat_arbitrary_id_suffix_as_identifier(self) -> None:
@@ -555,9 +561,7 @@ class ProtocolEvidenceTests(unittest.TestCase):
             ]
         )
         treatment["requestHeadersArray"] = [
-            item
-            for item in treatment["requestHeadersArray"]
-            if item["name"].lower() != "x-debug"
+            item for item in treatment["requestHeadersArray"] if item["name"].lower() != "x-debug"
         ] + [{"name": "X-Debug", "value": "replacement"}]
         header_result = assess_paired_mutation_effectiveness(
             ReplaceHeaderMutation(
@@ -704,6 +708,147 @@ class ProtocolEvidenceTests(unittest.TestCase):
                 RequestMatcher(request_id="13"),
             )
         )
+
+    def test_add_mutations_and_duplicate_occurrences_preserve_wire_order(self) -> None:
+        snapshot = self.snapshot()
+        snapshot["url"] = "https://example.test/path?tag=one&keep=x&tag=two"
+        snapshot["requestHeadersArray"] = [
+            {"name": "X-Tag", "value": "one"},
+            {"name": "X-Keep", "value": "x"},
+            {"name": "X-Tag", "value": "two"},
+            {"name": "Content-Type", "value": "application/json"},
+        ]
+        spec, _ = build_replay_spec(
+            snapshot,
+            [
+                AddJsonPathMutation(
+                    type="add_json_path",
+                    path="/new_field",
+                    value="new",
+                ),
+                ReplaceHeaderMutation(
+                    type="replace_header",
+                    name="X-Tag",
+                    value="changed",
+                    occurrence=1,
+                ),
+                RemoveQueryParameterMutation(
+                    type="remove_query_parameter",
+                    name="tag",
+                    occurrence=0,
+                ),
+                AddQueryParameterMutation(
+                    type="add_query_parameter",
+                    name="tag",
+                    value="three",
+                ),
+                AddHeaderMutation(
+                    type="add_header",
+                    name="X-Tag",
+                    value="three",
+                ),
+            ],
+        )
+
+        self.assertEqual(
+            [(item["name"], item["value"]) for item in spec["headers"]],
+            [
+                ("X-Tag", "one"),
+                ("X-Keep", "x"),
+                ("X-Tag", "changed"),
+                ("Content-Type", "application/json"),
+                ("X-Tag", "three"),
+            ],
+        )
+        self.assertEqual(
+            spec["url"],
+            "https://example.test/path?keep=x&tag=two&tag=three",
+        )
+        self.assertEqual(json.loads(spec["body"]["text"])["new_field"], "new")
+
+    def test_wire_order_changes_require_explicit_normalization(self) -> None:
+        control = self.snapshot()
+        treatment = json.loads(json.dumps(control))
+        treatment_body = json.loads(treatment["requestBody"]["text"])
+        treatment_body.pop("tracking_id")
+        treatment["requestBody"]["text"] = json.dumps(treatment_body)
+        treatment["requestHeadersArray"] = list(reversed(treatment["requestHeadersArray"]))
+        treatment["url"] = "https://example.test/conversation?keep=yes&tracking=abc"
+        mutation = RemoveJsonPathMutation(
+            type="remove_json_path",
+            path="/tracking_id",
+        )
+
+        strict = assess_paired_mutation_effectiveness(
+            mutation,
+            control,
+            treatment,
+            volatile_bindings=[],
+            control_binding_values={},
+            treatment_binding_values={},
+        )
+        normalized = assess_paired_mutation_effectiveness(
+            mutation,
+            control,
+            treatment,
+            volatile_bindings=[],
+            control_binding_values={},
+            treatment_binding_values={},
+            normalize_wire_order=True,
+        )
+
+        self.assertFalse(strict["non_target_fields_equivalent"])
+        self.assertTrue(normalized["non_target_fields_equivalent"])
+
+    def test_exact_body_pointer_and_conflicting_validation_signals(self) -> None:
+        mutation = RemoveJsonPathMutation(
+            type="remove_json_path",
+            path="/body/id",
+        )
+        result = classify_replay_response(
+            status=422,
+            content_type="application/json",
+            response_value={
+                "errors": [
+                    {"field": "/body/id", "code": "field_required"},
+                    {"field": "/body/id", "code": "not_required"},
+                ]
+            },
+            mutation=mutation,
+        )
+        wrong_target = classify_replay_response(
+            status=422,
+            content_type="application/json",
+            response_value={"field": "/body/id", "code": "field_required"},
+            mutation=RemoveJsonPathMutation(type="remove_json_path", path="/id"),
+        )
+
+        self.assertTrue(result["observations"]["signals_conflict"])
+        self.assertEqual(result["validation_evidence"]["semantic"], "conflicting")
+        self.assertEqual(
+            result["observations"]["normalized_validation_paths"],
+            ["/body/id", "/body/id"],
+        )
+        self.assertEqual(wrong_target["classification"], "unknown_rejection")
+
+    def test_preserve_source_binding_selects_duplicate_occurrence(self) -> None:
+        snapshot = self.snapshot()
+        snapshot["requestHeadersArray"].extend(
+            [
+                {"name": "X-Token", "value": "first"},
+                {"name": "X-Token", "value": "second"},
+            ]
+        )
+        binding = VolatileBinding(
+            binding_id="second_token",
+            target="header",
+            name="X-Token",
+            occurrence=1,
+            value_source="preserve_source",
+            reuse_policy="same_value",
+        )
+
+        self.assertEqual(binding_value_from_snapshot(snapshot, binding), "second")
 
 
 if __name__ == "__main__":
