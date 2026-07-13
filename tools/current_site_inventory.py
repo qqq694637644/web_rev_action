@@ -8,8 +8,8 @@ reported as evidence gaps instead of being inferred from historical protocol ass
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
-import re
 import sys
 from collections import Counter
 from collections.abc import Iterable
@@ -17,23 +17,17 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlsplit
 
+_RULES_ROOT = Path(__file__).resolve().parents[1] / "src" / "skill_temple"
+if str(_RULES_ROOT) not in sys.path:
+    sys.path.insert(0, str(_RULES_ROOT))
+
+is_sensitive_header = importlib.import_module("evidence_name_rules").is_sensitive_header
+
 REPORT_FILENAMES = (
     "current-site-inventory.md",
     "current-ui-map.md",
     "current-network-map.md",
     "open-questions.md",
-)
-
-_CREDENTIAL_HEADER_NAMES = {
-    "authorization",
-    "cookie",
-    "proxy-authorization",
-    "x-api-key",
-}
-_CREDENTIAL_HEADER_FRAGMENTS = ("csrf", "xsrf", "token", "session", "auth")
-_IDENTIFIER_PATH_RE = re.compile(
-    r"(?:^|[/_.-])(?:id|ids|uuid|nonce|cursor|parent|thread|conversation|message)(?:$|[/_.-])",
-    re.IGNORECASE,
 )
 
 
@@ -99,7 +93,7 @@ def _content_type(summary: dict[str, Any]) -> str | None:
     return value.split(";", 1)[0].strip().lower() or None
 
 
-def _transport_label(summary: dict[str, Any], url_fact: dict[str, Any] | None) -> str:
+def _network_transport_label(summary: dict[str, Any], url_fact: dict[str, Any] | None) -> str:
     resource_type = str(summary.get("resource_type") or "").strip().lower()
     content_type = _content_type(summary)
     scheme = url_fact.get("scheme") if url_fact else ""
@@ -108,7 +102,11 @@ def _transport_label(summary: dict[str, Any], url_fact: dict[str, Any] | None) -
     if content_type == "text/event-stream":
         if resource_type == "eventsource":
             return "SSE (EventSource)"
-        return "SSE over fetch/XHR"
+        if resource_type == "fetch":
+            return "SSE over Fetch"
+        if resource_type == "xhr":
+            return "SSE over XHR"
+        return "SSE (delivery unknown)"
     if content_type in {"application/x-ndjson", "application/ndjson"}:
         return "NDJSON"
     if content_type == "application/json-seq":
@@ -120,14 +118,25 @@ def _transport_label(summary: dict[str, Any], url_fact: dict[str, Any] | None) -
     return "HTTP/unknown"
 
 
+def _stream_transport_label(summary: dict[str, Any], url_fact: dict[str, Any] | None) -> str:
+    source = str(summary.get("primary_event_source") or "").strip().lower()
+    scheme = url_fact.get("scheme") if url_fact else ""
+    if scheme in {"ws", "wss"}:
+        return "WebSocket"
+    if source == "eventsource":
+        return "SSE (EventSource)"
+    if source == "raw-stream" and scheme in {"http", "https"}:
+        return "HTTP stream (delivery unknown)"
+    if source and source != "none":
+        return f"Stream evidence ({source})"
+    return "Stream (delivery unknown)"
+
+
 def _credential_header_names(summary: dict[str, Any]) -> set[str]:
     names: set[str] = set()
     for item in _dict_list(summary.get("request_headers")):
         name = str(item.get("name", "")).strip()
-        normalized = name.lower()
-        if normalized in _CREDENTIAL_HEADER_NAMES or any(
-            fragment in normalized for fragment in _CREDENTIAL_HEADER_FRAGMENTS
-        ):
+        if is_sensitive_header(name):
             names.add(name)
     return names
 
@@ -139,7 +148,11 @@ def _request_identifier_paths(summary: dict[str, Any]) -> set[str]:
     paths = shape.get("paths")
     if not isinstance(paths, dict):
         return set()
-    return {str(path) for path in paths if _IDENTIFIER_PATH_RE.search(str(path))}
+    return {
+        str(path)
+        for path, entry in paths.items()
+        if isinstance(entry, dict) and entry.get("value") == "<identifier>"
+    }
 
 
 def load_manifests(
@@ -328,7 +341,7 @@ def collect_facts(
                         "status": summary.get("status"),
                         "resource_type": summary.get("resource_type"),
                         "content_type": _content_type(summary),
-                        "transport": _transport_label(summary, url_fact),
+                        "transport": _network_transport_label(summary, url_fact),
                         "snapshot_integrity": (
                             summary.get("snapshot_integrity")
                             if isinstance(summary.get("snapshot_integrity"), dict)
@@ -359,6 +372,7 @@ def collect_facts(
                         "raw_capture_integrity": summary.get("raw_capture_integrity"),
                         "semantic_parse_integrity": summary.get("semantic_parse_integrity"),
                         "stream_artifact_integrity": summary.get("stream_artifact_integrity"),
+                        "transport": _stream_transport_label(summary, url_fact),
                         **safe_url_fact,
                     }
                 )
@@ -368,9 +382,13 @@ def collect_facts(
 
 def render_current_site_inventory(facts: dict[str, Any]) -> str:
     origins = sorted(
-        {item["origin"] for item in [*facts["pages"], *facts["network"]] if item.get("origin")}
+        {
+            item["origin"]
+            for item in [*facts["pages"], *facts["network"], *facts["streams"]]
+            if item.get("origin")
+        }
     )
-    transports = sorted({item["transport"] for item in facts["network"]})
+    transports = sorted({item["transport"] for item in [*facts["network"], *facts["streams"]]})
     evidence_kinds = facts["evidence_kinds"]
     evidence_rows = sorted(evidence_kinds.items())
     origins_text = ", ".join(origins) if origins else "none"
@@ -410,8 +428,8 @@ def render_current_site_inventory(facts: dict[str, Any]) -> str:
         "",
         "## Observed inventory",
         "",
-        f"- Origins observed in page or network facts: {origins_text}.",
-        f"- Network transports represented by evidence: "
+        f"- Origins observed in page, network, or stream facts: {origins_text}.",
+        f"- Transports represented by network or stream evidence: "
         f"{', '.join(transports) if transports else 'none'}.",
         f"- Stream request evidence entries: {len(facts['streams'])}.",
         f"- Page observations: {len(facts['pages'])}; step results: {len(facts['steps'])}.",
@@ -548,6 +566,7 @@ def render_current_network_map(facts: dict[str, Any]) -> str:
                     "Experiment",
                     "Evidence",
                     "Endpoint",
+                    "Transport",
                     "Event source",
                     "Terminal reason",
                     "Raw events",
@@ -561,6 +580,7 @@ def render_current_network_map(facts: dict[str, Any]) -> str:
                         item["experiment_id"],
                         item["evidence_id"],
                         item["endpoint"],
+                        item["transport"],
                         item["primary_event_source"],
                         item["terminal_reason"],
                         item["raw_event_count"],
@@ -585,7 +605,7 @@ def render_current_network_map(facts: dict[str, Any]) -> str:
 
 
 def render_open_questions(facts: dict[str, Any]) -> str:
-    transports = sorted({item["transport"] for item in facts["network"]})
+    transports = sorted({item["transport"] for item in [*facts["network"], *facts["streams"]]})
     terminal_reasons = sorted(
         {str(item["terminal_reason"]) for item in facts["streams"] if item.get("terminal_reason")}
     )
