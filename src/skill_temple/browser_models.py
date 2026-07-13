@@ -758,17 +758,6 @@ ReplayRequestPayload = Annotated[
 ]
 
 
-class CaptureBaselinePayload(CaptureFlowPayload):
-    objective: str = "capture baseline page and network state"
-    primary_request: PrimaryRequest = Field(
-        default_factory=lambda: PrimaryRequest(
-            expected_min_matches=0,
-            expected_max_matches=100,
-        )
-    )
-    flow: list[FlowStep] = Field(default_factory=list, max_length=0)
-
-
 class OpenSessionRequest(StrictModel):
     contract_version: Literal["1.0"] = "1.0"
     operation: Literal["open_session"]
@@ -779,8 +768,33 @@ class OpenSessionRequest(StrictModel):
 class CaptureBaselineRequest(StrictModel):
     contract_version: Literal["1.0"] = "1.0"
     operation: Literal["capture_baseline"]
-    payload: CaptureBaselinePayload
+    payload: CaptureFlowPayload
     skill_binding: SkillBinding | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def apply_capture_flow_preset(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        normalized = dict(value)
+        raw_payload = normalized.get("payload")
+        if not isinstance(raw_payload, dict):
+            return value
+        payload = dict(raw_payload)
+        flow = payload.get("flow", [])
+        if flow:
+            raise ValueError("capture_baseline alias requires an empty flow")
+        payload.setdefault("objective", "capture baseline page and network state")
+        payload.setdefault(
+            "primary_request",
+            {
+                "expected_min_matches": 0,
+                "expected_max_matches": 100,
+            },
+        )
+        payload["flow"] = []
+        normalized["payload"] = payload
+        return normalized
 
 
 class CaptureFlowRequest(StrictModel):
@@ -1005,6 +1019,7 @@ InspectBrowserEvidenceRequest = Annotated[
 
 class FlowStepResult(StrictModel):
     step_id: str
+    phase: Literal["setup", "action", "verification", "replay"]
     status: Literal[
         "completed",
         "failed",

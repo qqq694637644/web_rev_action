@@ -567,8 +567,8 @@ capture 时，阶段 B 的事实确认项仍保持未完成。
 
 ### 阶段 C：合并重复入口和重复状态
 
-- [ ] 将 `capture_baseline` 变为 `capture_flow` preset/alias。
-- [ ] 统一 flow/setup/verification step executor。
+- [x] 将 `capture_baseline` 变为 `capture_flow` preset/alias。
+- [x] 统一 flow/setup/verification step executor。
 - [ ] 删除 `inference_eligibility`。
 - [ ] 将固定 response classifier 降级为可选 analyzer。
 - [ ] 合并完整性和 completeness 字段。
