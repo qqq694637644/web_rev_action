@@ -2115,7 +2115,7 @@ class BrowserActionService:
             return (
                 {
                     "request_body": facts.get("request_body_canonical_sha256"),
-                    "response_status": facts.get("status"),
+                    "response_status": facts.get("http_status"),
                     "response_content_type": (
                         response_content_type(snapshot)
                         if isinstance(snapshot, dict)
@@ -2680,7 +2680,10 @@ class BrowserActionService:
                         "observation_id": observation.get("observation_id"),
                         "url": str(facts.get("url", ""))[:2048],
                         "method": facts.get("method"),
-                        "status": facts.get("status"),
+                        "http_status": facts.get("http_status"),
+                        "request_lifecycle_status": facts.get(
+                            "request_lifecycle_status"
+                        ),
                         "association": observation.get("association"),
                         "completeness": observation.get("completeness"),
                         "missing_evidence": observation.get("missing_evidence"),
@@ -4933,23 +4936,8 @@ class BrowserActionService:
                     (item for item in network_observations if isinstance(item, dict)),
                     {},
                 )
-                observation_facts = first_observation.get("facts")
-                observation_facts = observation_facts if isinstance(observation_facts, dict) else {}
-                current_stream_facts = (
-                    {
-                        "raw_event_count": observation_facts.get("raw_event_count"),
-                        "semantic_event_count": observation_facts.get("semantic_event_count"),
-                        "terminal_reason": observation_facts.get("terminal_reason"),
-                    }
-                    if any(
-                        observation_facts.get(key) is not None
-                        for key in (
-                            "raw_event_count",
-                            "semantic_event_count",
-                            "terminal_reason",
-                        )
-                    )
-                    else None
+                current_stream_facts = self._stream_summary_from_observation(
+                    first_observation
                 )
                 comparison_results = self._build_replay_comparison_results(
                     replay_plan,

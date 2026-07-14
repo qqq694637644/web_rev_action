@@ -583,9 +583,9 @@ CONSOLE_HTML = """<!doctype html>
   <label for="token">Bearer token</label>
   <input id="token" type="password" placeholder="Optional token from .env" />
   <label for="query">Query</label>
-  <textarea id="query">Use $pandora-protocol-reproduction to inspect protocol evidence</textarea>
+  <textarea id="query">Use $current-site-analysis to inspect the current website</textarea>
   <label for="hints">Hinted skill ids, comma-separated</label>
-  <input id="hints" type="text" value="pandora-protocol-reproduction" />
+  <input id="hints" type="text" value="current-site-analysis" />
   <div class="row">
     <label><input id="allow_chain" type="checkbox" /> Compatibility chaining flag</label>
     <label><input id="include_debug" type="checkbox" checked /> Include debug</label>

@@ -661,13 +661,18 @@ class ReplayTerminalCondition(StrictModel):
 
     @model_validator(mode="after")
     def validate_terminal_condition(self) -> ReplayTerminalCondition:
-        if self.type in {"exact_sse_data", "text_pattern"} and self.value is None:
-            raise ValueError(f"{self.type} requires value")
+        if self.type == "exact_sse_data" and self.value is None:
+            raise ValueError("exact_sse_data requires value")
+        if self.type == "text_pattern" and not self.value:
+            raise ValueError("text_pattern requires a non-empty value")
         if self.type == "idle_window" and self.window_ms is None:
             self.window_ms = 15_000
         if self.type != "idle_window" and self.window_ms is not None:
             raise ValueError("window_ms is only valid for idle_window")
-        if self.type != "exact_sse_data" and self.event_name is not None:
+        if self.type in {"network_close", "idle_window"}:
+            self.value = None
+            self.event_name = None
+        elif self.type != "exact_sse_data" and self.event_name is not None:
             raise ValueError("event_name is only valid for exact_sse_data")
         return self
 
@@ -701,8 +706,11 @@ class ReplayTermination(StrictModel):
         exact_sse_count = sum(
             item.type == "exact_sse_data" for item in self.conditions
         )
+        idle_window_count = sum(item.type == "idle_window" for item in self.conditions)
         if exact_sse_count > 1:
             raise ValueError("termination allows at most one exact_sse_data condition")
+        if idle_window_count > 1:
+            raise ValueError("termination allows at most one idle_window condition")
         return self
 
 

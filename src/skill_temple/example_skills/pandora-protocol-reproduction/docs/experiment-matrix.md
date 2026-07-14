@@ -1,5 +1,9 @@
 # Experiment matrix
 
+This is an optional specialized matrix. Use it only after the generic
+`current-site-analysis` inventory has confirmed the corresponding conversational
+tree, regenerate, edit, stop, and reload behaviors.
+
 ## Series fields
 
 Use one `analysis_series_id` for the complete investigation. Set `predecessor_experiment_id` explicitly and increase `sequence_index` monotonically.

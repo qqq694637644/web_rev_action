@@ -1,11 +1,14 @@
 ---
 name: pandora-protocol-reproduction
-description: Use to reverse engineer and reproduce Pandora-like conversational web protocols through atomic browser experiments, stable evidence IDs, source tracing, browser-context request replay, state-machine experiments, schemas, and auditable reports. 中文：用于通过原子浏览器实验、稳定证据 ID、源码追踪、浏览器上下文请求重放和状态机实验复刻 Pandora 类对话协议。
+description: Optional specialized template for a current site that has already been observed to expose Pandora-like conversational tree, regenerate, edit, and stop semantics. 中文：仅在当前网页已确认具有 Pandora 类对话树语义时使用的可选专用模板。
 ---
 
-# Pandora protocol reproduction
+# Optional Pandora protocol reproduction template
 
-Use this Skill when the user wants to understand, reproduce, compare, or document a modern conversational web protocol, including first message, second message, regenerate, edit, stop, conversation state, authentication, request construction, and streaming events.
+Use this Skill only after a current-site inventory has confirmed a conversational
+tree with first message, follow-up message, regenerate, edit, stop, and reload
+semantics. For an unfamiliar or non-conversational website, use
+`current-site-analysis` instead.
 
 ## Architecture boundary
 

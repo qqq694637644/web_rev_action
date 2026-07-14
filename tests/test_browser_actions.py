@@ -46,6 +46,7 @@ from skill_temple.browser_service import (
     ExperimentStore,
     build_browser_service_from_environment,
 )
+from skill_temple.protocol_evidence import build_network_observation
 from skill_temple.replay_presets import (
     control_preset,
     exploratory_preset,
@@ -1306,6 +1307,145 @@ class BrowserActionTests(unittest.TestCase):
                 "supporting-persistent",
             )
 
+    def test_stream_only_response_status_comparison_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            client, _, _ = self.make_client(root, include_supporting_failure=False)
+            service = client.app.state.browser_action_service
+            observation = build_network_observation(
+                observation_id="obs_stream_only",
+                network_evidence=None,
+                stream_request={
+                    "status": "finished",
+                    "terminalReason": "network_close",
+                    "rawEventCount": 3,
+                    "semanticEventCount": 3,
+                    "primaryEventSource": "fetch-stream",
+                    "rawCaptureIntegrity": "complete",
+                    "semanticParseIntegrity": "complete",
+                    "artifactIntegrity": "complete",
+                },
+                association={"status": "not_found", "method": None},
+            )
+            experiment_id = "exp_stream_only"
+            service.experiments.experiment_dir(experiment_id).mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+            service.experiments.write_manifest(
+                experiment_id,
+                {
+                    "experiment_id": experiment_id,
+                    "network_observations": [observation],
+                },
+            )
+
+            results = service._build_replay_comparison_results(
+                {
+                    "comparison": {
+                        "references": [
+                            {
+                                "experiment_id": experiment_id,
+                                "observation_id": "obs_stream_only",
+                            }
+                        ],
+                        "dimensions": ["response_status"],
+                    }
+                },
+                current_request_body_sha256=None,
+                current_response_status=200,
+                current_response_content_type=None,
+                current_stream_facts=None,
+                current_environment=None,
+            )
+
+            self.assertEqual(results[0]["status"], "missing")
+            self.assertEqual(
+                results[0]["dimensions"]["response_status"],
+                {"status": "missing", "reference": None, "current": 200},
+            )
+
+    def test_stream_summary_uses_one_canonical_shape_on_both_sides(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            client, _, _ = self.make_client(root, include_supporting_failure=False)
+            service = client.app.state.browser_action_service
+            observation = build_network_observation(
+                observation_id="obs_stream_reference",
+                network_evidence={
+                    "evidence_id": "ev_stream_reference",
+                    "summary": {
+                        "url": "https://example.test/stream",
+                        "method": "POST",
+                        "status": 200,
+                    },
+                },
+                stream_request={
+                    "status": "finished",
+                    "terminalReason": "network_close",
+                    "rawEventCount": 3,
+                    "semanticEventCount": 3,
+                    "primaryEventSource": "fetch-stream",
+                    "rawCaptureIntegrity": "complete",
+                    "semanticParseIntegrity": "complete",
+                    "artifactIntegrity": "complete",
+                },
+                association={"status": "matched", "method": "network_request_id"},
+            )
+            experiment_id = "exp_stream_reference"
+            service.experiments.experiment_dir(experiment_id).mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+            service.experiments.write_manifest(
+                experiment_id,
+                {
+                    "experiment_id": experiment_id,
+                    "network_observations": [observation],
+                },
+            )
+            current_summary = service._stream_summary_from_observation(observation)
+            replay_plan = {
+                "comparison": {
+                    "references": [
+                        {
+                            "experiment_id": experiment_id,
+                            "observation_id": "obs_stream_reference",
+                        }
+                    ],
+                    "dimensions": ["stream_summary"],
+                }
+            }
+
+            equivalent = service._build_replay_comparison_results(
+                replay_plan,
+                current_request_body_sha256=None,
+                current_response_status=200,
+                current_response_content_type="text/event-stream",
+                current_stream_facts=current_summary,
+                current_environment=None,
+            )
+            different = service._build_replay_comparison_results(
+                replay_plan,
+                current_request_body_sha256=None,
+                current_response_status=200,
+                current_response_content_type="text/event-stream",
+                current_stream_facts={
+                    **current_summary,
+                    "primary_event_source": "eventsource",
+                },
+                current_environment=None,
+            )
+
+            self.assertEqual(
+                equivalent[0]["dimensions"]["stream_summary"]["status"],
+                "equivalent",
+            )
+            self.assertEqual(
+                different[0]["dimensions"]["stream_summary"]["status"],
+                "different",
+            )
+
     def test_include_source_compares_exact_source_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -1762,7 +1902,14 @@ class BrowserActionTests(unittest.TestCase):
                                 "max_events": 128,
                             },
                             "termination": {
-                                "conditions": [{"type": "exact_sse_data", "value": "[DONE]"}],
+                                "conditions": [
+                                    {"type": "exact_sse_data", "value": "[DONE]"},
+                                    {
+                                        "type": "network_close",
+                                        "value": "ignored",
+                                        "event_name": "ignored",
+                                    },
+                                ],
                             },
                             "execution_mode": "sync",
                             "deadline_ms": 10_000,
@@ -1782,7 +1929,10 @@ class BrowserActionTests(unittest.TestCase):
             self.assertEqual(protocol["response_reader"]["max_events"], 128)
             self.assertEqual(
                 protocol["termination"]["conditions"],
-                [{"type": "exact_sse_data", "value": "[DONE]"}],
+                [
+                    {"type": "exact_sse_data", "value": "[DONE]"},
+                    {"type": "network_close"},
+                ],
             )
 
     def test_complete_http_500_sse_is_complete_evidence(self) -> None:

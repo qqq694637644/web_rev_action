@@ -127,11 +127,36 @@ class ProtocolEvidenceTests(unittest.TestCase):
         self.assertEqual(observation["completeness"]["request_headers"], "complete")
         self.assertEqual(observation["completeness"]["request_body"], "complete")
         self.assertEqual(observation["completeness"]["semantic_stream"], "partial")
+        self.assertEqual(observation["facts"]["http_status"], 200)
+        self.assertIsNone(observation["facts"]["request_lifecycle_status"])
         self.assertEqual(
             observation["artifact_ids"],
             ["art_headers", "art_headers_extra", "art_network"],
         )
         self.assertNotIn("integrity_status", observation)
+
+    def test_stream_only_observation_keeps_lifecycle_separate_from_http_status(self) -> None:
+        observation = build_network_observation(
+            observation_id="obs_stream_only",
+            network_evidence=None,
+            stream_request={
+                "status": "finished",
+                "terminalReason": "network_close",
+                "rawEventCount": 3,
+                "semanticEventCount": 3,
+                "primaryEventSource": "fetch-stream",
+                "rawCaptureIntegrity": "complete",
+                "semanticParseIntegrity": "complete",
+                "artifactIntegrity": "complete",
+            },
+            association={"status": "not_found", "method": None},
+        )
+
+        self.assertIsNone(observation["facts"]["http_status"])
+        self.assertEqual(
+            observation["facts"]["request_lifecycle_status"],
+            "finished",
+        )
 
     def test_observation_quality_aggregates_only_required_dimensions(self) -> None:
         observations = [
@@ -425,6 +450,58 @@ class ProtocolEvidenceTests(unittest.TestCase):
                     },
                 }
             )
+        with self.assertRaises(ValidationError):
+            ReplayRequestPayload.model_validate(
+                {
+                    **base,
+                    "termination": {
+                        "conditions": [
+                            {"type": "idle_window", "window_ms": 1_000},
+                            {"type": "idle_window", "window_ms": 5_000},
+                        ]
+                    },
+                }
+            )
+        with self.assertRaises(ValidationError):
+            ReplayRequestPayload.model_validate(
+                {
+                    **base,
+                    "termination": {
+                        "conditions": [{"type": "text_pattern", "value": ""}]
+                    },
+                }
+            )
+        normalized_termination = ReplayRequestPayload.model_validate(
+            {
+                **base,
+                "termination": {
+                    "conditions": [
+                        {
+                            "type": "network_close",
+                            "value": "ignored",
+                            "event_name": "ignored",
+                        },
+                        {
+                            "type": "idle_window",
+                            "value": "ignored",
+                            "event_name": "ignored",
+                        },
+                    ]
+                },
+            }
+        )
+        self.assertEqual(
+            normalized_termination.termination.model_dump(
+                mode="json",
+                exclude_none=True,
+            ),
+            {
+                "conditions": [
+                    {"type": "network_close"},
+                    {"type": "idle_window", "window_ms": 15_000},
+                ]
+            },
+        )
 
         with self.assertRaises(ValidationError):
             ReplayRequestPayload.model_validate(

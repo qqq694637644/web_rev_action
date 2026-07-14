@@ -177,7 +177,9 @@ tests/test_runtime.py 中只验证 idapython 示例的测试
 - 删除仅用于展示“多 Skill 平台”的示例逻辑；
 - 不把本项目继续发展成通用 Skill 托管服务。
 
-状态：**IDAPython 删除后，默认发行物只剩项目分析 Skill；通用 catalog runtime 是否继续保留，留待单独审计。**
+状态：**默认入口已改为 `current-site-analysis` 通用项目分析 Skill；
+`pandora-protocol-reproduction` 仅作为检测到对话树语义后的可选专用模板。
+catalog runtime 是否继续保留，留待单独审计。**
 
 ### 6.3 Pandora 专有命名的 smoke fixture 和报告名
 
@@ -724,6 +726,12 @@ network_response_json + RequestMatcher + JSON Pointer
 - [x] add/remove/replace mutation；
 - [x] request source 的 method、完整 URL/query、body 指纹和时间窗口关联；
 - [x] credential、browser-managed header、artifact 大小、deadline 和取消等安全边界。
+
+#### D6. 默认分析入口通用化
+
+- [x] 提供从当前页面 inventory 和 evidence gap 开始的 `current-site-analysis` Skill。
+- [x] runtime catalog、README、Action prompt 和调试控制台默认指向通用 Skill。
+- [x] Pandora 六场景保留为可选专用模板，不作为未知网页的默认完成标准。
 
 阶段 D 的完成标准不是“类名更统一”，而是新增网页或新研究方法时，可以通过组合 source、mutation、extractor、binding、transport、reader、termination 和 comparison 表达，而不需要再增加一种专属 replay mode。
 

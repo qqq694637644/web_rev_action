@@ -56,21 +56,42 @@ def _write_skill(
 
 
 class RuntimeTests(unittest.TestCase):
-    def test_packaged_skill_uses_skill_md_as_the_only_entrypoint(self) -> None:
+    def test_packaged_skills_use_skill_md_as_the_only_entrypoint(self) -> None:
         runtime = load_runtime()
         result = runtime.list_skills()
 
-        self.assertEqual([item["skill_id"] for item in result["skills"]], [
-            "pandora-protocol-reproduction"
-        ])
-        skill = result["skills"][0]
-        self.assertEqual(skill["entrypoint"], "SKILL.md")
-        self.assertIn("conversational web protocols", skill["description"])
-        self.assertTrue(skill["content_hash"].startswith("sha256:"))
-        root = Path(runtime.skills_dir) / "pandora-protocol-reproduction"
-        self.assertTrue((root / "SKILL.md").is_file())
-        self.assertFalse((root / "skill.json").exists())
-        self.assertFalse((root / "INDEX.md").exists())
+        self.assertEqual(
+            [item["skill_id"] for item in result["skills"]],
+            ["current-site-analysis", "pandora-protocol-reproduction"],
+        )
+        for skill in result["skills"]:
+            self.assertEqual(skill["entrypoint"], "SKILL.md")
+            self.assertTrue(skill["content_hash"].startswith("sha256:"))
+            root = Path(runtime.skills_dir) / skill["skill_id"]
+            self.assertTrue((root / "SKILL.md").is_file())
+            self.assertFalse((root / "skill.json").exists())
+            self.assertFalse((root / "INDEX.md").exists())
+        self.assertIn("current website", result["skills"][0]["description"])
+
+    def test_current_site_skill_is_the_generic_default_workflow(self) -> None:
+        runtime = load_runtime()
+        result = runtime.retrieve(
+            "use $current-site-analysis for this website",
+            hinted_skill_ids=["current-site-analysis"],
+        )
+
+        selected = result["selected_skills"][0]
+        self.assertEqual(selected["skill_id"], "current-site-analysis")
+        self.assertIn("Do not begin with a fixed scenario list", selected["instructions"])
+        self.assertEqual(
+            set(selected["referenced_paths"]),
+            {
+                "docs/experiment-design.md",
+                "docs/inventory-checklist.md",
+                "docs/report-contract.md",
+            },
+        )
+        self.assertIn("current-site-analysis", result["explicit_skill_ids"])
 
     def test_packaged_pandora_skill_exposes_protocol_reproduction_workflow(self) -> None:
         runtime = load_runtime()
@@ -81,7 +102,11 @@ class RuntimeTests(unittest.TestCase):
 
         selected = result["selected_skills"][0]
         self.assertEqual(selected["skill_id"], "pandora-protocol-reproduction")
-        self.assertIn("browser-context request replay", selected["instructions"])
+        self.assertIn(
+            "Optional Pandora protocol reproduction template",
+            selected["instructions"],
+        )
+        self.assertIn("current-site-analysis", selected["instructions"])
         self.assertEqual(
             set(selected["referenced_paths"]),
             {
@@ -96,12 +121,12 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue((root / "docs" / "evidence-contract.md").is_file())
         self.assertTrue((root / "docs" / "report-templates.md").is_file())
 
-    def test_packaged_skill_uses_current_generic_replay_contract(self) -> None:
+    def test_packaged_skills_use_current_generic_replay_contract(self) -> None:
         runtime = load_runtime()
-        root = Path(runtime.skills_dir) / "pandora-protocol-reproduction"
         content = "\n".join(
             path.read_text(encoding="utf-8")
-            for path in sorted(root.rglob("*.md"))
+            for skill_id in ["current-site-analysis", "pandora-protocol-reproduction"]
+            for path in sorted((Path(runtime.skills_dir) / skill_id).rglob("*.md"))
         )
 
         for removed_field in [
@@ -135,8 +160,8 @@ class RuntimeTests(unittest.TestCase):
             )
             self.assertNotIn("confidence", result["matches"][0])
             self.assertEqual(
-                result["available_skills"][0]["skill_id"],
-                "pandora-protocol-reproduction",
+                [item["skill_id"] for item in result["available_skills"]],
+                ["current-site-analysis", "pandora-protocol-reproduction"],
             )
 
     def test_resolve_does_not_make_server_side_semantic_selection(self) -> None:
@@ -153,7 +178,7 @@ class RuntimeTests(unittest.TestCase):
                 self.assertEqual(result["matches"], [])
                 self.assertEqual(
                     result["available_skills"][0]["skill_id"],
-                    "pandora-protocol-reproduction",
+                    "current-site-analysis",
                 )
 
     def test_retrieve_returns_selected_skill_entrypoint_and_references(self) -> None:
@@ -183,8 +208,8 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(result["selected_skills"], [])
         self.assertEqual(result["decision"]["next_action"], "selectSkillOrAnswer")
         self.assertTrue(result["catalog_included"])
-        self.assertEqual(result["available_skill_count"], 1)
-        self.assertEqual(result["included_skill_count"], 1)
+        self.assertEqual(result["available_skill_count"], 2)
+        self.assertEqual(result["included_skill_count"], 2)
         self.assertEqual(result["omitted_skill_count"], 0)
 
     def test_multiple_explicit_skills_auto_chain_and_preserve_order(self) -> None:
@@ -544,6 +569,8 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(read.status_code, 200)
         self.assertEqual(search.status_code, 200)
         self.assertIn("Skill Temple Console", console.text)
+        self.assertIn("Use $current-site-analysis to inspect the current website", console.text)
+        self.assertIn('value="current-site-analysis"', console.text)
         self.assertIn("debug", debug.json())
         self.assertEqual(bad_hint.status_code, 404)
         self.assertEqual(bad_hint.json()["detail"]["error"]["code"], "skill_not_found")

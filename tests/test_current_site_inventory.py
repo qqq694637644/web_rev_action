@@ -121,7 +121,8 @@ class CurrentSiteInventoryTests(unittest.TestCase):
                     "facts": {
                         "url": "https://api.example.test/v2/stream?cursor=secret-value",
                         "method": "POST",
-                        "status": 200,
+                        "http_status": 200,
+                        "request_lifecycle_status": "finished",
                     },
                     "association": {
                         "status": "matched",

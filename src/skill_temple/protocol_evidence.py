@@ -342,7 +342,12 @@ def build_network_observation(
             "url": str(summary.get("url") or stream_request.get("url") or "")[:8192],
             "method": summary.get("method") or stream_request.get("method"),
             "resource_type": summary.get("resource_type"),
-            "status": summary.get("status") or stream_request.get("status"),
+            "http_status": (
+                summary.get("status")
+                if isinstance(summary.get("status"), int)
+                else None
+            ),
+            "request_lifecycle_status": stream_request.get("status"),
             "status_text": summary.get("status_text"),
             "failure": summary.get("failure"),
             "observed_at": network_evidence.get("observed_at"),
