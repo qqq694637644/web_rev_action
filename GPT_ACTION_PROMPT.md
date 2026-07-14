@@ -107,6 +107,12 @@ exact_sse_data/text_pattern/network_close/idle_window。只有声明 idle_window
 `window_ms`；未声明时等待 network close 或整体 deadline。SSE parser 只在完整 event 的
 合并 data 精确匹配条件时结束；正文中的字面 marker 不应提前终止。
 
+审计 replay 时区分 `requested_replay_protocol` 与有效的 `replay_protocol`。后者包含
+stream detection 自动启用后的 capture/requirements，`replay_protocol_hash` 也是有效配置
+的 hash。显式 reader mode 必须与 `stream_response_contract.observed_response_mode` 一致。
+构建当前 stream comparison 时只使用 `replay.network_evidence_id` 唯一关联的 observation；
+零命中保持 missing，多命中保持 ambiguous，不得回退到第一条 observation。
+
 Query mutation 默认使用 `query_serialization=preserve_raw`，不要重编码未修改参数。只有
 任务明确需要 canonical normalization 时才使用 `normalize`。
 

@@ -77,6 +77,7 @@ source_evidence_id
 mutation list
 extractor definitions and extractor observations
 binding metadata and binding observations
+requested_replay_protocol_hash
 replay_protocol_hash
 setup_flow and setup step results
 replay_attempt_id and dispatch time
@@ -97,6 +98,11 @@ Request context is `observed` only when exact header completeness is proven by a
 
 Replay primary stream evidence must reference the exact replay ordinary evidence ID.
 Same-URL streams without that stable association are supporting evidence.
+
+`requested_replay_protocol_hash` identifies the normalized caller request.
+`replay_protocol_hash` identifies the effective protocol after stream detection has
+upgraded capture and evidence requirements. Stream comparison must use the unique
+observation whose `sources.network_evidence_id` equals the replay evidence ID.
 
 A replay response status alone is insufficient to determine field necessity.
 Comparison is optional and fact-based. Each reference must contain an exact

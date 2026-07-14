@@ -216,6 +216,7 @@ class FakeJsReverse:
         self.replay_termination_reason: str | None = None
         self.replay_done_event_name_observed: str | None = "message"
         self.replay_truncated = False
+        self.replay_observed_response_mode: str | None = None
         self.wire_cookie_value: str | None = None
         self.omit_observed_at_reqids: set[int] = set()
         self.response_body_available = True
@@ -676,7 +677,9 @@ class FakeJsReverse:
             else False
         )
         termination_reason = self.replay_termination_reason or ("network_close")
-        response_mode = "sse" if is_stream else "ordinary"
+        response_mode = self.replay_observed_response_mode or (
+            "sse" if is_stream else "ordinary"
+        )
         output_file.write_text(
             json.dumps(
                 {
@@ -1446,6 +1449,62 @@ class BrowserActionTests(unittest.TestCase):
                 "different",
             )
 
+            supporting = build_network_observation(
+                observation_id="obs_supporting",
+                network_evidence={
+                    "evidence_id": "ev_supporting",
+                    "summary": {
+                        "url": "https://example.test/stream",
+                        "method": "POST",
+                        "status": 200,
+                    },
+                },
+                stream_request={
+                    "status": "finished",
+                    "terminalReason": "idle_window",
+                    "rawEventCount": 9,
+                    "semanticEventCount": 9,
+                    "primaryEventSource": "eventsource",
+                    "rawCaptureIntegrity": "complete",
+                    "semanticParseIntegrity": "complete",
+                    "artifactIntegrity": "complete",
+                },
+                association={"status": "matched", "method": "network_request_id"},
+            )
+            selected, selected_status = service._current_replay_stream_summary(
+                [supporting, observation],
+                "ev_stream_reference",
+            )
+            missing, missing_status = service._current_replay_stream_summary(
+                [supporting, observation],
+                "ev_not_present",
+            )
+            duplicate = {**observation, "observation_id": "obs_stream_duplicate"}
+            ambiguous, ambiguous_status = service._current_replay_stream_summary(
+                [observation, duplicate],
+                "ev_stream_reference",
+            )
+            ambiguous_result = service._build_replay_comparison_results(
+                replay_plan,
+                current_request_body_sha256=None,
+                current_response_status=200,
+                current_response_content_type="text/event-stream",
+                current_stream_facts=ambiguous,
+                current_environment=None,
+                current_status_overrides={"stream_summary": ambiguous_status},
+            )
+
+            self.assertEqual(selected, current_summary)
+            self.assertIsNone(selected_status)
+            self.assertIsNone(missing)
+            self.assertEqual(missing_status, "missing")
+            self.assertIsNone(ambiguous)
+            self.assertEqual(ambiguous_status, "ambiguous")
+            self.assertEqual(
+                ambiguous_result[0]["dimensions"]["stream_summary"]["status"],
+                "ambiguous",
+            )
+
     def test_include_source_compares_exact_source_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -1924,9 +1983,24 @@ class BrowserActionTests(unittest.TestCase):
             )
             self.assertEqual(manifest["stream_response_contract"]["status"], "complete")
             self.assertTrue(manifest["replay"]["source_is_stream"])
-            protocol = manifest["replay"]["replay_protocol"]
+            replay = manifest["replay"]
+            protocol = replay["replay_protocol"]
+            requested_protocol = replay["requested_replay_protocol"]
             self.assertEqual(protocol["response_reader"]["mode"], "sse")
             self.assertEqual(protocol["response_reader"]["max_events"], 128)
+            self.assertFalse(requested_protocol["capture"]["stream"])
+            self.assertFalse(
+                requested_protocol["requirements"]["require_raw_capture"]
+            )
+            self.assertTrue(protocol["capture"]["stream"])
+            self.assertTrue(protocol["requirements"]["require_raw_capture"])
+            self.assertFalse(protocol["requirements"]["require_semantic_parse"])
+            self.assertTrue(protocol["requirements"]["require_artifacts"])
+            self.assertTrue(protocol["source_is_stream"])
+            self.assertNotEqual(
+                replay["requested_replay_protocol_hash"],
+                replay["replay_protocol_hash"],
+            )
             self.assertEqual(
                 protocol["termination"]["conditions"],
                 [
@@ -1934,6 +2008,52 @@ class BrowserActionTests(unittest.TestCase):
                     {"type": "network_close"},
                 ],
             )
+
+    def test_stream_contract_requires_observed_reader_mode_to_match(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            client, _, js = self.make_client(root, include_supporting_failure=False)
+            js.network_response_content_type = "text/event-stream"
+            js.replay_done_marker_observed = True
+            js.replay_termination_reason = "done_marker"
+            js.replay_observed_response_mode = "ordinary"
+            with client:
+                self.open_session(client)
+                source_id, source_evidence, _ = self.capture_replay_source(client, root)
+                response = client.post(
+                    "/v1/browser/run",
+                    json={
+                        "operation": "replay_request",
+                        "payload": {
+                            "session_id": "session_one",
+                            "objective": "reject a contradictory observed reader mode",
+                            "source": {
+                                "experiment_id": source_id,
+                                "evidence_id": source_evidence["evidence_id"],
+                            },
+                            "response_reader": {"mode": "sse", "raw_only": True},
+                            "termination": {
+                                "conditions": [
+                                    {"type": "exact_sse_data", "value": "[DONE]"}
+                                ]
+                            },
+                            "execution_mode": "sync",
+                            "deadline_ms": 10_000,
+                        },
+                    },
+                )
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json()["status"], "partial")
+            manifest = json.loads(
+                (root / response.json()["result"]["manifest_relative_path"]).read_text(
+                    encoding="utf-8"
+                )
+            )
+            contract = manifest["stream_response_contract"]
+            self.assertEqual(contract["status"], "partial")
+            self.assertEqual(contract["response_mode"], "sse")
+            self.assertEqual(contract["observed_response_mode"], "ordinary")
+            self.assertFalse(contract["response_mode_matches"])
 
     def test_complete_http_500_sse_is_complete_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

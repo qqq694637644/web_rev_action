@@ -96,7 +96,11 @@ Rules:
 - `network_close` has no value or event name;
 - `idle_window` uses `window_ms` and no value or event name.
 
-The normalized termination configuration is saved in `replay.replay_protocol`.
+The normalized termination configuration and the effective capture/requirements are
+saved in `replay.replay_protocol`. The original normalized request is saved in
+`replay.requested_replay_protocol`; their hashes identify requested versus effective
+configuration. When comparing the current stream, use only the unique observation
+linked to `replay.network_evidence_id`. Do not fall back to the first observation.
 
 ## Strong-evidence Stop template
 

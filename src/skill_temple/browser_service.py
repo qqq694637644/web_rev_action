@@ -1818,6 +1818,8 @@ class BrowserActionService:
             "doneEventNameObserved",
         )
         truncated = bool(cls._extract_response_field(replay_response, "truncated"))
+        mode_ok: bool | None = None
+        content_type_ok: bool | None = None
         if isinstance(status, int) and status >= 400 and content_type != "text/event-stream":
             contract_status = "not_applicable_non_stream_response"
         else:
@@ -1835,17 +1837,22 @@ class BrowserActionService:
                 )
                 or ("idle_window" in terminal_types and termination == "idle_window")
             )
+            valid_observed_modes = {"ordinary", "sse", "ndjson", "raw_stream"}
             mode_ok = bool(
-                response_mode == "raw_stream"
-                or response_mode == "auto"
-                or response_mode == "sse"
+                observed_mode in valid_observed_modes
+                and (response_mode == "auto" or observed_mode == response_mode)
+            )
+            content_type_ok = bool(
+                observed_mode in {"ordinary", "raw_stream"}
+                or observed_mode == "sse"
                 and content_type == "text/event-stream"
-                or response_mode == "ndjson"
+                or observed_mode == "ndjson"
                 and content_type
                 in {"application/x-ndjson", "application/ndjson", "application/json-seq"}
             )
             complete = bool(
                 mode_ok
+                and content_type_ok
                 and marker_ok
                 and event_ok
                 and terminal_ok
@@ -1856,6 +1863,8 @@ class BrowserActionService:
             "status": contract_status,
             "response_mode": response_mode,
             "observed_response_mode": observed_mode,
+            "response_mode_matches": mode_ok,
+            "content_type_matches_observed_mode": content_type_ok,
             "terminal_conditions": terminal_conditions,
             "terminal_condition_matched": terminal_condition_matched,
             "observed_termination": termination,
@@ -2072,6 +2081,28 @@ class BrowserActionService:
         }
         return value if any(item is not None for item in value.values()) else None
 
+    @classmethod
+    def _current_replay_stream_summary(
+        cls,
+        observations: list[dict[str, Any]],
+        replay_network_evidence_id: str | None,
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        if not replay_network_evidence_id:
+            return None, "missing"
+        matches = [
+            item
+            for item in observations
+            if isinstance(item.get("sources"), dict)
+            and item["sources"].get("network_evidence_id")
+            == replay_network_evidence_id
+        ]
+        if not matches:
+            return None, "missing"
+        if len(matches) > 1:
+            return None, "ambiguous"
+        summary = cls._stream_summary_from_observation(matches[0])
+        return (summary, None) if summary is not None else (None, "missing")
+
     def _comparison_reference_facts(
         self,
         manifest: dict[str, Any],
@@ -2185,6 +2216,7 @@ class BrowserActionService:
         current_response_content_type: str | None,
         current_stream_facts: dict[str, Any] | None,
         current_environment: dict[str, Any] | None,
+        current_status_overrides: dict[str, str] | None = None,
     ) -> list[dict[str, Any]]:
         comparison = replay_plan.get("comparison")
         if not isinstance(comparison, dict):
@@ -2222,6 +2254,7 @@ class BrowserActionService:
             "stream_summary": current_stream_facts,
             "environment": current_environment,
         }
+        current_status_overrides = current_status_overrides or {}
         results: list[dict[str, Any]] = []
         for reference_selector in references:
             reference_id = str(reference_selector.get("experiment_id") or "")
@@ -2268,10 +2301,20 @@ class BrowserActionService:
                     continue
                 reference_value = reference.get(dimension)
                 current_value = current.get(dimension)
+                override_statuses = {
+                    status
+                    for status in (
+                        status_overrides.get(dimension),
+                        current_status_overrides.get(dimension),
+                    )
+                    if status
+                }
                 dimension_results[dimension] = {
                     "status": (
-                        status_overrides[dimension]
-                        if dimension in status_overrides
+                        "ambiguous"
+                        if "ambiguous" in override_statuses
+                        else "missing"
+                        if "missing" in override_statuses
                         else "missing"
                         if reference_value is None or current_value is None
                         else "equivalent"
@@ -2402,8 +2445,10 @@ class BrowserActionService:
         payload = request.payload
         mutations = list(payload.mutations)
         binding_specs = list(payload.bindings)
-        replay_protocol = self._replay_protocol(payload)
-        replay_protocol_hash = canonical_json_sha256(replay_protocol)
+        requested_replay_protocol = self._replay_protocol(payload)
+        requested_replay_protocol_hash = canonical_json_sha256(
+            requested_replay_protocol
+        )
         source_manifest = self.experiments.load_manifest(payload.source.experiment_id)
         if source_manifest.get("session_id") != payload.session_id:
             raise BrowserServiceError(
@@ -2584,6 +2629,17 @@ class BrowserActionService:
                 "series": series,
             }
         )
+        replay_protocol = json.loads(json.dumps(requested_replay_protocol))
+        replay_protocol["capture"] = normalized.capture.model_dump(mode="json")
+        replay_protocol["requirements"] = normalized.requirements.model_dump(
+            mode="json"
+        )
+        replay_protocol["network_evidence"] = [
+            item.model_dump(mode="json", exclude_none=True)
+            for item in normalized.network_evidence
+        ]
+        replay_protocol["source_is_stream"] = source_is_stream
+        replay_protocol_hash = canonical_json_sha256(replay_protocol)
         replay_attempt_id = f"replay_{uuid.uuid4().hex}"
         comparison = (
             payload.comparison.model_dump(mode="json", exclude_none=True)
@@ -2613,6 +2669,8 @@ class BrowserActionService:
             ),
             "replay_protocol": replay_protocol,
             "replay_protocol_hash": replay_protocol_hash,
+            "requested_replay_protocol": requested_replay_protocol,
+            "requested_replay_protocol_hash": requested_replay_protocol_hash,
             "setup_flow": [
                 step.model_dump(mode="json", exclude_none=True) for step in payload.setup_flow
             ],
@@ -2659,6 +2717,12 @@ class BrowserActionService:
             "comparison": replay_plan["comparison"],
             "replay_protocol": replay_plan["replay_protocol"],
             "replay_protocol_hash": replay_plan["replay_protocol_hash"],
+            "requested_replay_protocol": replay_plan[
+                "requested_replay_protocol"
+            ],
+            "requested_replay_protocol_hash": replay_plan[
+                "requested_replay_protocol_hash"
+            ],
             "replay_attempt_id": replay_plan["replay_attempt_id"],
             "expected_request_body_canonical_sha256": replay_plan[
                 "expected_request_body_canonical_sha256"
@@ -4932,12 +4996,15 @@ class BrowserActionService:
                     }
                 )
             if replay_plan is not None:
-                first_observation = next(
-                    (item for item in network_observations if isinstance(item, dict)),
-                    {},
-                )
-                current_stream_facts = self._stream_summary_from_observation(
-                    first_observation
+                current_stream_facts, current_stream_status = (
+                    self._current_replay_stream_summary(
+                        [
+                            item
+                            for item in network_observations
+                            if isinstance(item, dict)
+                        ],
+                        replay_network_evidence_id,
+                    )
                 )
                 comparison_results = self._build_replay_comparison_results(
                     replay_plan,
@@ -4950,6 +5017,11 @@ class BrowserActionService:
                     current_response_content_type=replay_response_content_type,
                     current_stream_facts=current_stream_facts,
                     current_environment=pre_dispatch_environment,
+                    current_status_overrides=(
+                        {"stream_summary": current_stream_status}
+                        if current_stream_status
+                        else None
+                    ),
                 )
             capture_summary = (
                 final_status_payload.get("capture")
@@ -5260,6 +5332,9 @@ class BrowserActionService:
                         "kind": "replay_attempt",
                         "replay_attempt_id": replay_plan["replay_attempt_id"],
                         "replay_protocol_hash": replay_plan["replay_protocol_hash"],
+                        "requested_replay_protocol_hash": replay_plan[
+                            "requested_replay_protocol_hash"
+                        ],
                         "source_experiment_id": replay_plan["source_experiment_id"],
                         "source_evidence_id": replay_plan["source_evidence_id"],
                         "network_evidence_id": replay_network_evidence_id,
@@ -5344,6 +5419,11 @@ class BrowserActionService:
                     ),
                     "replay_protocol_hash": (
                         replay_plan["replay_protocol_hash"] if replay_plan is not None else None
+                    ),
+                    "requested_replay_protocol_hash": (
+                        replay_plan["requested_replay_protocol_hash"]
+                        if replay_plan is not None
+                        else None
                     ),
                     "pre_dispatch_environment": pre_dispatch_environment,
                     "post_response_environment": post_response_environment,

@@ -212,6 +212,20 @@ termination.conditions = exact_sse_data | text_pattern | network_close | idle_wi
 `max_events` 对 SSE 按完整 event、对 NDJSON 按 record、对 raw stream 按 accepted chunk
 计数；达到上限时记录 `terminationReason=max_events`。
 
+Manifest 同时保存请求与实际执行协议：
+
+```text
+replay.requested_replay_protocol
+replay.requested_replay_protocol_hash
+replay.replay_protocol
+replay.replay_protocol_hash
+```
+
+`replay_protocol` 和其 hash 表示应用默认值及 stream 自动升级后的有效配置，包括最终
+`capture`、`requirements` 和 network evidence selectors。显式 reader mode 只有在 runtime
+返回相同 `observed_response_mode` 时才满足 stream contract；`auto` 接受 runtime 的有效
+自动选择结果。
+
 Idle 不再是 reader 的无条件超时。只有显式声明
 `{"type":"idle_window","window_ms":...}` 时才启动该窗口，并记录
 `terminalConditionMatched=idle_window`。`text_pattern` 匹配 UTF-8 解码后的文本，不宣称
