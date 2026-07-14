@@ -74,53 +74,43 @@ Pandora 类协议复刻优先选择 `pandora-protocol-reproduction` Skill。Skil
 
 普通请求需要复刻或字段必要性分析时，在 capture_flow 中配置 `network_evidence`，至少为 replay source 导出 `all`。完成后先调用 `list_evidence`，再分页调用 `get_request_shape` 选择 JSON Pointer，例如 `/messages/0/id`；使用 `path_prefix/page_idx/page_size/max_depth/max_array_items` 控制范围，默认不要请求 redacted body。不要从隐藏的 credential artifact 或源码猜字段结构。然后使用 `get_network_evidence` 和 `get_request_initiator`。需要长期引用源码时调用 `save_script_source`，保存 URL/script ID、范围、SHA-256 和 initiator evidence 关联。
 
-字段分类必须成对执行。先运行`replay_mode=control`、`mutations=[]`。一次性ID、nonce、
-timestamp使用`value_source=generated + reuse_policy=fresh_equivalent`；需要保留现有
-conversation ID或parent node时使用`value_source=preserve_source + same_value`。
-`generated + same_value`只表示共用一个新生成值，不表示保留source值。Control必须
-成功，且wire snapshot必须观察到所有bindings。
+Replay 使用单一通用 payload。必须显式提供 `source.experiment_id` 和
+`source.evidence_id`；mutation 可以为零个、一个或多个。不要发送 `replay_mode`、
+`control_experiment_id` 或 pair protocol 字段。
 
-有状态请求在Control中声明`setup_flow`，Treatment会自动继承。顺序固定为setup →
-记录pre-dispatch环境 → fetch → verification。不要用verification_flow恢复发送前状态。
+动态输入分别声明 extractor 和 binding。一次性 ID、nonce、timestamp 使用
+`value_source=generated`；保留 source 值使用 `preserve_source`；setup/network 响应值
+使用 `value_source=extractor + extractor_id`；人工已知值使用 `literal` 或
+`manual_input`。Extractor 失败默认只形成 evidence，不要把它描述为执行失败；检查
+`replay.extractor_observations`、`unresolved_binding_ids` 和 `quality_summary`。
 
-Treatment payload只能包含 `replay_mode=treatment`、`control_experiment_id` 和一个 `mutation`；不要重传 session、source、target、capture、wait、verification、deadline或network selector。后端继承并校验 Control 的 `pair_protocol_hash`。只有以下全部满足时才能解释 Treatment：
+需要比较时显式设置 `comparison.references` 和 `comparison.dimensions`。可以比较零个、
+一个或多个历史实验；不配置 comparison 时不要生成或推断 comparability。比较结果只
+表示 `equivalent`、`different`、`missing` 或 `unknown`，不能自动解释为字段 required、
+optional 或因果成立。
 
-```text
-Control target baseline存在
-Treatment target delta正确
-volatile bindings在wire上有效
-规范化后的非目标字段等价
-mutation_effective=true
-pre-dispatch environment status = observed_equivalent
-replay request候选唯一
-```
+Environment comparison 默认 `preset=none`。只有任务确实需要时才选择 `minimal`、
+`browser_context` 或带 dimensions 的 `explicit`；环境不同或缺失只作为 comparison
+fact，不阻止 replay。Post-response 和 post-verification 环境是结果事实，不应伪装成
+pre-dispatch 基线。
 
-Cookie、Origin、Referer、Host、Content-Length 和 `Sec-*` 属于 browser-managed header，不能通过 browser-context header mutation测试。
+Cookie、Origin、Referer、Host、Content-Length 和 `Sec-*` 属于 browser-managed
+header，不能通过 browser-context header mutation测试。JSON Pointer和query参数名严格
+区分大小写；header名不区分大小写。同名重复header/query必须比较完整有序值列表和
+multiplicity，不能只看第一项。
 
-JSON Pointer和query参数名严格区分大小写；header名不区分大小写。同名重复header/query必须比较完整有序值列表和multiplicity，不能只看第一项。
+Response 读取使用 `response_reader`，终止使用 `termination`。Source response 为流时
+显式选择 auto/sse/ndjson/raw_stream，并按任务设置 raw_only、max_bytes、max_events、
+idle_timeout_ms 和 exact_sse_data/byte_pattern/network_close/idle_window。SSE parser 只在完整 event 的
+合并 data 精确匹配条件时结束；正文中的字面 marker 不应提前终止。
 
-Source response为`text/event-stream`时，后端默认要求raw、semantic和artifacts；仅在
-明确只分析raw时设置`raw_only=true`。Reader解析完整SSE event，只有data精确等于
-marker且可选event name匹配才结束。Parser支持LF、CRLF、CR、混合换行与EOF flush。
-恰好达到byte limit时要等下一次read判断EOF或overflow。检查`stream_response_contract`；idle timeout、
-byte limit、truncated、缺marker或semantic失败不能报告complete。
+可选 response analyzer 只提供带版本的分析提示，完整结果只在 `replay_attempt`
+evidence 中。HTTP status、redirect、mutation wire observation 和 binding application
+都是事实，不是 replay 合法性条件。不要把任意4xx、409或 analyzer classification直接
+写成字段必要性结论。
 
-不要把任意4xx解释为required。只有remove mutation得到HTTP 400/422，且exact response
-中的结构化field/path/loc精确指向目标并表达required/missing时才可支持required。
-Replace校验失败是`constrained_value`；409一律是`conflict`。Preview-only、weak text、
-401/403、429、5xx、通用4xx、任意redirect、缺失或错误Content-Type都必须
-partial/inconclusive。
-
-HTTP 300–399即使`redirected=false`也属于`redirect_or_cache_response`，不能证明optional。Validation path对JSON/query区分大小写，header不区分；错误code只接受明确白名单，`not_required`等未知code保持inconclusive。
-
-环境只用`pre_dispatch_environment`做因果比较；post-response和post-verification是
-结果。比较状态是observed_equivalent、different或insufficient。缺失current node、
-bundle、page或auth context时不能声称等价。后端只保存本机Cookie名值、Authorization、
-CSRF和组合请求上下文的SHA-256摘要；不做Cookie加密或密钥管理。
-
-只有request headers完整性已证明时auth context才是observed。仅有headers数组或空列表时必须unavailable。Cookie hash保留发送顺序；`ignored_cookie_names`和`ignored_context_headers`默认空，仅在用户明确知道某项无关轮换时使用。Post-response/post-verification不应携带旧request context。
-
-Replay stream objective只使用与exact replay ordinary evidence稳定关联的唯一stream；同URL的其他流是supporting evidence。
+Replay stream objective只使用与 exact replay ordinary evidence 稳定关联的唯一stream；
+同 URL 的其他流是 supporting evidence。
 
 相关实验使用同一个 analysis_series_id，并显式设置 scenario_type、predecessor_experiment_id、sequence_index 和已知的 conversation_key。不要用创建时间猜 predecessor。
 

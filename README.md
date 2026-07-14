@@ -129,98 +129,88 @@ step 类型、checkpoint、超时、失败或取消语义。
 
 GPT 不直接协调 start、click、wait、stop。
 
-一次 `replay_request` 同样由后端原子执行：
-
-```text
-验证 source_experiment_id + source_evidence_id
-→ Control 保存 immutable pair_protocol_hash 和 volatile binding policy
-→ 本地读取 exact network snapshot
-→ Treatment 只提交 control_experiment_id + 唯一 mutation
-→ generated+fresh_equivalent 重新生成一次性值
-→ preserve_source+same_value 复用真实 source 上下文
-→ 启动新 experiment 和 capture/checkpoint
-→ 执行 Control 定义且 Treatment 自动继承的 setup_flow
-→ 重新对齐并记录 pre_dispatch_environment
-→ 在当前页面上下文执行 fetch(credentials=include)
-→ 导出新 network/page/console evidence
-→ 唯一锁定 Control/Treatment exact outbound request
-→ 验证 Control baseline、target delta、volatile effectiveness
-→ 规范化后验证 non-target fields equivalent
-→ 保存 request diff 与 response artifact
-```
-
-response category 不再是 replay 的固定后端 verdict。默认只保存 HTTP status、
-Content-Type、response artifact、wire mutation assessment 和环境比较事实。需要旧式
-HTTP response 分类提示时，Control 显式声明：
+一次 `replay_request` 只接受一个通用 payload：
 
 ```json
 {
-  "response_analyzer": {
-    "name": "http_response_classifier",
-    "version": "1"
-  }
+  "session_id": "session_one",
+  "objective": "replay one observed request",
+  "source": {
+    "experiment_id": "exp_source",
+    "evidence_id": "ev_network"
+  },
+  "mutations": [],
+  "extractors": [],
+  "bindings": [],
+  "transport": {},
+  "response_reader": {"mode": "auto"},
+  "termination": {"conditions": [{"type": "network_close"}]},
+  "comparison": null
 }
 ```
 
-analyzer 配置会写入 immutable pair protocol 并由 Treatment 继承。完整输出只保存在
-对应 `replay_attempt` evidence 的 `response_analysis` 中；manifest 仅保存 evidence ID
-和 analyzer/classification 的有限摘要。它不会把实验自动改成 failed、partial 或
-“可推断”。
+核心 API 不再包含 Control、Exploratory 或 Treatment 类型，也不继承 pair protocol。
+`src/skill_temple/replay_presets.py` 提供同名客户端 preset，但三个 helper 最终都生成
+同一个 `ReplayRequestPayload`。调用方必须显式提交 source、setup、binding、mutation、
+reader、termination 和 comparison；后端只负责执行、观察和保存。
 
-公开 payload 不接受任意本地路径，也不返回 Cookie、Authorization 或 CSRF。JSON mutation 使用 RFC 6901 Pointer，例如 `/messages/0/content/parts/0`；不支持 wildcard。JSON Pointer 和 query 参数名严格区分大小写，header 名不区分大小写。Cookie、Origin、Referer、Host、Content-Length 和 `Sec-*` 等 browser-managed header mutation 会被拒绝。
-
-Control 必须 `mutations=[]`，并在 actual wire snapshot 中观察到所有 volatile bindings。HTTP status 是比较事实，不是 Treatment 的入口条件；Control 和 Treatment 的状态及是否变化记录在 `replay_comparison`。若实验需要限定 2xx，应由该实验显式声明，而不是作为全局规则。每个 binding 选择：
+一次 replay 的内部顺序是：
 
 ```text
-value_source=generated + fresh_equivalent
-  message/request ID、nonce、timestamp分别生成新值
-
-value_source=generated + same_value
-  Control/Treatment共用一个新生成值
-
-value_source=preserve_source + same_value
-  保留现有 conversation ID、parent node 或固定上下文
+验证 source experiment + evidence
+→ 读取 exact network snapshot
+→ 应用 generated / preserve_source / literal / manual_input binding
+→ 运行可选 setup_flow
+→ 独立运行 extractor 并记录每项 completed / failed
+→ 将成功 extractor 输出注入对应 binding
+→ 在当前 browser context 执行 fetch
+→ 保存 ordinary network、stream、artifact 和 wire observation
+→ 运行可选 verification_flow
+→ 按 comparison.references 和 comparison.dimensions 生成事实差异
 ```
 
-`same_value` 本身不表示保留 source 原值；需要原值时必须使用
-`preserve_source`。Binding 路径是 mutation祖先时会被拒绝，避免规范化先
-抹掉被测试字段。
+Extractor 失败默认只是 `replay_extractor` evidence，不阻止探索；只有显式
+`required=true` 时才进入 `quality_summary`。未解析 binding 保留在
+`replay.unresolved_binding_ids`，不会伪装成已注入。
 
-Treatment 的公开 payload 只能包含 `control_experiment_id` 和一个 `mutation`；target、capture、wait、verification、deadline、source 和 network selector全部从 Control 的 `pair_protocol_hash` 继承。Fresh 值不要求物理相同，而是在成对比较时规范化为同一逻辑 placeholder。若 Control 中没有 target、Treatment 没有产生预期 delta、volatile binding未上 wire、非目标字段不等价或 replay request候选不唯一，实验直接失败。
-
-有状态请求可以在 Control 中声明不可变 `setup_flow`。Treatment 自动继承并按固定顺序执行：
+Binding 支持：
 
 ```text
-start collector
-→ setup_flow
-→ 重新对齐页面并记录 pre_dispatch_environment
-→ replay fetch
-→ verification_flow
+value_source=generated
+value_source=preserve_source
+value_source=extractor + extractor_id
+value_source=literal + value
+value_source=manual_input + value
 ```
 
-`setup_flow` 用于 reload、重新打开同一 conversation、选中同一分支或创建隔离测试状态；`verification_flow` 只描述响应后的验证，不能拿来伪造发送前环境等价。
+JSON Pointer 和 query 参数名严格区分大小写，header 名不区分大小写。Cookie、Origin、
+Referer、Host、Content-Length 和 `Sec-*` 等 browser-managed header 仍不能通过 replay
+header mutation 覆盖。
 
-若 source response 是 `text/event-stream`，replay 默认要求 raw capture、
-semantic parse 和 stream artifacts；只有显式 `raw_only=true` 才跳过 semantic
-要求。Evaluate 使用增量 `ReadableStream` reader和小型 SSE parser，支持 LF、
-CRLF、CR、混合换行和 EOF 最终 event；只在完整 event的合并 `data` 精确等于 marker、且可选 event name匹配时终止。正文、JSON
-或工具参数中的字面量 `[DONE]` 不会提前结束。`idle_timeout`、字节上限截断、
-缺失 marker、semantic失败或Content-Type不符都会进入 partial/failed。
+`comparison` 完全可选，可以引用零个、一个或多个实验。未配置时不生成 comparison
+verdict。当前可选维度为 request body、response status、response headers、stream events
+和 environment；输出只使用 `equivalent`、`different`、`missing`、`unknown`，不生成
+字段必要性或因果资格结论。Environment 默认 `preset=none`，可显式选择 `minimal`、
+`browser_context` 或指定 dimensions 的 `explicit`。
 
-响应恰好等于 `max_response_bytes` 时会再读一次：下一次 EOF 才判完整，只有出现额外字节才标记 truncated。
-
-有效 Treatment 返回非流错误响应时，ordinary exact response 可以终结本轮实验而不误报 collector 故障，但只有以下情况能支持 required：
+Response 读取和终止策略是独立对象：
 
 ```text
-validation_rejection = remove mutation + HTTP 400 / 422
-且结构化 field_required 精确引用被测试目标
+response_reader.mode = auto | ordinary | sse | ndjson | raw_stream
+response_reader.max_bytes / max_events / idle_timeout_ms
+termination.conditions = exact_sse_data | byte_pattern | network_close | idle_window
 ```
 
-Replace返回 enum/type/format校验错误只说明 `constrained_value`，不说明字段
-required。HTTP 409统一是 `conflict`。自然语言字段名只算 weak text hint；required
-必须来自 exact network response body，或确认未截断且长度完全匹配的 bounded
-replay response body。Preview-only、认证失败、限流、5xx、通用4xx、redirect和
-response contract mismatch都必须 partial/inconclusive。
+`max_events` 对 SSE 按完整 event、对 NDJSON 按 record、对 raw stream 按 accepted chunk
+计数；达到上限时记录 `terminationReason=max_events`。
+
+SSE parser 仍支持 LF、CRLF、CR、混合换行和 EOF flush；只有完整 event 的合并 `data`
+精确匹配条件时才结束。字节预算、idle timeout、raw-only、analyzer 和 transport semantics
+均由请求显式配置。Analyzer 默认关闭；启用时完整结果只保存在 `replay_attempt`
+evidence，不影响执行合法性或 comparison。
+
+HTTP status、mutation 是否出现在 wire、binding 是否注入成功都作为 observation 保存。
+4xx/5xx 不会使 replay 请求本身非法，也不会自动证明 required、optional 或 conflict。
 
 Capture 阶段禁止 `target.start_url`。需要观察页面初始化请求、重定向、首屏脚本或初始 SSE 时，必须把导航写成 flow 的第一个显式 `navigate` step。这样 running manifest、Trace 和 stream collector 都会在导航前创建。
 

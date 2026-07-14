@@ -47,9 +47,7 @@ SESSION_ID = "browser-action-windows-smoke"
 
 
 def artifact_by_kind(manifest: dict[str, Any], *kinds: str) -> dict[str, Any]:
-    artifacts = [
-        item for item in manifest.get("artifacts", []) if isinstance(item, dict)
-    ]
+    artifacts = [item for item in manifest.get("artifacts", []) if isinstance(item, dict)]
     for kind in kinds:
         for item in artifacts:
             if item.get("kind") == kind:
@@ -310,9 +308,7 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
             if isinstance(item, dict) and item.get("matched_request_ids")
         ]
         if len(matched_ids) < 2 or len(set(matched_ids[-2:])) != 2:
-            raise AssertionError(
-                f"Sequential waits did not bind to two requests: {waits}"
-            )
+            raise AssertionError(f"Sequential waits did not bind to two requests: {waits}")
         raw = artifact_by_kind(manifest, "raw_bytes")
         events = artifact_by_kind(manifest, "events", "eventsource_events")
         headers = artifact_by_kind(
@@ -347,9 +343,7 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
         )
         if any(item.error for item in read.files):
             raise AssertionError(f"workspaceReadFiles errors: {read.model_dump()}")
-        events_text = next(
-            item.content for item in read.files if item.path == events_relative
-        )
+        events_text = next(item.content for item in read.files if item.path == events_relative)
         if "[DONE]" not in events_text:
             raise AssertionError("events artifact did not contain [DONE]")
         quoted_raw = raw_relative.replace("'", "''")
@@ -454,14 +448,9 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
         if stateful_capture.status != "completed":
             raise AssertionError(stateful_capture.model_dump())
         stateful_manifest_path = (
-            evidence_root
-            / "experiments"
-            / str(stateful_capture.experiment_id)
-            / "manifest.json"
+            evidence_root / "experiments" / str(stateful_capture.experiment_id) / "manifest.json"
         )
-        stateful_manifest = json.loads(
-            stateful_manifest_path.read_text(encoding="utf-8")
-        )
+        stateful_manifest = json.loads(stateful_manifest_path.read_text(encoding="utf-8"))
         source_evidence = next(
             item
             for item in stateful_manifest.get("evidence", [])
@@ -500,52 +489,65 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
             if expected_pointer not in shape_paths:
                 raise AssertionError(shape.model_dump())
 
+        replay_common = {
+            "session_id": SESSION_ID,
+            "source": {
+                "experiment_id": stateful_capture.experiment_id,
+                "evidence_id": source_evidence["evidence_id"],
+            },
+            "bindings": [
+                {
+                    "binding_id": "event_id",
+                    "target": "json_pointer",
+                    "path": "/events/0/id",
+                    "value_source": "generated",
+                    "generator": "uuid4",
+                }
+            ],
+            "setup_flow": [
+                {
+                    "step_id": "setup_reload_fixture",
+                    "action": "navigate",
+                    "value": fixture_url,
+                }
+            ],
+            "response_reader": {
+                "mode": "auto",
+                "analyzer": {
+                    "name": "http_response_classifier",
+                    "version": "1",
+                },
+            },
+            "termination": {
+                "conditions": [
+                    {"type": "exact_sse_data", "value": "[DONE]"}
+                ],
+            },
+            "execution_mode": "sync",
+            "deadline_ms": 30_000,
+            "capture": {
+                "network": True,
+                "stream": False,
+                "trace": False,
+                "screenshots": False,
+                "page_snapshots": True,
+                "console_errors": True,
+            },
+            "series": {
+                "analysis_series_id": "stateful-stream-fixture-series",
+                "scenario_type": "generic_replay",
+                "predecessor_experiment_id": stateful_capture.experiment_id,
+                "sequence_index": 2,
+                "conversation_key": "stateful-stream-fixture",
+            },
+        }
         control = await service.run(
             ReplayRequestRequest(
                 operation="replay_request",
                 payload={
-                    "session_id": SESSION_ID,
-                    "objective": "stateful stream control replay",
-                    "source_experiment_id": stateful_capture.experiment_id,
-                    "source_evidence_id": source_evidence["evidence_id"],
-                    "replay_mode": "control",
+                    **replay_common,
+                    "objective": "stateful stream baseline replay",
                     "mutations": [],
-                    "response_analyzer": {
-                        "name": "http_response_classifier",
-                        "version": "1",
-                    },
-                    "volatile_bindings": [
-                        {
-                            "binding_id": "event_id",
-                            "target": "json_pointer",
-                            "path": "/events/0/id",
-                            "generator": "uuid4",
-                        }
-                    ],
-                    "setup_flow": [
-                        {
-                            "step_id": "setup_reload_fixture",
-                            "action": "navigate",
-                            "value": fixture_url,
-                        }
-                    ],
-                    "execution_mode": "sync",
-                    "deadline_ms": 30_000,
-                    "capture": {
-                        "network": True,
-                        "stream": False,
-                        "trace": False,
-                        "screenshots": False,
-                        "page_snapshots": True,
-                        "console_errors": True,
-                    },
-                    "series": {
-                        "analysis_series_id": "stateful-stream-fixture-series",
-                        "scenario_type": "control_replay",
-                        "predecessor_experiment_id": stateful_capture.experiment_id,
-                        "sequence_index": 2,
-                        "conversation_key": "stateful-stream-fixture",
-                    },
                 },
             )
         )
@@ -553,10 +555,7 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
             raise AssertionError(control.model_dump())
         control_manifest = json.loads(
             (
-                evidence_root
-                / "experiments"
-                / str(control.experiment_id)
-                / "manifest.json"
+                evidence_root / "experiments" / str(control.experiment_id) / "manifest.json"
             ).read_text(encoding="utf-8")
         )
         if control_manifest.get("replay_http_status") != 200:
@@ -564,9 +563,7 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
         if not control_manifest.get("replay", {}).get("source_is_stream"):
             raise AssertionError(control_manifest)
         control_setup = (
-            control_manifest.get("replay", {})
-            .get("pair_protocol", {})
-            .get("setup_flow", [])
+            control_manifest.get("replay", {}).get("replay_protocol", {}).get("setup_flow", [])
         )
         if not control_setup or control_setup[0].get("step_id") != "setup_reload_fixture":
             raise AssertionError(control_manifest)
@@ -579,39 +576,38 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
             None,
         )
         if not control_stream:
-            raise AssertionError("Control replay produced no stream_request evidence")
+            raise AssertionError("Baseline replay produced no stream_request evidence")
         control_response_artifact = artifact_by_kind(
             control_manifest,
             "replay_response",
         )
         control_response_value = json.loads(
-            (evidence_root / relative_path(control_response_artifact)).read_text(
-                encoding="utf-8"
-            )
+            (evidence_root / relative_path(control_response_artifact)).read_text(encoding="utf-8")
         )
         if find_field(control_response_value, "doneMarkerObserved") is not True:
             raise AssertionError(control_response_value)
         if find_field(control_response_value, "terminationReason") != "done_marker":
             raise AssertionError(control_response_value)
         control_preview = str(find_field(control_response_value, "bodyPreview") or "")
-        if "literal [DONE] text" not in control_preview:
+        if "literal [DONE] text" not in control_preview or "stream_state" not in control_preview:
             raise AssertionError(control_response_value)
-        if "stream_state" not in control_preview:
-            raise AssertionError(
-                "Replay reader stopped at [DONE] text inside a normal SSE event"
-            )
 
         async def run_replay(
             *,
+            objective: str,
             mutation: dict[str, Any],
         ) -> tuple[dict[str, Any], int, dict[str, Any]]:
             replay = await service.run(
                 ReplayRequestRequest(
                     operation="replay_request",
                     payload={
-                        "replay_mode": "treatment",
-                        "control_experiment_id": control.experiment_id,
-                        "mutation": mutation,
+                        **replay_common,
+                        "objective": objective,
+                        "mutations": [mutation],
+                        "comparison": {
+                            "references": [control.experiment_id],
+                            "dimensions": ["request_body", "response_status"],
+                        },
                     },
                 )
             )
@@ -619,20 +615,12 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
                 raise AssertionError(replay.model_dump())
             replay_manifest = json.loads(
                 (
-                    evidence_root
-                    / "experiments"
-                    / str(replay.experiment_id)
-                    / "manifest.json"
+                    evidence_root / "experiments" / str(replay.experiment_id) / "manifest.json"
                 ).read_text(encoding="utf-8")
             )
-            response_artifact = artifact_by_kind(
-                replay_manifest,
-                "replay_response",
-            )
+            response_artifact = artifact_by_kind(replay_manifest, "replay_response")
             response_value = json.loads(
-                (evidence_root / relative_path(response_artifact)).read_text(
-                    encoding="utf-8"
-                )
+                (evidence_root / relative_path(response_artifact)).read_text(encoding="utf-8")
             )
             response_status = find_numeric_status(response_value)
             if response_status is None:
@@ -640,24 +628,18 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
             return replay_manifest, response_status, response_value
 
         tracking_manifest, tracking_status, tracking_response = await run_replay(
-            mutation={
-                "type": "remove_json_path",
-                "path": "/tracking_id",
-            },
+            objective="remove optional tracking field",
+            mutation={"type": "remove_json_path", "path": "/tracking_id"},
         )
         if tracking_status != 200:
             raise AssertionError(tracking_manifest)
         required_manifest, required_status, required_response = await run_replay(
-            mutation={
-                "type": "remove_json_path",
-                "path": "/events/0/id",
-            },
+            objective="remove required event id",
+            mutation={"type": "remove_json_path", "path": "/events/0/id"},
         )
         if required_status != 422:
             raise AssertionError(required_manifest)
         if find_field(tracking_response, "doneMarkerObserved") is not True:
-            raise AssertionError(tracking_response)
-        if find_field(tracking_response, "terminationReason") != "done_marker":
             raise AssertionError(tracking_response)
         if find_field(required_response, "terminationReason") not in {
             "network_close",
@@ -670,22 +652,18 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
                 for item in replay_manifest.get("evidence", [])
                 if item.get("kind") == "replay_attempt"
             )
-            if replay_attempt.get("source_evidence_id") != source_evidence.get(
-                "evidence_id"
-            ):
-                raise AssertionError(replay_attempt)
-            if replay_attempt.get("control_experiment_id") != control.experiment_id:
+            if replay_attempt.get("source_evidence_id") != source_evidence.get("evidence_id"):
                 raise AssertionError(replay_attempt)
             mutation_assessment = replay_manifest.get("mutation_assessment") or {}
-            if mutation_assessment.get("mutation_effective") is not True:
+            mutation_results = mutation_assessment.get("mutations") or []
+            if not mutation_results or mutation_results[0].get("mutation_effective") is not True:
                 raise AssertionError(mutation_assessment)
-            if mutation_assessment.get("non_target_fields_equivalent") is not True:
-                raise AssertionError(mutation_assessment)
-            environment = replay_manifest.get("pair_environment_comparison") or {}
-            if environment.get("status") != "insufficient":
-                raise AssertionError(environment)
-            if environment.get("observed_dimensions_equivalent") is not True:
-                raise AssertionError(environment)
+            comparison_results = replay_manifest.get("comparison_results") or []
+            if (
+                not comparison_results
+                or comparison_results[0].get("reference_experiment_id") != control.experiment_id
+            ):
+                raise AssertionError(comparison_results)
             setup_steps = [
                 step
                 for step in replay_manifest.get("steps", [])
@@ -693,13 +671,8 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
             ]
             if len(setup_steps) != 1 or setup_steps[0].get("status") != "completed":
                 raise AssertionError(replay_manifest)
-            diff_artifact = artifact_by_kind(
-                replay_manifest,
-                "replay_request_diff",
-            )
-            diff_text = (
-                evidence_root / relative_path(diff_artifact)
-            ).read_text(encoding="utf-8")
+            diff_artifact = artifact_by_kind(replay_manifest, "replay_request_diff")
+            diff_text = (evidence_root / relative_path(diff_artifact)).read_text(encoding="utf-8")
             if "fixture-token" in diff_text or "fixture-session" in diff_text:
                 raise AssertionError("Replay diff leaked fixture credentials")
         tracking_stream = next(
@@ -711,10 +684,11 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
             None,
         )
         if not tracking_stream:
-            raise AssertionError("Tracking treatment produced no stream evidence")
+            raise AssertionError("Tracking replay produced no stream evidence")
         required_analysis = replay_response_analysis(required_manifest)
         if required_analysis.get("classification") != "validation_rejection":
             raise AssertionError(required_manifest)
+
         control_spec = json.loads(
             (
                 evidence_root
@@ -724,6 +698,7 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
                 / "request-spec.json"
             ).read_text(encoding="utf-8")
         )
+        control_event_id = json.loads(control_spec["body"]["text"])["events"][0]["id"]
         tracking_spec = json.loads(
             (
                 evidence_root
@@ -733,84 +708,45 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
                 / "request-spec.json"
             ).read_text(encoding="utf-8")
         )
-        control_event_id = json.loads(control_spec["body"]["text"])["events"][0]["id"]
         tracking_event_id = json.loads(tracking_spec["body"]["text"])["events"][0]["id"]
-        if control_event_id == tracking_event_id:
-            raise AssertionError("fresh_equivalent event IDs were reused")
-
-        same_value_control = await service.run(
+        duplicate_replay = await service.run(
             ReplayRequestRequest(
                 operation="replay_request",
                 payload={
-                    "session_id": SESSION_ID,
-                    "objective": "prove duplicate event IDs invalidate a pair",
-                    "source_experiment_id": stateful_capture.experiment_id,
-                    "source_evidence_id": source_evidence["evidence_id"],
-                    "replay_mode": "control",
-                    "mutations": [],
-                    "response_analyzer": {
-                        "name": "http_response_classifier",
-                        "version": "1",
-                    },
-                    "volatile_bindings": [
+                    **replay_common,
+                    "objective": "reuse an observed event id explicitly",
+                    "bindings": [
                         {
                             "binding_id": "event_id",
                             "target": "json_pointer",
                             "path": "/events/0/id",
-                            "generator": "uuid4",
-                            "reuse_policy": "same_value",
+                            "value_source": "literal",
+                            "value": control_event_id,
                         }
                     ],
-                    "execution_mode": "sync",
-                    "deadline_ms": 30_000,
-                    "capture": {
-                        "network": True,
-                        "stream": False,
-                        "trace": False,
-                        "screenshots": False,
-                        "page_snapshots": False,
-                        "console_errors": False,
+                    "mutations": [{"type": "remove_json_path", "path": "/tracking_id"}],
+                    "comparison": {
+                        "references": [control.experiment_id],
+                        "dimensions": ["request_body", "response_status"],
                     },
                 },
             )
         )
-        if same_value_control.status != "completed":
-            raise AssertionError(same_value_control.model_dump())
-        same_value_treatment = await service.run(
-            ReplayRequestRequest(
-                operation="replay_request",
-                payload={
-                    "replay_mode": "treatment",
-                    "control_experiment_id": same_value_control.experiment_id,
-                    "mutation": {
-                        "type": "remove_json_path",
-                        "path": "/tracking_id",
-                    },
-                },
-            )
-        )
-        if same_value_treatment.status != "completed":
-            raise AssertionError(same_value_treatment.model_dump())
-        same_value_manifest = json.loads(
+        if duplicate_replay.status != "completed":
+            raise AssertionError(duplicate_replay.model_dump())
+        duplicate_manifest = json.loads(
             (
                 evidence_root
                 / "experiments"
-                / str(same_value_treatment.experiment_id)
+                / str(duplicate_replay.experiment_id)
                 / "manifest.json"
             ).read_text(encoding="utf-8")
         )
-        if same_value_manifest.get("replay_http_status") != 409:
-            raise AssertionError(same_value_manifest)
-        same_value_analysis = replay_response_analysis(same_value_manifest)
-        if same_value_analysis.get("classification") != "conflict":
-            raise AssertionError(same_value_manifest)
-        if (
-            same_value_manifest.get("mutation_assessment", {}).get(
-                "mutation_effective"
-            )
-            is not True
-        ):
-            raise AssertionError(same_value_manifest)
+        if duplicate_manifest.get("replay_http_status") != 409:
+            raise AssertionError(duplicate_manifest)
+        duplicate_analysis = replay_response_analysis(duplicate_manifest)
+        if duplicate_analysis.get("classification") != "conflict":
+            raise AssertionError(duplicate_manifest)
 
         cancellation_started = await service.run(
             CaptureFlowRequest(
@@ -874,9 +810,7 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
             / str(cancellation_started.experiment_id)
             / "manifest.json"
         )
-        cancellation_manifest = json.loads(
-            cancellation_manifest_path.read_text(encoding="utf-8")
-        )
+        cancellation_manifest = json.loads(cancellation_manifest_path.read_text(encoding="utf-8"))
         if cancellation_manifest.get("status") != "interrupted":
             raise AssertionError(cancellation_manifest)
         cancellation_steps = cancellation_manifest.get("steps") or []
@@ -938,53 +872,43 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
             "sequential_request_ids": matched_ids[-2:],
             "stateful_source_experiment_id": stateful_capture.experiment_id,
             "stateful_source_evidence_id": source_evidence["evidence_id"],
-            "stateful_control_experiment_id": control.experiment_id,
-            "stateful_control_status": control_manifest.get("replay_http_status"),
-            "stateful_control_done_marker_observed": find_field(
+            "stateful_baseline_experiment_id": control.experiment_id,
+            "stateful_baseline_status": control_manifest.get("replay_http_status"),
+            "stateful_baseline_done_marker_observed": find_field(
                 control_response_value,
                 "doneMarkerObserved",
             ),
-            "stateful_control_termination_reason": find_field(
+            "stateful_baseline_termination_reason": find_field(
                 control_response_value,
                 "terminationReason",
             ),
-            "stateful_setup_flow_inherited": True,
+            "stateful_setup_flow_explicit_per_replay": True,
             "stateful_tracking_replay_status": tracking_status,
-            "stateful_tracking_mutation_effective": tracking_manifest.get(
-                "mutation_assessment", {}
-            ).get("mutation_effective"),
-            "stateful_tracking_non_target_equivalent": tracking_manifest.get(
-                "mutation_assessment", {}
-            ).get("non_target_fields_equivalent"),
-            "stateful_tracking_environment_status": tracking_manifest.get(
-                "pair_environment_comparison", {}
-            ).get("status"),
-            "stateful_tracking_observed_environment_equivalent": tracking_manifest.get(
-                "pair_environment_comparison", {}
-            ).get("observed_dimensions_equivalent"),
+            "stateful_tracking_mutation_effective": (
+                tracking_manifest.get("mutation_assessment", {})
+                .get("mutations", [{}])[0]
+                .get("mutation_effective")
+            ),
+            "stateful_tracking_comparison_status": (
+                tracking_manifest.get("comparison_results", [{}])[0].get("status")
+            ),
             "stateful_tracking_done_marker_observed": find_field(
                 tracking_response,
                 "doneMarkerObserved",
             ),
             "stateful_fresh_event_ids_differ": control_event_id != tracking_event_id,
             "stateful_required_replay_status": required_status,
-            "stateful_required_mutation_effective": required_manifest.get(
-                "mutation_assessment", {}
-            ).get("mutation_effective"),
-            "stateful_required_response_analysis": required_analysis.get(
-                "classification"
+            "stateful_required_mutation_effective": (
+                required_manifest.get("mutation_assessment", {})
+                .get("mutations", [{}])[0]
+                .get("mutation_effective")
             ),
-            "stateful_same_value_duplicate_status": same_value_manifest.get(
-                "replay_http_status"
-            ),
-            "stateful_same_value_duplicate_analysis": same_value_analysis.get(
-                "classification"
-            ),
+            "stateful_required_response_analysis": required_analysis.get("classification"),
+            "stateful_explicit_duplicate_status": duplicate_manifest.get("replay_http_status"),
+            "stateful_explicit_duplicate_analysis": duplicate_analysis.get("classification"),
             "cancellation_status": cancellation_manifest.get("status"),
             "cancellation_step_status": cancellation_steps[0].get("status"),
-            "cancellation_collector_cleanup": cancellation_health.get(
-                "collector_cleanup"
-            ),
+            "cancellation_collector_cleanup": cancellation_health.get("collector_cleanup"),
             "residual_processes": [],
         }
     finally:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import unittest
 
-from pydantic import TypeAdapter, ValidationError
+from pydantic import ValidationError
 
 from skill_temple.browser_models import (
     AddHeaderMutation,
@@ -14,15 +14,13 @@ from skill_temple.browser_models import (
     RemoveQueryParameterMutation,
     ReplaceHeaderMutation,
     ReplaceJsonPathMutation,
-    ReplaceQueryParameterMutation,
+    ReplayBinding,
     ReplayRequestPayload,
     RequestMatcher,
-    VolatileBinding,
 )
 from skill_temple.protocol_evidence import (
     aggregate_observation_completeness,
     analyze_replay_response,
-    assess_paired_mutation_effectiveness,
     binding_value_from_snapshot,
     build_network_observation,
     build_replay_spec,
@@ -32,7 +30,6 @@ from skill_temple.protocol_evidence import (
     redacted_request_body_from_snapshot,
     request_shape_from_snapshot,
     requests_after_checkpoint,
-    validate_binding_mutation_compatibility,
 )
 
 
@@ -279,159 +276,107 @@ class ProtocolEvidenceTests(unittest.TestCase):
             ):
                 RemoveHeaderMutation(type="remove_header", name=name)
 
-    def test_paired_mutation_effectiveness_requires_control_delta_and_equivalence(
-        self,
-    ) -> None:
-        mutation = RemoveJsonPathMutation(
-            type="remove_json_path",
-            path="/messages/0/id",
-        )
-        binding = VolatileBinding(
-            binding_id="parent",
-            target="json_pointer",
-            path="/parent_message_id",
-            generator="uuid4",
-            reuse_policy="fresh_equivalent",
-        )
-        control_spec, _ = build_replay_spec(
-            self.snapshot(),
-            [],
-            volatile_bindings=[binding],
-            binding_values={"parent": "control-parent"},
-        )
-        treatment_spec, _ = build_replay_spec(
-            self.snapshot(),
-            [mutation],
-            volatile_bindings=[binding],
-            binding_values={"parent": "treatment-parent"},
-        )
-        control_wire = self.snapshot()
-        treatment_wire = self.snapshot()
-        control_wire["requestBody"] = control_spec["body"]
-        treatment_wire["requestBody"] = treatment_spec["body"]
-
-        effective = assess_paired_mutation_effectiveness(
-            mutation,
-            control_wire,
-            treatment_wire,
-            volatile_bindings=[binding],
-            control_binding_values={"parent": "control-parent"},
-            treatment_binding_values={"parent": "treatment-parent"},
-        )
-        self.assertTrue(effective["target_delta_observed"])
-        self.assertTrue(effective["non_target_fields_equivalent"])
-        self.assertTrue(effective["volatile_bindings_effective"])
-        self.assertTrue(effective["mutation_effective"])
-        self.assertEqual(effective["control_wire_value"], "<identifier>")
-        self.assertEqual(effective["treatment_wire_value"], "<absent>")
-
-        unchanged = assess_paired_mutation_effectiveness(
-            mutation,
-            control_wire,
-            control_wire,
-            volatile_bindings=[binding],
-            control_binding_values={"parent": "control-parent"},
-            treatment_binding_values={"parent": "control-parent"},
-        )
-        self.assertFalse(unchanged["target_delta_observed"])
-        self.assertFalse(unchanged["mutation_effective"])
-
-        changed_body = json.loads(treatment_spec["body"]["text"])
-        changed_body["model"] = "other-model"
-        treatment_wire["requestBody"] = {
-            **treatment_spec["body"],
-            "text": json.dumps(changed_body),
-        }
-        non_target_change = assess_paired_mutation_effectiveness(
-            mutation,
-            control_wire,
-            treatment_wire,
-            volatile_bindings=[binding],
-            control_binding_values={"parent": "control-parent"},
-            treatment_binding_values={"parent": "treatment-parent"},
-        )
-        self.assertFalse(non_target_change["non_target_fields_equivalent"])
-        self.assertFalse(non_target_change["mutation_effective"])
-
-        target_binding = VolatileBinding(
-            binding_id="message_id",
-            target="json_pointer",
-            path="/messages/0/id",
-            generator="uuid4",
-            reuse_policy="fresh_equivalent",
-        )
-        control_target_spec, _ = build_replay_spec(
-            self.snapshot(),
-            [],
-            volatile_bindings=[target_binding],
-            binding_values={"message_id": "control-id"},
-        )
-        treatment_target_spec, _ = build_replay_spec(
-            self.snapshot(),
-            [mutation],
-            volatile_bindings=[target_binding],
-            binding_values={"message_id": "treatment-id"},
-        )
-        control_target_wire = self.snapshot()
-        treatment_target_wire = self.snapshot()
-        control_target_wire["requestBody"] = control_target_spec["body"]
-        treatment_target_wire["requestBody"] = treatment_target_spec["body"]
-        target_binding_result = assess_paired_mutation_effectiveness(
-            mutation,
-            control_target_wire,
-            treatment_target_wire,
-            volatile_bindings=[target_binding],
-            control_binding_values={"message_id": "control-id"},
-            treatment_binding_values={"message_id": "treatment-id"},
-        )
-        self.assertTrue(target_binding_result["volatile_bindings_effective"])
-        self.assertTrue(target_binding_result["mutation_effective"])
-
-    def test_replay_mode_enforces_control_and_single_treatment_mutation(self) -> None:
+    def test_generic_replay_payload_rejects_legacy_modes_and_validates_inputs(self) -> None:
         base = {
             "session_id": "session_one",
-            "objective": "paired replay",
-            "source_experiment_id": "exp_source",
-            "source_evidence_id": "ev_source",
+            "objective": "generic replay",
+            "source": {
+                "experiment_id": "exp_source",
+                "evidence_id": "ev_source",
+            },
         }
-        adapter = TypeAdapter(ReplayRequestPayload)
-        control = adapter.validate_python({**base, "replay_mode": "control", "mutations": []})
-        self.assertEqual(control.replay_mode, "control")
-
-        with self.assertRaises(ValidationError):
-            adapter.validate_python(
-                {
-                    **base,
-                    "replay_mode": "control",
-                    "mutations": [
-                        {
-                            "type": "remove_json_path",
-                            "path": "/tracking_id",
-                        }
-                    ],
-                }
-            )
-        treatment = adapter.validate_python(
+        payload = ReplayRequestPayload.model_validate(
             {
-                "replay_mode": "treatment",
-                "control_experiment_id": "exp_control",
-                "mutation": {
-                    "type": "remove_json_path",
-                    "path": "/tracking_id",
+                **base,
+                "mutations": [
+                    {"type": "remove_json_path", "path": "/tracking_id"},
+                    {
+                        "type": "add_json_path",
+                        "path": "/feature",
+                        "value": True,
+                    },
+                ],
+                "extractors": [
+                    {
+                        "extractor_id": "created_id",
+                        "type": "network_response_json",
+                        "selector": {"url_contains": "/create", "method": "POST"},
+                        "pointer": "/id",
+                    }
+                ],
+                "bindings": [
+                    {
+                        "binding_id": "created_id",
+                        "target": "json_pointer",
+                        "path": "/parent_id",
+                        "value_source": "extractor",
+                        "extractor_id": "created_id",
+                    },
+                    {
+                        "binding_id": "manual",
+                        "target": "header",
+                        "name": "X-Manual",
+                        "value_source": "manual_input",
+                        "value": "value",
+                    },
+                ],
+                "comparison": {
+                    "references": ["exp_reference", "exp_other"],
+                    "dimensions": ["response_status", "environment"],
+                    "environment": {
+                        "preset": "explicit",
+                        "dimensions": ["page_origin"],
+                    },
                 },
             }
         )
-        self.assertEqual(treatment.control_experiment_id, "exp_control")
+        self.assertEqual(len(payload.mutations), 2)
+        self.assertEqual(payload.comparison.references, ["exp_reference", "exp_other"])
+        self.assertEqual(payload.comparison.environment.dimensions, ["page_origin"])
+
         with self.assertRaises(ValidationError):
-            adapter.validate_python(
+            ReplayRequestPayload.model_validate(
                 {
-                    "replay_mode": "treatment",
-                    "control_experiment_id": "exp_control",
-                    "mutation": {
-                        "type": "remove_json_path",
-                        "path": "/tracking_id",
+                    **base,
+                    "comparison": {
+                        "references": ["exp_reference"],
+                        "dimensions": ["environment"],
                     },
-                    "capture": {"stream": False},
+                }
+            )
+        with self.assertRaises(ValidationError):
+            ReplayRequestPayload.model_validate(
+                {
+                    **base,
+                    "termination": {
+                        "conditions": [
+                            {"type": "exact_sse_data", "value": "done-a"},
+                            {"type": "exact_sse_data", "value": "done-b"},
+                        ]
+                    },
+                }
+            )
+
+        with self.assertRaises(ValidationError):
+            ReplayRequestPayload.model_validate(
+                {
+                    **base,
+                    "replay_mode": "control",
+                }
+            )
+        with self.assertRaises(ValidationError):
+            ReplayRequestPayload.model_validate(
+                {
+                    **base,
+                    "bindings": [
+                        {
+                            "binding_id": "missing",
+                            "target": "header",
+                            "name": "X-Missing",
+                            "value_source": "extractor",
+                            "extractor_id": "not_declared",
+                        }
+                    ],
                 }
             )
 
@@ -627,56 +572,6 @@ class ProtocolEvidenceTests(unittest.TestCase):
         for path in ["/valid", "/grid", "/hybrid", "/solid"]:
             self.assertEqual(shape["paths"][path]["value"], "<string>")
 
-    def test_duplicate_header_and_query_values_use_ordered_multiplicity(self) -> None:
-        control = self.snapshot()
-        treatment = self.snapshot()
-        control["requestHeadersArray"].extend(
-            [
-                {"name": "X-Debug", "value": "one"},
-                {"name": "x-debug", "value": "two"},
-            ]
-        )
-        treatment["requestHeadersArray"] = [
-            item for item in treatment["requestHeadersArray"] if item["name"].lower() != "x-debug"
-        ] + [{"name": "X-Debug", "value": "replacement"}]
-        header_result = assess_paired_mutation_effectiveness(
-            ReplaceHeaderMutation(
-                type="replace_header",
-                name="X-Debug",
-                value="replacement",
-            ),
-            control,
-            treatment,
-            volatile_bindings=[],
-            control_binding_values={},
-            treatment_binding_values={},
-        )
-
-        query_control = self.snapshot()
-        query_treatment = self.snapshot()
-        query_control["url"] = "https://example.test/path?k=one&k=two&keep=yes"
-        query_treatment["url"] = "https://example.test/path?keep=yes&k=replacement"
-        query_result = assess_paired_mutation_effectiveness(
-            ReplaceQueryParameterMutation(
-                type="replace_query_parameter",
-                name="k",
-                value="replacement",
-            ),
-            query_control,
-            query_treatment,
-            volatile_bindings=[],
-            control_binding_values={},
-            treatment_binding_values={},
-        )
-
-        self.assertEqual(header_result["control_value_count"], 2)
-        self.assertEqual(header_result["treatment_value_count"], 1)
-        self.assertTrue(header_result["multiplicity_changed"])
-        self.assertTrue(header_result["target_delta_observed"])
-        self.assertEqual(query_result["control_wire_value"], ["<string>", "<string>"])
-        self.assertEqual(query_result["treatment_value_count"], 1)
-        self.assertTrue(query_result["target_delta_observed"])
-
     def test_http_304_is_inconclusive_not_success(self) -> None:
         result = analyze_replay_response(
             status=304,
@@ -688,76 +583,42 @@ class ProtocolEvidenceTests(unittest.TestCase):
 
         self.assertEqual(result["classification"], "redirect_or_cache_response")
 
-    def test_non_json_body_is_part_of_non_target_equivalence(self) -> None:
-        mutation = RemoveHeaderMutation(type="remove_header", name="X-Tracking")
-        control = self.snapshot()
-        treatment = self.snapshot()
-        control["requestBody"] = {
-            "available": True,
-            "size": 5,
-            "encoding": "utf8",
-            "text": "alpha",
-        }
-        treatment["requestBody"] = {
-            "available": True,
-            "size": 4,
-            "encoding": "utf8",
-            "text": "beta",
-        }
-        treatment["requestHeadersArray"] = [
-            item
-            for item in treatment["requestHeadersArray"]
-            if item["name"].lower() != "x-tracking"
-        ]
-        assessment = assess_paired_mutation_effectiveness(
-            mutation,
-            control,
-            treatment,
-            volatile_bindings=[],
-            control_binding_values={},
-            treatment_binding_values={},
-        )
-
-        self.assertTrue(assessment["target_delta_observed"])
-        self.assertFalse(assessment["non_target_fields_equivalent"])
-        self.assertFalse(assessment["mutation_effective"])
-
-    def test_preserve_source_binding_and_pointer_overlap_rules(self) -> None:
-        preserve = VolatileBinding(
+    def test_preserve_source_binding_and_mutation_order(self) -> None:
+        preserve = ReplayBinding(
             binding_id="parent",
             target="json_pointer",
             path="/parent_message_id",
             value_source="preserve_source",
-            reuse_policy="same_value",
         )
         self.assertEqual(
             binding_value_from_snapshot(self.snapshot(), preserve),
             "parent-secret-id",
         )
-        ancestor = VolatileBinding(
+        ancestor = ReplayBinding(
             binding_id="message",
             target="json_pointer",
             path="/messages/0",
-            generator="uuid4",
+            value_source="literal",
+            value={
+                "id": "bound-message-id",
+                "author": {"role": "user"},
+                "content": {"parts": ["bound text"]},
+            },
         )
-        with self.assertRaisesRegex(ValueError, "contains the mutation target"):
-            validate_binding_mutation_compatibility(
-                [ancestor],
+        spec, _ = build_replay_spec(
+            self.snapshot(),
+            [
                 RemoveJsonPathMutation(
                     type="remove_json_path",
                     path="/messages/0/id",
-                ),
-            )
-        descendant = VolatileBinding(
-            binding_id="message_id",
-            target="json_pointer",
-            path="/messages/0/id",
-            generator="uuid4",
+                )
+            ],
+            bindings=[ancestor],
+            binding_values={"message": ancestor.value},
         )
-        validate_binding_mutation_compatibility(
-            [descendant],
-            RemoveJsonPathMutation(type="remove_json_path", path="/messages/0"),
-        )
+        body = json.loads(spec["body"]["text"])
+        self.assertNotIn("id", body["messages"][0])
+        self.assertEqual(body["messages"][0]["content"]["parts"], ["bound text"])
 
     def test_network_matcher_uses_stable_reqid_url_method_and_resource_type(self) -> None:
         request = {
@@ -841,40 +702,6 @@ class ProtocolEvidenceTests(unittest.TestCase):
         )
         self.assertEqual(json.loads(spec["body"]["text"])["new_field"], "new")
 
-    def test_wire_order_changes_require_explicit_normalization(self) -> None:
-        control = self.snapshot()
-        treatment = json.loads(json.dumps(control))
-        treatment_body = json.loads(treatment["requestBody"]["text"])
-        treatment_body.pop("tracking_id")
-        treatment["requestBody"]["text"] = json.dumps(treatment_body)
-        treatment["requestHeadersArray"] = list(reversed(treatment["requestHeadersArray"]))
-        treatment["url"] = "https://example.test/conversation?keep=yes&tracking=abc"
-        mutation = RemoveJsonPathMutation(
-            type="remove_json_path",
-            path="/tracking_id",
-        )
-
-        strict = assess_paired_mutation_effectiveness(
-            mutation,
-            control,
-            treatment,
-            volatile_bindings=[],
-            control_binding_values={},
-            treatment_binding_values={},
-        )
-        normalized = assess_paired_mutation_effectiveness(
-            mutation,
-            control,
-            treatment,
-            volatile_bindings=[],
-            control_binding_values={},
-            treatment_binding_values={},
-            normalize_wire_order=True,
-        )
-
-        self.assertFalse(strict["non_target_fields_equivalent"])
-        self.assertTrue(normalized["non_target_fields_equivalent"])
-
     def test_exact_body_pointer_and_conflicting_validation_signals(self) -> None:
         mutation = RemoveJsonPathMutation(
             type="remove_json_path",
@@ -914,13 +741,12 @@ class ProtocolEvidenceTests(unittest.TestCase):
                 {"name": "X-Token", "value": "second"},
             ]
         )
-        binding = VolatileBinding(
+        binding = ReplayBinding(
             binding_id="second_token",
             target="header",
             name="X-Token",
             occurrence=1,
             value_source="preserve_source",
-            reuse_policy="same_value",
         )
 
         self.assertEqual(binding_value_from_snapshot(snapshot, binding), "second")
