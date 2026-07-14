@@ -274,7 +274,10 @@ def collect_facts(
                     "observation_id": observation.get("observation_id"),
                     "url": observation_facts.get("url"),
                     "method": observation_facts.get("method"),
-                    "status": observation_facts.get("status"),
+                    "http_status": observation_facts.get("http_status"),
+                    "request_lifecycle_status": observation_facts.get(
+                        "request_lifecycle_status"
+                    ),
                     "association": observation.get("association"),
                     "completeness": observation.get("completeness"),
                     "missing_evidence": observation.get("missing_evidence"),

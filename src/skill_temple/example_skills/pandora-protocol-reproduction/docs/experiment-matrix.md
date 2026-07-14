@@ -1,5 +1,9 @@
 # Experiment matrix
 
+This is an optional specialized matrix. Use it only after the generic
+`current-site-analysis` inventory has confirmed the corresponding conversational
+tree, regenerate, edit, stop, and reload behaviors.
+
 ## Series fields
 
 Use one `analysis_series_id` for the complete investigation. Set `predecessor_experiment_id` explicitly and increase `sequence_index` monotonically.
@@ -32,19 +36,26 @@ Use `export_parts=["all"]` for requests that may become replay sources. Use boun
 
 ## Field mutation matrix
 
-Create one Control replay followed by one Treatment replay per row. Treatment submits only `control_experiment_id` and exactly one `mutation`; all other execution settings are inherited from the Control pair protocol.
+Create one explicit zero-mutation baseline replay and one explicit target-mutation
+replay per row. Both requests use the generic replay payload and repeat their
+source, setup, bindings, reader, termination, capture, and deadline settings.
+Nothing is inherited by the backend.
 
-Declare volatile bindings on the Control:
+Declare bindings on each replay:
 
-| Value class | value_source | reuse_policy | Reason |
-|---|---|---|---|
-| message/request ID, nonce, timestamp | `generated` | `fresh_equivalent` | Avoid duplicate or expired values |
-| newly generated shared value | `generated` | `same_value` | Share one fresh pair value |
-| existing conversation ID or parent | `preserve_source` | `same_value` | Preserve real source context |
+| Value class | value_source | Reason |
+|---|---|---|
+| message/request ID, nonce, timestamp | `generated` | Avoid duplicate or expired values |
+| existing conversation ID or parent | `preserve_source` | Preserve real source context |
+| setup/network response value | `extractor` | Bind an explicitly observed dynamic value |
+| fixed experiment input | `literal` or `manual_input` | Make caller-provided input explicit |
 
-`fresh_equivalent` values differ physically but are normalized before non-target request comparison.
+Generated values are fresh for each replay. The backend does not normalize two
+replays into a hidden pair. Compare only explicitly selected facts and preserve
+unavailable facts as missing.
 
-For stateful rows, define one Control `setup_flow`; Treatment inherits it. Setup must restore the same branch/conversation before pre-dispatch evidence is recorded.
+For stateful rows, repeat `setup_flow` on every replay that needs the precondition.
+Setup must restore the intended branch or conversation before dispatch.
 
 Use JSON Pointer rather than dotted JSONPath:
 
@@ -73,13 +84,12 @@ The Skill and analyst may classify each result as `required`, `conditionally_req
 Before classification require:
 
 ```text
-pair_protocol_hash equal
-Control target baseline present
-target_delta_observed true
-non_target_fields_equivalent true
-volatile_bindings_effective true
-mutation_effective true
-pair_environment_comparison status = observed_equivalent
+exact source experiment_id + evidence_id selected
+baseline comparison reference includes evidence_id or observation_id
+requested target mutation observed on the outbound wire request
+resolved bindings observed on the outbound wire request
+requested comparison dimensions are equivalent, different, missing, or ambiguous
+persistent state verification supports the claimed behavior
 ```
 
 Only `remove + HTTP 400/422 + structured field_required at the exact target`

@@ -427,7 +427,7 @@ class ReplaceJsonPathMutation(StrictModel):
 class RemoveHeaderMutation(StrictModel):
     type: Literal["remove_header"]
     name: str = Field(min_length=1, max_length=256)
-    occurrence: int | Literal["all"] = Field(default="all")
+    occurrence: Annotated[int, Field(ge=0, le=255)] | Literal["all"] = "all"
 
     @model_validator(mode="after")
     def validate_header(self) -> RemoveHeaderMutation:
@@ -439,7 +439,7 @@ class ReplaceHeaderMutation(StrictModel):
     type: Literal["replace_header"]
     name: str = Field(min_length=1, max_length=256)
     value: str = Field(max_length=32_000)
-    occurrence: int | Literal["all"] = Field(default="all")
+    occurrence: Annotated[int, Field(ge=0, le=255)] | Literal["all"] = "all"
 
     @model_validator(mode="after")
     def validate_header(self) -> ReplaceHeaderMutation:
@@ -451,7 +451,7 @@ class AddHeaderMutation(StrictModel):
     type: Literal["add_header"]
     name: str = Field(min_length=1, max_length=256)
     value: str = Field(max_length=32_000)
-    occurrence: int | Literal["append"] = Field(default="append")
+    occurrence: Literal["append"] = "append"
 
     @model_validator(mode="after")
     def validate_header(self) -> AddHeaderMutation:
@@ -462,21 +462,21 @@ class AddHeaderMutation(StrictModel):
 class RemoveQueryParameterMutation(StrictModel):
     type: Literal["remove_query_parameter"]
     name: str = Field(min_length=1, max_length=512)
-    occurrence: int | Literal["all"] = Field(default="all")
+    occurrence: Annotated[int, Field(ge=0, le=255)] | Literal["all"] = "all"
 
 
 class ReplaceQueryParameterMutation(StrictModel):
     type: Literal["replace_query_parameter"]
     name: str = Field(min_length=1, max_length=512)
     value: str = Field(max_length=32_000)
-    occurrence: int | Literal["all"] = Field(default="all")
+    occurrence: Annotated[int, Field(ge=0, le=255)] | Literal["all"] = "all"
 
 
 class AddQueryParameterMutation(StrictModel):
     type: Literal["add_query_parameter"]
     name: str = Field(min_length=1, max_length=512)
     value: str = Field(max_length=32_000)
-    occurrence: int | Literal["append"] = Field(default="append")
+    occurrence: Literal["append"] = "append"
 
 
 ReplayMutation = Annotated[
@@ -493,13 +493,19 @@ ReplayMutation = Annotated[
 ]
 
 
-class VolatileBinding(StrictModel):
+class ReplayBinding(StrictModel):
     binding_id: str = Field(pattern=r"^[a-zA-Z0-9_.-]+$", min_length=1, max_length=128)
     target: Literal["json_pointer", "header", "query_parameter"]
     path: str | None = Field(default=None, max_length=512)
     name: str | None = Field(default=None, max_length=256)
     occurrence: int = Field(default=0, ge=0, le=255)
-    value_source: Literal["generated", "preserve_source", "setup_output"] = "generated"
+    value_source: Literal[
+        "generated",
+        "preserve_source",
+        "extractor",
+        "literal",
+        "manual_input",
+    ] = "generated"
     generator: (
         Literal[
             "uuid4",
@@ -509,10 +515,15 @@ class VolatileBinding(StrictModel):
         ]
         | None
     ) = None
-    reuse_policy: Literal["fresh_equivalent", "same_value"] = "fresh_equivalent"
+    extractor_id: str | None = Field(
+        default=None,
+        pattern=r"^[a-zA-Z0-9_.-]+$",
+        max_length=128,
+    )
+    value: Any | None = None
 
     @model_validator(mode="after")
-    def validate_target(self) -> VolatileBinding:
+    def validate_target(self) -> ReplayBinding:
         if self.target == "json_pointer":
             if not self.path or self.name is not None:
                 raise ValueError("json_pointer binding requires path and forbids name")
@@ -525,36 +536,48 @@ class VolatileBinding(StrictModel):
         if self.value_source == "generated" and self.generator is None:
             raise ValueError("generated volatile binding requires generator")
         if self.value_source == "preserve_source":
+            if self.generator is not None or self.extractor_id is not None:
+                raise ValueError(
+                    "preserve_source binding must not declare generator or extractor_id"
+                )
+        if self.value_source == "extractor":
+            if not self.extractor_id or self.generator is not None:
+                raise ValueError("extractor binding requires extractor_id and forbids generator")
+        elif self.extractor_id is not None:
+            raise ValueError("extractor_id is only valid for extractor bindings")
+        if self.value_source in {"literal", "manual_input"}:
+            if "value" not in self.model_fields_set:
+                raise ValueError(f"{self.value_source} binding requires value")
             if self.generator is not None:
-                raise ValueError("preserve_source binding must not declare generator")
-            if self.reuse_policy != "same_value":
-                raise ValueError("preserve_source binding requires reuse_policy=same_value")
-        if self.value_source == "setup_output" and self.generator is not None:
-            raise ValueError("setup_output binding must not declare generator")
+                raise ValueError(f"{self.value_source} binding forbids generator")
+        elif "value" in self.model_fields_set:
+            raise ValueError("value is only valid for literal or manual_input bindings")
         return self
 
 
-class NetworkResponseJsonSetupOutput(StrictModel):
-    binding_id: str = Field(pattern=r"^[a-zA-Z0-9_.-]+$", min_length=1, max_length=128)
-    source: Literal["network_response_json"]
+class NetworkResponseJsonExtractor(StrictModel):
+    extractor_id: str = Field(pattern=r"^[a-zA-Z0-9_.-]+$", min_length=1, max_length=128)
+    type: Literal["network_response_json"]
     selector: RequestMatcher
     pointer: str = Field(min_length=2, max_length=512)
-    occurrence: int | Literal["first", "last"] = "last"
+    occurrence: Annotated[int, Field(ge=0, le=255)] | Literal["first", "last"] = "last"
+    required: bool = False
 
     @model_validator(mode="after")
-    def validate_pointer(self) -> NetworkResponseJsonSetupOutput:
+    def validate_pointer(self) -> NetworkResponseJsonExtractor:
         _validate_json_pointer(self.pointer)
         return self
 
 
-SetupOutput = Annotated[
-    NetworkResponseJsonSetupOutput,
-    Field(discriminator="source"),
+ReplayExtractor = Annotated[
+    NetworkResponseJsonExtractor,
+    Field(discriminator="type"),
 ]
 
 
-class EnvironmentComparisonPolicy(StrictModel):
-    required_dimensions: list[
+class ReplayEnvironmentComparison(StrictModel):
+    preset: Literal["none", "minimal", "browser_context", "explicit"] = "none"
+    dimensions: list[
         Literal[
             "page_id",
             "page_url",
@@ -562,54 +585,38 @@ class EnvironmentComparisonPolicy(StrictModel):
             "request_origin",
             "request_path",
             "request_context_sha256",
-            "conversation_current_node",
-            "critical_bundle_sha256",
         ]
-    ] = Field(
-        default_factory=lambda: ["page_origin", "request_context_sha256"],
-        max_length=8,
-    )
-    advisory_dimensions: list[
-        Literal[
-            "page_id",
-            "page_url",
-            "page_origin",
-            "request_origin",
-            "request_path",
-            "request_context_sha256",
-            "conversation_current_node",
-            "critical_bundle_sha256",
-        ]
-    ] = Field(
-        default_factory=lambda: [
-            "page_url",
-            "request_origin",
-            "request_path",
-            "conversation_current_node",
-            "critical_bundle_sha256",
-        ],
-        max_length=8,
-    )
+    ] = Field(default_factory=list, max_length=8)
     context_header_names: list[str] = Field(
-        default_factory=lambda: [
-            "authorization",
-            "proxy-authorization",
-            "x-csrf-token",
-            "x-xsrf-token",
-        ],
+        default_factory=list,
         max_length=64,
     )
+    ignored_cookie_names: list[str] = Field(default_factory=list, max_length=64)
+    ignored_context_headers: list[str] = Field(default_factory=list, max_length=64)
 
     @model_validator(mode="after")
-    def normalize_policy(self) -> EnvironmentComparisonPolicy:
-        self.required_dimensions = list(dict.fromkeys(self.required_dimensions))
-        self.advisory_dimensions = [
-            item
-            for item in dict.fromkeys(self.advisory_dimensions)
-            if item not in self.required_dimensions
-        ]
+    def normalize_policy(self) -> ReplayEnvironmentComparison:
+        preset_dimensions = {
+            "none": [],
+            "minimal": ["page_origin"],
+            "browser_context": ["page_origin", "request_context_sha256"],
+        }
+        if self.preset == "explicit" and not self.dimensions:
+            raise ValueError("explicit environment comparison requires dimensions")
+        if self.preset != "explicit" and self.dimensions:
+            raise ValueError("dimensions are only valid for explicit environment comparison")
+        if self.preset != "explicit":
+            self.dimensions = list(preset_dimensions[self.preset])
+        else:
+            self.dimensions = list(dict.fromkeys(self.dimensions))
         self.context_header_names = sorted(
             {item.strip().lower() for item in self.context_header_names if item.strip()}
+        )
+        self.ignored_cookie_names = sorted(
+            {item.strip().lower() for item in self.ignored_cookie_names if item.strip()}
+        )
+        self.ignored_context_headers = sorted(
+            {item.strip().lower() for item in self.ignored_context_headers if item.strip()}
         )
         return self
 
@@ -644,18 +651,28 @@ class ReplayTransportOptions(StrictModel):
 class ReplayTerminalCondition(StrictModel):
     type: Literal[
         "exact_sse_data",
-        "byte_pattern",
+        "text_pattern",
         "network_close",
         "idle_window",
     ]
     value: str | None = Field(default=None, max_length=4096)
     event_name: str | None = Field(default=None, max_length=128)
+    window_ms: int | None = Field(default=None, ge=10, le=120_000)
 
     @model_validator(mode="after")
     def validate_terminal_condition(self) -> ReplayTerminalCondition:
-        if self.type in {"exact_sse_data", "byte_pattern"} and self.value is None:
-            raise ValueError(f"{self.type} requires value")
-        if self.type != "exact_sse_data" and self.event_name is not None:
+        if self.type == "exact_sse_data" and self.value is None:
+            raise ValueError("exact_sse_data requires value")
+        if self.type == "text_pattern" and not self.value:
+            raise ValueError("text_pattern requires a non-empty value")
+        if self.type == "idle_window" and self.window_ms is None:
+            self.window_ms = 15_000
+        if self.type != "idle_window" and self.window_ms is not None:
+            raise ValueError("window_ms is only valid for idle_window")
+        if self.type in {"network_close", "idle_window"}:
+            self.value = None
+            self.event_name = None
+        elif self.type != "exact_sse_data" and self.event_name is not None:
             raise ValueError("event_name is only valid for exact_sse_data")
         return self
 
@@ -665,45 +682,114 @@ class ReplayResponseAnalyzer(StrictModel):
     version: Literal["1"] = "1"
 
 
-class ReplayControlPayload(StrictModel):
+class ReplaySource(StrictModel):
+    experiment_id: str = Field(pattern=r"^[a-zA-Z0-9_.-]+$", max_length=128)
+    evidence_id: str = Field(pattern=r"^[a-zA-Z0-9_.-]+$", max_length=256)
+
+
+class ReplayResponseReader(StrictModel):
+    mode: Literal["auto", "ordinary", "sse", "ndjson", "raw_stream"] = "auto"
+    max_bytes: int = Field(default=8 * 1024 * 1024, ge=8_192, le=64 * 1024 * 1024)
+    max_events: int = Field(default=10_000, ge=1, le=1_000_000)
+    raw_only: bool = False
+    analyzer: ReplayResponseAnalyzer | None = None
+
+
+class ReplayTermination(StrictModel):
+    conditions: list[ReplayTerminalCondition] = Field(
+        default_factory=lambda: [ReplayTerminalCondition(type="network_close")],
+        max_length=8,
+    )
+
+    @model_validator(mode="after")
+    def validate_conditions(self) -> ReplayTermination:
+        if not self.conditions:
+            self.conditions = [ReplayTerminalCondition(type="network_close")]
+        exact_sse_count = sum(
+            item.type == "exact_sse_data" for item in self.conditions
+        )
+        idle_window_count = sum(item.type == "idle_window" for item in self.conditions)
+        if exact_sse_count > 1:
+            raise ValueError("termination allows at most one exact_sse_data condition")
+        if idle_window_count > 1:
+            raise ValueError("termination allows at most one idle_window condition")
+        return self
+
+
+class ReplayComparisonReference(StrictModel):
+    experiment_id: str = Field(pattern=r"^[a-zA-Z0-9_.-]+$", max_length=128)
+    evidence_id: str | None = Field(
+        default=None,
+        pattern=r"^[a-zA-Z0-9_.-]+$",
+        max_length=256,
+    )
+    observation_id: str | None = Field(
+        default=None,
+        pattern=r"^[a-zA-Z0-9_.-]+$",
+        max_length=256,
+    )
+
+    @model_validator(mode="after")
+    def validate_selector(self) -> ReplayComparisonReference:
+        if bool(self.evidence_id) == bool(self.observation_id):
+            raise ValueError(
+                "comparison reference requires exactly one evidence_id or observation_id"
+            )
+        return self
+
+
+class ReplayComparison(StrictModel):
+    references: list[ReplayComparisonReference] = Field(default_factory=list, max_length=16)
+    include_source: bool = False
+    dimensions: list[
+        Literal[
+            "request_body",
+            "response_status",
+            "response_content_type",
+            "stream_summary",
+            "environment",
+        ]
+    ] = Field(default_factory=lambda: ["response_status"], max_length=5)
+    environment: ReplayEnvironmentComparison = Field(default_factory=ReplayEnvironmentComparison)
+
+    @model_validator(mode="after")
+    def validate_comparison(self) -> ReplayComparison:
+        unique: dict[tuple[str, str | None, str | None], ReplayComparisonReference] = {}
+        for item in self.references:
+            unique[(item.experiment_id, item.evidence_id, item.observation_id)] = item
+        self.references = list(unique.values())
+        self.dimensions = list(dict.fromkeys(self.dimensions))
+        if not self.references and not self.include_source:
+            raise ValueError("comparison requires references or include_source=true")
+        if "environment" in self.dimensions and self.environment.preset == "none":
+            raise ValueError(
+                "environment comparison dimension requires a non-none environment preset"
+            )
+        if self.environment.preset != "none" and "environment" not in self.dimensions:
+            raise ValueError("environment comparison requires the environment comparison dimension")
+        return self
+
+
+class ReplayRequestPayload(StrictModel):
     session_id: str = Field(pattern=r"^[a-zA-Z0-9_.-]+$", max_length=128)
     objective: str = Field(min_length=1, max_length=2048)
-    source_experiment_id: str = Field(pattern=r"^[a-zA-Z0-9_.-]+$", max_length=128)
-    source_evidence_id: str = Field(pattern=r"^[a-zA-Z0-9_.-]+$", max_length=256)
-    mode: Literal["browser_context"] = "browser_context"
-    replay_mode: Literal["control"]
-    mutations: list[ReplayMutation] = Field(default_factory=list, max_length=0)
-    volatile_bindings: list[VolatileBinding] = Field(default_factory=list, max_length=32)
+    source: ReplaySource
+    execution_context: Literal["browser_context"] = "browser_context"
+    mutations: list[ReplayMutation] = Field(default_factory=list, max_length=32)
+    extractors: list[ReplayExtractor] = Field(default_factory=list, max_length=32)
+    bindings: list[ReplayBinding] = Field(default_factory=list, max_length=32)
     target: BrowserTarget = Field(default_factory=BrowserTarget)
     setup_flow: list[FlowStep] = Field(default_factory=list, max_length=20)
-    setup_outputs: list[SetupOutput] = Field(default_factory=list, max_length=32)
     wait_for: WaitCondition | None = None
     verification_flow: list[FlowStep] = Field(default_factory=list, max_length=20)
     execution_mode: Literal["job", "sync"] = "job"
     deadline_ms: int = Field(default=42_000, ge=1_000, le=42_000)
     job_timeout_ms: int = Field(default=300_000, ge=10_000, le=1_800_000)
-    max_response_bytes: int = Field(
-        default=8 * 1024 * 1024,
-        ge=8_192,
-        le=64 * 1024 * 1024,
-    )
-    stream_idle_timeout_ms: int = Field(default=15_000, ge=1_000, le=120_000)
-    response_mode: Literal["auto", "ordinary", "sse", "ndjson", "raw_stream"] = "auto"
-    response_analyzer: ReplayResponseAnalyzer | None = None
-    terminal_conditions: list[ReplayTerminalCondition] = Field(
-        default_factory=lambda: [ReplayTerminalCondition(type="network_close")],
-        max_length=8,
-    )
-    default_done_marker: str | None = Field(default=None, max_length=512)
-    default_done_event_name: str | None = Field(default=None, max_length=128)
-    raw_only: bool = False
-    ignored_cookie_names: list[str] = Field(default_factory=list, max_length=64)
-    ignored_context_headers: list[str] = Field(default_factory=list, max_length=64)
-    normalize_wire_order: bool = False
-    environment_comparison: EnvironmentComparisonPolicy = Field(
-        default_factory=EnvironmentComparisonPolicy
-    )
+    query_serialization: Literal["preserve_raw", "normalize"] = "preserve_raw"
     transport: ReplayTransportOptions = Field(default_factory=ReplayTransportOptions)
+    response_reader: ReplayResponseReader = Field(default_factory=ReplayResponseReader)
+    termination: ReplayTermination = Field(default_factory=ReplayTermination)
+    comparison: ReplayComparison | None = None
     capture: CaptureOptions = Field(default_factory=lambda: CaptureOptions(stream=False))
     requirements: ObjectiveRequirements = Field(
         default_factory=lambda: ObjectiveRequirements(
@@ -712,56 +798,39 @@ class ReplayControlPayload(StrictModel):
             require_artifacts=True,
         )
     )
-    network_evidence: list[NetworkEvidenceSelector] = Field(default_factory=list, max_length=20)
+    network_evidence: list[NetworkEvidenceSelector] = Field(default_factory=list, max_length=19)
     series: ExperimentSeries = Field(default_factory=ExperimentSeries)
 
     @model_validator(mode="after")
-    def validate_replay(self) -> ReplayControlPayload:
+    def validate_replay(self) -> ReplayRequestPayload:
         if self.target.start_url is not None:
             raise ValueError("replay_request does not allow target.start_url")
-        if self.replay_mode == "control" and self.mutations:
-            raise ValueError("control replay requires mutations=[]")
         step_ids = [step.step_id for step in [*self.setup_flow, *self.verification_flow]]
         if len(step_ids) != len(set(step_ids)):
             raise ValueError("setup_flow and verification_flow step_id values must be unique")
-        output_ids = [item.binding_id for item in self.setup_outputs]
-        if len(output_ids) != len(set(output_ids)):
-            raise ValueError("setup_outputs binding_id values must be unique")
-        if self.setup_outputs and not self.setup_flow:
-            raise ValueError("setup_outputs requires a non-empty setup_flow")
-        declared_setup_bindings = {
-            item.binding_id
-            for item in self.volatile_bindings
-            if item.value_source == "setup_output"
-        }
-        if declared_setup_bindings != set(output_ids):
+        extractor_ids = [item.extractor_id for item in self.extractors]
+        if len(extractor_ids) != len(set(extractor_ids)):
+            raise ValueError("extractor_id values must be unique")
+        binding_ids = [item.binding_id for item in self.bindings]
+        if len(binding_ids) != len(set(binding_ids)):
+            raise ValueError("binding_id values must be unique")
+        known_extractors = set(extractor_ids)
+        missing_extractors = sorted(
+            {
+                str(item.extractor_id)
+                for item in self.bindings
+                if item.value_source == "extractor" and item.extractor_id not in known_extractors
+            }
+        )
+        if missing_extractors:
             raise ValueError(
-                "setup_output volatile bindings and setup_outputs must declare the same binding IDs"
+                "bindings reference unknown extractors: " + ", ".join(missing_extractors)
             )
-        self.ignored_cookie_names = sorted(
-            {item.strip().lower() for item in self.ignored_cookie_names if item.strip()}
-        )
-        self.ignored_context_headers = sorted(
-            {item.strip().lower() for item in self.ignored_context_headers if item.strip()}
-        )
+        if any(item.selector_id == "replay_request" for item in self.network_evidence):
+            raise ValueError(
+                "network_evidence selector_id=replay_request is reserved for exact replay evidence"
+            )
         return self
-
-
-class ReplayExploratoryPayload(ReplayControlPayload):
-    replay_mode: Literal["exploratory"]
-    mutations: list[ReplayMutation] = Field(default_factory=list, max_length=32)
-
-
-class ReplayTreatmentPayload(StrictModel):
-    replay_mode: Literal["treatment"]
-    control_experiment_id: str = Field(pattern=r"^[a-zA-Z0-9_.-]+$", max_length=128)
-    mutation: ReplayMutation
-
-
-ReplayRequestPayload = Annotated[
-    ReplayControlPayload | ReplayExploratoryPayload | ReplayTreatmentPayload,
-    Field(discriminator="replay_mode"),
-]
 
 
 class OpenSessionRequest(StrictModel):

@@ -1494,10 +1494,13 @@ class JsReverseMcpAdapter:
             8192,
             Number(responseControl.maxResponseBytes || 8 * 1024 * 1024),
           );
-          const idleTimeoutMs = Math.max(
-            1000,
-            Number(responseControl.idleTimeoutMs || 15000),
+          const maxEvents = Math.max(
+            1,
+            Number(responseControl.maxEvents || 10000),
           );
+          const idleWindowMs = responseControl.idleWindowMs == null
+            ? null
+            : Math.max(10, Number(responseControl.idleWindowMs));
           const configuredMode = String(responseControl.responseMode || 'auto');
           const responseHeaderEntries = Array.from(response.headers.entries());
           const contentTypeHeader = response.headers.get
@@ -1522,8 +1525,8 @@ class JsReverseMcpAdapter:
           const exactSseCondition = terminalConditions.find(
             (item) => item && item.type === 'exact_sse_data',
           );
-          const bytePatternConditions = terminalConditions.filter(
-            (item) => item && item.type === 'byte_pattern' && item.value != null,
+          const textPatternConditions = terminalConditions.filter(
+            (item) => item && item.type === 'text_pattern' && item.value != null,
           );
           const doneMarker = exactSseCondition && exactSseCondition.value != null
             ? String(exactSseCondition.value)
@@ -1548,10 +1551,12 @@ class JsReverseMcpAdapter:
           let sseLineBuffer = '';
           let sseEventName = 'message';
           let sseDataLines = [];
-          let bytePatternBuffer = '';
+          let textPatternBuffer = '';
           let ndjsonLineBuffer = '';
           let ndjsonRecordCount = 0;
           let ndjsonParseErrorCount = 0;
+          let sseEventCount = 0;
+          let rawChunkCount = 0;
           const ndjsonRecordMetadata = [];
           const chunkBoundaries = [];
           const consumeNdjson = (text, eof) => {
@@ -1560,6 +1565,7 @@ class JsReverseMcpAdapter:
             ndjsonLineBuffer = eof ? '' : lines.pop() || '';
             if (eof && ndjsonLineBuffer) lines.push(ndjsonLineBuffer);
             for (const rawLine of lines) {
+              if (ndjsonRecordCount >= maxEvents) return true;
               const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
               if (!line.trim()) continue;
               let valid = true;
@@ -1573,33 +1579,39 @@ class JsReverseMcpAdapter:
                 });
               }
               ndjsonRecordCount += 1;
+              if (ndjsonRecordCount >= maxEvents) return true;
             }
+            return false;
           };
           const dispatchSseEvent = () => {
             const data = sseDataLines.join('\n');
             const eventName = sseEventName;
+            const hasEvent = sseDataLines.length > 0 || eventName !== 'message';
             sseEventName = 'message';
             sseDataLines = [];
+            if (!hasEvent) return null;
+            sseEventCount += 1;
             if (
               doneMarker &&
               data === doneMarker &&
               (!doneEventName || eventName === doneEventName)
             ) {
               doneEventNameObserved = eventName;
-              return true;
+              return 'done_marker';
             }
-            return false;
+            if (sseEventCount >= maxEvents) return 'max_events';
+            return null;
           };
           const consumeSseLine = (line) => {
             if (line === '') return dispatchSseEvent();
-            if (line.startsWith(':')) return false;
+            if (line.startsWith(':')) return null;
             const colon = line.indexOf(':');
             const field = colon < 0 ? line : line.slice(0, colon);
             let fieldValue = colon < 0 ? '' : line.slice(colon + 1);
             if (fieldValue.startsWith(' ')) fieldValue = fieldValue.slice(1);
             if (field === 'event') sseEventName = fieldValue;
             if (field === 'data') sseDataLines.push(fieldValue);
-            return false;
+            return null;
           };
           const consumeSseEvents = (text, eof = false) => {
             sseLineBuffer += text;
@@ -1630,17 +1642,19 @@ class JsReverseMcpAdapter:
                 next += 1;
               }
               offset = next;
-              if (consumeSseLine(line)) {
+              const terminalReason = consumeSseLine(line);
+              if (terminalReason) {
                 sseLineBuffer = sseLineBuffer.slice(offset);
-                return true;
+                return terminalReason;
               }
             }
             sseLineBuffer = sseLineBuffer.slice(offset);
             if (eof) {
               if (sseLineBuffer.length > 0) {
-                if (consumeSseLine(sseLineBuffer)) {
+                const terminalReason = consumeSseLine(sseLineBuffer);
+                if (terminalReason) {
                   sseLineBuffer = '';
-                  return true;
+                  return terminalReason;
                 }
                 sseLineBuffer = '';
               }
@@ -1648,17 +1662,18 @@ class JsReverseMcpAdapter:
                 return dispatchSseEvent();
               }
             }
-            return false;
+            return null;
           };
-          const readWithIdleTimeout = async () => {
+          const readWithIdleWindow = async () => {
+            if (idleWindowMs == null) return await reader.read();
             let timer;
             try {
               return await Promise.race([
                 reader.read(),
                 new Promise((_, reject) => {
                   timer = setTimeout(
-                    () => reject(new Error('__REPLAY_IDLE_TIMEOUT__')),
-                    idleTimeoutMs,
+                    () => reject(new Error('__REPLAY_IDLE_WINDOW__')),
+                    idleWindowMs,
                   );
                 }),
               ]);
@@ -1670,21 +1685,35 @@ class JsReverseMcpAdapter:
             while (true) {
               let readResult;
               try {
-                readResult = await readWithIdleTimeout();
+                readResult = await readWithIdleWindow();
               } catch (error) {
-                if (String(error && error.message) !== '__REPLAY_IDLE_TIMEOUT__') throw error;
-                terminationReason = 'idle_timeout';
-                await reader.cancel('idle_timeout').catch(() => {});
+                if (String(error && error.message) !== '__REPLAY_IDLE_WINDOW__') throw error;
+                terminalConditionMatched = 'idle_window';
+                terminationReason = 'idle_window';
+                await reader.cancel('idle_window').catch(() => {});
                 break;
               }
               if (readResult.done) {
                 const finalText = decoder.decode();
-                if (responseMode === 'ndjson') consumeNdjson(finalText, true);
-                if (doneMarker && consumeSseEvents(finalText, true)) {
-                  doneMarkerObserved = true;
-                  terminalConditionMatched = 'exact_sse_data';
-                  terminationReason = 'done_marker';
+                const ndjsonLimitReached = responseMode === 'ndjson'
+                  ? consumeNdjson(finalText, true)
+                  : false;
+                const sseTermination = responseMode === 'sse'
+                  ? consumeSseEvents(finalText, true)
+                  : null;
+                if (ndjsonLimitReached) {
+                  terminalConditionMatched = 'max_events';
+                  terminationReason = 'max_events';
+                } else if (sseTermination) {
+                  doneMarkerObserved = sseTermination === 'done_marker';
+                  terminalConditionMatched = doneMarkerObserved
+                    ? 'exact_sse_data'
+                    : 'max_events';
+                  terminationReason = sseTermination;
                 } else {
+                  terminalConditionMatched = terminalConditions.some(
+                    (item) => item && item.type === 'network_close',
+                  ) ? 'network_close' : null;
                   terminationReason = 'network_close';
                 }
                 break;
@@ -1715,25 +1744,44 @@ class JsReverseMcpAdapter:
                 previewByteLength += previewPart.byteLength;
               }
               const decodedText = decoder.decode(accepted, {stream: true});
-              if (responseMode === 'ndjson') consumeNdjson(decodedText, false);
-              if (doneMarker && responseMode === 'sse') {
-                if (consumeSseEvents(decodedText, false)) {
-                  doneMarkerObserved = true;
-                  terminalConditionMatched = 'exact_sse_data';
-                  terminationReason = 'done_marker';
-                  await reader.cancel('done_marker').catch(() => {});
+              if (responseMode === 'ndjson') {
+                if (consumeNdjson(decodedText, false)) {
+                  terminalConditionMatched = 'max_events';
+                  terminationReason = 'max_events';
+                  await reader.cancel('max_events').catch(() => {});
                   break;
                 }
               }
-              if (bytePatternConditions.length > 0) {
-                bytePatternBuffer = (bytePatternBuffer + decodedText).slice(-65536);
-                const matchedPattern = bytePatternConditions.find(
-                  (item) => bytePatternBuffer.includes(String(item.value)),
+              if (responseMode === 'sse') {
+                const sseTermination = consumeSseEvents(decodedText, false);
+                if (sseTermination) {
+                  doneMarkerObserved = sseTermination === 'done_marker';
+                  terminalConditionMatched = doneMarkerObserved
+                    ? 'exact_sse_data'
+                    : 'max_events';
+                  terminationReason = sseTermination;
+                  await reader.cancel(sseTermination).catch(() => {});
+                  break;
+                }
+              }
+              if (textPatternConditions.length > 0) {
+                textPatternBuffer = (textPatternBuffer + decodedText).slice(-65536);
+                const matchedPattern = textPatternConditions.find(
+                  (item) => textPatternBuffer.includes(String(item.value)),
                 );
                 if (matchedPattern) {
-                  terminalConditionMatched = 'byte_pattern';
-                  terminationReason = 'byte_pattern';
-                  await reader.cancel('byte_pattern').catch(() => {});
+                  terminalConditionMatched = 'text_pattern';
+                  terminationReason = 'text_pattern';
+                  await reader.cancel('text_pattern').catch(() => {});
+                  break;
+                }
+              }
+              if (responseMode === 'raw_stream' && accepted.byteLength > 0) {
+                rawChunkCount += 1;
+                if (rawChunkCount >= maxEvents) {
+                  terminalConditionMatched = 'max_events';
+                  terminationReason = 'max_events';
+                  await reader.cancel('max_events').catch(() => {});
                   break;
                 }
               }
@@ -1770,11 +1818,21 @@ class JsReverseMcpAdapter:
             ndjsonRecordCount,
             ndjsonParseErrorCount,
             ndjsonRecordMetadata,
+            sseEventCount,
+            rawChunkCount,
+            streamEventCount: responseMode === 'sse'
+              ? sseEventCount
+              : responseMode === 'ndjson'
+                ? ndjsonRecordCount
+                : responseMode === 'raw_stream'
+                  ? rawChunkCount
+                  : 0,
             terminalConditionMatched,
             terminationReason,
             truncated,
             maxResponseBytes,
-            idleTimeoutMs,
+            maxEvents,
+            idleWindowMs,
           };
         }"""
         return await self._call(
