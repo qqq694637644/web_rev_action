@@ -560,6 +560,11 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
         )
         if control_manifest.get("replay_http_status") != 200:
             raise AssertionError(control_manifest)
+        control_network_evidence_id = control_manifest.get("replay", {}).get(
+            "network_evidence_id"
+        )
+        if not control_network_evidence_id:
+            raise AssertionError(control_manifest)
         if not control_manifest.get("replay", {}).get("source_is_stream"):
             raise AssertionError(control_manifest)
         control_setup = (
@@ -605,7 +610,12 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
                         "objective": objective,
                         "mutations": [mutation],
                         "comparison": {
-                            "references": [control.experiment_id],
+                            "references": [
+                                {
+                                    "experiment_id": control.experiment_id,
+                                    "evidence_id": control_network_evidence_id,
+                                }
+                            ],
                             "dimensions": ["request_body", "response_status"],
                         },
                     },
@@ -726,7 +736,12 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
                     ],
                     "mutations": [{"type": "remove_json_path", "path": "/tracking_id"}],
                     "comparison": {
-                        "references": [control.experiment_id],
+                        "references": [
+                            {
+                                "experiment_id": control.experiment_id,
+                                "evidence_id": control_network_evidence_id,
+                            }
+                        ],
                         "dimensions": ["request_body", "response_status"],
                     },
                 },

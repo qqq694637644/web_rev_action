@@ -96,6 +96,29 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue((root / "docs" / "evidence-contract.md").is_file())
         self.assertTrue((root / "docs" / "report-templates.md").is_file())
 
+    def test_packaged_skill_uses_current_generic_replay_contract(self) -> None:
+        runtime = load_runtime()
+        root = Path(runtime.skills_dir) / "pandora-protocol-reproduction"
+        content = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in sorted(root.rglob("*.md"))
+        )
+
+        for removed_field in [
+            "replay_mode",
+            "control_experiment_id",
+            "pair_protocol",
+            "volatile_bindings",
+            "fresh_equivalent",
+            "non_target_fields_equivalent",
+        ]:
+            with self.subTest(removed_field=removed_field):
+                self.assertNotIn(removed_field, content)
+        self.assertIn('"source"', content)
+        self.assertIn('"evidence_id"', content)
+        self.assertIn('"comparison"', content)
+        self.assertIn("text_pattern", content)
+
     def test_resolve_uses_exact_mentions_and_explicit_hints(self) -> None:
         runtime = load_runtime()
         results = [
@@ -282,7 +305,7 @@ class RuntimeTests(unittest.TestCase):
         runtime = load_runtime()
         result = runtime.search(
             "pandora-protocol-reproduction",
-            "pair_protocol_hash",
+            "replay_protocol_hash",
             limit=3,
         )
 
@@ -488,7 +511,7 @@ class RuntimeTests(unittest.TestCase):
             "/v1/skills/search",
             json={
                 "skill_id": "pandora-protocol-reproduction",
-                "query": "pair_protocol_hash",
+                "query": "replay_protocol_hash",
             },
         )
         console = client.get("/console")

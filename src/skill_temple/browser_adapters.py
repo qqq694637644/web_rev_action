@@ -1498,10 +1498,9 @@ class JsReverseMcpAdapter:
             1,
             Number(responseControl.maxEvents || 10000),
           );
-          const idleTimeoutMs = Math.max(
-            1000,
-            Number(responseControl.idleTimeoutMs || 15000),
-          );
+          const idleWindowMs = responseControl.idleWindowMs == null
+            ? null
+            : Math.max(10, Number(responseControl.idleWindowMs));
           const configuredMode = String(responseControl.responseMode || 'auto');
           const responseHeaderEntries = Array.from(response.headers.entries());
           const contentTypeHeader = response.headers.get
@@ -1526,8 +1525,8 @@ class JsReverseMcpAdapter:
           const exactSseCondition = terminalConditions.find(
             (item) => item && item.type === 'exact_sse_data',
           );
-          const bytePatternConditions = terminalConditions.filter(
-            (item) => item && item.type === 'byte_pattern' && item.value != null,
+          const textPatternConditions = terminalConditions.filter(
+            (item) => item && item.type === 'text_pattern' && item.value != null,
           );
           const doneMarker = exactSseCondition && exactSseCondition.value != null
             ? String(exactSseCondition.value)
@@ -1552,7 +1551,7 @@ class JsReverseMcpAdapter:
           let sseLineBuffer = '';
           let sseEventName = 'message';
           let sseDataLines = [];
-          let bytePatternBuffer = '';
+          let textPatternBuffer = '';
           let ndjsonLineBuffer = '';
           let ndjsonRecordCount = 0;
           let ndjsonParseErrorCount = 0;
@@ -1665,15 +1664,16 @@ class JsReverseMcpAdapter:
             }
             return null;
           };
-          const readWithIdleTimeout = async () => {
+          const readWithIdleWindow = async () => {
+            if (idleWindowMs == null) return await reader.read();
             let timer;
             try {
               return await Promise.race([
                 reader.read(),
                 new Promise((_, reject) => {
                   timer = setTimeout(
-                    () => reject(new Error('__REPLAY_IDLE_TIMEOUT__')),
-                    idleTimeoutMs,
+                    () => reject(new Error('__REPLAY_IDLE_WINDOW__')),
+                    idleWindowMs,
                   );
                 }),
               ]);
@@ -1685,11 +1685,12 @@ class JsReverseMcpAdapter:
             while (true) {
               let readResult;
               try {
-                readResult = await readWithIdleTimeout();
+                readResult = await readWithIdleWindow();
               } catch (error) {
-                if (String(error && error.message) !== '__REPLAY_IDLE_TIMEOUT__') throw error;
-                terminationReason = 'idle_timeout';
-                await reader.cancel('idle_timeout').catch(() => {});
+                if (String(error && error.message) !== '__REPLAY_IDLE_WINDOW__') throw error;
+                terminalConditionMatched = 'idle_window';
+                terminationReason = 'idle_window';
+                await reader.cancel('idle_window').catch(() => {});
                 break;
               }
               if (readResult.done) {
@@ -1710,6 +1711,9 @@ class JsReverseMcpAdapter:
                     : 'max_events';
                   terminationReason = sseTermination;
                 } else {
+                  terminalConditionMatched = terminalConditions.some(
+                    (item) => item && item.type === 'network_close',
+                  ) ? 'network_close' : null;
                   terminationReason = 'network_close';
                 }
                 break;
@@ -1760,15 +1764,15 @@ class JsReverseMcpAdapter:
                   break;
                 }
               }
-              if (bytePatternConditions.length > 0) {
-                bytePatternBuffer = (bytePatternBuffer + decodedText).slice(-65536);
-                const matchedPattern = bytePatternConditions.find(
-                  (item) => bytePatternBuffer.includes(String(item.value)),
+              if (textPatternConditions.length > 0) {
+                textPatternBuffer = (textPatternBuffer + decodedText).slice(-65536);
+                const matchedPattern = textPatternConditions.find(
+                  (item) => textPatternBuffer.includes(String(item.value)),
                 );
                 if (matchedPattern) {
-                  terminalConditionMatched = 'byte_pattern';
-                  terminationReason = 'byte_pattern';
-                  await reader.cancel('byte_pattern').catch(() => {});
+                  terminalConditionMatched = 'text_pattern';
+                  terminationReason = 'text_pattern';
+                  await reader.cancel('text_pattern').catch(() => {});
                   break;
                 }
               }
@@ -1828,7 +1832,7 @@ class JsReverseMcpAdapter:
             truncated,
             maxResponseBytes,
             maxEvents,
-            idleTimeoutMs,
+            idleWindowMs,
           };
         }"""
         return await self._call(

@@ -1031,7 +1031,7 @@ class BrowserActionService:
         checkpoint: dict[str, Any],
         experiment_dir: Path,
         deadline: Deadline,
-    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
         requests = requests_after_checkpoint(
             await self._all_network_requests(deadline),
             checkpoint,
@@ -1039,14 +1039,17 @@ class BrowserActionService:
         )
         values: dict[str, Any] = {}
         records: list[dict[str, Any]] = []
+        artifacts: list[dict[str, Any]] = []
         output_dir = experiment_dir / "replay" / "extractors"
         output_dir.mkdir(parents=True, exist_ok=True)
         for extractor in extractors:
+            artifact_ids: list[str] = []
             record: dict[str, Any] = {
                 "extractor_id": extractor.extractor_id,
                 "type": extractor.type,
                 "required": extractor.required,
                 "status": "failed",
+                "artifact_ids": artifact_ids,
             }
             try:
                 matches = [
@@ -1069,6 +1072,19 @@ class BrowserActionService:
                     "all",
                     deadline.child(min(5_000, deadline.remaining_ms())),
                 )
+                artifact_id_value = (
+                    f"art_{experiment_dir.name}_replay_extractor_{extractor.extractor_id}"
+                )
+                descriptor = self.experiments.describe_local_artifact(
+                    str(snapshot_path),
+                    artifact_id=artifact_id_value,
+                    kind="replay_extractor_snapshot",
+                    sensitivity="credential",
+                    contains_credentials=True,
+                )
+                if descriptor is not None:
+                    artifacts.append(descriptor)
+                    artifact_ids.append(artifact_id_value)
                 snapshot = load_snapshot(snapshot_path)
                 response_value = response_value_from_snapshot(snapshot)
                 if response_value is None:
@@ -1082,13 +1098,12 @@ class BrowserActionService:
                         "request_id": reqid,
                         "request_url_sha256": canonical_json_sha256(str(selected.get("url") or "")),
                         "value_sha256": canonical_json_sha256(value),
-                        "snapshot_relative_path": self.experiments.relative_path(snapshot_path),
                     }
                 )
             except Exception as exc:
                 record["error"] = str(exc)[:2000]
             records.append(record)
-        return values, records
+        return values, records, artifacts
 
     async def _export_network_evidence(
         self,
@@ -1813,12 +1828,12 @@ class BrowserActionService:
             } or {"network_close"}
             terminal_ok = bool(
                 ("exact_sse_data" in terminal_types and termination == "done_marker")
-                or ("byte_pattern" in terminal_types and termination == "byte_pattern")
+                or ("text_pattern" in terminal_types and termination == "text_pattern")
                 or (
                     "network_close" in terminal_types
                     and termination in {"network_close", "no_response_body"}
                 )
-                or ("idle_window" in terminal_types and termination == "idle_timeout")
+                or ("idle_window" in terminal_types and termination == "idle_window")
             )
             mode_ok = bool(
                 response_mode == "raw_stream"
@@ -1830,9 +1845,7 @@ class BrowserActionService:
                 in {"application/x-ndjson", "application/ndjson", "application/json-seq"}
             )
             complete = bool(
-                isinstance(status, int)
-                and 200 <= status < 400
-                and mode_ok
+                mode_ok
                 and marker_ok
                 and event_ok
                 and terminal_ok
@@ -1987,10 +2000,7 @@ class BrowserActionService:
                 "context_header_names": sorted(context_header_names or []),
             }
         )
-        unavailable = [
-            "conversation_current_node",
-            "critical_bundle_sha256",
-        ]
+        unavailable: list[str] = []
         if alignment is None or alignment.status != "aligned":
             unavailable.extend(["page_id", "page_url", "page_origin"])
         if include_request_context and request_context["status"] != "observed":
@@ -2051,38 +2061,120 @@ class BrowserActionService:
         }
 
     @staticmethod
-    def _manifest_replay_facts(manifest: dict[str, Any]) -> dict[str, Any]:
-        replay = manifest.get("replay")
-        replay = replay if isinstance(replay, dict) else {}
-        observations = manifest.get("network_observations")
-        observations = observations if isinstance(observations, list) else []
-        first_observation = next(
-            (item for item in observations if isinstance(item, dict)),
-            {},
-        )
-        observation_facts = first_observation.get("facts")
-        observation_facts = observation_facts if isinstance(observation_facts, dict) else {}
-        return {
-            "request_body": (
-                observation_facts.get("request_body_canonical_sha256")
-                or replay.get("expected_request_body_canonical_sha256")
-            ),
-            "response_status": manifest.get("replay_http_status"),
-            "response_headers": {"content_type": manifest.get("replay_response_content_type")}
-            if manifest.get("replay_response_content_type") is not None
-            else None,
-            "stream_events": {
-                "raw_event_count": observation_facts.get("raw_event_count"),
-                "semantic_event_count": observation_facts.get("semantic_event_count"),
-                "terminal_reason": observation_facts.get("terminal_reason"),
-            }
-            if any(
-                observation_facts.get(key) is not None
-                for key in ("raw_event_count", "semantic_event_count", "terminal_reason")
-            )
-            else None,
-            "environment": manifest.get("pre_dispatch_environment"),
+    def _stream_summary_from_observation(observation: dict[str, Any]) -> dict[str, Any] | None:
+        facts = observation.get("facts")
+        facts = facts if isinstance(facts, dict) else {}
+        value = {
+            "raw_event_count": facts.get("raw_event_count"),
+            "semantic_event_count": facts.get("semantic_event_count"),
+            "terminal_reason": facts.get("terminal_reason"),
+            "primary_event_source": facts.get("primary_event_source"),
         }
+        return value if any(item is not None for item in value.values()) else None
+
+    def _comparison_reference_facts(
+        self,
+        manifest: dict[str, Any],
+        reference: dict[str, Any],
+    ) -> tuple[dict[str, Any] | None, dict[str, str], str | None]:
+        observations = manifest.get("network_observations")
+        observations = (
+            [item for item in observations if isinstance(item, dict)]
+            if isinstance(observations, list)
+            else []
+        )
+        evidence_id_value = reference.get("evidence_id")
+        observation_id_value = reference.get("observation_id")
+        overrides: dict[str, str] = {}
+        if isinstance(observation_id_value, str):
+            matches = [
+                item
+                for item in observations
+                if item.get("observation_id") == observation_id_value
+            ]
+            if not matches:
+                return None, {}, "observation_not_found"
+            if len(matches) > 1:
+                return None, {}, "observation_ambiguous"
+            observation = matches[0]
+            facts = observation.get("facts")
+            facts = facts if isinstance(facts, dict) else {}
+            sources = observation.get("sources")
+            sources = sources if isinstance(sources, dict) else {}
+            linked_evidence_id = sources.get("network_evidence_id")
+            snapshot = None
+            if isinstance(linked_evidence_id, str):
+                try:
+                    linked_evidence = self._find_evidence(manifest, linked_evidence_id)
+                    snapshot = self._network_evidence_snapshot(
+                        self.experiments.root,
+                        linked_evidence,
+                    )
+                except BrowserServiceError:
+                    snapshot = None
+            return (
+                {
+                    "request_body": facts.get("request_body_canonical_sha256"),
+                    "response_status": facts.get("status"),
+                    "response_content_type": (
+                        response_content_type(snapshot)
+                        if isinstance(snapshot, dict)
+                        else None
+                    ),
+                    "stream_summary": self._stream_summary_from_observation(observation),
+                    "environment": manifest.get("pre_dispatch_environment"),
+                },
+                overrides,
+                None,
+            )
+        if not isinstance(evidence_id_value, str):
+            return None, {}, "reference_selector_missing"
+        try:
+            evidence = self._find_evidence(manifest, evidence_id_value)
+        except BrowserServiceError as exc:
+            return None, {}, exc.code
+        if evidence.get("kind") != "network_request":
+            return None, {}, "comparison_evidence_kind_invalid"
+        summary = evidence.get("summary")
+        summary = summary if isinstance(summary, dict) else {}
+        snapshot = self._network_evidence_snapshot(self.experiments.root, evidence)
+        linked_observations = [
+            item
+            for item in observations
+            if isinstance(item.get("sources"), dict)
+            and item["sources"].get("network_evidence_id") == evidence_id_value
+        ]
+        stream_summary = None
+        if len(linked_observations) == 1:
+            stream_summary = self._stream_summary_from_observation(linked_observations[0])
+        elif len(linked_observations) > 1:
+            overrides["stream_summary"] = "ambiguous"
+        return (
+            {
+                "request_body": (
+                    evidence.get("request_body_canonical_sha256")
+                    or (
+                        request_body_canonical_sha256_from_snapshot(snapshot)
+                        if isinstance(snapshot, dict)
+                        else None
+                    )
+                ),
+                "response_status": (
+                    snapshot.get("status")
+                    if isinstance(snapshot, dict)
+                    else summary.get("status")
+                ),
+                "response_content_type": (
+                    response_content_type(snapshot)
+                    if isinstance(snapshot, dict)
+                    else None
+                ),
+                "stream_summary": stream_summary,
+                "environment": manifest.get("pre_dispatch_environment"),
+            },
+            overrides,
+            None,
+        )
 
     def _build_replay_comparison_results(
         self,
@@ -2097,10 +2189,28 @@ class BrowserActionService:
         comparison = replay_plan.get("comparison")
         if not isinstance(comparison, dict):
             return []
-        references = [str(item) for item in comparison.get("references", [])]
+        references = [
+            dict(item)
+            for item in comparison.get("references", [])
+            if isinstance(item, dict)
+        ]
         if comparison.get("include_source") is True:
-            references.insert(0, str(replay_plan["source_experiment_id"]))
-        references = list(dict.fromkeys(references))
+            references.insert(
+                0,
+                {
+                    "experiment_id": str(replay_plan["source_experiment_id"]),
+                    "evidence_id": str(replay_plan["source_evidence_id"]),
+                },
+            )
+        unique_references: dict[tuple[str, str | None, str | None], dict[str, Any]] = {}
+        for item in references:
+            key = (
+                str(item.get("experiment_id") or ""),
+                str(item.get("evidence_id")) if item.get("evidence_id") else None,
+                str(item.get("observation_id")) if item.get("observation_id") else None,
+            )
+            unique_references[key] = item
+        references = list(unique_references.values())
         dimensions = [str(item) for item in comparison.get("dimensions", [])]
         environment = comparison.get("environment")
         environment = environment if isinstance(environment, dict) else {}
@@ -2108,29 +2218,45 @@ class BrowserActionService:
         current = {
             "request_body": current_request_body_sha256,
             "response_status": current_response_status,
-            "response_headers": (
-                {"content_type": current_response_content_type}
-                if current_response_content_type is not None
-                else None
-            ),
-            "stream_events": current_stream_facts,
+            "response_content_type": current_response_content_type,
+            "stream_summary": current_stream_facts,
             "environment": current_environment,
         }
         results: list[dict[str, Any]] = []
-        for reference_id in references:
+        for reference_selector in references:
+            reference_id = str(reference_selector.get("experiment_id") or "")
             try:
                 reference_manifest = self.experiments.load_manifest(reference_id)
             except BrowserServiceError as exc:
                 results.append(
                     {
                         "reference_experiment_id": reference_id,
+                        "reference": reference_selector,
                         "status": "missing",
                         "error": exc.code,
                         "dimensions": {},
                     }
                 )
                 continue
-            reference = self._manifest_replay_facts(reference_manifest)
+            reference, status_overrides, selection_error = self._comparison_reference_facts(
+                reference_manifest,
+                reference_selector,
+            )
+            if reference is None:
+                results.append(
+                    {
+                        "reference_experiment_id": reference_id,
+                        "reference": reference_selector,
+                        "status": (
+                            "ambiguous"
+                            if selection_error and "ambiguous" in selection_error
+                            else "missing"
+                        ),
+                        "error": selection_error,
+                        "dimensions": {},
+                    }
+                )
+                continue
             dimension_results: dict[str, Any] = {}
             for dimension in dimensions:
                 if dimension == "environment":
@@ -2144,7 +2270,9 @@ class BrowserActionService:
                 current_value = current.get(dimension)
                 dimension_results[dimension] = {
                     "status": (
-                        "missing"
+                        status_overrides[dimension]
+                        if dimension in status_overrides
+                        else "missing"
                         if reference_value is None or current_value is None
                         else "equivalent"
                         if reference_value == current_value
@@ -2157,8 +2285,11 @@ class BrowserActionService:
             results.append(
                 {
                     "reference_experiment_id": reference_id,
+                    "reference": reference_selector,
                     "status": (
-                        "different"
+                        "ambiguous"
+                        if "ambiguous" in statuses
+                        else "different"
                         if "different" in statuses
                         else "missing"
                         if "missing" in statuses
@@ -2325,6 +2456,7 @@ class BrowserActionService:
                 mutations,
                 bindings=resolved_bindings,
                 binding_values=binding_values,
+                query_serialization=payload.query_serialization,
             )
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             raise BrowserServiceError(
@@ -2393,10 +2525,22 @@ class BrowserActionService:
             ),
             None,
         )
+        idle_window_condition = next(
+            (
+                item
+                for item in terminal_conditions
+                if item.get("type") == "idle_window"
+            ),
+            None,
+        )
         spec["responseControl"] = {
             "maxResponseBytes": reader.max_bytes,
             "maxEvents": reader.max_events,
-            "idleTimeoutMs": reader.idle_timeout_ms,
+            "idleWindowMs": (
+                idle_window_condition.get("window_ms")
+                if isinstance(idle_window_condition, dict)
+                else None
+            ),
             "responseMode": reader.mode,
             "terminalConditions": terminal_conditions,
             "doneMarker": (
@@ -2479,7 +2623,7 @@ class BrowserActionService:
             "_extractors": list(payload.extractors),
             "_source_snapshot": snapshot,
             "_binding_specs": binding_specs,
-            "normalize_wire_order": payload.normalize_wire_order,
+            "query_serialization": payload.query_serialization,
             "comparison": comparison,
             "environment_comparison": environment,
             "ignored_cookie_names": list(environment.get("ignored_cookie_names", []))
@@ -4029,7 +4173,11 @@ class BrowserActionService:
                             wait_observations=wait_observations,
                         )
                     if isinstance(extractor_checkpoint, dict):
-                        extractor_values, extractor_records = await self._run_replay_extractors(
+                        (
+                            extractor_values,
+                            extractor_records,
+                            extractor_artifacts,
+                        ) = await self._run_replay_extractors(
                             extractors=extractors,
                             checkpoint=extractor_checkpoint,
                             experiment_dir=experiment_dir,
@@ -4039,6 +4187,7 @@ class BrowserActionService:
                                 "run replay extractors",
                             ),
                         )
+                        replay_artifacts.extend(extractor_artifacts)
                         for binding in replay_plan["_binding_specs"]:
                             if (
                                 binding.value_source == "extractor"
@@ -4062,6 +4211,7 @@ class BrowserActionService:
                             replay_plan["mutations"],
                             bindings=resolved_bindings,
                             binding_values=replay_plan["binding_values"],
+                            query_serialization=replay_plan["query_serialization"],
                         )
                         rebuilt_spec["responseControl"] = replay_plan["spec"]["responseControl"]
                         rebuilt_spec["transport"] = replay_plan["spec"]["transport"]
@@ -4774,6 +4924,7 @@ class BrowserActionService:
                         ),
                         "kind": "replay_extractor",
                         "step_ids": ["replay_request"],
+                        "artifact_ids": observation.get("artifact_ids", []),
                         "summary": observation,
                     }
                 )

@@ -75,22 +75,19 @@ A replay attempt should link:
 source_experiment_id
 source_evidence_id
 mutation list
-control_experiment_id
-volatile binding metadata
-pair_protocol_hash
+extractor definitions and extractor observations
+binding metadata and binding observations
+replay_protocol_hash
 setup_flow and setup step results
 replay_attempt_id and dispatch time
-control/treatment exact network evidence IDs
-control_wire_value / treatment_wire_value
-target_delta_observed
-non_target_fields_equivalent
-volatile_bindings_effective
-mutation_effective
-response classification
+exact replay network evidence ID
+mutation observations
+optional comparison references and dimension results
+optional response analyzer evidence ID
 pre-dispatch, post-response, and post-verification environments
-environment comparison status and missing dimensions
 request diff artifact
 replay response artifact
+extractor snapshot artifact IDs
 new network evidence IDs
 stream request/event-range evidence IDs
 page and console evidence IDs
@@ -98,12 +95,15 @@ page and console evidence IDs
 
 Request context is `observed` only when exact header completeness is proven by an explicit marker or associated request headers + ExtraInfo/associatedCookies evidence. Empty or ordinary header arrays are insufficient. Post environments do not reuse the pre-dispatch request context.
 
-Replay primary stream evidence must reference the exact replay ordinary evidence ID. Same-URL streams without that stable association are supporting evidence.
+Replay primary stream evidence must reference the exact replay ordinary evidence ID.
+Same-URL streams without that stable association are supporting evidence.
 
 A replay response status alone is insufficient to determine field necessity.
-Causal comparison uses only pre-dispatch data and returns
-`observed_equivalent`, `different`, or `insufficient` with compared and missing
-dimensions. Post-response and post-verification environments are outcomes.
+Comparison is optional and fact-based. Each reference must contain an exact
+`evidence_id` or `observation_id`; selecting the first request in an experiment is
+not allowed. Results use `equivalent`, `different`, `missing`, `ambiguous`, or
+`unknown`. Environment dimensions are opt-in pre-dispatch facts. Post-response and
+post-verification environments are outcomes.
 
 Field validation must use an exact structured response body. Priority is exact
 network response body, then a complete bounded replay response body, then preview

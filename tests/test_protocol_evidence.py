@@ -14,6 +14,7 @@ from skill_temple.browser_models import (
     RemoveQueryParameterMutation,
     ReplaceHeaderMutation,
     ReplaceJsonPathMutation,
+    ReplaceQueryParameterMutation,
     ReplayBinding,
     ReplayRequestPayload,
     RequestMatcher,
@@ -321,7 +322,16 @@ class ProtocolEvidenceTests(unittest.TestCase):
                     },
                 ],
                 "comparison": {
-                    "references": ["exp_reference", "exp_other"],
+                    "references": [
+                        {
+                            "experiment_id": "exp_reference",
+                            "evidence_id": "ev_reference",
+                        },
+                        {
+                            "experiment_id": "exp_other",
+                            "observation_id": "obs_other",
+                        },
+                    ],
                     "dimensions": ["response_status", "environment"],
                     "environment": {
                         "preset": "explicit",
@@ -331,7 +341,16 @@ class ProtocolEvidenceTests(unittest.TestCase):
             }
         )
         self.assertEqual(len(payload.mutations), 2)
-        self.assertEqual(payload.comparison.references, ["exp_reference", "exp_other"])
+        self.assertEqual(
+            [
+                item.model_dump(mode="json", exclude_none=True)
+                for item in payload.comparison.references
+            ],
+            [
+                {"experiment_id": "exp_reference", "evidence_id": "ev_reference"},
+                {"experiment_id": "exp_other", "observation_id": "obs_other"},
+            ],
+        )
         self.assertEqual(payload.comparison.environment.dimensions, ["page_origin"])
 
         with self.assertRaises(ValidationError):
@@ -339,8 +358,58 @@ class ProtocolEvidenceTests(unittest.TestCase):
                 {
                     **base,
                     "comparison": {
-                        "references": ["exp_reference"],
+                        "references": [
+                            {
+                                "experiment_id": "exp_reference",
+                                "evidence_id": "ev_reference",
+                            }
+                        ],
                         "dimensions": ["environment"],
+                    },
+                }
+            )
+        with self.assertRaises(ValidationError):
+            ReplayRequestPayload.model_validate(
+                {
+                    **base,
+                    "comparison": {
+                        "references": [
+                            {
+                                "experiment_id": "exp_reference",
+                                "evidence_id": "ev_reference",
+                                "observation_id": "obs_reference",
+                            }
+                        ],
+                        "dimensions": ["response_status"],
+                    },
+                }
+            )
+        with self.assertRaises(ValidationError):
+            ReplayRequestPayload.model_validate(
+                {
+                    **base,
+                    "comparison": {
+                        "references": [{"experiment_id": "exp_reference"}],
+                        "dimensions": ["response_status"],
+                    },
+                }
+            )
+        with self.assertRaises(ValidationError):
+            ReplayRequestPayload.model_validate(
+                {
+                    **base,
+                    "comparison": {
+                        "references": [
+                            {
+                                "experiment_id": "exp_reference",
+                                "evidence_id": "ev_reference",
+                            }
+                        ],
+                        "dimensions": ["environment"],
+                        "environment": {
+                            "preset": "explicit",
+                            "dimensions": ["conversation_current_node"],
+                        },
                     },
                 }
             )
@@ -701,6 +770,36 @@ class ProtocolEvidenceTests(unittest.TestCase):
             "https://example.test/path?keep=x&tag=two&tag=three",
         )
         self.assertEqual(json.loads(spec["body"]["text"])["new_field"], "new")
+
+    def test_query_mutation_preserves_non_target_raw_encoding_by_default(self) -> None:
+        snapshot = self.snapshot()
+        snapshot["url"] = (
+            "https://example.test/path?untouched=a%20b&slash=%2f&tag=one&tag=two"
+        )
+        mutation = ReplaceQueryParameterMutation(
+            type="replace_query_parameter",
+            name="tag",
+            value="changed",
+            occurrence=1,
+        )
+
+        preserved, _ = build_replay_spec(snapshot, [mutation])
+        normalized, _ = build_replay_spec(
+            snapshot,
+            [mutation],
+            query_serialization="normalize",
+        )
+
+        self.assertEqual(
+            preserved["url"],
+            "https://example.test/path?untouched=a%20b&slash=%2f&tag=one&tag=changed",
+        )
+        self.assertEqual(preserved["querySerialization"], "preserve_raw")
+        self.assertEqual(
+            normalized["url"],
+            "https://example.test/path?untouched=a+b&slash=%2F&tag=one&tag=changed",
+        )
+        self.assertEqual(normalized["querySerialization"], "normalize")
 
     def test_exact_body_pointer_and_conflicting_validation_signals(self) -> None:
         mutation = RemoveJsonPathMutation(

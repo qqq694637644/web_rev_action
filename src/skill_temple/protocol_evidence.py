@@ -9,7 +9,7 @@ import json
 import re
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote_plus, urlencode, urlsplit, urlunsplit
 
 from .browser_models import (
     NetworkEvidenceSelector,
@@ -635,6 +635,7 @@ def build_replay_spec(
     *,
     bindings: list[ReplayBinding] | None = None,
     binding_values: dict[str, Any] | None = None,
+    query_serialization: str = "preserve_raw",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     url = str(snapshot.get("url", ""))
     method = str(snapshot.get("method", "GET")).upper()
@@ -665,6 +666,7 @@ def build_replay_spec(
                 str(binding_value),
                 operation="replace",
                 occurrence=binding.occurrence,
+                serialization=query_serialization,
             )
 
     for mutation in mutations:
@@ -682,6 +684,7 @@ def build_replay_spec(
                 getattr(mutation, "value", None),
                 operation=operation,
                 occurrence=mutation.occurrence,
+                serialization=query_serialization,
             )
         elif mutation.type in {
             "remove_json_path",
@@ -703,6 +706,7 @@ def build_replay_spec(
         "method": method,
         "headers": replay_headers,
         "body": body if isinstance(body, dict) and body.get("available") else None,
+        "querySerialization": query_serialization,
     }
     diff = {
         "source": {
@@ -717,6 +721,7 @@ def build_replay_spec(
             "header_names": [item["name"] for item in replay_headers],
             "ignored_browser_managed_headers": sorted(set(ignored_headers)),
             "request_body": _public_body_summary(body),
+            "query_serialization": query_serialization,
         },
         "mutations": [_redacted_mutation(mutation) for mutation in mutations],
         "bindings": [
@@ -1391,8 +1396,53 @@ def _mutate_query(
     *,
     operation: str,
     occurrence: int | str,
+    serialization: str = "preserve_raw",
 ) -> str:
     split = urlsplit(url)
+    if serialization == "preserve_raw":
+        raw_entries = split.query.split("&") if split.query else []
+        decoded_names = [
+            unquote_plus(item.partition("=")[0])
+            for item in raw_entries
+        ]
+        matches = [index for index, key in enumerate(decoded_names) if key == name]
+        encoded_pair = urlencode([(name, value or "")])
+        if operation == "add":
+            raw_entries.append(encoded_pair)
+        elif occurrence == "all":
+            if operation == "remove":
+                raw_entries = [
+                    item
+                    for index, item in enumerate(raw_entries)
+                    if index not in set(matches)
+                ]
+            else:
+                if not matches:
+                    raise ValueError(f"Query parameter does not exist: {name}")
+                for index in matches:
+                    raw_key = raw_entries[index].partition("=")[0]
+                    raw_entries[index] = f"{raw_key}={encoded_pair.partition('=')[2]}"
+        else:
+            selected = int(occurrence)
+            if selected >= len(matches):
+                raise ValueError(f"Query occurrence does not exist: {name}[{selected}]")
+            target_index = matches[selected]
+            if operation == "remove":
+                del raw_entries[target_index]
+            else:
+                raw_key = raw_entries[target_index].partition("=")[0]
+                raw_entries[target_index] = f"{raw_key}={encoded_pair.partition('=')[2]}"
+        return urlunsplit(
+            (
+                split.scheme,
+                split.netloc,
+                split.path,
+                "&".join(raw_entries),
+                split.fragment,
+            )
+        )
+    if serialization != "normalize":
+        raise ValueError(f"Unsupported query serialization mode: {serialization}")
     entries = list(parse_qsl(split.query, keep_blank_values=True))
     matches = [index for index, (key, _) in enumerate(entries) if key == name]
     if operation == "add":

@@ -83,7 +83,7 @@ def treatment_preset(
     objective: str,
     source_experiment_id: str,
     source_evidence_id: str,
-    reference_experiment_ids: list[str],
+    references: list[dict[str, Any]],
     mutations: list[dict[str, Any]],
     comparison_dimensions: list[str] | None = None,
     **options: Any,
@@ -93,7 +93,7 @@ def treatment_preset(
     comparison = options.pop(
         "comparison",
         {
-            "references": reference_experiment_ids,
+            "references": references,
             "dimensions": comparison_dimensions or ["response_status"],
         },
     )

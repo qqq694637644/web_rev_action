@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -586,8 +585,6 @@ class ReplayEnvironmentComparison(StrictModel):
             "request_origin",
             "request_path",
             "request_context_sha256",
-            "conversation_current_node",
-            "critical_bundle_sha256",
         ]
     ] = Field(default_factory=list, max_length=8)
     context_header_names: list[str] = Field(
@@ -654,17 +651,22 @@ class ReplayTransportOptions(StrictModel):
 class ReplayTerminalCondition(StrictModel):
     type: Literal[
         "exact_sse_data",
-        "byte_pattern",
+        "text_pattern",
         "network_close",
         "idle_window",
     ]
     value: str | None = Field(default=None, max_length=4096)
     event_name: str | None = Field(default=None, max_length=128)
+    window_ms: int | None = Field(default=None, ge=10, le=120_000)
 
     @model_validator(mode="after")
     def validate_terminal_condition(self) -> ReplayTerminalCondition:
-        if self.type in {"exact_sse_data", "byte_pattern"} and self.value is None:
+        if self.type in {"exact_sse_data", "text_pattern"} and self.value is None:
             raise ValueError(f"{self.type} requires value")
+        if self.type == "idle_window" and self.window_ms is None:
+            self.window_ms = 15_000
+        if self.type != "idle_window" and self.window_ms is not None:
+            raise ValueError("window_ms is only valid for idle_window")
         if self.type != "exact_sse_data" and self.event_name is not None:
             raise ValueError("event_name is only valid for exact_sse_data")
         return self
@@ -684,7 +686,6 @@ class ReplayResponseReader(StrictModel):
     mode: Literal["auto", "ordinary", "sse", "ndjson", "raw_stream"] = "auto"
     max_bytes: int = Field(default=8 * 1024 * 1024, ge=8_192, le=64 * 1024 * 1024)
     max_events: int = Field(default=10_000, ge=1, le=1_000_000)
-    idle_timeout_ms: int = Field(default=15_000, ge=1_000, le=120_000)
     raw_only: bool = False
     analyzer: ReplayResponseAnalyzer | None = None
 
@@ -705,15 +706,37 @@ class ReplayTermination(StrictModel):
         return self
 
 
+class ReplayComparisonReference(StrictModel):
+    experiment_id: str = Field(pattern=r"^[a-zA-Z0-9_.-]+$", max_length=128)
+    evidence_id: str | None = Field(
+        default=None,
+        pattern=r"^[a-zA-Z0-9_.-]+$",
+        max_length=256,
+    )
+    observation_id: str | None = Field(
+        default=None,
+        pattern=r"^[a-zA-Z0-9_.-]+$",
+        max_length=256,
+    )
+
+    @model_validator(mode="after")
+    def validate_selector(self) -> ReplayComparisonReference:
+        if bool(self.evidence_id) == bool(self.observation_id):
+            raise ValueError(
+                "comparison reference requires exactly one evidence_id or observation_id"
+            )
+        return self
+
+
 class ReplayComparison(StrictModel):
-    references: list[str] = Field(default_factory=list, max_length=16)
+    references: list[ReplayComparisonReference] = Field(default_factory=list, max_length=16)
     include_source: bool = False
     dimensions: list[
         Literal[
             "request_body",
             "response_status",
-            "response_headers",
-            "stream_events",
+            "response_content_type",
+            "stream_summary",
             "environment",
         ]
     ] = Field(default_factory=lambda: ["response_status"], max_length=5)
@@ -721,14 +744,10 @@ class ReplayComparison(StrictModel):
 
     @model_validator(mode="after")
     def validate_comparison(self) -> ReplayComparison:
-        self.references = list(dict.fromkeys(self.references))
-        invalid_references = [
-            item
-            for item in self.references
-            if len(item) > 128 or re.fullmatch(r"[a-zA-Z0-9_.-]+", item) is None
-        ]
-        if invalid_references:
-            raise ValueError("comparison references must be valid experiment IDs")
+        unique: dict[tuple[str, str | None, str | None], ReplayComparisonReference] = {}
+        for item in self.references:
+            unique[(item.experiment_id, item.evidence_id, item.observation_id)] = item
+        self.references = list(unique.values())
         self.dimensions = list(dict.fromkeys(self.dimensions))
         if not self.references and not self.include_source:
             raise ValueError("comparison requires references or include_source=true")
@@ -756,7 +775,7 @@ class ReplayRequestPayload(StrictModel):
     execution_mode: Literal["job", "sync"] = "job"
     deadline_ms: int = Field(default=42_000, ge=1_000, le=42_000)
     job_timeout_ms: int = Field(default=300_000, ge=10_000, le=1_800_000)
-    normalize_wire_order: bool = False
+    query_serialization: Literal["preserve_raw", "normalize"] = "preserve_raw"
     transport: ReplayTransportOptions = Field(default_factory=ReplayTransportOptions)
     response_reader: ReplayResponseReader = Field(default_factory=ReplayResponseReader)
     termination: ReplayTermination = Field(default_factory=ReplayTermination)

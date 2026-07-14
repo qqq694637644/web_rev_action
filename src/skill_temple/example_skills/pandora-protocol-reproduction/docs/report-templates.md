@@ -53,8 +53,8 @@ Use these sections:
 
 The field necessity matrix should contain:
 
-| Field or header | Exact case-sensitive path/name | Classification | Control experiment | Treatment experiment | Setup flow | Pair hash | Target delta/multiplicity | Non-target equivalent | Response class | State verification | Notes |
-|---|---|---|---|---|---|---|---|---|---|---|---|
+| Field or header | Exact case-sensitive path/name | Classification | Baseline experiment/evidence | Mutation experiment/evidence | Setup flow | Target wire observation | Comparison facts | Response analysis | State verification | Notes |
+|---|---|---|---|---|---|---|---|---|---|---|
 
 Never include credential values. Header names are allowed.
 
@@ -130,12 +130,12 @@ Generate JSON Schema from observed and replay-tested request bodies. Add custom 
 }
 ```
 
-A field should be in `required` only after a successful Control, an effective
-one-variable remove Treatment, equivalent non-target request fields, an
-`observed_equivalent` pre-dispatch environment, and an exact HTTP 400/422
-structured `field_required` response at the target. Record missing environment
-dimensions explicitly. Replace failures belong under `constrained_value`; 409
-belongs under `conflict`.
+A field should be in `required` only after an explicit zero-mutation baseline, an
+effective one-target remove replay, exact source and comparison evidence IDs, an
+exact HTTP 400/422 structured `field_required` response at the target, and
+persistent-state verification. Record missing or ambiguous comparison facts
+explicitly. Replace failures belong under `constrained_value`; 409 belongs under
+`conflict`.
 
 ## `schemas/stream-events.schema.json`
 
@@ -164,7 +164,7 @@ Rules:
 - credentials come from environment variables or explicit placeholders;
 - never embed captured Cookie, Authorization, CSRF, or token values;
 - preserve a comment with source experiment/evidence IDs;
-- preserve control/treatment experiment IDs when the script is derived from a classification replay;
+- preserve baseline/mutation experiment and exact evidence IDs when the script is derived from replay observations;
 - expose required/optional fields as typed parameters;
 - print bounded status and response diagnostics;
 - support stream decoding only when the stream report confirms the framing.
