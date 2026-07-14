@@ -992,6 +992,42 @@ class BrowserActionService:
         return protocol
 
     @staticmethod
+    def _apply_observed_replay_mode(
+        replay_plan: dict[str, Any],
+        observed_mode: str | None,
+    ) -> None:
+        valid_modes = {"ordinary", "sse", "ndjson", "raw_stream"}
+        if observed_mode not in valid_modes:
+            return
+        protocol = json.loads(json.dumps(replay_plan["replay_protocol"]))
+        response_reader = protocol.get("response_reader")
+        response_reader = response_reader if isinstance(response_reader, dict) else {}
+        requested_mode = str(response_reader.get("mode") or "auto")
+        if requested_mode == "auto":
+            response_reader["mode"] = observed_mode
+        protocol["response_reader"] = response_reader
+        response_is_stream = observed_mode in {"sse", "ndjson", "raw_stream"}
+        protocol["observed_response_mode"] = observed_mode
+        protocol["response_is_stream"] = response_is_stream
+        if response_is_stream:
+            capture = protocol.get("capture")
+            capture = capture if isinstance(capture, dict) else {}
+            capture["stream"] = True
+            protocol["capture"] = capture
+            requirements = protocol.get("requirements")
+            requirements = requirements if isinstance(requirements, dict) else {}
+            requirements["require_raw_capture"] = True
+            requirements["require_semantic_parse"] = not bool(
+                response_reader.get("raw_only")
+            )
+            requirements["require_artifacts"] = True
+            protocol["requirements"] = requirements
+        replay_plan["replay_protocol"] = protocol
+        replay_plan["replay_protocol_hash"] = canonical_json_sha256(protocol)
+        replay_plan["observed_response_mode"] = observed_mode
+        replay_plan["response_is_stream"] = response_is_stream
+
+    @staticmethod
     def _binding_observations(
         bindings: list[ReplayBinding],
         values: dict[str, Any],
@@ -1793,12 +1829,38 @@ class BrowserActionService:
         status: int | None,
         content_type: str | None,
     ) -> dict[str, Any] | None:
-        if replay_plan.get("source_is_stream") is not True:
-            return None
         response_control = replay_plan.get("spec", {}).get("responseControl", {})
         response_control = response_control if isinstance(response_control, dict) else {}
         response_mode = str(response_control.get("responseMode") or "auto")
         observed_mode = cls._extract_response_field(replay_response, "responseMode")
+        observed_mode = str(observed_mode) if observed_mode is not None else None
+        stream_modes = {"sse", "ndjson", "raw_stream"}
+        valid_observed_modes = {"ordinary", *stream_modes}
+        known_ndjson_types = {
+            "application/x-ndjson",
+            "application/ndjson",
+            "application/json-seq",
+        }
+        normalized_content_type = (
+            str(content_type).split(";", 1)[0].strip().lower()
+            if content_type
+            else None
+        )
+        auto_selected_mode = (
+            "sse"
+            if normalized_content_type == "text/event-stream"
+            else "ndjson"
+            if normalized_content_type in known_ndjson_types
+            else "ordinary"
+        )
+        contract_expected = bool(
+            response_mode in stream_modes
+            or observed_mode in stream_modes
+            or replay_plan.get("source_is_stream") is True
+            or auto_selected_mode in stream_modes
+        )
+        if not contract_expected:
+            return None
         terminal_conditions = response_control.get("terminalConditions")
         terminal_conditions = (
             [item for item in terminal_conditions if isinstance(item, dict)]
@@ -1820,7 +1882,14 @@ class BrowserActionService:
         truncated = bool(cls._extract_response_field(replay_response, "truncated"))
         mode_ok: bool | None = None
         content_type_ok: bool | None = None
-        if isinstance(status, int) and status >= 400 and content_type != "text/event-stream":
+        content_type_required = response_mode in {"auto", "ordinary"}
+        if (
+            isinstance(status, int)
+            and status >= 400
+            and observed_mode == "ordinary"
+            and response_mode in {"auto", "ordinary"}
+            and auto_selected_mode == "ordinary"
+        ):
             contract_status = "not_applicable_non_stream_response"
         else:
             marker_ok = not marker or marker_observed
@@ -1837,22 +1906,14 @@ class BrowserActionService:
                 )
                 or ("idle_window" in terminal_types and termination == "idle_window")
             )
-            valid_observed_modes = {"ordinary", "sse", "ndjson", "raw_stream"}
             mode_ok = bool(
                 observed_mode in valid_observed_modes
                 and (response_mode == "auto" or observed_mode == response_mode)
             )
-            content_type_ok = bool(
-                observed_mode in {"ordinary", "raw_stream"}
-                or observed_mode == "sse"
-                and content_type == "text/event-stream"
-                or observed_mode == "ndjson"
-                and content_type
-                in {"application/x-ndjson", "application/ndjson", "application/json-seq"}
-            )
+            content_type_ok = observed_mode == auto_selected_mode
             complete = bool(
                 mode_ok
-                and content_type_ok
+                and (content_type_ok or not content_type_required)
                 and marker_ok
                 and event_ok
                 and terminal_ok
@@ -1865,6 +1926,7 @@ class BrowserActionService:
             "observed_response_mode": observed_mode,
             "response_mode_matches": mode_ok,
             "content_type_matches_observed_mode": content_type_ok,
+            "content_type_required_for_contract": content_type_required,
             "terminal_conditions": terminal_conditions,
             "terminal_condition_matched": terminal_condition_matched,
             "observed_termination": termination,
@@ -2524,6 +2586,7 @@ class BrowserActionService:
             and source_content_type
             in {"text/event-stream", "application/x-ndjson", "application/ndjson"}
         )
+        stream_capture_enabled = source_is_stream or reader.mode == "auto"
         matcher = RequestMatcher(
             url_contains=source_url.split("?", 1)[0],
             method=source_method,
@@ -2553,8 +2616,9 @@ class BrowserActionService:
         capture = payload.capture.model_dump(mode="json")
         requirements = payload.requirements.model_dump(mode="json")
         wait_for = payload.wait_for
-        if source_is_stream:
+        if stream_capture_enabled:
             capture["stream"] = True
+        if source_is_stream:
             requirements["require_raw_capture"] = True
             requirements["require_semantic_parse"] = not reader.raw_only
             requirements["require_artifacts"] = True
@@ -2590,12 +2654,12 @@ class BrowserActionService:
             "terminalConditions": terminal_conditions,
             "doneMarker": (
                 exact_sse_condition.get("value")
-                if source_is_stream and isinstance(exact_sse_condition, dict)
+                if isinstance(exact_sse_condition, dict)
                 else None
             ),
             "doneEventName": (
                 exact_sse_condition.get("event_name")
-                if source_is_stream and isinstance(exact_sse_condition, dict)
+                if isinstance(exact_sse_condition, dict)
                 else None
             ),
         }
@@ -2639,6 +2703,7 @@ class BrowserActionService:
             for item in normalized.network_evidence
         ]
         replay_protocol["source_is_stream"] = source_is_stream
+        replay_protocol["stream_capture_enabled"] = stream_capture_enabled
         replay_protocol_hash = canonical_json_sha256(replay_protocol)
         replay_attempt_id = f"replay_{uuid.uuid4().hex}"
         comparison = (
@@ -2658,6 +2723,7 @@ class BrowserActionService:
             "source_evidence": source_evidence,
             "source_content_type": source_content_type,
             "source_is_stream": source_is_stream,
+            "stream_capture_enabled": stream_capture_enabled,
             "bindings": self._public_binding_specs(binding_specs),
             "binding_values": binding_values,
             "binding_observations": self._binding_observations(
@@ -2710,6 +2776,7 @@ class BrowserActionService:
             "source_evidence_id": replay_plan["source_evidence_id"],
             "source_content_type": replay_plan["source_content_type"],
             "source_is_stream": replay_plan["source_is_stream"],
+            "stream_capture_enabled": replay_plan["stream_capture_enabled"],
             "bindings": replay_plan["bindings"],
             "binding_observations": replay_plan["binding_observations"],
             "unresolved_binding_ids": replay_plan["unresolved_binding_ids"],
@@ -4014,6 +4081,7 @@ class BrowserActionService:
             replay_response: Any = None
             replay_http_status: int | None = None
             replay_response_content_type: str | None = None
+            replay_observed_response_mode: str | None = None
             post_response_alignment: AlignmentResult | None = None
             pre_dispatch_alignment: AlignmentResult = alignment
             replay_artifacts: list[dict[str, Any]] = []
@@ -4421,6 +4489,15 @@ class BrowserActionService:
                                 replay_http_status = self._extract_http_status(replay_response)
                                 replay_response_content_type = self._extract_response_content_type(
                                     replay_response
+                                )
+                                observed_mode_value = self._extract_response_field(
+                                    replay_response,
+                                    "responseMode",
+                                )
+                                replay_observed_response_mode = (
+                                    str(observed_mode_value)
+                                    if observed_mode_value is not None
+                                    else None
                                 )
                             except (OSError, json.JSONDecodeError) as exc:
                                 warnings.append(f"replay response status: {str(exc)[:1000]}")
@@ -4836,6 +4913,24 @@ class BrowserActionService:
                         observations["mutation_effective"] = mutation_assessment.get(
                             "all_mutations_effective"
                         )
+                self._apply_observed_replay_mode(
+                    replay_plan,
+                    replay_observed_response_mode,
+                )
+                replay_manifest = manifest.get("replay")
+                if isinstance(replay_manifest, dict):
+                    replay_manifest["replay_protocol"] = replay_plan[
+                        "replay_protocol"
+                    ]
+                    replay_manifest["replay_protocol_hash"] = replay_plan[
+                        "replay_protocol_hash"
+                    ]
+                    replay_manifest["observed_response_mode"] = replay_plan.get(
+                        "observed_response_mode"
+                    )
+                    replay_manifest["response_is_stream"] = replay_plan.get(
+                        "response_is_stream"
+                    )
                 stream_response_contract = self._stream_response_contract(
                     replay_plan,
                     replay_response,
@@ -4888,18 +4983,43 @@ class BrowserActionService:
             network_evidence_entries = [
                 item for item in evidence_entries if item.get("kind") == "network_request"
             ]
+            observed_stream_response = replay_observed_response_mode in {
+                "sse",
+                "ndjson",
+                "raw_stream",
+            }
+            configured_response_mode = (
+                str(
+                    replay_plan.get("spec", {})
+                    .get("responseControl", {})
+                    .get("responseMode", "auto")
+                )
+                if replay_plan is not None
+                else "ordinary"
+            )
             non_stream_error_response_observed = bool(
                 replay_plan is not None
-                and replay_plan.get("source_is_stream") is True
+                and payload.capture.stream
                 and isinstance(replay_http_status, int)
                 and replay_http_status >= 400
-                and replay_response_content_type != "text/event-stream"
+                and replay_observed_response_mode == "ordinary"
+                and configured_response_mode in {"auto", "ordinary"}
+                and (
+                    stream_response_contract is None
+                    or stream_response_contract.get("status")
+                    == "not_applicable_non_stream_response"
+                )
                 and replay_network_evidence_id
+            )
+            stream_evidence_required = (
+                observed_stream_response
+                if replay_plan is not None
+                else payload.capture.stream
             )
             primary_status_payload = final_status_payload
             if (
                 replay_plan is not None
-                and replay_plan.get("source_is_stream") is True
+                and observed_stream_response
                 and replay_network_evidence_id
                 and not non_stream_error_response_observed
             ):
@@ -4931,7 +5051,7 @@ class BrowserActionService:
                 primary_status_payload,
                 primary_network_payload,
             )
-            if non_stream_error_response_observed:
+            if replay_plan is not None and not observed_stream_response:
                 primary_requests = list(primary_network_payload["requests"])
                 count_ok = (
                     payload.primary_request.expected_min_matches
@@ -4950,7 +5070,7 @@ class BrowserActionService:
                 experiment_id,
                 primary_requests,
                 network_evidence_entries,
-                stream_capture=payload.capture.stream and not non_stream_error_response_observed,
+                stream_capture=stream_evidence_required,
             )
             if (
                 non_stream_error_response_observed
@@ -4966,7 +5086,7 @@ class BrowserActionService:
                         observation["missing_evidence"] = [
                             item for item in missing if item != "response_body"
                         ]
-            if payload.capture.stream and not non_stream_error_response_observed:
+            if stream_evidence_required:
                 evidence_entries.extend(
                     self._stream_evidence_entries(
                         experiment_id,
@@ -5047,19 +5167,33 @@ class BrowserActionService:
             required_dimensions: set[str] = set()
             if payload.primary_request.expected_min_matches > 0:
                 if (
-                    payload.requirements.require_raw_capture
+                    (
+                        payload.requirements.require_raw_capture
+                        or (replay_plan is not None and observed_stream_response)
+                    )
                     and not non_stream_error_response_observed
                 ):
                     required_dimensions.add("raw_stream")
                 if (
-                    payload.requirements.require_semantic_parse
+                    (
+                        payload.requirements.require_semantic_parse
+                        or (
+                            observed_stream_response
+                            and replay_plan is not None
+                            and not bool(
+                                replay_plan.get("replay_protocol", {})
+                                .get("response_reader", {})
+                                .get("raw_only")
+                            )
+                        )
+                    )
                     and not non_stream_error_response_observed
                 ):
                     required_dimensions.add("semantic_stream")
                 if payload.requirements.require_request_snapshot:
                     required_dimensions.update({"request_headers", "request_body"})
                 if payload.requirements.require_artifacts:
-                    if payload.capture.stream and not non_stream_error_response_observed:
+                    if stream_evidence_required:
                         required_dimensions.add("stream_artifacts")
                     else:
                         required_dimensions.add("network_artifacts")
@@ -5071,7 +5205,6 @@ class BrowserActionService:
             )
             if (
                 replay_plan is not None
-                and replay_plan.get("source_is_stream") is True
                 and not non_stream_error_response_observed
                 and isinstance(stream_response_contract, dict)
             ):
@@ -5108,7 +5241,7 @@ class BrowserActionService:
                         evidence_errors.append(f"network_association_failed:{observation_id}")
                         missing_evidence.append(f"association:{observation_id}")
             if (
-                payload.capture.stream
+                stream_evidence_required
                 and not payload.primary_request.allow_supporting_failures
                 and collector_integrity != "complete"
             ):
@@ -5123,7 +5256,7 @@ class BrowserActionService:
             evidence_partial = not evidence_failed and (
                 any(value != "complete" for value in required_values)
                 or (
-                    payload.capture.stream
+                    stream_evidence_required
                     and not payload.primary_request.allow_supporting_failures
                     and collector_integrity != "complete"
                 )

@@ -102,6 +102,13 @@ saved in `replay.replay_protocol`. The original normalized request is saved in
 configuration. When comparing the current stream, use only the unique observation
 linked to `replay.network_evidence_id`. Do not fall back to the first observation.
 
+`mode=auto` starts stream capture as a probe. Evidence requirements are selected after
+dispatch from the runtime `observed_response_mode`: ordinary uses ordinary network
+evidence; SSE, NDJSON, and raw stream require their stream evidence and terminal
+contract. HTTP status does not select the mode. Explicit stream readers may accept a
+missing or non-standard Content-Type when the runtime mode matches; auto mode must
+remain consistent with the Content-Type-based automatic selection rule.
+
 ## Strong-evidence Stop template
 
 When the page exposes a Stop control and the goal is to classify a user cancellation, the following is a useful strong-evidence template:

@@ -721,6 +721,7 @@ network_response_json + RequestMatcher + JSON Pointer
 - [x] raw body、结构化 body 和 body fingerprint；
 - [x] Fetch、XHR、EventSource 以及未知 delivery 的事实记录；
 - [x] SSE、NDJSON、raw stream 和无 Content-Type；
+- [x] auto reader 预启用 stream 探测，并按 runtime observed mode 动态选择 ordinary 或 stream quality requirements；
 - [x] 可配置 response reader、byte/event limit 和 termination condition；
 - [x] browser-context replay；
 - [x] add/remove/replace mutation；

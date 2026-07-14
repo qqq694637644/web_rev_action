@@ -2104,6 +2104,218 @@ class BrowserActionTests(unittest.TestCase):
                 manifest["quality_summary"]["missing_evidence"],
             )
 
+    def test_http_500_ndjson_and_raw_stream_remain_stream_evidence(self) -> None:
+        cases = [
+            ("ndjson", "application/x-ndjson"),
+            ("raw_stream", "application/octet-stream"),
+        ]
+        for mode, content_type in cases:
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                client, _, js = self.make_client(root, include_supporting_failure=False)
+                js.network_response_content_type = content_type
+                js.replay_observed_response_mode = mode
+                js.replay_termination_reason = "network_close"
+                with client:
+                    self.open_session(client)
+                    source_id, source_evidence, _ = self.capture_replay_source(client, root)
+                    js.replay_response_status = 500
+                    response = client.post(
+                        "/v1/browser/run",
+                        json={
+                            "operation": "replay_request",
+                            "payload": {
+                                "session_id": "session_one",
+                                "objective": f"preserve a complete HTTP 500 {mode} response",
+                                "source": {
+                                    "experiment_id": source_id,
+                                    "evidence_id": source_evidence["evidence_id"],
+                                },
+                                "response_reader": {"mode": mode, "raw_only": True},
+                                "termination": {
+                                    "conditions": [{"type": "network_close"}]
+                                },
+                                "execution_mode": "sync",
+                                "deadline_ms": 10_000,
+                            },
+                        },
+                    )
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(response.json()["status"], "completed")
+                manifest = json.loads(
+                    (root / response.json()["result"]["manifest_relative_path"]).read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertEqual(manifest["replay_http_status"], 500)
+                self.assertFalse(manifest["non_stream_error_response_observed"])
+                self.assertEqual(
+                    manifest["stream_response_contract"]["status"],
+                    "complete",
+                )
+                self.assertEqual(
+                    manifest["stream_response_contract"]["observed_response_mode"],
+                    mode,
+                )
+                self.assertEqual(manifest["quality_summary"]["status"], "complete")
+
+    def test_explicit_stream_reader_allows_missing_content_type(self) -> None:
+        for mode in ("sse", "ndjson"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                client, _, js = self.make_client(root, include_supporting_failure=False)
+                js.network_response_content_type = None
+                js.replay_observed_response_mode = mode
+                js.replay_termination_reason = "network_close"
+                with client:
+                    self.open_session(client)
+                    source_id, source_evidence, _ = self.capture_replay_source(client, root)
+                    response = client.post(
+                        "/v1/browser/run",
+                        json={
+                            "operation": "replay_request",
+                            "payload": {
+                                "session_id": "session_one",
+                                "objective": f"read {mode} without Content-Type",
+                                "source": {
+                                    "experiment_id": source_id,
+                                    "evidence_id": source_evidence["evidence_id"],
+                                },
+                                "response_reader": {"mode": mode, "raw_only": True},
+                                "termination": {
+                                    "conditions": [{"type": "network_close"}]
+                                },
+                                "execution_mode": "sync",
+                                "deadline_ms": 10_000,
+                            },
+                        },
+                    )
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(response.json()["status"], "completed")
+                manifest = json.loads(
+                    (root / response.json()["result"]["manifest_relative_path"]).read_text(
+                        encoding="utf-8"
+                    )
+                )
+                contract = manifest["stream_response_contract"]
+                self.assertEqual(contract["status"], "complete")
+                self.assertTrue(contract["response_mode_matches"])
+                self.assertFalse(contract["content_type_matches_observed_mode"])
+                self.assertFalse(contract["content_type_required_for_contract"])
+
+    def test_auto_reader_rejects_content_type_mode_contradiction(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            client, _, js = self.make_client(root, include_supporting_failure=False)
+            js.network_response_content_type = "text/event-stream"
+            js.replay_observed_response_mode = "ordinary"
+            js.replay_termination_reason = "network_close"
+            with client:
+                self.open_session(client)
+                source_id, source_evidence, _ = self.capture_replay_source(client, root)
+                response = client.post(
+                    "/v1/browser/run",
+                    json={
+                        "operation": "replay_request",
+                        "payload": {
+                            "session_id": "session_one",
+                            "objective": "detect an auto-reader Content-Type contradiction",
+                            "source": {
+                                "experiment_id": source_id,
+                                "evidence_id": source_evidence["evidence_id"],
+                            },
+                            "response_reader": {"mode": "auto", "raw_only": True},
+                            "termination": {
+                                "conditions": [{"type": "network_close"}]
+                            },
+                            "execution_mode": "sync",
+                            "deadline_ms": 10_000,
+                        },
+                    },
+                )
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json()["status"], "partial")
+            manifest = json.loads(
+                (root / response.json()["result"]["manifest_relative_path"]).read_text(
+                    encoding="utf-8"
+                )
+            )
+            contract = manifest["stream_response_contract"]
+            self.assertEqual(contract["status"], "partial")
+            self.assertTrue(contract["response_mode_matches"])
+            self.assertFalse(contract["content_type_matches_observed_mode"])
+            self.assertTrue(contract["content_type_required_for_contract"])
+
+    def test_auto_reader_captures_response_that_changes_from_json_to_stream(self) -> None:
+        cases = [
+            ("sse", "text/event-stream", "done_marker"),
+            ("ndjson", "application/x-ndjson", "network_close"),
+        ]
+        for mode, content_type, termination_reason in cases:
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                client, _, js = self.make_client(root, include_supporting_failure=False)
+                js.network_response_content_type = "application/json"
+                with client:
+                    self.open_session(client)
+                    source_id, source_evidence, _ = self.capture_replay_source(client, root)
+                    js.network_response_content_type = content_type
+                    js.replay_observed_response_mode = mode
+                    js.replay_termination_reason = termination_reason
+                    js.replay_done_marker_observed = mode == "sse"
+                    termination = (
+                        {"conditions": [{"type": "exact_sse_data", "value": "[DONE]"}]}
+                        if mode == "sse"
+                        else {"conditions": [{"type": "network_close"}]}
+                    )
+                    response = client.post(
+                        "/v1/browser/run",
+                        json={
+                            "operation": "replay_request",
+                            "payload": {
+                                "session_id": "session_one",
+                                "objective": f"auto-detect a JSON to {mode} transition",
+                                "source": {
+                                    "experiment_id": source_id,
+                                    "evidence_id": source_evidence["evidence_id"],
+                                },
+                                "response_reader": {"mode": "auto", "raw_only": True},
+                                "termination": termination,
+                                "execution_mode": "sync",
+                                "deadline_ms": 10_000,
+                            },
+                        },
+                    )
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(response.json()["status"], "completed")
+                manifest = json.loads(
+                    (root / response.json()["result"]["manifest_relative_path"]).read_text(
+                        encoding="utf-8"
+                    )
+                )
+                replay = manifest["replay"]
+                self.assertFalse(replay["source_is_stream"])
+                self.assertTrue(replay["stream_capture_enabled"])
+                self.assertTrue(replay["response_is_stream"])
+                self.assertEqual(replay["observed_response_mode"], mode)
+                self.assertEqual(
+                    replay["requested_replay_protocol"]["response_reader"]["mode"],
+                    "auto",
+                )
+                self.assertEqual(
+                    replay["replay_protocol"]["response_reader"]["mode"],
+                    mode,
+                )
+                self.assertTrue(replay["replay_protocol"]["capture"]["stream"])
+                self.assertTrue(
+                    replay["replay_protocol"]["requirements"]["require_raw_capture"]
+                )
+                self.assertEqual(
+                    manifest["stream_response_contract"]["status"],
+                    "complete",
+                )
+                self.assertEqual(manifest["quality_summary"]["status"], "complete")
+
     def test_atomic_capture_order_manifest_and_primary_integrity(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

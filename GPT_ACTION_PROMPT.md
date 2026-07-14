@@ -113,6 +113,12 @@ stream detection 自动启用后的 capture/requirements，`replay_protocol_hash
 构建当前 stream comparison 时只使用 `replay.network_evidence_id` 唯一关联的 observation；
 零命中保持 missing，多命中保持 ambiguous，不得回退到第一条 observation。
 
+`response_reader.mode=auto` 会预先启动 stream collector，但只有 runtime 实际观察到
+`sse`、`ndjson` 或 `raw_stream` 时才要求 stream completeness；观察到 ordinary 时使用
+ordinary network evidence。HTTP 4xx/5xx 不决定是否为流。显式 stream reader 缺少或使用
+非标准 Content-Type 时保留 consistency fact，但不自动降级；auto 的 observed mode 必须与
+Content-Type 自动选择规则一致。
+
 Query mutation 默认使用 `query_serialization=preserve_raw`，不要重编码未修改参数。只有
 任务明确需要 canonical normalization 时才使用 `normalize`。
 

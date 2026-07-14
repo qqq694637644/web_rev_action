@@ -226,6 +226,21 @@ replay.replay_protocol_hash
 返回相同 `observed_response_mode` 时才满足 stream contract；`auto` 接受 runtime 的有效
 自动选择结果。
 
+`response_reader.mode=auto` 会启动 stream collector 作为探测，但执行前不强制要求 stream
+completeness。执行后根据 runtime 的 `observed_response_mode` 决定有效 requirements：
+
+```text
+observed ordinary              → ordinary network completeness
+observed sse/ndjson/raw_stream → raw/semantic/artifact/terminal stream completeness
+```
+
+因此 source 为普通 JSON、实际 replay 变为 SSE 或 NDJSON 时不会静默漏掉 stream evidence。
+HTTP 4xx/5xx 不改变该规则；observed NDJSON/raw stream 仍按 stream contract 评估。
+
+Content-Type 在显式 `sse`、`ndjson` 或 `raw_stream` reader 下只作为 consistency fact；缺失
+或不规范 header 不会替代 runtime 已成功使用的显式 reader。`auto` 必须遵守 runtime 的
+自动选择规则：event-stream → SSE，NDJSON Content-Type → NDJSON，其他或缺失 → ordinary。
+
 Idle 不再是 reader 的无条件超时。只有显式声明
 `{"type":"idle_window","window_ms":...}` 时才启动该窗口，并记录
 `terminalConditionMatched=idle_window`。`text_pattern` 匹配 UTF-8 解码后的文本，不宣称
