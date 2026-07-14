@@ -1132,6 +1132,192 @@ class BrowserActionTests(unittest.TestCase):
             )
             self.assertEqual(replay_network["request_ids"]["reqid"], 3)
 
+    def test_custom_network_evidence_keeps_mandatory_replay_selector(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            client, _, _ = self.make_client(root, include_supporting_failure=False)
+            with client:
+                self.open_session(client)
+                source_id, source_evidence, _ = self.capture_replay_source(client, root)
+                response = client.post(
+                    "/v1/browser/run",
+                    json={
+                        "operation": "replay_request",
+                        "payload": {
+                            "session_id": "session_one",
+                            "objective": "capture exact replay plus supporting traffic",
+                            "source": {
+                                "experiment_id": source_id,
+                                "evidence_id": source_evidence["evidence_id"],
+                            },
+                            "network_evidence": [
+                                {
+                                    "selector_id": "supporting_only",
+                                    "matcher": {
+                                        "url_contains": "/unrelated-supporting",
+                                        "method": "GET",
+                                    },
+                                    "export_parts": ["all"],
+                                }
+                            ],
+                            "execution_mode": "sync",
+                            "deadline_ms": 10_000,
+                        },
+                    },
+                )
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json()["status"], "completed")
+            manifest = json.loads(
+                (root / response.json()["result"]["manifest_relative_path"]).read_text(
+                    encoding="utf-8"
+                )
+            )
+            replay = manifest["replay"]
+            self.assertIsNotNone(replay["network_evidence_id"])
+            self.assertEqual(
+                [
+                    item["selector_id"]
+                    for item in replay["requested_replay_protocol"]["network_evidence"]
+                ],
+                ["supporting_only"],
+            )
+            self.assertEqual(
+                [
+                    item["selector_id"]
+                    for item in replay["replay_protocol"]["network_evidence"]
+                ],
+                ["replay_request", "supporting_only"],
+            )
+            exact = next(
+                item
+                for item in manifest["evidence"]
+                if item.get("evidence_id") == replay["network_evidence_id"]
+            )
+            self.assertEqual(exact["selector_id"], "replay_request")
+
+    def test_overwritten_bindings_and_mutations_are_applied_not_ineffective(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            client, _, _ = self.make_client(root, include_supporting_failure=False)
+            with client:
+                self.open_session(client)
+                source_id, source_evidence, _ = self.capture_replay_source(client, root)
+                response = client.post(
+                    "/v1/browser/run",
+                    json={
+                        "operation": "replay_request",
+                        "payload": {
+                            "session_id": "session_one",
+                            "objective": "audit ordered overlapping replay operations",
+                            "source": {
+                                "experiment_id": source_id,
+                                "evidence_id": source_evidence["evidence_id"],
+                            },
+                            "bindings": [
+                                {
+                                    "binding_id": "parent",
+                                    "target": "json_pointer",
+                                    "path": "/parent_message_id",
+                                    "value_source": "literal",
+                                    "value": "bound-parent",
+                                }
+                            ],
+                            "mutations": [
+                                {
+                                    "type": "replace_json_path",
+                                    "path": "/parent_message_id",
+                                    "value": "first-parent",
+                                },
+                                {
+                                    "type": "replace_json_path",
+                                    "path": "/parent_message_id",
+                                    "value": "final-parent",
+                                },
+                            ],
+                            "execution_mode": "sync",
+                            "deadline_ms": 10_000,
+                        },
+                    },
+                )
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json()["status"], "completed")
+            manifest = json.loads(
+                (root / response.json()["result"]["manifest_relative_path"]).read_text(
+                    encoding="utf-8"
+                )
+            )
+            assessment = manifest["mutation_assessment"]
+            self.assertTrue(assessment["all_mutations_applied_to_spec"])
+            self.assertTrue(assessment["all_mutations_effective"])
+            first, second = assessment["mutations"]
+            self.assertIsNone(first["mutation_effective"])
+            self.assertEqual(
+                first["final_wire_observability"],
+                "overwritten_by_later_operation",
+            )
+            self.assertTrue(second["mutation_effective"])
+            binding = assessment["bindings"]
+            self.assertTrue(binding["binding_application_complete"])
+            self.assertEqual(
+                binding["binding_observations"][0]["final_wire_observability"],
+                "overwritten_by_later_operation",
+            )
+
+    def test_stream_contract_requires_terminal_match_consistency(self) -> None:
+        replay_plan = {
+            "source_is_stream": True,
+            "spec": {
+                "responseControl": {
+                    "responseMode": "sse",
+                    "terminalConditions": [{"type": "network_close"}],
+                }
+            },
+        }
+        contradictory = BrowserActionService._stream_response_contract(
+            replay_plan,
+            {
+                "responseMode": "sse",
+                "terminationReason": "network_close",
+                "terminalConditionMatched": "idle_window",
+                "truncated": False,
+            },
+            status=200,
+            content_type="text/event-stream",
+        )
+        missing_marker_match = BrowserActionService._stream_response_contract(
+            {
+                "source_is_stream": True,
+                "spec": {
+                    "responseControl": {
+                        "responseMode": "sse",
+                        "doneMarker": "[DONE]",
+                        "terminalConditions": [
+                            {"type": "exact_sse_data", "value": "[DONE]"}
+                        ],
+                    }
+                },
+            },
+            {
+                "responseMode": "sse",
+                "terminationReason": "done_marker",
+                "terminalConditionMatched": None,
+                "doneMarkerObserved": True,
+                "truncated": False,
+            },
+            status=200,
+            content_type="text/event-stream",
+        )
+
+        self.assertEqual(contradictory["status"], "partial")
+        self.assertTrue(contradictory["termination_reason_matches_conditions"])
+        self.assertFalse(
+            contradictory["terminal_condition_matches_observed_termination"]
+        )
+        self.assertEqual(missing_marker_match["status"], "partial")
+        self.assertFalse(
+            missing_marker_match["terminal_condition_matches_observed_termination"]
+        )
+
     def test_generic_replay_fails_closed_on_ambiguous_exact_candidates(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

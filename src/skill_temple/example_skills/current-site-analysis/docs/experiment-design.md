@@ -31,6 +31,16 @@ Extractor failure is an observation unless `required=true`. Every exported extra
 
 Bindings run first. Mutations run afterward in list order.
 
+The service always adds the reserved `replay_request` network-evidence selector for
+the exact outbound request. User selectors are supporting selectors and are appended;
+do not use the reserved selector ID. Integer occurrence values are non-negative.
+Add-header and add-query operations use only `append`.
+
+Audit ordered operations with two separate facts: whether the operation was applied
+to the replay spec, and whether its intermediate value remains independently visible
+on the final wire. A value intentionally replaced or removed by a later operation is
+`overwritten_by_later_operation`, not ineffective.
+
 ## Mutation discipline
 
 The generic API supports multiple mutations, but one target mutation per experiment is usually easier to interpret. Record the actual outbound wire observation before drawing a conclusion.
@@ -95,6 +105,8 @@ Rules:
 - `text_pattern.value` must be non-empty;
 - `network_close` has no value or event name;
 - `idle_window` uses `window_ms` and no value or event name.
+- an empty condition list normalizes to `network_close`;
+- runtime termination reason and matched condition must agree.
 
 The normalized termination configuration and the effective capture/requirements are
 saved in `replay.replay_protocol`. The original normalized request is saved in

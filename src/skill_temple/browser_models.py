@@ -427,7 +427,7 @@ class ReplaceJsonPathMutation(StrictModel):
 class RemoveHeaderMutation(StrictModel):
     type: Literal["remove_header"]
     name: str = Field(min_length=1, max_length=256)
-    occurrence: int | Literal["all"] = Field(default="all")
+    occurrence: Annotated[int, Field(ge=0, le=255)] | Literal["all"] = "all"
 
     @model_validator(mode="after")
     def validate_header(self) -> RemoveHeaderMutation:
@@ -439,7 +439,7 @@ class ReplaceHeaderMutation(StrictModel):
     type: Literal["replace_header"]
     name: str = Field(min_length=1, max_length=256)
     value: str = Field(max_length=32_000)
-    occurrence: int | Literal["all"] = Field(default="all")
+    occurrence: Annotated[int, Field(ge=0, le=255)] | Literal["all"] = "all"
 
     @model_validator(mode="after")
     def validate_header(self) -> ReplaceHeaderMutation:
@@ -451,7 +451,7 @@ class AddHeaderMutation(StrictModel):
     type: Literal["add_header"]
     name: str = Field(min_length=1, max_length=256)
     value: str = Field(max_length=32_000)
-    occurrence: int | Literal["append"] = Field(default="append")
+    occurrence: Literal["append"] = "append"
 
     @model_validator(mode="after")
     def validate_header(self) -> AddHeaderMutation:
@@ -462,21 +462,21 @@ class AddHeaderMutation(StrictModel):
 class RemoveQueryParameterMutation(StrictModel):
     type: Literal["remove_query_parameter"]
     name: str = Field(min_length=1, max_length=512)
-    occurrence: int | Literal["all"] = Field(default="all")
+    occurrence: Annotated[int, Field(ge=0, le=255)] | Literal["all"] = "all"
 
 
 class ReplaceQueryParameterMutation(StrictModel):
     type: Literal["replace_query_parameter"]
     name: str = Field(min_length=1, max_length=512)
     value: str = Field(max_length=32_000)
-    occurrence: int | Literal["all"] = Field(default="all")
+    occurrence: Annotated[int, Field(ge=0, le=255)] | Literal["all"] = "all"
 
 
 class AddQueryParameterMutation(StrictModel):
     type: Literal["add_query_parameter"]
     name: str = Field(min_length=1, max_length=512)
     value: str = Field(max_length=32_000)
-    occurrence: int | Literal["append"] = Field(default="append")
+    occurrence: Literal["append"] = "append"
 
 
 ReplayMutation = Annotated[
@@ -560,7 +560,7 @@ class NetworkResponseJsonExtractor(StrictModel):
     type: Literal["network_response_json"]
     selector: RequestMatcher
     pointer: str = Field(min_length=2, max_length=512)
-    occurrence: int | Literal["first", "last"] = "last"
+    occurrence: Annotated[int, Field(ge=0, le=255)] | Literal["first", "last"] = "last"
     required: bool = False
 
     @model_validator(mode="after")
@@ -703,6 +703,8 @@ class ReplayTermination(StrictModel):
 
     @model_validator(mode="after")
     def validate_conditions(self) -> ReplayTermination:
+        if not self.conditions:
+            self.conditions = [ReplayTerminalCondition(type="network_close")]
         exact_sse_count = sum(
             item.type == "exact_sse_data" for item in self.conditions
         )
@@ -796,7 +798,7 @@ class ReplayRequestPayload(StrictModel):
             require_artifacts=True,
         )
     )
-    network_evidence: list[NetworkEvidenceSelector] = Field(default_factory=list, max_length=20)
+    network_evidence: list[NetworkEvidenceSelector] = Field(default_factory=list, max_length=19)
     series: ExperimentSeries = Field(default_factory=ExperimentSeries)
 
     @model_validator(mode="after")
@@ -823,6 +825,10 @@ class ReplayRequestPayload(StrictModel):
         if missing_extractors:
             raise ValueError(
                 "bindings reference unknown extractors: " + ", ".join(missing_extractors)
+            )
+        if any(item.selector_id == "replay_request" for item in self.network_evidence):
+            raise ValueError(
+                "network_evidence selector_id=replay_request is reserved for exact replay evidence"
             )
         return self
 

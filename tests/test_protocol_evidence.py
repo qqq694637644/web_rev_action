@@ -502,6 +502,86 @@ class ProtocolEvidenceTests(unittest.TestCase):
                 ]
             },
         )
+        empty_termination = ReplayRequestPayload.model_validate(
+            {
+                **base,
+                "termination": {"conditions": []},
+            }
+        )
+        self.assertEqual(
+            empty_termination.termination.model_dump(mode="json", exclude_none=True),
+            {"conditions": [{"type": "network_close"}]},
+        )
+
+        invalid_occurrence_payloads = [
+            {
+                "mutations": [
+                    {
+                        "type": "replace_header",
+                        "name": "X-Test",
+                        "value": "value",
+                        "occurrence": -1,
+                    }
+                ]
+            },
+            {
+                "mutations": [
+                    {
+                        "type": "replace_query_parameter",
+                        "name": "item",
+                        "value": "value",
+                        "occurrence": -1,
+                    }
+                ]
+            },
+            {
+                "mutations": [
+                    {
+                        "type": "add_header",
+                        "name": "X-Test",
+                        "value": "value",
+                        "occurrence": 0,
+                    }
+                ]
+            },
+            {
+                "mutations": [
+                    {
+                        "type": "add_query_parameter",
+                        "name": "item",
+                        "value": "value",
+                        "occurrence": 0,
+                    }
+                ]
+            },
+            {
+                "extractors": [
+                    {
+                        "extractor_id": "negative",
+                        "type": "network_response_json",
+                        "selector": {"url_contains": "/create", "method": "POST"},
+                        "pointer": "/id",
+                        "occurrence": -1,
+                    }
+                ]
+            },
+        ]
+        for invalid in invalid_occurrence_payloads:
+            with self.subTest(invalid=invalid), self.assertRaises(ValidationError):
+                ReplayRequestPayload.model_validate({**base, **invalid})
+
+        with self.assertRaises(ValidationError):
+            ReplayRequestPayload.model_validate(
+                {
+                    **base,
+                    "network_evidence": [
+                        {
+                            "selector_id": "replay_request",
+                            "matcher": {"url_contains": "/supporting"},
+                        }
+                    ],
+                }
+            )
 
         with self.assertRaises(ValidationError):
             ReplayRequestPayload.model_validate(

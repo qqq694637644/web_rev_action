@@ -78,6 +78,7 @@ from .protocol_evidence import (
     observe_binding_application,
     public_network_summary,
     redacted_request_body_from_snapshot,
+    replay_operation_overwritten_by_later,
     request_body_canonical_sha256_from_snapshot,
     request_body_canonical_sha256_from_spec,
     request_shape_from_snapshot,
@@ -1839,7 +1840,6 @@ class BrowserActionService:
         known_ndjson_types = {
             "application/x-ndjson",
             "application/ndjson",
-            "application/json-seq",
         }
         normalized_content_type = (
             str(content_type).split(";", 1)[0].strip().lower()
@@ -1882,6 +1882,8 @@ class BrowserActionService:
         truncated = bool(cls._extract_response_field(replay_response, "truncated"))
         mode_ok: bool | None = None
         content_type_ok: bool | None = None
+        terminal_reason_ok: bool | None = None
+        terminal_match_ok: bool | None = None
         content_type_required = response_mode in {"auto", "ordinary"}
         if (
             isinstance(status, int)
@@ -1897,7 +1899,7 @@ class BrowserActionService:
             terminal_types = {
                 str(item.get("type")) for item in terminal_conditions if item.get("type")
             } or {"network_close"}
-            terminal_ok = bool(
+            terminal_reason_ok = bool(
                 ("exact_sse_data" in terminal_types and termination == "done_marker")
                 or ("text_pattern" in terminal_types and termination == "text_pattern")
                 or (
@@ -1905,6 +1907,17 @@ class BrowserActionService:
                     and termination in {"network_close", "no_response_body"}
                 )
                 or ("idle_window" in terminal_types and termination == "idle_window")
+            )
+            expected_terminal_match = {
+                "done_marker": "exact_sse_data",
+                "text_pattern": "text_pattern",
+                "network_close": "network_close",
+                "no_response_body": "network_close",
+                "idle_window": "idle_window",
+            }.get(str(termination))
+            terminal_match_ok = bool(
+                expected_terminal_match
+                and terminal_condition_matched == expected_terminal_match
             )
             mode_ok = bool(
                 observed_mode in valid_observed_modes
@@ -1916,7 +1929,8 @@ class BrowserActionService:
                 and (content_type_ok or not content_type_required)
                 and marker_ok
                 and event_ok
-                and terminal_ok
+                and terminal_reason_ok
+                and terminal_match_ok
                 and not truncated
             )
             contract_status = "complete" if complete else "partial"
@@ -1930,6 +1944,8 @@ class BrowserActionService:
             "terminal_conditions": terminal_conditions,
             "terminal_condition_matched": terminal_condition_matched,
             "observed_termination": termination,
+            "termination_reason_matches_conditions": terminal_reason_ok,
+            "terminal_condition_matches_observed_termination": terminal_match_ok,
             "done_marker_required": bool(marker),
             "done_marker_observed": marker_observed,
             "done_event_name_required": event_name,
@@ -2602,17 +2618,16 @@ class BrowserActionService:
             allow_supporting_failures=True,
             include_in_flight=False,
         )
-        selectors: list[Any] = list(payload.network_evidence)
-        if not selectors:
-            selectors = [
-                {
-                    "selector_id": "replay_request",
-                    "matcher": matcher.model_dump(mode="json", exclude_none=True),
-                    "max_matches": 20,
-                    "export_parts": ["all"],
-                    "include_initiator": True,
-                }
-            ]
+        selectors: list[Any] = [
+            {
+                "selector_id": "replay_request",
+                "matcher": matcher.model_dump(mode="json", exclude_none=True),
+                "max_matches": 20,
+                "export_parts": ["all"],
+                "include_initiator": True,
+            },
+            *payload.network_evidence,
+        ]
         capture = payload.capture.model_dump(mode="json")
         requirements = payload.requirements.model_dump(mode="json")
         wait_for = payload.wait_for
@@ -4831,9 +4846,17 @@ class BrowserActionService:
                 replay_manifest = manifest.get("replay")
                 if isinstance(replay_manifest, dict):
                     replay_manifest["network_evidence_id"] = replay_network_evidence_id
+                replay_mutations = list(replay_plan.get("mutations", []))
                 mutation_observations = [
-                    assess_mutation_effectiveness(item, wire_snapshot)
-                    for item in replay_plan.get("mutations", [])
+                    assess_mutation_effectiveness(
+                        item,
+                        wire_snapshot,
+                        overwritten_by_later=any(
+                            replay_operation_overwritten_by_later(item, later)
+                            for later in replay_mutations[index + 1 :]
+                        ),
+                    )
+                    for index, item in enumerate(replay_mutations)
                 ]
                 resolved_binding_specs = [
                     item
@@ -4844,15 +4867,23 @@ class BrowserActionService:
                     wire_snapshot,
                     bindings=resolved_binding_specs,
                     binding_values=replay_plan["binding_values"],
+                    mutations=replay_mutations,
                 )
                 mutation_assessment = {
                     "mutations": mutation_observations,
                     "all_mutations_effective": (
                         all(
-                            item.get("mutation_effective") is True for item in mutation_observations
+                            item.get("mutation_effective") is True
+                            or item.get("final_wire_observability")
+                            == "overwritten_by_later_operation"
+                            for item in mutation_observations
                         )
                         if mutation_observations
                         else True
+                    ),
+                    "all_mutations_applied_to_spec": all(
+                        item.get("operation_applied_to_spec") is True
+                        for item in mutation_observations
                     ),
                     "bindings": binding_observation,
                     "unresolved_binding_ids": replay_plan.get("unresolved_binding_ids", []),

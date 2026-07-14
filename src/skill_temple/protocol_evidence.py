@@ -779,23 +779,97 @@ def _body_canonical_sha256(body: Any) -> str | None:
     return None
 
 
+def _replay_operation_target(operation: ReplayBinding | ReplayMutation) -> dict[str, Any]:
+    if isinstance(operation, ReplayBinding):
+        return {
+            "kind": operation.target,
+            "name": (
+                str(operation.path)
+                if operation.target == "json_pointer"
+                else str(operation.name).lower()
+                if operation.target == "header"
+                else str(operation.name)
+            ),
+            "occurrence": operation.occurrence,
+            "action": "binding",
+        }
+    if operation.type.endswith("json_path"):
+        return {
+            "kind": "json_pointer",
+            "name": str(operation.path),
+            "occurrence": None,
+            "action": operation.type.split("_", 1)[0],
+        }
+    kind = "header" if operation.type.endswith("header") else "query_parameter"
+    return {
+        "kind": kind,
+        "name": (
+            str(operation.name).lower() if kind == "header" else str(operation.name)
+        ),
+        "occurrence": operation.occurrence,
+        "action": operation.type.split("_", 1)[0],
+    }
+
+
+def replay_operation_overwritten_by_later(
+    operation: ReplayBinding | ReplayMutation,
+    later_operation: ReplayMutation,
+) -> bool:
+    current = _replay_operation_target(operation)
+    later = _replay_operation_target(later_operation)
+    if current["kind"] != later["kind"] or later["action"] == "add":
+        return False
+    if current["kind"] == "json_pointer":
+        current_tokens = _decode_pointer(str(current["name"]))
+        later_tokens = _decode_pointer(str(later["name"]))
+        return (
+            current_tokens[: len(later_tokens)] == later_tokens
+            or later_tokens[: len(current_tokens)] == current_tokens
+        )
+    if current["name"] != later["name"]:
+        return False
+    later_occurrence = later["occurrence"]
+    current_occurrence = current["occurrence"]
+    return later_occurrence == "all" or (
+        isinstance(current_occurrence, int)
+        and isinstance(later_occurrence, int)
+        and current_occurrence == later_occurrence
+    )
+
+
 def assess_mutation_effectiveness(
     mutation: ReplayMutation | None,
     wire_snapshot: dict[str, Any] | None,
+    *,
+    overwritten_by_later: bool = False,
 ) -> dict[str, Any]:
     if mutation is None:
         return {
             "mutation_requested": None,
             "mutation_observed_on_wire": None,
             "mutation_effective": None,
-            "reason": "control replay has no classification mutation",
+            "reason": "replay has no mutation to observe",
         }
     requested = _redacted_mutation(mutation)
+    if overwritten_by_later:
+        return {
+            "mutation_requested": requested,
+            "operation_applied_to_spec": True,
+            "mutation_observed_on_wire": None,
+            "mutation_effective": None,
+            "final_wire_observability": "overwritten_by_later_operation",
+            "reason": (
+                "mutation was applied in order but its intermediate value was "
+                "overwritten by a later operation"
+            ),
+        }
     if wire_snapshot is None:
         return {
             "mutation_requested": requested,
+            "operation_applied_to_spec": True,
             "mutation_observed_on_wire": None,
             "mutation_effective": False,
+            "final_wire_observability": "unavailable",
             "reason": "exact replay request snapshot was not exported",
         }
     try:
@@ -844,8 +918,10 @@ def assess_mutation_effectiveness(
             observed_public = "<absent>" if not values else "<present>"
         return {
             "mutation_requested": requested,
+            "operation_applied_to_spec": True,
             "mutation_observed_on_wire": observed_public,
             "mutation_effective": effective,
+            "final_wire_observability": "observed" if effective else "contradicted",
             "reason": (
                 "wire request matches requested mutation"
                 if effective
@@ -855,8 +931,10 @@ def assess_mutation_effectiveness(
     except ValueError as exc:
         return {
             "mutation_requested": requested,
+            "operation_applied_to_spec": True,
             "mutation_observed_on_wire": None,
             "mutation_effective": False,
+            "final_wire_observability": "unavailable",
             "reason": str(exc),
         }
 
@@ -866,25 +944,65 @@ def observe_binding_application(
     *,
     bindings: list[ReplayBinding],
     binding_values: dict[str, Any],
+    mutations: list[ReplayMutation] | None = None,
 ) -> dict[str, Any]:
+    mutations = mutations or []
     if wire_snapshot is None:
         return {
             "binding_count": len(bindings),
             "binding_application_complete": False,
+            "binding_observations": [
+                {
+                    "binding_id": binding.binding_id,
+                    "operation_applied_to_spec": True,
+                    "final_wire_observability": "unavailable",
+                }
+                for binding in bindings
+            ],
             "reason": "exact replay request snapshot is required",
         }
-    bindings_effective = _bindings_match_snapshot(
-        wire_snapshot,
-        bindings,
-        binding_values,
+    observations: list[dict[str, Any]] = []
+    for binding in bindings:
+        overwritten = any(
+            replay_operation_overwritten_by_later(binding, mutation)
+            for mutation in mutations
+        )
+        if overwritten:
+            observations.append(
+                {
+                    "binding_id": binding.binding_id,
+                    "operation_applied_to_spec": True,
+                    "binding_observed_on_final_wire": None,
+                    "final_wire_observability": "overwritten_by_later_operation",
+                }
+            )
+            continue
+        visible = _bindings_match_snapshot(
+            wire_snapshot,
+            [binding],
+            binding_values,
+        )
+        observations.append(
+            {
+                "binding_id": binding.binding_id,
+                "operation_applied_to_spec": True,
+                "binding_observed_on_final_wire": visible,
+                "final_wire_observability": "observed" if visible else "contradicted",
+            }
+        )
+    bindings_effective = all(
+        item["final_wire_observability"]
+        in {"observed", "overwritten_by_later_operation"}
+        for item in observations
     )
     return {
         "binding_count": len(bindings),
         "binding_application_complete": bindings_effective,
+        "binding_observations": observations,
         "reason": (
-            "all resolved bindings were observed on the wire request"
+            "all resolved bindings were applied; visible values match the final wire"
             if bindings_effective
-            else "one or more resolved bindings were not observed on the wire request"
+            else "one or more resolved bindings contradict the final wire request"
         ),
     }
 

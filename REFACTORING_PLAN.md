@@ -718,11 +718,15 @@ network_response_json + RequestMatcher + JSON Pointer
 阶段 D 是模型收敛，不是删除 transport 能力。以下行为必须保持：
 
 - [x] header/query wire order 和重复 occurrence；
+- [x] replay exact network selector 始终保留，自定义 selector 只追加；
+- [x] 有序 binding/mutation 区分 spec application、final wire visibility 和 later overwrite；
+- [x] occurrence 非负且 add 操作只接受 append；
 - [x] raw body、结构化 body 和 body fingerprint；
 - [x] Fetch、XHR、EventSource 以及未知 delivery 的事实记录；
 - [x] SSE、NDJSON、raw stream 和无 Content-Type；
 - [x] auto reader 预启用 stream 探测，并按 runtime observed mode 动态选择 ordinary 或 stream quality requirements；
 - [x] 可配置 response reader、byte/event limit 和 termination condition；
+- [x] termination reason 与 matched condition 一致性验证；
 - [x] browser-context replay；
 - [x] add/remove/replace mutation；
 - [x] request source 的 method、完整 URL/query、body 指纹和时间窗口关联；
