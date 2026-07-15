@@ -1,28 +1,29 @@
-const STAGE0_SOURCE_MARKER = "stage0-script-search-marker";
+const SYNTHETIC_SOURCE_MARKER = "synthetic-script-search-marker";
+const TERMINAL_MARKER = "fixture-complete";
 
-function stage0RequestBuilder() {
+function buildEchoRequest() {
   return {
-    marker: "stage0-request",
+    marker: "synthetic-request",
     count: 3,
-    sourceMarker: STAGE0_SOURCE_MARKER,
+    sourceMarker: SYNTHETIC_SOURCE_MARKER,
   };
 }
 
-function buildPandoraConversationRequest() {
+function buildAuthenticatedStreamRequest() {
   return {
-    conversation_id: "conversation-fixture",
-    model: "fixture-model",
-    messages: [
+    job_id: "authenticated-stream-fixture",
+    profile: "fixture-profile",
+    records: [
       {
-        id: "user-message-1",
-        author: { role: "user" },
+        record_id: "client-record-1",
+        source: { kind: "client" },
         content: {
-          content_type: "text",
-          parts: ["hello fixture"],
+          format: "text",
+          segments: ["hello fixture"],
         },
       },
     ],
-    parent_message_id: "root-message",
+    cursor_id: "root-cursor",
     timezone_offset_min: 0,
     tracking_id: "tracking-only-value",
   };
@@ -37,27 +38,27 @@ function parseSseText(text) {
       .map((line) => line.slice(5).trim())
       .join("\n");
     if (!data) continue;
-    events.push(data === "[DONE]" ? data : JSON.parse(data));
+    events.push(data === TERMINAL_MARKER ? data : JSON.parse(data));
   }
   return events;
 }
 
-async function sendPandoraConversation() {
-  const response = await fetch("/api/pandora/conversation", {
+async function sendAuthenticatedStream() {
+  const response = await fetch("/api/stateful-stream", {
     method: "POST",
     headers: {
       "Authorization": "Bearer fixture-token",
       "Content-Type": "application/json",
     },
     credentials: "include",
-    body: JSON.stringify(buildPandoraConversationRequest()),
+    body: JSON.stringify(buildAuthenticatedStreamRequest()),
   });
   const contentType = response.headers.get("content-type") || "";
   const payload = contentType.includes("text/event-stream")
     ? parseSseText(await response.text())
     : await response.json();
   document.querySelector("#result").textContent = JSON.stringify(payload, null, 2);
-  document.querySelector("#status").textContent = `pandora-${response.status}`;
+  document.querySelector("#status").textContent = `stateful-stream-${response.status}`;
   return payload;
 }
 
@@ -67,7 +68,7 @@ async function sendEcho() {
     headers: {
       "Content-Type": "application/json",
     },
-    body: JSON.stringify(stage0RequestBuilder()),
+    body: JSON.stringify(buildEchoRequest()),
   });
   if (!response.ok) {
     throw new Error(`Echo request failed: ${response.status}`);
@@ -80,10 +81,10 @@ function collectSse() {
     const events = [];
     const source = new EventSource("/api/sse");
 
-    source.onmessage = (event) => {
+    source.addEventListener("chunk", (event) => {
       events.push(event.data);
-    };
-    source.addEventListener("done", (event) => {
+    });
+    source.addEventListener("complete", (event) => {
       events.push(event.data);
       source.close();
       resolve(events);
@@ -111,4 +112,4 @@ async function runCapture() {
 
 document.querySelector("#run-capture").addEventListener("click", runCapture);
 document.querySelector("#send-echo").addEventListener("click", sendEcho);
-document.querySelector("#send-pandora").addEventListener("click", sendPandoraConversation);
+document.querySelector("#send-stateful-stream").addEventListener("click", sendAuthenticatedStream);

@@ -56,18 +56,42 @@ def _write_skill(
 
 
 class RuntimeTests(unittest.TestCase):
-    def test_packaged_example_uses_skill_md_as_the_only_entrypoint(self) -> None:
+    def test_packaged_skills_use_skill_md_as_the_only_entrypoint(self) -> None:
         runtime = load_runtime()
         result = runtime.list_skills()
 
-        skill = next(item for item in result["skills"] if item["skill_id"] == "idapython")
-        self.assertEqual(skill["entrypoint"], "SKILL.md")
-        self.assertIn("IDAPython", skill["description"])
-        self.assertTrue(skill["content_hash"].startswith("sha256:"))
-        root = Path(runtime.skills_dir) / "idapython"
-        self.assertTrue((root / "SKILL.md").is_file())
-        self.assertFalse((root / "skill.json").exists())
-        self.assertFalse((root / "INDEX.md").exists())
+        self.assertEqual(
+            [item["skill_id"] for item in result["skills"]],
+            ["current-site-analysis", "pandora-protocol-reproduction"],
+        )
+        for skill in result["skills"]:
+            self.assertEqual(skill["entrypoint"], "SKILL.md")
+            self.assertTrue(skill["content_hash"].startswith("sha256:"))
+            root = Path(runtime.skills_dir) / skill["skill_id"]
+            self.assertTrue((root / "SKILL.md").is_file())
+            self.assertFalse((root / "skill.json").exists())
+            self.assertFalse((root / "INDEX.md").exists())
+        self.assertIn("current website", result["skills"][0]["description"])
+
+    def test_current_site_skill_is_the_generic_default_workflow(self) -> None:
+        runtime = load_runtime()
+        result = runtime.retrieve(
+            "use $current-site-analysis for this website",
+            hinted_skill_ids=["current-site-analysis"],
+        )
+
+        selected = result["selected_skills"][0]
+        self.assertEqual(selected["skill_id"], "current-site-analysis")
+        self.assertIn("Do not begin with a fixed scenario list", selected["instructions"])
+        self.assertEqual(
+            set(selected["referenced_paths"]),
+            {
+                "docs/experiment-design.md",
+                "docs/inventory-checklist.md",
+                "docs/report-contract.md",
+            },
+        )
+        self.assertIn("current-site-analysis", result["explicit_skill_ids"])
 
     def test_packaged_pandora_skill_exposes_protocol_reproduction_workflow(self) -> None:
         runtime = load_runtime()
@@ -78,7 +102,11 @@ class RuntimeTests(unittest.TestCase):
 
         selected = result["selected_skills"][0]
         self.assertEqual(selected["skill_id"], "pandora-protocol-reproduction")
-        self.assertIn("browser-context request replay", selected["instructions"])
+        self.assertIn(
+            "Optional Pandora protocol reproduction template",
+            selected["instructions"],
+        )
+        self.assertIn("current-site-analysis", selected["instructions"])
         self.assertEqual(
             set(selected["referenced_paths"]),
             {
@@ -93,18 +121,48 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue((root / "docs" / "evidence-contract.md").is_file())
         self.assertTrue((root / "docs" / "report-templates.md").is_file())
 
+    def test_packaged_skills_use_current_generic_replay_contract(self) -> None:
+        runtime = load_runtime()
+        content = "\n".join(
+            path.read_text(encoding="utf-8")
+            for skill_id in ["current-site-analysis", "pandora-protocol-reproduction"]
+            for path in sorted((Path(runtime.skills_dir) / skill_id).rglob("*.md"))
+        )
+
+        for removed_field in [
+            "replay_mode",
+            "control_experiment_id",
+            "pair_protocol",
+            "volatile_bindings",
+            "fresh_equivalent",
+            "non_target_fields_equivalent",
+        ]:
+            with self.subTest(removed_field=removed_field):
+                self.assertNotIn(removed_field, content)
+        self.assertIn('"source"', content)
+        self.assertIn('"evidence_id"', content)
+        self.assertIn('"comparison"', content)
+        self.assertIn("text_pattern", content)
+
     def test_resolve_uses_exact_mentions_and_explicit_hints(self) -> None:
         runtime = load_runtime()
         results = [
-            runtime.resolve("@idapython inspect references"),
-            runtime.resolve("use $idapython for this task"),
-            runtime.resolve("中文任务", hinted_skill_ids=["idapython"]),
+            runtime.resolve("@pandora-protocol-reproduction inspect references"),
+            runtime.resolve("use $pandora-protocol-reproduction for this task"),
+            runtime.resolve(
+                "中文任务", hinted_skill_ids=["pandora-protocol-reproduction"]
+            ),
         ]
 
         for result in results:
-            self.assertEqual(result["matches"][0]["skill_id"], "idapython")
+            self.assertEqual(
+                result["matches"][0]["skill_id"], "pandora-protocol-reproduction"
+            )
             self.assertNotIn("confidence", result["matches"][0])
-            self.assertEqual(result["available_skills"][0]["skill_id"], "idapython")
+            self.assertEqual(
+                [item["skill_id"] for item in result["available_skills"]],
+                ["current-site-analysis", "pandora-protocol-reproduction"],
+            )
 
     def test_resolve_does_not_make_server_side_semantic_selection(self) -> None:
         runtime = load_runtime()
@@ -118,19 +176,25 @@ class RuntimeTests(unittest.TestCase):
             with self.subTest(query=query):
                 result = runtime.resolve(query)
                 self.assertEqual(result["matches"], [])
-                self.assertEqual(result["available_skills"][0]["skill_id"], "idapython")
+                self.assertEqual(
+                    result["available_skills"][0]["skill_id"],
+                    "current-site-analysis",
+                )
 
     def test_retrieve_returns_selected_skill_entrypoint_and_references(self) -> None:
         runtime = load_runtime()
-        result = runtime.retrieve("use $idapython", hinted_skill_ids=["idapython"])
+        result = runtime.retrieve(
+            "use $pandora-protocol-reproduction",
+            hinted_skill_ids=["pandora-protocol-reproduction"],
+        )
 
         selected = result["selected_skills"][0]
-        self.assertEqual(selected["skill_id"], "idapython")
+        self.assertEqual(selected["skill_id"], "pandora-protocol-reproduction")
         self.assertEqual(selected["role"], "primary")
         self.assertEqual(selected["source_path"], "SKILL.md")
-        self.assertIn("name: idapython", selected["instructions"])
-        self.assertIn("docs/idautils.md", selected["referenced_paths"])
-        self.assertIn("docs/ida_hexrays.md", selected["referenced_paths"])
+        self.assertIn("name: pandora-protocol-reproduction", selected["instructions"])
+        self.assertIn("docs/experiment-matrix.md", selected["referenced_paths"])
+        self.assertIn("docs/evidence-contract.md", selected["referenced_paths"])
         self.assertFalse(selected["truncated"])
         self.assertTrue(result["decision"]["selected"])
         self.assertEqual(result["decision"]["next_action"], "followSkillInstructions")
@@ -264,29 +328,35 @@ class RuntimeTests(unittest.TestCase):
 
     def test_search_finds_relevant_reference(self) -> None:
         runtime = load_runtime()
-        result = runtime.search("idapython", "ctree_visitor_t cot_call", limit=3)
+        result = runtime.search(
+            "pandora-protocol-reproduction",
+            "replay_protocol_hash",
+            limit=3,
+        )
 
         self.assertTrue(result["matches"])
         self.assertEqual(result["engine"], "sqlite_fts5_symbol_index")
-        self.assertEqual(result["matches"][0]["path"], "docs/ida_hexrays.md")
-        self.assertIn("ctree_visitor_t", result["matches"][0]["symbols"])
+        self.assertIn(
+            "docs/evidence-contract.md",
+            {item["path"] for item in result["matches"]},
+        )
         self.assertEqual(result["recommended_next_action"], "readSkillContent")
 
     def test_search_rejects_non_keyword_mode(self) -> None:
         runtime = load_runtime()
         with self.assertRaisesRegex(RuntimeError, "Only keyword search mode"):
-            runtime.search("idapython", "ctree", mode="hybrid")
+            runtime.search("pandora-protocol-reproduction", "pair", mode="hybrid")
 
     def test_read_returns_continuation_and_rejects_unsafe_paths(self) -> None:
         runtime = load_runtime()
-        result = runtime.read("idapython", "SKILL.md", max_lines=5)
+        result = runtime.read("pandora-protocol-reproduction", "SKILL.md", max_lines=5)
 
         self.assertTrue(result["truncated"])
         self.assertEqual(result["next_start_line"], 6)
         for path in ["../README.md", "/etc/passwd", "docs/../../SKILL.md"]:
             with self.subTest(path=path):
                 with self.assertRaises(SkillPathError):
-                    runtime.read("idapython", path)
+                    runtime.read("pandora-protocol-reproduction", path)
 
     def test_read_does_not_lose_an_oversized_single_line(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -449,22 +519,32 @@ class RuntimeTests(unittest.TestCase):
         discovery = client.post("/v1/skills/retrieve", json={"query": "discover"})
         selected = client.post(
             "/v1/skills/retrieve",
-            json={"query": "task", "hinted_skill_ids": ["idapython"]},
+            json={
+                "query": "task",
+                "hinted_skill_ids": ["pandora-protocol-reproduction"],
+            },
         )
         read = client.post(
             "/v1/skills/read",
-            json={"skill_id": "idapython", "path": "SKILL.md", "max_lines": 5},
+            json={
+                "skill_id": "pandora-protocol-reproduction",
+                "path": "SKILL.md",
+                "max_lines": 5,
+            },
         )
         search = client.post(
             "/v1/skills/search",
-            json={"skill_id": "idapython", "query": "ctree_visitor_t"},
+            json={
+                "skill_id": "pandora-protocol-reproduction",
+                "query": "replay_protocol_hash",
+            },
         )
         console = client.get("/console")
         debug = client.post(
             "/console/retrieve",
             json={
-                "query": "$idapython",
-                "hinted_skill_ids": ["idapython"],
+                "query": "$pandora-protocol-reproduction",
+                "hinted_skill_ids": ["pandora-protocol-reproduction"],
                 "include_debug": True,
             },
         )
@@ -474,15 +554,23 @@ class RuntimeTests(unittest.TestCase):
         )
         unsafe = client.post(
             "/v1/skills/read",
-            json={"skill_id": "idapython", "path": "../README.md"},
+            json={
+                "skill_id": "pandora-protocol-reproduction",
+                "path": "../README.md",
+            },
         )
 
         self.assertEqual(discovery.status_code, 200)
         self.assertEqual(selected.status_code, 200)
-        self.assertEqual(selected.json()["selected_skills"][0]["skill_id"], "idapython")
+        self.assertEqual(
+            selected.json()["selected_skills"][0]["skill_id"],
+            "pandora-protocol-reproduction",
+        )
         self.assertEqual(read.status_code, 200)
         self.assertEqual(search.status_code, 200)
         self.assertIn("Skill Temple Console", console.text)
+        self.assertIn("Use $current-site-analysis to inspect the current website", console.text)
+        self.assertIn('value="current-site-analysis"', console.text)
         self.assertIn("debug", debug.json())
         self.assertEqual(bad_hint.status_code, 404)
         self.assertEqual(bad_hint.json()["detail"]["error"]["code"], "skill_not_found")

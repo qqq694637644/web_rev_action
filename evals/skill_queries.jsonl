@@ -1,4 +1,2 @@
-{"id":"idapython-xrefs","query":"@idapython write a script to find xrefs to strcpy","expected_skill":"idapython","expected_paths":["docs/idautils.md"],"expected_symbols":["XrefsTo"]}
-{"id":"idapython-ctree","query":"@idapython walk ctree calls with ctree_visitor_t cot_call","expected_skill":"idapython","expected_paths":["docs/ida_hexrays.md"],"expected_symbols":["ctree_visitor_t","cot_call"]}
 {"id":"pandora-replay","query":"@pandora-protocol-reproduction determine whether tracking_id is required with a browser-context replay","expected_skill":"pandora-protocol-reproduction","expected_paths":["docs/experiment-matrix.md","docs/evidence-contract.md"],"expected_symbols":[]}
 {"id":"pandora-reports","query":"@pandora-protocol-reproduction produce an evidence-backed protocol map, state machine, schemas, and open questions","expected_skill":"pandora-protocol-reproduction","expected_paths":["docs/report-templates.md"],"expected_symbols":[]}

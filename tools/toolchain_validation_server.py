@@ -10,9 +10,9 @@ from typing import Final
 from urllib.parse import parse_qs, urlsplit
 
 SSE_EVENTS: Final[tuple[bytes, ...]] = (
-    b'event: message\ndata: {"sequence":1,"value":"alpha"}\n\n',
-    b'event: message\ndata: {"sequence":2,"value":"beta"}\n\n',
-    b'event: done\ndata: [DONE]\n\n',
+    b'event: chunk\ndata: {"sequence":1,"value":"alpha"}\n\n',
+    b'event: chunk\ndata: {"sequence":2,"value":"beta"}\n\n',
+    b'event: complete\ndata: fixture-complete\n\n',
 )
 
 
@@ -20,8 +20,8 @@ class ToolchainValidationHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     fixture_root: Path
     slow_started_event: threading.Event
-    conversation_lock: threading.Lock
-    conversation_states: dict[str, dict[str, object]]
+    stream_state_lock: threading.Lock
+    stream_states: dict[str, dict[str, object]]
 
     def handle(self) -> None:
         try:
@@ -37,7 +37,7 @@ class ToolchainValidationHandler(BaseHTTPRequestHandler):
                 "text/html; charset=utf-8",
                 extra_headers={
                     "Set-Cookie": (
-                        "pandora_session=fixture-session; Path=/; HttpOnly; SameSite=Lax"
+                        "fixture_session=fixture-session; Path=/; HttpOnly; SameSite=Lax"
                     )
                 },
             )
@@ -75,8 +75,8 @@ class ToolchainValidationHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         path = urlsplit(self.path).path
-        if path == "/api/pandora/conversation":
-            self._handle_pandora_conversation()
+        if path == "/api/stateful-stream":
+            self._handle_stateful_stream()
             return
         if path != "/api/echo":
             self.send_error(HTTPStatus.NOT_FOUND)
@@ -98,11 +98,13 @@ class ToolchainValidationHandler(BaseHTTPRequestHandler):
             }
         )
 
-    def _handle_pandora_conversation(self) -> None:
+    def _handle_stateful_stream(self) -> None:
+        content_length = int(self.headers.get("Content-Length", "0"))
+        raw_body = self.rfile.read(content_length)
         cookie = self.headers.get("Cookie", "")
         authorization = self.headers.get("Authorization", "")
         if (
-            "pandora_session=fixture-session" not in cookie
+            "fixture_session=fixture-session" not in cookie
             and authorization != "Bearer fixture-token"
         ):
             self._send_json(
@@ -110,8 +112,6 @@ class ToolchainValidationHandler(BaseHTTPRequestHandler):
                 HTTPStatus.UNAUTHORIZED,
             )
             return
-        content_length = int(self.headers.get("Content-Length", "0"))
-        raw_body = self.rfile.read(content_length)
         try:
             payload = json.loads(raw_body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
@@ -120,28 +120,36 @@ class ToolchainValidationHandler(BaseHTTPRequestHandler):
                 HTTPStatus.BAD_REQUEST,
             )
             return
-        messages = payload.get("messages") if isinstance(payload, dict) else None
-        message = (
-            messages[0]
-            if isinstance(messages, list) and messages and isinstance(messages[0], dict)
+        if isinstance(payload, dict) and payload.get("profile") == "fixture-server-error":
+            self._send_json(
+                {"ok": False, "error": "synthetic-server-failure"},
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            return
+        records = payload.get("records") if isinstance(payload, dict) else None
+        record = (
+            records[0]
+            if isinstance(records, list) and records and isinstance(records[0], dict)
             else None
         )
-        author = message.get("author") if isinstance(message, dict) else None
-        content = message.get("content") if isinstance(message, dict) else None
-        parts = content.get("parts") if isinstance(content, dict) else None
+        source = record.get("source") if isinstance(record, dict) else None
+        content = record.get("content") if isinstance(record, dict) else None
+        segments = content.get("segments") if isinstance(content, dict) else None
         required = {
-            "conversation_id": payload.get("conversation_id")
+            "job_id": payload.get("job_id")
             if isinstance(payload, dict)
             else None,
-            "model": payload.get("model") if isinstance(payload, dict) else None,
-            "messages[0].id": message.get("id") if isinstance(message, dict) else None,
-            "messages[0].author.role": (
-                author.get("role") if isinstance(author, dict) else None
+            "profile": payload.get("profile") if isinstance(payload, dict) else None,
+            "records[0].record_id": (
+                record.get("record_id") if isinstance(record, dict) else None
             ),
-            "messages[0].content.parts[0]": (
-                parts[0] if isinstance(parts, list) and parts else None
+            "records[0].source.kind": (
+                source.get("kind") if isinstance(source, dict) else None
             ),
-            "parent_message_id": payload.get("parent_message_id")
+            "records[0].content.segments[0]": (
+                segments[0] if isinstance(segments, list) and segments else None
+            ),
+            "cursor_id": payload.get("cursor_id")
             if isinstance(payload, dict)
             else None,
         }
@@ -156,71 +164,71 @@ class ToolchainValidationHandler(BaseHTTPRequestHandler):
                 HTTPStatus.UNPROCESSABLE_ENTITY,
             )
             return
-        conversation_id = str(payload["conversation_id"])
-        user_message_id = str(message["id"])
-        parent_message_id = str(payload["parent_message_id"])
-        assistant_message_id = f"assistant-{user_message_id}"
-        with self.conversation_lock:
-            state = self.conversation_states.setdefault(
-                conversation_id,
+        job_id = str(payload["job_id"])
+        client_record_id = str(record["record_id"])
+        cursor_id = str(payload["cursor_id"])
+        server_record_id = f"server-{client_record_id}"
+        with self.stream_state_lock:
+            state = self.stream_states.setdefault(
+                job_id,
                 {
-                    "conversation_id": conversation_id,
-                    "mapping": {},
-                    "current_node": parent_message_id,
+                    "job_id": job_id,
+                    "records": {},
+                    "current_cursor": cursor_id,
                 },
             )
-            mapping = state["mapping"]
-            assert isinstance(mapping, dict)
-            if user_message_id in mapping:
+            stored_records = state["records"]
+            assert isinstance(stored_records, dict)
+            if client_record_id in stored_records:
                 self._send_json(
                     {
                         "ok": False,
-                        "error": "duplicate-message-id",
-                        "field": "messages[0].id",
+                        "error": "duplicate-record-id",
+                        "field": "records[0].record_id",
                     },
                     HTTPStatus.CONFLICT,
                 )
                 return
-            mapping[user_message_id] = {
-                "id": user_message_id,
-                "parent": parent_message_id,
-                "role": author["role"],
-                "content": parts,
+            stored_records[client_record_id] = {
+                "record_id": client_record_id,
+                "cursor_id": cursor_id,
+                "kind": source["kind"],
+                "segments": segments,
             }
-            mapping[assistant_message_id] = {
-                "id": assistant_message_id,
-                "parent": user_message_id,
-                "role": "assistant",
-                "content": ["fixture answer"],
+            stored_records[server_record_id] = {
+                "record_id": server_record_id,
+                "cursor_id": client_record_id,
+                "kind": "server",
+                "segments": ["fixture result"],
             }
-            state["current_node"] = assistant_message_id
+            state["current_cursor"] = server_record_id
             state_snapshot = json.loads(json.dumps(state))
-        events = (
+        output_events = (
             {
-                "type": "message_start",
-                "conversation_id": conversation_id,
-                "message": {
-                    "id": assistant_message_id,
-                    "parent_id": user_message_id,
-                    "author": {"role": "assistant"},
+                "type": "record_open",
+                "job_id": job_id,
+                "record": {
+                    "record_id": server_record_id,
+                    "cursor_id": client_record_id,
+                    "source": {"kind": "server"},
                 },
             },
             {
-                "type": "message_delta",
-                "message_id": assistant_message_id,
-                "delta": "fixture answer contains literal [DONE] text",
+                "type": "record_delta",
+                "record_id": server_record_id,
+                "delta": "fixture result contains custom terminal text",
             },
             {
-                "type": "conversation_state",
-                "conversation_id": conversation_id,
-                "current_node": assistant_message_id,
-                "mapping": state_snapshot["mapping"],
-                "model": payload["model"],
+                "type": "state_snapshot",
+                "job_id": job_id,
+                "current_cursor": server_record_id,
+                "records": state_snapshot["records"],
+                "profile": payload["profile"],
                 "optional_timezone_seen": "timezone_offset_min" in payload,
                 "tracking_seen": "tracking_id" in payload,
             },
         )
-        self._send_sse_json(events)
+        self._send_sse_json(output_events)
 
     def log_message(self, format: str, *args: object) -> None:
         return
@@ -279,13 +287,13 @@ class ToolchainValidationHandler(BaseHTTPRequestHandler):
         self.end_headers()
         for index, payload in enumerate(events):
             event = (
-                f"event: message\nid: {index}\ndata: "
+                f"event: chunk\nid: {index}\ndata: "
                 f"{json.dumps(payload, separators=(',', ':'), ensure_ascii=False)}\n\n"
             ).encode()
             self.wfile.write(event)
             self.wfile.flush()
             time.sleep(0.03)
-        self.wfile.write(b"event: done\ndata: [DONE]\n\n")
+        self.wfile.write(b"event: complete\ndata: fixture-complete\n\n")
         self.wfile.flush()
         self.close_connection = True
 
@@ -301,8 +309,8 @@ def start_server(
         {
             "fixture_root": fixture_root,
             "slow_started_event": threading.Event(),
-            "conversation_lock": threading.Lock(),
-            "conversation_states": {},
+            "stream_state_lock": threading.Lock(),
+            "stream_states": {},
         },
     )
     server = ThreadingHTTPServer((host, port), handler_type)
