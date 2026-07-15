@@ -15,17 +15,20 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from skill_temple.app import create_app
-from skill_temple.browser.adapters import (
+from skill_temple.browser.adapters.command import SubprocessCommandRunner
+from skill_temple.browser.adapters.contracts import (
     AdapterError,
     AlignmentResult,
-    JsReverseMcpAdapter,
     McpToolCallError,
     PageState,
-    StdioMcpToolTransport,
     StreamCheckpoint,
     StreamRequestCheckpoint,
     StreamWaitResult,
-    SubprocessCommandRunner,
+)
+from skill_temple.browser.adapters.js_reverse import JsReverseMcpAdapter
+from skill_temple.browser.adapters.mcp import StdioMcpToolTransport
+from skill_temple.browser.adapters.playwright import (
+    PlaywrightCliAdapter,
     build_playwright_attach_args,
 )
 from skill_temple.browser_models import (
@@ -5800,8 +5803,6 @@ async function runCase(
         self.assertLess(len(json.dumps(summary).encode("utf-8")), 50_000)
 
     def test_playwright_locator_rendering_uses_supported_cli_locators(self) -> None:
-        from skill_temple.browser.adapters import PlaywrightCliAdapter
-
         adapter = PlaywrightCliAdapter()
         self.assertEqual(adapter.render_locator(Locator(ref="e12")), "e12")
         self.assertEqual(adapter.render_locator(Locator(css="#send")), "#send")

@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import os
+import subprocess
+import sys
 import tomllib
 import unittest
 from pathlib import Path
 
+import skill_temple.browser.adapters.js_reverse as js_reverse
 import skill_temple.protocol_evidence as protocol_evidence
-from skill_temple.browser.adapters import js_reverse
 from skill_temple.browser.operations.capture import BrowserCaptureOperations
 from skill_temple.browser.operations.evidence import BrowserEvidenceOperations
 from skill_temple.browser.operations.finalization import BrowserFinalizationOperations
@@ -33,6 +36,24 @@ from skill_temple.protocol.matching import network_request_matches
 
 
 class StageEBoundaryTests(unittest.TestCase):
+    @staticmethod
+    def _run_fresh_python(source: str) -> subprocess.CompletedProcess[str]:
+        environment = os.environ.copy()
+        source_root = str(Path("src").resolve())
+        existing_path = environment.get("PYTHONPATH")
+        environment["PYTHONPATH"] = (
+            os.pathsep.join([source_root, existing_path])
+            if existing_path
+            else source_root
+        )
+        return subprocess.run(
+            [sys.executable, "-c", source],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+
     def test_browser_action_service_is_a_thin_facade(self) -> None:
         path = Path("src/skill_temple/browser_service.py")
         source = path.read_text(encoding="utf-8")
@@ -179,6 +200,25 @@ class StageEBoundaryTests(unittest.TestCase):
         self.assertTrue((root / "js_reverse.py").is_file())
         self.assertIs(js_reverse.JsReverseMcpAdapter.__mro__[1], object)
 
+        package_tree = ast.parse((root / "__init__.py").read_text(encoding="utf-8"))
+        imported_modules = {
+            node.module
+            for node in package_tree.body
+            if isinstance(node, ast.ImportFrom)
+        }
+        self.assertEqual(imported_modules, {"contracts"})
+
+        service_source = Path("src/skill_temple/browser_service.py").read_text(
+            encoding="utf-8"
+        )
+        for module in [
+            ".browser.adapters.js_reverse",
+            ".browser.adapters.mcp",
+            ".browser.adapters.playwright",
+        ]:
+            with self.subTest(module=module):
+                self.assertIn(f"from {module} import", service_source)
+
     def test_stream_state_is_shared_without_concrete_adapter_dependency(self) -> None:
         matcher = RequestMatcher(
             url_contains="/conversation",
@@ -214,6 +254,30 @@ class StageEBoundaryTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertNotIn("JsReverseMcpAdapter", session_source)
         self.assertIn("from ..adapters.contracts import", session_source)
+
+    def test_stream_state_imports_first_in_a_fresh_process(self) -> None:
+        result = self._run_fresh_python(
+            "from skill_temple.browser.stream_state import checkpoint_from_status; "
+            "print(checkpoint_from_status.__name__)"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "checkpoint_from_status")
+
+    def test_session_import_does_not_load_concrete_adapters(self) -> None:
+        result = self._run_fresh_python(
+            "import sys; "
+            "from skill_temple.browser.operations.session import BrowserSessionOperations; "
+            "forbidden = ["
+            "'skill_temple.browser.adapters.command', "
+            "'skill_temple.browser.adapters.playwright', "
+            "'skill_temple.browser.adapters.mcp', "
+            "'skill_temple.browser.adapters.js_reverse']; "
+            "loaded = [name for name in forbidden if name in sys.modules]; "
+            "assert not loaded, loaded; "
+            "print(BrowserSessionOperations.__name__)"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "BrowserSessionOperations")
 
     def test_breaking_legacy_import_surfaces_are_removed(self) -> None:
         self.assertIsNone(importlib.util.find_spec("skill_temple.browser_adapters"))

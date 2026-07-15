@@ -104,6 +104,18 @@ McpToolTransport
 CommandRunner
 ```
 
+`browser/adapters/__init__.py` 只导出上述 contracts，不导入任何具体 transport。具体实现必须
+从各自模块导入：
+
+```text
+browser.adapters.command.SubprocessCommandRunner
+browser.adapters.playwright.PlaywrightCliAdapter
+browser.adapters.mcp.StdioMcpToolTransport
+browser.adapters.js_reverse.JsReverseMcpAdapter
+```
+
+只有 `browser_service.py` composition root 负责组装这些实现。
+
 Operation 模块只从 `browser/adapters/contracts.py` 导入 adapter 类型和错误，不从
 `browser.adapters` package facade 或具体 transport 实现导入。js-reverse stream status 的
 request matching 与 checkpoint 转换位于纯函数模块 `browser/stream_state.py`，session 和
@@ -117,7 +129,7 @@ browser、manifest 或 execution status。
 这是破坏式模块边界变更，不提供旧路径兜底：
 
 ```text
-skill_temple.browser_adapters                 → skill_temple.browser.adapters
+skill_temple.browser_adapters                 → direct browser.adapters.<transport> imports
 protocol_evidence.build_replay_spec           → protocol.mutations.build_replay_spec
 protocol_evidence.network_request_matches     → protocol.matching.network_request_matches
 protocol_evidence.request_shape_from_snapshot → protocol.shapes.request_shape_from_snapshot

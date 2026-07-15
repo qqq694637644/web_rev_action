@@ -8,14 +8,14 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from .browser.adapters import (
+from .browser.adapters.contracts import (
     JsReverseAdapter,
-    JsReverseMcpAdapter,
     McpToolTransport,
     PlaywrightAdapter,
-    PlaywrightCliAdapter,
-    StdioMcpToolTransport,
 )
+from .browser.adapters.js_reverse import JsReverseMcpAdapter
+from .browser.adapters.mcp import StdioMcpToolTransport
+from .browser.adapters.playwright import PlaywrightCliAdapter
 from .browser.artifacts import ExperimentStore
 from .browser.core import BrowserServiceError, Deadline, utc_now
 from .browser.dispatcher import dispatch_browser_request

@@ -82,7 +82,8 @@ evidence collection/observation assembly、finalization、inspection 和 session
 Operation 层只能依赖 `browser/adapters/contracts.py`，不得导入 `JsReverseMcpAdapter`、
 `PlaywrightCliAdapter`、`StdioMcpToolTransport` 或 `SubprocessCommandRunner`。Stream request
 matching 与 status checkpoint 转换使用 `browser/stream_state.py` 的纯函数；只有 composition
-root 和 adapter package 选择具体实现。
+root `browser_service.py` 选择具体实现。`browser/adapters/__init__.py` 只导出 contracts，
+不得 eager import command、Playwright、MCP 或 js-reverse 实现。
 
 Stage E 是破坏式 import 迁移，不提供旧路径兜底：不要使用
 `skill_temple.browser_adapters`，也不要从 `protocol_evidence` 导入 matching、mutation、shape

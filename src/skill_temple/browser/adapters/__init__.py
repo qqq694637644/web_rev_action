@@ -1,6 +1,5 @@
-"""Explicit browser transport contracts and implementations."""
+"""Adapter contracts only; concrete transports are imported by the composition root."""
 
-from .command import SubprocessCommandRunner
 from .contracts import (
     AdapterError,
     AlignmentResult,
@@ -17,9 +16,6 @@ from .contracts import (
     StreamRequestCheckpoint,
     StreamWaitResult,
 )
-from .js_reverse import JsReverseMcpAdapter
-from .mcp import StdioMcpToolTransport
-from .playwright import PlaywrightCliAdapter, build_playwright_attach_args
 
 __all__ = [
     "AdapterError",
@@ -28,17 +24,12 @@ __all__ = [
     "CommandRunner",
     "DeadlineLike",
     "JsReverseAdapter",
-    "JsReverseMcpAdapter",
     "McpToolCallError",
     "McpToolTransport",
     "McpTransportError",
     "PageState",
     "PlaywrightAdapter",
-    "PlaywrightCliAdapter",
-    "StdioMcpToolTransport",
     "StreamCheckpoint",
     "StreamRequestCheckpoint",
     "StreamWaitResult",
-    "SubprocessCommandRunner",
-    "build_playwright_attach_args",
 ]
