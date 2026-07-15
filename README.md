@@ -41,9 +41,37 @@ web_rev_action
 ├── RuntimeCoordinator
 │   ├── browser operation reservation
 │   └── protected workspace mutation reservation
-├── Browser Orchestrator
-│   ├── PlaywrightCliAdapter
-│   └── JsReverseMcpAdapter
+├── BrowserActionService
+│   └── thin public facade
+├── browser/
+│   ├── dispatcher.py
+│   ├── core.py / artifacts.py / steps.py
+│   ├── replay_runtime.js
+│   ├── stream_state.py
+│   ├── adapters/
+│   │   ├── contracts.py
+│   │   ├── command.py
+│   │   ├── playwright.py
+│   │   ├── mcp.py
+│   │   └── js_reverse.py
+│   └── operations/
+│       ├── capture.py
+│       ├── replay.py
+│       ├── replay_analysis.py
+│       ├── finalization.py
+│       ├── evidence.py
+│       ├── inspection.py
+│       ├── session.py
+│       └── context.py
+├── protocol/
+│   ├── mutations.py
+│   ├── matching.py
+│   ├── shapes.py
+│   ├── fingerprints.py
+│   ├── values.py
+│   └── analyzers/
+│       ├── response.py
+│       └── differences.py
 ├── ExperimentStore
 │   └── 只保存 session 和 experiment manifest
 └── AnalysisWorkspaceService
@@ -58,6 +86,59 @@ web_rev_action
 - 服务重启后的 interrupted 恢复。
 
 所有普通文件读取、搜索、编辑和脚本执行都由 6 个 workspace Action 完成。
+
+### Stage E 职责边界
+
+`BrowserActionService` 只保留依赖构造、public `run` facade 和生命周期 `close`。
+请求分派位于 `browser/dispatcher.py`；capture lifecycle、replay preparation/dispatch、
+replay analysis、evidence collection/observation assembly、finalization、inspection 和
+session 各自拥有明确变化原因。Browser-context replay JavaScript 位于独立
+`browser/replay_runtime.js`，Python adapter 只加载 runtime、传入参数并映射结果。
+
+真实外部边界的 contracts 位于 `browser/adapters/contracts.py`：
+
+```text
+PlaywrightAdapter
+JsReverseAdapter
+McpToolTransport
+CommandRunner
+```
+
+`browser/adapters/__init__.py` 只导出上述 contracts，不导入任何具体 transport。具体实现必须
+从各自模块导入：
+
+```text
+browser.adapters.command.SubprocessCommandRunner
+browser.adapters.playwright.PlaywrightCliAdapter
+browser.adapters.mcp.StdioMcpToolTransport
+browser.adapters.js_reverse.JsReverseMcpAdapter
+```
+
+只有 `browser_service.py` composition root 负责组装这些实现。
+
+Operation 模块只从 `browser/adapters/contracts.py` 导入 adapter 类型和错误，不从
+`browser.adapters` package facade 或具体 transport 实现导入。js-reverse stream status 的
+request matching 与 checkpoint 转换位于纯函数模块 `browser/stream_state.py`，session 和
+具体 js-reverse adapter 共同依赖该模块。
+
+新增 transport 实现不需要修改 `BrowserActionService`。Request matching、ordered
+mutation/binding execution、request shape、fingerprint、response analyzer 和 factual
+difference analyzer 分别位于 `protocol/` 边界；analyzer 只消费结构化事实，不操作
+browser、manifest 或 execution status。
+
+这是破坏式模块边界变更，不提供旧路径兜底：
+
+```text
+skill_temple.browser_adapters                 → direct browser.adapters.<transport> imports
+protocol_evidence.build_replay_spec           → protocol.mutations.build_replay_spec
+protocol_evidence.network_request_matches     → protocol.matching.network_request_matches
+protocol_evidence.request_shape_from_snapshot → protocol.shapes.request_shape_from_snapshot
+protocol_evidence.analyze_replay_response     → protocol.analyzers.response.analyze_replay_response
+```
+
+`protocol_evidence.py` 只保留 evidence construction、snapshot response facts 和 canonical
+network observation；`browser_adapters.py` 已删除。公共 request/response Pydantic 模型仍位于
+`browser_models.py`，没有复制第二套模型。
 
 ## Public GPT Actions
 

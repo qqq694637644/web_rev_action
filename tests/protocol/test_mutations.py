@@ -17,7 +17,7 @@ from skill_temple.browser_models import (
     ReplayBinding,
     ReplayRequestPayload,
 )
-from skill_temple.protocol_evidence import (
+from skill_temple.protocol.mutations import (
     binding_value_from_snapshot,
     build_replay_spec,
 )

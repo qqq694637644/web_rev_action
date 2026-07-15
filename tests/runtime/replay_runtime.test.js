@@ -112,6 +112,23 @@ test('SSE exact marker and event name terminate without fixed global contract', 
   assert.deepEqual(matched.cancellations, ['done_marker']);
 });
 
+test('CR-only EOF exact marker terminates correctly', async () => {
+  const matched = await runCase({
+    chunks: ['event: complete\rdata: custom-terminal'],
+    responseControl: {
+      responseMode: 'sse',
+      terminalConditions: [
+        {type: 'exact_sse_data', value: 'custom-terminal', event_name: 'complete'},
+      ],
+    },
+  });
+  assert.equal(matched.result.sseEventCount, 1);
+  assert.equal(matched.result.terminationReason, 'done_marker');
+  assert.equal(matched.result.terminalConditionMatched, 'exact_sse_data');
+  assert.equal(matched.result.doneMarkerObserved, true);
+  assert.equal(matched.result.doneEventNameObserved, 'complete');
+});
+
 test('UTF-8 decoder preserves multibyte characters split across chunks', async () => {
   const encoded = Buffer.from('data: café\n\n', 'utf8');
   const split = encoded.indexOf(0xc3) + 1;
@@ -177,6 +194,69 @@ test('byte and event limits cancel the reader with auditable reasons', async () 
   assert.equal(eventsLimited.result.ndjsonRecordCount, 1);
   assert.equal(eventsLimited.result.terminationReason, 'max_events');
   assert.deepEqual(eventsLimited.cancellations, ['max_events']);
+});
+
+test('exact byte boundary is complete and not truncated', async () => {
+  const output = await runCase({
+    chunks: [new Uint8Array(8192).fill(97)],
+    contentType: 'application/octet-stream',
+    responseControl: {
+      responseMode: 'raw_stream',
+      maxResponseBytes: 8192,
+      terminalConditions: [{type: 'network_close'}],
+    },
+  });
+  assert.equal(output.result.bodyByteLength, 8192);
+  assert.equal(output.result.truncated, false);
+  assert.equal(output.result.terminationReason, 'network_close');
+  assert.equal(output.result.terminalConditionMatched, 'network_close');
+  assert.deepEqual(output.cancellations, []);
+});
+
+test('SSE max_events counts complete events', async () => {
+  const output = await runCase({
+    chunks: ['data: one\n\ndata: two\n\n'],
+    responseControl: {
+      responseMode: 'sse',
+      maxEvents: 1,
+      terminalConditions: [{type: 'network_close'}],
+    },
+  });
+  assert.equal(output.result.sseEventCount, 1);
+  assert.equal(output.result.terminationReason, 'max_events');
+  assert.deepEqual(output.cancellations, ['max_events']);
+});
+
+test('raw max_events counts accepted chunks', async () => {
+  const output = await runCase({
+    chunks: ['first', 'second'],
+    contentType: 'application/octet-stream',
+    responseControl: {
+      responseMode: 'raw_stream',
+      maxEvents: 1,
+      terminalConditions: [{type: 'network_close'}],
+    },
+  });
+  assert.equal(output.result.rawChunkCount, 1);
+  assert.equal(output.result.bodyByteLength, 5);
+  assert.equal(output.result.terminationReason, 'max_events');
+  assert.deepEqual(output.cancellations, ['max_events']);
+});
+
+test('network_close waits through delayed reads without idle_window', async () => {
+  const output = await runCase({
+    chunks: ['late'],
+    contentType: 'application/octet-stream',
+    readDelayMs: 40,
+    responseControl: {
+      responseMode: 'raw_stream',
+      terminalConditions: [{type: 'network_close'}],
+    },
+  });
+  assert.equal(output.result.bodyByteLength, 4);
+  assert.equal(output.result.terminationReason, 'network_close');
+  assert.equal(output.result.terminalConditionMatched, 'network_close');
+  assert.deepEqual(output.cancellations, []);
 });
 
 test('idle-window and text-pattern termination are independent', async () => {

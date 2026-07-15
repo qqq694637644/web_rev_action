@@ -62,7 +62,9 @@ def test_no_python_test_file_returns_to_giant_single_file_scale() -> None:
 
 def test_replay_runtime_is_standalone_packaged_and_node_tested() -> None:
     runtime_path = Path("src/skill_temple/browser/replay_runtime.js")
-    adapter_source = Path("src/skill_temple/browser_adapters.py").read_text(encoding="utf-8")
+    adapter_source = Path(
+        "src/skill_temple/browser/adapters/js_reverse.py"
+    ).read_text(encoding="utf-8")
     runtime_tests = Path("tests/runtime/replay_runtime.test.js").read_text(encoding="utf-8")
     package_config = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
     package_data = package_config["tool"]["setuptools"]["package-data"]["skill_temple"]
@@ -78,6 +80,11 @@ def test_replay_runtime_is_standalone_packaged_and_node_tested() -> None:
         "NDJSON handles chunk boundaries",
         "raw stream records exact chunk boundaries",
         "byte and event limits cancel",
+        "exact byte boundary is complete and not truncated",
+        "SSE max_events counts complete events",
+        "raw max_events counts accepted chunks",
+        "network_close waits through delayed reads without idle_window",
+        "CR-only EOF exact marker terminates correctly",
         "idle-window and text-pattern termination",
     ]:
         assert required_case in runtime_tests
@@ -142,6 +149,33 @@ def test_product_specific_replay_conclusion_tests_are_absent() -> None:
         "fixed six scenarios",
     ]:
         assert forbidden not in source
+
+
+def test_stage_f_tests_use_stage_e_direct_capability_imports() -> None:
+    forbidden_evidence_names = {
+        "analyze_replay_response",
+        "binding_value_from_snapshot",
+        "build_replay_spec",
+        "network_checkpoint",
+        "network_request_matches",
+        "redacted_request_body_from_snapshot",
+        "request_shape_from_snapshot",
+        "requests_after_checkpoint",
+    }
+    violations: list[str] = []
+    for path in TEST_ROOT.rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom):
+                continue
+            if node.module == "skill_temple.browser_adapters":
+                violations.append(f"{path}: legacy browser_adapters import")
+            if node.module == "skill_temple.protocol_evidence":
+                imported = {alias.name for alias in node.names}
+                legacy = sorted(imported & forbidden_evidence_names)
+                if legacy:
+                    violations.append(f"{path}: protocol_evidence legacy names {legacy}")
+    assert violations == []
 
 
 def test_test_method_names_are_unique_after_mechanical_split() -> None:

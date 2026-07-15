@@ -9,5 +9,5 @@ _RUNTIME_PATH = Path(__file__).with_name("replay_runtime.js")
 
 @lru_cache(maxsize=1)
 def load_replay_runtime() -> str:
-    """Return the reviewed JavaScript runtime asset."""
+    """Return the reviewed JavaScript runtime without rebuilding it in Python."""
     return _RUNTIME_PATH.read_text(encoding="utf-8")

@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 
+from skill_temple.protocol.shapes import (
+    redacted_request_body_from_snapshot,
+    request_shape_from_snapshot,
+)
 from skill_temple.protocol_evidence import (
     aggregate_observation_completeness,
     build_network_observation,
     public_network_summary,
-    redacted_request_body_from_snapshot,
-    request_shape_from_snapshot,
 )
 from tests.protocol.common import ProtocolTestCase
 

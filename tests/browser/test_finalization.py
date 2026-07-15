@@ -6,7 +6,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from skill_temple.browser_adapters import (
+from skill_temple.browser.adapters.contracts import (
     StreamCheckpoint,
     StreamWaitResult,
 )

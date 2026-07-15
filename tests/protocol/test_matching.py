@@ -3,7 +3,7 @@ from __future__ import annotations
 from skill_temple.browser_models import (
     RequestMatcher,
 )
-from skill_temple.protocol_evidence import (
+from skill_temple.protocol.matching import (
     network_checkpoint,
     network_request_matches,
     requests_after_checkpoint,

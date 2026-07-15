@@ -4,7 +4,7 @@ import json
 import tempfile
 from pathlib import Path
 
-from skill_temple.browser_adapters import (
+from skill_temple.browser.adapters.contracts import (
     AlignmentResult,
     PageState,
 )

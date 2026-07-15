@@ -1,1 +1,1 @@
-"""Browser runtime assets."""
+"""Browser experiment capability boundaries."""

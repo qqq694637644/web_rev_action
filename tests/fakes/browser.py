@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from skill_temple.browser_adapters import (
+from skill_temple.browser.adapters.contracts import (
     AlignmentResult,
     PageState,
     StreamCheckpoint,

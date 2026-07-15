@@ -5,7 +5,7 @@ from typing import Any
 import pytest
 
 from skill_temple.browser_models import RemoveJsonPathMutation
-from skill_temple.protocol_evidence import analyze_replay_response
+from skill_temple.protocol.analyzers.response import analyze_replay_response
 
 
 @pytest.mark.parametrize(

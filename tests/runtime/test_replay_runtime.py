@@ -11,7 +11,9 @@ from skill_temple.browser.replay_runtime import load_replay_runtime
 
 def test_python_loader_returns_standalone_runtime_asset() -> None:
     runtime_path = Path("src/skill_temple/browser/replay_runtime.js")
-    adapter_source = Path("src/skill_temple/browser_adapters.py").read_text(encoding="utf-8")
+    adapter_source = Path(
+        "src/skill_temple/browser/adapters/js_reverse.py"
+    ).read_text(encoding="utf-8")
 
     assert load_replay_runtime() == runtime_path.read_text(encoding="utf-8")
     assert "function = load_replay_runtime()" in adapter_source

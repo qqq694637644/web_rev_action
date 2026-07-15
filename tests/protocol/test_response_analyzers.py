@@ -6,7 +6,7 @@ from skill_temple.browser_models import (
     RemoveQueryParameterMutation,
     ReplaceJsonPathMutation,
 )
-from skill_temple.protocol_evidence import (
+from skill_temple.protocol.analyzers.response import (
     analyze_replay_response,
 )
 from tests.protocol.common import ProtocolTestCase

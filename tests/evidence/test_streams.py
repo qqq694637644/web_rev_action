@@ -9,13 +9,13 @@ from typing import Any
 from fastapi.testclient import TestClient
 
 from skill_temple.app import create_app
-from skill_temple.browser_adapters import (
-    JsReverseMcpAdapter,
+from skill_temple.browser.adapters.contracts import (
     McpToolCallError,
     StreamCheckpoint,
     StreamRequestCheckpoint,
     StreamWaitResult,
 )
+from skill_temple.browser.adapters.js_reverse import JsReverseMcpAdapter
 from skill_temple.browser_models import (
     CaptureFlowRequest,
     ExactDataPredicate,
