@@ -189,6 +189,15 @@ Workspace inspect/search/read 默认 `include_credentials=false`，不会返回 
 
 需要实时状态、外部数据或执行结果时必须调用相应 Action，不要用 Skill 文档代替实时证据。
 
+仓库测试按能力分布在 `tests/browser`、`tests/evidence`、`tests/protocol`、
+`tests/workspace`、`tests/runtime`、`tests/smoke` 和 `tests/fakes`。修改 transport、extractor、
+analyzer、workspace 或 runtime 时运行对应目录的小型测试，并在提交前运行全量 pytest。
+Browser replay JavaScript 的 parser、framing、limit、abort 和 termination 行为由
+`tests/runtime/replay_runtime.test.js` 的 Node suite 直接验证，不要重新把 runtime 或 Node
+fixture 嵌入 Python 测试。Synthetic smoke 只能使用通用 resource/record/cursor 等术语，不能
+把 Pandora、conversation/message/parent、固定 `[DONE]` 或 Control/Treatment catalog 当作
+框架契约。
+
 任何 Action 返回截断、分页或 continuation 字段时，都把结果视为不完整。只在任务确实需要更多内容时继续，并确保分页位置或 continuation 位置前进。
 
 只执行用户明确请求范围内的修改。个人可信工作流可以不增加重复确认，但不能因为推测便利而扩大修改范围。修改完成后，如果执行响应不足以证明结果，执行一次针对性读回验证。

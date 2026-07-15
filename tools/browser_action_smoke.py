@@ -251,7 +251,7 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
                                 },
                                 "predicate": {
                                     "type": "exact_data",
-                                    "value": "[DONE]",
+                                    "value": "fixture-complete",
                                 },
                                 "timeout_ms": 15_000,
                             },
@@ -271,7 +271,7 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
                             "resource_types": ["eventsource"],
                             "mime_types": ["text/event-stream"],
                         },
-                        "predicate": {"type": "exact_data", "value": "[DONE]"},
+                        "predicate": {"type": "exact_data", "value": "fixture-complete"},
                         "timeout_ms": 15_000,
                     },
                     "execution_mode": "sync",
@@ -320,7 +320,7 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
         inspected = await workspace.inspect(
             WorkspaceInspectRequest(
                 paths=[f"experiments/{captured.experiment_id}"],
-                queries=["[DONE]"],
+                queries=["fixture-complete"],
                 max_depth=8,
                 max_tree_entries=500,
                 max_read_files=5,
@@ -342,8 +342,8 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
         if any(item.error for item in read.files):
             raise AssertionError(f"workspaceReadFiles errors: {read.model_dump()}")
         events_text = next(item.content for item in read.files if item.path == events_relative)
-        if "[DONE]" not in events_text:
-            raise AssertionError("events artifact did not contain [DONE]")
+        if "fixture-complete" not in events_text:
+            raise AssertionError("events artifact did not contain fixture-complete")
         quoted_raw = raw_relative.replace("'", "''")
         binary = await workspace.exec_pwsh(
             WorkspaceExecPwshRequest(
@@ -436,9 +436,8 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
                     ],
                     "series": {
                         "analysis_series_id": "stateful-stream-fixture-series",
-                        "scenario_type": "initial_stream_event",
+                        "scenario_type": "initial_stream_record",
                         "sequence_index": 1,
-                        "conversation_key": "stateful-stream-fixture",
                     },
                 },
             )
@@ -479,9 +478,9 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
             else {}
         )
         for expected_pointer in [
-            "/events/0/id",
-            "/events/0/payload/parts/0",
-            "/parent_event_id",
+            "/records/0/record_id",
+            "/records/0/content/segments/0",
+            "/cursor_id",
             "/tracking_id",
         ]:
             if expected_pointer not in shape_paths:
@@ -495,9 +494,9 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
             },
             "bindings": [
                 {
-                    "binding_id": "event_id",
+                    "binding_id": "record_id",
                     "target": "json_pointer",
-                    "path": "/events/0/id",
+                    "path": "/records/0/record_id",
                     "value_source": "generated",
                     "generator": "uuid4",
                 }
@@ -518,7 +517,7 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
             },
             "termination": {
                 "conditions": [
-                    {"type": "exact_sse_data", "value": "[DONE]"}
+                    {"type": "exact_sse_data", "value": "fixture-complete"}
                 ],
             },
             "execution_mode": "sync",
@@ -536,7 +535,6 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
                 "scenario_type": "generic_replay",
                 "predecessor_experiment_id": stateful_capture.experiment_id,
                 "sequence_index": 2,
-                "conversation_key": "stateful-stream-fixture",
             },
         }
         control = await service.run(
@@ -592,7 +590,10 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
         if find_field(control_response_value, "terminationReason") != "done_marker":
             raise AssertionError(control_response_value)
         control_preview = str(find_field(control_response_value, "bodyPreview") or "")
-        if "literal [DONE] text" not in control_preview or "stream_state" not in control_preview:
+        if (
+            "fixture result contains custom terminal text" not in control_preview
+            or "state_snapshot" not in control_preview
+        ):
             raise AssertionError(control_response_value)
 
         async def run_replay(
@@ -642,11 +643,21 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
         if tracking_status != 200:
             raise AssertionError(tracking_manifest)
         required_manifest, required_status, required_response = await run_replay(
-            objective="remove required event id",
-            mutation={"type": "remove_json_path", "path": "/events/0/id"},
+            objective="remove required record id",
+            mutation={"type": "remove_json_path", "path": "/records/0/record_id"},
         )
         if required_status != 422:
             raise AssertionError(required_manifest)
+        failure_manifest, failure_status, failure_response = await run_replay(
+            objective="request a synthetic server failure profile",
+            mutation={
+                "type": "replace_json_path",
+                "path": "/profile",
+                "value": "fixture-server-error",
+            },
+        )
+        if failure_status != 500:
+            raise AssertionError(failure_manifest)
         if find_field(tracking_response, "doneMarkerObserved") is not True:
             raise AssertionError(tracking_response)
         if find_field(required_response, "terminationReason") not in {
@@ -654,7 +665,7 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
             "no_response_body",
         }:
             raise AssertionError(required_response)
-        for replay_manifest in [tracking_manifest, required_manifest]:
+        for replay_manifest in [tracking_manifest, required_manifest, failure_manifest]:
             replay_attempt = next(
                 item
                 for item in replay_manifest.get("evidence", [])
@@ -696,6 +707,9 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
         required_analysis = replay_response_analysis(required_manifest)
         if required_analysis.get("classification") != "validation_rejection":
             raise AssertionError(required_manifest)
+        failure_analysis = replay_response_analysis(failure_manifest)
+        if failure_analysis.get("classification") != "server_failure":
+            raise AssertionError(failure_manifest)
 
         control_spec = json.loads(
             (
@@ -706,7 +720,7 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
                 / "request-spec.json"
             ).read_text(encoding="utf-8")
         )
-        control_event_id = json.loads(control_spec["body"]["text"])["events"][0]["id"]
+        control_record_id = json.loads(control_spec["body"]["text"])["records"][0]["record_id"]
         tracking_spec = json.loads(
             (
                 evidence_root
@@ -716,20 +730,20 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
                 / "request-spec.json"
             ).read_text(encoding="utf-8")
         )
-        tracking_event_id = json.loads(tracking_spec["body"]["text"])["events"][0]["id"]
+        tracking_record_id = json.loads(tracking_spec["body"]["text"])["records"][0]["record_id"]
         duplicate_replay = await service.run(
             ReplayRequestRequest(
                 operation="replay_request",
                 payload={
                     **replay_common,
-                    "objective": "reuse an observed event id explicitly",
+                    "objective": "reuse an observed record id explicitly",
                     "bindings": [
                         {
-                            "binding_id": "event_id",
+                            "binding_id": "record_id",
                             "target": "json_pointer",
-                            "path": "/events/0/id",
+                            "path": "/records/0/record_id",
                             "value_source": "literal",
-                            "value": control_event_id,
+                            "value": control_record_id,
                         }
                     ],
                     "mutations": [{"type": "remove_json_path", "path": "/tracking_id"}],
@@ -909,7 +923,7 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
                 tracking_response,
                 "doneMarkerObserved",
             ),
-            "stateful_fresh_event_ids_differ": control_event_id != tracking_event_id,
+            "stateful_fresh_record_ids_differ": control_record_id != tracking_record_id,
             "stateful_required_replay_status": required_status,
             "stateful_required_mutation_effective": (
                 required_manifest.get("mutation_assessment", {})
@@ -917,6 +931,8 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
                 .get("mutation_effective")
             ),
             "stateful_required_response_analysis": required_analysis.get("classification"),
+            "stateful_failure_replay_status": failure_status,
+            "stateful_failure_response_analysis": failure_analysis.get("classification"),
             "stateful_explicit_duplicate_status": duplicate_manifest.get("replay_http_status"),
             "stateful_explicit_duplicate_analysis": duplicate_analysis.get("classification"),
             "cancellation_status": cancellation_manifest.get("status"),
