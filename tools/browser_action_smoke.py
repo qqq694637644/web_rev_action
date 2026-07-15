@@ -22,11 +22,9 @@ from toolchain_validation import (
 )
 from toolchain_validation_server import SSE_EVENTS, start_server
 
-from skill_temple.browser_adapters import (
-    JsReverseMcpAdapter,
-    PlaywrightCliAdapter,
-    StdioMcpToolTransport,
-)
+from skill_temple.browser.adapters.js_reverse import JsReverseMcpAdapter
+from skill_temple.browser.adapters.mcp import StdioMcpToolTransport
+from skill_temple.browser.adapters.playwright import PlaywrightCliAdapter
 from skill_temple.browser_models import (
     CancelExperimentRequest,
     CaptureFlowRequest,
