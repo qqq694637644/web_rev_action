@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 import ast
+import importlib.util
 import tomllib
 import unittest
 from pathlib import Path
 
-from skill_temple import browser_adapters
-from skill_temple.browser.adapters import contracts
+import skill_temple.protocol_evidence as protocol_evidence
+from skill_temple.browser.adapters import js_reverse
 from skill_temple.browser.operations.capture import BrowserCaptureOperations
 from skill_temple.browser.operations.evidence import BrowserEvidenceOperations
 from skill_temple.browser.operations.finalization import BrowserFinalizationOperations
 from skill_temple.browser.operations.inspection import BrowserInspectionOperations
 from skill_temple.browser.operations.replay import BrowserReplayOperations
+from skill_temple.browser.operations.replay_analysis import BrowserReplayAnalysisOperations
 from skill_temple.browser.operations.session import BrowserSessionOperations
 from skill_temple.browser.replay_runtime import load_replay_runtime
 from skill_temple.browser_models import RequestMatcher
@@ -24,7 +26,6 @@ from skill_temple.protocol.analyzers.differences import (
 )
 from skill_temple.protocol.analyzers.response import analyze_replay_response
 from skill_temple.protocol.matching import network_request_matches
-from skill_temple.protocol_evidence import analyze_replay_response as compatibility_analyzer
 
 
 class StageEBoundaryTests(unittest.TestCase):
@@ -57,6 +58,9 @@ class StageEBoundaryTests(unittest.TestCase):
         )
         self.assertTrue(hasattr(BrowserEvidenceOperations, "_export_network_evidence"))
         self.assertTrue(hasattr(BrowserReplayOperations, "_prepare_replay_execution"))
+        self.assertTrue(
+            hasattr(BrowserReplayAnalysisOperations, "_analyze_replay_evidence_stage")
+        )
         self.assertTrue(hasattr(BrowserInspectionOperations, "inspect"))
         self.assertTrue(hasattr(BrowserSessionOperations, "_open_session"))
 
@@ -64,16 +68,72 @@ class StageEBoundaryTests(unittest.TestCase):
             BrowserCaptureOperations,
             BrowserFinalizationOperations,
             BrowserReplayOperations,
+            BrowserReplayAnalysisOperations,
             BrowserEvidenceOperations,
             BrowserInspectionOperations,
             BrowserSessionOperations,
         }
         self.assertTrue(expected.issubset(set(BrowserActionService.__mro__)))
 
+    def test_operation_modules_use_explicit_imports(self) -> None:
+        root = Path("src/skill_temple/browser/operations")
+        self.assertFalse((root / "_support.py").exists())
+        for path in root.glob("*.py"):
+            if path.name == "__init__.py":
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            wildcard_imports = [
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, ast.ImportFrom)
+                and any(alias.name == "*" for alias in node.names)
+            ]
+            with self.subTest(path=path.name):
+                self.assertEqual(wildcard_imports, [])
+
+    def test_capture_flow_calls_stages_not_runtime_or_analyzers(self) -> None:
+        path = Path("src/skill_temple/browser/operations/capture.py")
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        capture_class = next(node for node in tree.body if isinstance(node, ast.ClassDef))
+        capture_flow = next(
+            node
+            for node in capture_class.body
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "_capture_flow"
+        )
+        calls = {
+            node.func.attr if isinstance(node.func, ast.Attribute) else node.func.id
+            for node in ast.walk(capture_flow)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, (ast.Attribute, ast.Name))
+        }
+        self.assertLessEqual(capture_flow.end_lineno - capture_flow.lineno + 1, 700)
+        self.assertTrue(
+            {
+                "_prepare_replay_dispatch_stage",
+                "_execute_replay_dispatch",
+                "_collect_post_flow_evidence",
+                "_analyze_replay_evidence_stage",
+                "_assemble_observations_stage",
+                "_finalize_experiment_runtime",
+                "_complete_capture_record",
+            }.issubset(calls)
+        )
+        self.assertTrue(
+            {
+                "evaluate_browser_replay",
+                "analyze_replay_response",
+                "build_replay_spec",
+                "assess_mutation_effectiveness",
+                "_export_network_evidence",
+                "_export_console_evidence",
+                "_build_replay_comparison_results",
+            }.isdisjoint(calls)
+        )
+
     def test_replay_runtime_is_a_standalone_javascript_asset(self) -> None:
         runtime_path = Path("src/skill_temple/browser/replay_runtime.js")
         runtime = runtime_path.read_text(encoding="utf-8")
-        adapter = Path("src/skill_temple/browser_adapters.py").read_text(
+        adapter = Path("src/skill_temple/browser/adapters/js_reverse.py").read_text(
             encoding="utf-8"
         )
 
@@ -85,21 +145,55 @@ class StageEBoundaryTests(unittest.TestCase):
         package_data = package_config["tool"]["setuptools"]["package-data"]["skill_temple"]
         self.assertIn("browser/*.js", package_data)
 
-    def test_external_adapter_contracts_remain_compatible_exports(self) -> None:
+    def test_adapter_implementations_are_split_by_transport(self) -> None:
+        root = Path("src/skill_temple/browser/adapters")
+        self.assertFalse(Path("src/skill_temple/browser_adapters.py").exists())
+        self.assertTrue((root / "command.py").is_file())
+        self.assertTrue((root / "playwright.py").is_file())
+        self.assertTrue((root / "mcp.py").is_file())
+        self.assertTrue((root / "js_reverse.py").is_file())
+        self.assertIs(js_reverse.JsReverseMcpAdapter.__mro__[1], object)
+
+    def test_breaking_legacy_import_surfaces_are_removed(self) -> None:
+        self.assertIsNone(importlib.util.find_spec("skill_temple.browser_adapters"))
         for name in [
-            "AdapterError",
-            "AlignmentResult",
-            "CommandRunner",
-            "JsReverseAdapter",
-            "McpToolTransport",
-            "PlaywrightAdapter",
-            "StreamCheckpoint",
+            "analyze_replay_response",
+            "build_replay_spec",
+            "network_request_matches",
+            "request_shape_from_snapshot",
         ]:
             with self.subTest(name=name):
-                self.assertIs(
-                    getattr(browser_adapters, name),
-                    getattr(contracts, name),
-                )
+                self.assertFalse(hasattr(protocol_evidence, name))
+
+    def test_mutation_execution_lives_in_protocol_mutations(self) -> None:
+        mutation_tree = ast.parse(
+            Path("src/skill_temple/protocol/mutations.py").read_text(encoding="utf-8")
+        )
+        evidence_tree = ast.parse(
+            Path("src/skill_temple/protocol_evidence.py").read_text(encoding="utf-8")
+        )
+        mutation_functions = {
+            node.name
+            for node in mutation_tree.body
+            if isinstance(node, ast.FunctionDef)
+        }
+        evidence_functions = {
+            node.name
+            for node in evidence_tree.body
+            if isinstance(node, ast.FunctionDef)
+        }
+        required = {
+            "build_replay_spec",
+            "binding_value_from_snapshot",
+            "assess_mutation_effectiveness",
+            "observe_binding_application",
+            "replay_operation_overwritten_by_later",
+            "_mutate_headers",
+            "_mutate_query",
+            "_mutate_json_body",
+        }
+        self.assertTrue(required.issubset(mutation_functions))
+        self.assertTrue(required.isdisjoint(evidence_functions))
 
     def test_difference_analyzer_is_pure_and_factual(self) -> None:
         reference = {
@@ -159,7 +253,6 @@ class StageEBoundaryTests(unittest.TestCase):
                 ),
             )
         )
-        self.assertIs(analyze_replay_response, compatibility_analyzer)
         result = analyze_replay_response(
             status=500,
             content_type="application/json",

@@ -71,11 +71,18 @@ inspectBrowserEvidence 只读，用于查询 session、experiment、stream、evi
 未知或当前网页分析默认选择 `current-site-analysis` Skill：先盘点页面、network/stream、worker/storage/auth、源码和 evidence gap，再按当前事实设计最小实验。只有 inventory 已确认对话树、regenerate、edit、stop 等 Pandora 类语义时，才选择可选的 `pandora-protocol-reproduction` 模板。实际 request replay 必须调用结构化 `replay_request`，不要使用 workspaceExecPwsh 或任意 JavaScript 自行发请求。
 
 内部维护边界：public browser 请求由薄 `BrowserActionService` facade 进入
-`browser/dispatcher.py`；capture/replay/finalization/evidence/inspection/session 分属专用
-operation 模块。Replay JavaScript 位于 `browser/replay_runtime.js`。新增 transport 实现
-遵循 `browser/adapters/contracts.py`，新增 analyzer 放入 `protocol/analyzers/`，不要把逻辑
-重新加入 facade 或 `protocol_evidence.py` 巨型模块。Workspace inspect/search/read/write/
-PowerShell 能力属于分析框架核心，不因 browser 拆分而删除。
+`browser/dispatcher.py`；capture lifecycle、replay preparation/dispatch、replay analysis、
+evidence collection/observation assembly、finalization、inspection 和 session 分属专用 operation
+模块，模块使用显式 import，不共享 wildcard namespace。Replay JavaScript 位于
+`browser/replay_runtime.js`。新增 transport 实现分别进入
+`browser/adapters/command.py|playwright.py|mcp.py|js_reverse.py`，新增 analyzer 放入
+`protocol/analyzers/`，ordered mutation/binding 执行只修改 `protocol/mutations.py`。
+不要把逻辑重新加入 facade、capture 主流程或 `protocol_evidence.py`。
+
+Stage E 是破坏式 import 迁移，不提供旧路径兜底：不要使用
+`skill_temple.browser_adapters`，也不要从 `protocol_evidence` 导入 matching、mutation、shape
+或 analyzer。Workspace inspect/search/read/write/PowerShell 能力属于分析框架核心，不因
+browser 拆分而删除。
 
 运行 capture_flow 前明确 objective、primary_request、flow 和 wait_for。默认使用 execution_mode=job；收到 status=running 后，用 inspectBrowserEvidence.get_experiment 查询到 completed、failed 或 interrupted，不要重复提交同一个实验。若当前任务提交错误或明显不再需要，使用 cancel_experiment，并传入该 experiment_id 和 session_id；不要重启服务或关闭 session 代替取消。只有明确需要快速同步结果时才使用 execution_mode=sync 和不超过 42 秒的 deadline。每次实验只改变一个变量。默认 include_in_flight=false，避免实验前已经发出的请求污染结果。
 

@@ -7,8 +7,8 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from ..browser_adapters import StreamCheckpoint
 from ..browser_models import FlowStep, FlowStepResult, RequestMatcher
+from .adapters import StreamCheckpoint
 from .core import BrowserServiceError, Deadline, utc_now
 
 if TYPE_CHECKING:

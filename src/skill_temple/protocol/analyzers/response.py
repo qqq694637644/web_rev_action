@@ -7,7 +7,7 @@ import re
 from typing import Any
 
 from ...browser_models import ReplayMutation
-from ..mutations import _decode_pointer, _encode_pointer_token
+from ..values import _decode_pointer, _encode_pointer_token
 
 
 def analyze_replay_response(

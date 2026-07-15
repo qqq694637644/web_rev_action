@@ -1,10 +1,33 @@
-"""Inspection responsibility extracted from BrowserActionService."""
-
-# ruff: noqa: F403,F405,I001
+"""Read-only session, experiment, source, and evidence inspection."""
 
 from __future__ import annotations
 
-from ._support import *  # noqa: F403
+import hashlib
+import json
+import re
+from pathlib import Path
+from typing import Any
+
+from ...browser_models import (
+    BrowserActionResponse,
+    CaptureFlowPayload,
+    GetExperimentRequest,
+    GetNetworkEvidenceRequest,
+    GetRequestInitiatorRequest,
+    GetRequestShapeRequest,
+    GetScriptSourceRequest,
+    GetSessionRequest,
+    GetStreamStatusRequest,
+    InspectBrowserEvidenceRequest,
+    ListConsoleErrorsRequest,
+    ListEvidenceRequest,
+    ListExperimentsRequest,
+    SaveScriptSourceRequest,
+    SearchScriptsRequest,
+)
+from ...protocol_evidence import evidence_id
+from ..core import BrowserServiceError, Deadline, utc_now
+
 
 class BrowserInspectionOperations:
     """Own inspection behavior while the public service remains a facade."""

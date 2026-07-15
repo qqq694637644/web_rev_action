@@ -19,18 +19,21 @@ from skill_temple.browser_models import (
     ReplayRequestPayload,
     RequestMatcher,
 )
-from skill_temple.protocol_evidence import (
-    aggregate_observation_completeness,
-    analyze_replay_response,
-    binding_value_from_snapshot,
-    build_network_observation,
-    build_replay_spec,
+from skill_temple.protocol.analyzers.response import analyze_replay_response
+from skill_temple.protocol.matching import (
     network_checkpoint,
     network_request_matches,
-    public_network_summary,
+    requests_after_checkpoint,
+)
+from skill_temple.protocol.mutations import binding_value_from_snapshot, build_replay_spec
+from skill_temple.protocol.shapes import (
     redacted_request_body_from_snapshot,
     request_shape_from_snapshot,
-    requests_after_checkpoint,
+)
+from skill_temple.protocol_evidence import (
+    aggregate_observation_completeness,
+    build_network_observation,
+    public_network_summary,
 )
 
 

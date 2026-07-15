@@ -15,7 +15,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from skill_temple.app import create_app
-from skill_temple.browser_adapters import (
+from skill_temple.browser.adapters import (
     AdapterError,
     AlignmentResult,
     JsReverseMcpAdapter,
@@ -5506,7 +5506,9 @@ class BrowserActionTests(unittest.TestCase):
         function_source = Path(
             "src/skill_temple/browser/replay_runtime.js"
         ).read_text(encoding="utf-8")
-        adapter_source = Path("src/skill_temple/browser_adapters.py").read_text(
+        adapter_source = Path(
+            "src/skill_temple/browser/adapters/js_reverse.py"
+        ).read_text(
             encoding="utf-8"
         )
         self.assertIn("function = load_replay_runtime()", adapter_source)
@@ -5798,7 +5800,7 @@ async function runCase(
         self.assertLess(len(json.dumps(summary).encode("utf-8")), 50_000)
 
     def test_playwright_locator_rendering_uses_supported_cli_locators(self) -> None:
-        from skill_temple.browser_adapters import PlaywrightCliAdapter
+        from skill_temple.browser.adapters import PlaywrightCliAdapter
 
         adapter = PlaywrightCliAdapter()
         self.assertEqual(adapter.render_locator(Locator(ref="e12")), "e12")

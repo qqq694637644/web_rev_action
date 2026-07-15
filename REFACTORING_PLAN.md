@@ -794,7 +794,7 @@ browser/infrastructure
 
 `browser/domain` 不是必选目录。只有 `ExperimentContext`、`NetworkObservation`、`ArtifactReference`、`ReplayRequest`、`Mutation`、`Extractor`、`Binding`、`ExecutionStatus` 和 `Completeness` 等对象已经稳定，并且确实被多个用例共享时，才放入独立 domain 层。
 
-当前落地结构保持浅层和兼容性：
+当前落地结构保持浅层，并明确采用破坏式 import 边界：
 
 ```text
 browser/
@@ -804,24 +804,36 @@ browser/
   steps.py                setup/action/verification step execution
   replay_runtime.js       browser-context replay runtime
   replay_runtime.py       reviewed runtime loader
-  adapters/contracts.py   Playwright、MCP、js-reverse Protocol 与 typed results
+  adapters/
+    contracts.py          Playwright、MCP、js-reverse Protocol 与 typed results
+    command.py            subprocess command implementation
+    playwright.py         Playwright CLI implementation
+    mcp.py                persistent stdio MCP transport
+    js_reverse.py         js-reverse tool mapping and stream operations
   operations/
     capture.py
     replay.py
+    replay_analysis.py
     finalization.py
     evidence.py
     inspection.py
     session.py
+    context.py             typed stage transfer objects
 
 protocol/
   mutations.py
   matching.py
+  shapes.py
+  fingerprints.py
+  values.py
   analyzers/
     response.py
     differences.py
 ```
 
-公共请求模型暂时继续保留在 `browser_models.py`，避免为了目录外观复制第二套模型。
+公共请求模型继续保留在 `browser_models.py`，避免为了目录外观复制第二套模型。
+`browser_adapters.py` 已删除；`protocol_evidence.py` 不再 re-export mutation、matching、shape
+或 analyzer。调用方必须迁移到直接能力路径，不提供兼容 facade 或 fallback。
 Workspace 原有 read/search/inspect/write/PowerShell 模块保持不变。
 
 #### E3. 推荐提取顺序
@@ -831,7 +843,7 @@ Workspace 原有 read/search/inspect/write/PowerShell 模块保持不变。
 - [x] 提取 evidence collection，集中处理 network、stream、console、script 和 artifact facts。
 - [x] 提取 replay execution，隔离 source resolution、mutation、binding、transport dispatch 和 response reading。
 - [x] 提取可选 analyzers，使其只消费事实并返回 observations/hints。
-- [x] 最后缩小 `BrowserActionService`，使其只负责 dispatch 或保留为兼容 facade。
+- [x] 最后缩小 `BrowserActionService`，使其只负责依赖构造、dispatch facade 和 lifecycle。
 
 #### E4. BrowserActionService 的目标
 
@@ -860,7 +872,20 @@ response 语义结论
 
 当前 `BrowserActionService` 仅保留依赖构造、`run` facade 和生命周期 `close`；
 `run` 委托给 `browser/dispatcher.py`，inspect/capture/replay/finalization/evidence/session
-行为由专用 operation boundary 提供。架构测试锁定 facade 自有方法和文件尺寸，防止职责回流。
+行为由专用 operation boundary 提供。Capture orchestrator 只调用显式阶段：
+
+```text
+prepare replay dispatch
+execute replay dispatch
+finalize runtime
+collect post-flow evidence
+analyze replay evidence
+assemble canonical observations/comparisons
+```
+
+它不直接调用 browser replay runtime、response analyzer、mutation executor、network/console
+evidence exporter 或 comparison builder。架构测试锁定 facade 自有方法、禁止 wildcard import、
+禁止上述直接调用，并限制 capture orchestrator 长度，防止职责回流。
 
 #### E5. Workspace 的定位
 
@@ -883,8 +908,18 @@ PowerShell 是否保留在核心中，根据真实分析用例决定。常用 ha
 
 阶段 E 的完成标准是：新 transport、新证据来源或新 analyzer 不再要求修改同一个巨型 service，而不是代码必须符合某种固定目录模板。
 
-当前扩展点分别是 `browser/adapters/contracts.py`、`browser/operations/evidence.py` 和
-`protocol/analyzers/`；新增实现不再需要修改 `BrowserActionService` 主流程。
+当前扩展点分别是：
+
+```text
+new command/Playwright/MCP/js-reverse behavior → browser/adapters/<transport>.py
+new replay preparation or dispatch             → browser/operations/replay.py
+new replay interpretation                      → browser/operations/replay_analysis.py
+new evidence source/observation                 → browser/operations/evidence.py
+new mutation or binding behavior                → protocol/mutations.py
+new analyzer                                    → protocol/analyzers/
+```
+
+新增能力不再要求修改 `BrowserActionService` 或同一个 capture 巨型流程。
 
 ### 阶段 F：让测试跟随能力边界
 

@@ -1,10 +1,36 @@
-"""Session responsibility extracted from BrowserActionService."""
-
-# ruff: noqa: F403,F405,I001
+"""Session reservation, alignment, waits, and request selection."""
 
 from __future__ import annotations
 
-from ._support import *  # noqa: F403
+import asyncio
+import uuid
+from collections.abc import Awaitable, Callable
+from contextlib import asynccontextmanager
+from dataclasses import asdict
+from datetime import datetime
+from typing import Any
+
+from ...browser_models import (
+    BrowserActionResponse,
+    CancelExperimentRequest,
+    CaptureBaselineRequest,
+    CaptureFlowPayload,
+    CaptureFlowRequest,
+    CloseSessionRequest,
+    FlowStepResult,
+    OpenSessionRequest,
+    RequestMatcher,
+    WaitCondition,
+)
+from ...runtime_coordinator import RuntimeOwner, RuntimeReservationError
+from ..adapters import (
+    AlignmentResult,
+    JsReverseMcpAdapter,
+    StreamCheckpoint,
+    StreamRequestCheckpoint,
+)
+from ..core import BrowserServiceError, Deadline, _safe_identifier, utc_now
+
 
 class BrowserSessionOperations:
     """Own session behavior while the public service remains a facade."""

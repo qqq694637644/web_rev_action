@@ -1,10 +1,15 @@
-"""Evidence responsibility extracted from BrowserActionService."""
-
-# ruff: noqa: F403,F405,I001
+"""Evidence collection and factual comparison with explicit dependencies."""
 
 from __future__ import annotations
 
-from ._support import *  # noqa: F403
+import hashlib
+import json
+import re
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlsplit
+
+from ...browser_models import CaptureFlowPayload, FlowStepResult, RequestMatcher
 from ...protocol.analyzers.differences import (
     aggregate_dimension_status,
     compare_dimension,
@@ -12,6 +17,29 @@ from ...protocol.analyzers.differences import (
     select_current_stream_summary,
     stream_summary_from_observation,
 )
+from ...protocol.fingerprints import request_body_canonical_sha256_from_snapshot
+from ...protocol.matching import (
+    network_request_matches,
+    requests_after_checkpoint,
+    select_network_evidence,
+)
+from ...protocol.shapes import (
+    redacted_request_body_from_snapshot,
+    request_shape_from_snapshot,
+)
+from ...protocol_evidence import (
+    build_network_observation,
+    evidence_id,
+    load_snapshot,
+    network_snapshot_dimensions,
+    public_network_summary,
+    response_content_type,
+    stream_request_has_complete_request_headers,
+)
+from ..adapters import AlignmentResult
+from ..core import BrowserServiceError, Deadline
+from .context import EvidenceCollectionResult, ObservationAssemblyResult
+
 
 class BrowserEvidenceOperations:
     """Own evidence behavior while the public service remains a facade."""
@@ -1294,3 +1322,275 @@ class BrowserEvidenceOperations:
         for payload in payloads:
             visit(payload)
         return list(artifacts.values())
+    async def _collect_post_flow_evidence(
+        self,
+        *,
+        experiment_id: str,
+        experiment_dir: Path,
+        manifest: dict[str, Any],
+        payload: CaptureFlowPayload,
+        network_payload: dict[str, Any],
+        network_checkpoint_value: dict[str, Any],
+        request_matcher: RequestMatcher,
+        canceled: bool,
+        step_results: list[FlowStepResult],
+        console_checkpoint_value: dict[str, Any],
+        warnings: list[str],
+    ) -> EvidenceCollectionResult:
+        raw_network_requests = network_payload.get("requests")
+        raw_network_requests = (
+            [item for item in raw_network_requests if isinstance(item, dict)]
+            if isinstance(raw_network_requests, list)
+            else []
+        )
+        window_requests = requests_after_checkpoint(
+            raw_network_requests,
+            network_checkpoint_value,
+            include_in_flight=payload.primary_request.include_in_flight,
+        )
+        network_payload["requests"] = window_requests
+        network_payload["window"] = {
+            **network_checkpoint_value,
+            "matched_request_count": len(window_requests),
+            "collector_generation_at_finalize": self._transport_generation(),
+        }
+        primary_network_payload = {
+            **network_payload,
+            "requests": [
+                item
+                for item in window_requests
+                if network_request_matches(item, request_matcher)
+            ],
+        }
+        evidence_entries = self._evidence_index(manifest)
+        evidence_artifacts: list[dict[str, Any]] = []
+        if (
+            not canceled
+            and payload.network_evidence
+            and self._transport_generation()
+            == int(
+                network_checkpoint_value.get(
+                    "collector_generation", self._transport_generation()
+                )
+            )
+        ):
+            try:
+                (
+                    exported_entries,
+                    exported_artifacts,
+                    export_warnings,
+                ) = await self._export_network_evidence(
+                    experiment_id=experiment_id,
+                    experiment_dir=experiment_dir,
+                    selectors=payload.network_evidence,
+                    requests=window_requests,
+                    deadline=Deadline(8_000),
+                    step_ids=[
+                        item.step_id for item in step_results if item.status == "completed"
+                    ],
+                )
+                evidence_entries.extend(exported_entries)
+                evidence_artifacts.extend(exported_artifacts)
+                warnings.extend(export_warnings)
+            except Exception as exc:
+                warnings.append(f"network evidence export: {str(exc)[:3000]}")
+        if not canceled and payload.capture.console_errors:
+            (
+                console_entries,
+                console_artifacts,
+                console_warnings,
+            ) = await self._export_console_evidence(
+                experiment_id=experiment_id,
+                experiment_dir=experiment_dir,
+                checkpoint=console_checkpoint_value,
+                deadline=Deadline(4_000),
+            )
+            evidence_entries.extend(console_entries)
+            evidence_artifacts.extend(console_artifacts)
+            warnings.extend(console_warnings)
+        return EvidenceCollectionResult(
+            network_payload=network_payload,
+            primary_network_payload=primary_network_payload,
+            evidence_entries=evidence_entries,
+            artifacts=evidence_artifacts,
+        )
+    def _assemble_observations_stage(
+        self,
+        *,
+        payload: CaptureFlowPayload,
+        replay_plan: dict[str, Any] | None,
+        experiment_id: str,
+        evidence_entries: list[dict[str, Any]],
+        final_status_payload: dict[str, Any],
+        primary_network_payload: dict[str, Any],
+        replay_network_evidence_id: str | None,
+        replay_observed_response_mode: str | None,
+        stream_response_contract: dict[str, Any] | None,
+        response_evidence_source: str | None,
+        step_results: list[FlowStepResult],
+        alignment: AlignmentResult,
+        post_alignment: AlignmentResult,
+        wait_observations: list[dict[str, Any]],
+        wire_snapshot: dict[str, Any] | None,
+        replay_http_status: int | None,
+        replay_response_content_type: str | None,
+        pre_dispatch_environment: dict[str, Any] | None,
+        errors: list[str],
+    ) -> ObservationAssemblyResult:
+        network_evidence_entries = [
+            item for item in evidence_entries if item.get("kind") == "network_request"
+        ]
+        observed_stream_response = replay_observed_response_mode in {
+            "sse",
+            "ndjson",
+            "raw_stream",
+        }
+        configured_response_mode = (
+            str(
+                replay_plan.get("spec", {})
+                .get("responseControl", {})
+                .get("responseMode", "auto")
+            )
+            if replay_plan is not None
+            else "ordinary"
+        )
+        non_stream_error_response_observed = bool(
+            replay_plan is not None
+            and payload.capture.stream
+            and isinstance(replay_http_status, int)
+            and replay_http_status >= 400
+            and replay_observed_response_mode == "ordinary"
+            and configured_response_mode in {"auto", "ordinary"}
+            and (
+                stream_response_contract is None
+                or stream_response_contract.get("status")
+                == "not_applicable_non_stream_response"
+            )
+            and replay_network_evidence_id
+        )
+        stream_evidence_required = (
+            observed_stream_response
+            if replay_plan is not None
+            else payload.capture.stream
+        )
+        primary_status_payload = final_status_payload
+        if (
+            replay_plan is not None
+            and observed_stream_response
+            and replay_network_evidence_id
+            and not non_stream_error_response_observed
+        ):
+            locked_stream_requests: list[dict[str, Any]] = []
+            for item in final_status_payload.get("requests", []):
+                if not isinstance(item, dict):
+                    continue
+                linked_network, _ = self._associate_stream_network_evidence(
+                    item,
+                    network_evidence_entries,
+                )
+                if (
+                    isinstance(linked_network, dict)
+                    and linked_network.get("evidence_id") == replay_network_evidence_id
+                ):
+                    locked_stream_requests.append(item)
+            primary_status_payload = {
+                **final_status_payload,
+                "requests": locked_stream_requests,
+            }
+            if len(locked_stream_requests) != 1:
+                errors.append(
+                    "Replay primary stream could not be locked to exactly one "
+                    "networkRequestId + collectorGeneration association."
+                )
+
+        primary_requests, count_ok = self._select_primary_requests(
+            payload,
+            primary_status_payload,
+            primary_network_payload,
+        )
+        if replay_plan is not None and not observed_stream_response:
+            primary_requests = list(primary_network_payload["requests"])
+            count_ok = (
+                payload.primary_request.expected_min_matches
+                <= len(primary_requests)
+                <= payload.primary_request.expected_max_matches
+            )
+        cancellation_classifications = self._classify_cancellations(
+            payload,
+            step_results,
+            primary_requests,
+            alignment,
+            post_alignment,
+            wait_observations,
+        )
+        network_observations = self._build_network_observations(
+            experiment_id,
+            primary_requests,
+            network_evidence_entries,
+            stream_capture=stream_evidence_required,
+        )
+        if (
+            non_stream_error_response_observed
+            and response_evidence_source == "complete_replay_response_body"
+        ):
+            for observation in network_observations:
+                completeness = observation.get("completeness")
+                if not isinstance(completeness, dict):
+                    continue
+                completeness["response_body"] = "complete"
+                missing = observation.get("missing_evidence")
+                if isinstance(missing, list):
+                    observation["missing_evidence"] = [
+                        item for item in missing if item != "response_body"
+                    ]
+        if stream_evidence_required:
+            evidence_entries.extend(
+                self._stream_evidence_entries(
+                    experiment_id,
+                    primary_requests,
+                )
+            )
+        extractor_observations = (
+            replay_plan.get("extractor_observations", []) if replay_plan is not None else []
+        )
+        extractor_observations = (
+            [item for item in extractor_observations if isinstance(item, dict)]
+            if isinstance(extractor_observations, list)
+            else []
+        )
+        for ordinal, observation in enumerate(extractor_observations, start=1):
+            evidence_entries.append(
+                {
+                    "evidence_id": evidence_id(
+                        experiment_id,
+                        "replay_extractor",
+                        stable_id=observation.get("extractor_id") or ordinal,
+                    ),
+                    "kind": "replay_extractor",
+                    "step_ids": ["replay_request"],
+                    "artifact_ids": observation.get("artifact_ids", []),
+                    "summary": observation,
+                }
+            )
+        comparison_results = self._build_replay_comparisons_stage(
+            replay_plan=replay_plan,
+            network_observations=[
+                item for item in network_observations if isinstance(item, dict)
+            ],
+            replay_network_evidence_id=replay_network_evidence_id,
+            wire_snapshot=wire_snapshot,
+            replay_http_status=replay_http_status,
+            replay_response_content_type=replay_response_content_type,
+            pre_dispatch_environment=pre_dispatch_environment,
+        )
+        return ObservationAssemblyResult(
+            primary_requests=primary_requests,
+            count_satisfied=count_ok,
+            cancellation_classifications=cancellation_classifications,
+            network_observations=network_observations,
+            comparison_results=comparison_results,
+            extractor_observations=extractor_observations,
+            observed_stream_response=observed_stream_response,
+            non_stream_error_response_observed=non_stream_error_response_observed,
+            stream_evidence_required=stream_evidence_required,
+        )

@@ -8,6 +8,14 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from .browser.adapters import (
+    JsReverseAdapter,
+    JsReverseMcpAdapter,
+    McpToolTransport,
+    PlaywrightAdapter,
+    PlaywrightCliAdapter,
+    StdioMcpToolTransport,
+)
 from .browser.artifacts import ExperimentStore
 from .browser.core import BrowserServiceError, Deadline, utc_now
 from .browser.dispatcher import dispatch_browser_request
@@ -16,15 +24,8 @@ from .browser.operations.evidence import BrowserEvidenceOperations
 from .browser.operations.finalization import BrowserFinalizationOperations
 from .browser.operations.inspection import BrowserInspectionOperations
 from .browser.operations.replay import BrowserReplayOperations
+from .browser.operations.replay_analysis import BrowserReplayAnalysisOperations
 from .browser.operations.session import BrowserSessionOperations
-from .browser_adapters import (
-    JsReverseAdapter,
-    JsReverseMcpAdapter,
-    McpToolTransport,
-    PlaywrightAdapter,
-    PlaywrightCliAdapter,
-    StdioMcpToolTransport,
-)
 from .browser_models import (
     BrowserActionResponse,
     RunBrowserExperimentRequest,
@@ -48,6 +49,7 @@ class BrowserActionService(
     BrowserCaptureOperations,
     BrowserFinalizationOperations,
     BrowserReplayOperations,
+    BrowserReplayAnalysisOperations,
     BrowserEvidenceOperations,
     BrowserInspectionOperations,
     BrowserSessionOperations,

@@ -42,22 +42,32 @@ web_rev_action
 │   ├── browser operation reservation
 │   └── protected workspace mutation reservation
 ├── BrowserActionService
-│   └── thin compatibility facade
+│   └── thin public facade
 ├── browser/
 │   ├── dispatcher.py
 │   ├── core.py / artifacts.py / steps.py
 │   ├── replay_runtime.js
-│   ├── adapters/contracts.py
+│   ├── adapters/
+│   │   ├── contracts.py
+│   │   ├── command.py
+│   │   ├── playwright.py
+│   │   ├── mcp.py
+│   │   └── js_reverse.py
 │   └── operations/
 │       ├── capture.py
 │       ├── replay.py
+│       ├── replay_analysis.py
 │       ├── finalization.py
 │       ├── evidence.py
 │       ├── inspection.py
-│       └── session.py
+│       ├── session.py
+│       └── context.py
 ├── protocol/
 │   ├── mutations.py
 │   ├── matching.py
+│   ├── shapes.py
+│   ├── fingerprints.py
+│   ├── values.py
 │   └── analyzers/
 │       ├── response.py
 │       └── differences.py
@@ -79,8 +89,9 @@ web_rev_action
 ### Stage E 职责边界
 
 `BrowserActionService` 只保留依赖构造、public `run` facade 和生命周期 `close`。
-请求分派位于 `browser/dispatcher.py`；capture、replay、finalization、evidence、inspection
-和 session 各自拥有单一变化原因。Browser-context replay JavaScript 位于独立
+请求分派位于 `browser/dispatcher.py`；capture lifecycle、replay preparation/dispatch、
+replay analysis、evidence collection/observation assembly、finalization、inspection 和
+session 各自拥有明确变化原因。Browser-context replay JavaScript 位于独立
 `browser/replay_runtime.js`，Python adapter 只加载 runtime、传入参数并映射结果。
 
 真实外部边界的 contracts 位于 `browser/adapters/contracts.py`：
@@ -92,13 +103,24 @@ McpToolTransport
 CommandRunner
 ```
 
-新增 transport 实现不需要修改 `BrowserActionService`。Request matching、mutation
-presentation、response analyzer 和 factual difference analyzer 分别位于 `protocol/`
-边界；analyzer 只消费结构化事实，不操作 browser、manifest 或 execution status。
+新增 transport 实现不需要修改 `BrowserActionService`。Request matching、ordered
+mutation/binding execution、request shape、fingerprint、response analyzer 和 factual
+difference analyzer 分别位于 `protocol/` 边界；analyzer 只消费结构化事实，不操作
+browser、manifest 或 execution status。
 
-公共 request/response Pydantic 模型暂时继续位于 `browser_models.py`，旧
-`browser_adapters.py` 和 `protocol_evidence.py` 继续兼容 re-export。这样避免一次拆分同时
-制造第二套 public model 或破坏现有调用方。
+这是破坏式模块边界变更，不提供旧路径兜底：
+
+```text
+skill_temple.browser_adapters                 → skill_temple.browser.adapters
+protocol_evidence.build_replay_spec           → protocol.mutations.build_replay_spec
+protocol_evidence.network_request_matches     → protocol.matching.network_request_matches
+protocol_evidence.request_shape_from_snapshot → protocol.shapes.request_shape_from_snapshot
+protocol_evidence.analyze_replay_response     → protocol.analyzers.response.analyze_replay_response
+```
+
+`protocol_evidence.py` 只保留 evidence construction、snapshot response facts 和 canonical
+network observation；`browser_adapters.py` 已删除。公共 request/response Pydantic 模型仍位于
+`browser_models.py`，没有复制第二套模型。
 
 ## Public GPT Actions
 

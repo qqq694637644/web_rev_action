@@ -1,10 +1,49 @@
-"""Replay responsibility extracted from BrowserActionService."""
-
-# ruff: noqa: F403,F405,I001
+"""Replay planning, source resolution, extraction, and effective protocol state."""
 
 from __future__ import annotations
 
-from ._support import *  # noqa: F403
+import asyncio
+import json
+import secrets
+import time
+import uuid
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+from ...browser_models import (
+    CaptureFlowPayload,
+    FlowStepResult,
+    PrimaryRequest,
+    ReplayBinding,
+    ReplayRequestPayload,
+    ReplayRequestRequest,
+    RequestMatcher,
+)
+from ...protocol.fingerprints import (
+    canonical_json_sha256,
+    request_body_canonical_sha256_from_spec,
+)
+from ...protocol.matching import (
+    network_checkpoint,
+    network_request_matches,
+    requests_after_checkpoint,
+)
+from ...protocol.mutations import (
+    binding_value_from_snapshot,
+    build_replay_spec,
+    json_pointer_value,
+)
+from ...protocol_evidence import (
+    load_snapshot,
+    response_content_type,
+    response_value_from_snapshot,
+)
+from ..adapters import AlignmentResult, StreamCheckpoint
+from ..core import BrowserServiceError, Deadline, utc_now
+from ..steps import StepExecutor
+from .context import ReplayDispatchResult, ReplayPreparationResult
+
 
 class BrowserReplayOperations:
     """Own replay behavior while the public service remains a facade."""
@@ -564,3 +603,341 @@ class BrowserReplayOperations:
                 "expected_request_body_canonical_sha256"
             ],
         }
+    async def _execute_replay_dispatch(
+        self,
+        *,
+        experiment_id: str,
+        experiment_dir: Path,
+        manifest: dict[str, Any],
+        replay_plan: dict[str, Any],
+        session_id: str,
+        session: dict[str, Any],
+        deadline: Deadline,
+        capture_id: int | None,
+        request_matcher: RequestMatcher,
+        stream_checkpoint: StreamCheckpoint,
+        first_mutation_wall_time_ms: int | None,
+        step_results: list[FlowStepResult],
+        warnings: list[str],
+    ) -> ReplayDispatchResult:
+        replay_result: dict[str, Any] = {}
+        replay_response: Any = None
+        replay_http_status: int | None = None
+        replay_response_content_type: str | None = None
+        replay_observed_response_mode: str | None = None
+        post_response_alignment: AlignmentResult | None = None
+        replay_artifacts: list[dict[str, Any]] = []
+        if capture_id is not None:
+            stream_checkpoint = await self._stream_checkpoint(
+                capture_id,
+                request_matcher,
+                self._operation_deadline(
+                    deadline,
+                    1_500,
+                    "checkpoint before replay",
+                ),
+            )
+        first_mutation_wall_time_ms = int(time.time() * 1000)
+        replay_dir = experiment_dir / "replay"
+        replay_dir.mkdir(parents=True, exist_ok=True)
+        spec_file = replay_dir / "request-spec.json"
+        diff_file = replay_dir / "request-diff.json"
+        result_file = replay_dir / "response.json"
+        spec_file.write_text(
+            json.dumps(replay_plan["spec"], ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        diff_file.write_text(
+            json.dumps(replay_plan["diff"], ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        started = utc_now()
+        try:
+            replay_plan["dispatch_wall_time_ms"] = int(time.time() * 1000)
+            replay_plan["correlation_window_end_wall_time_ms"] = replay_plan[
+                "dispatch_wall_time_ms"
+            ] + max(1_000, deadline.remaining_ms())
+            replay_manifest = manifest.get("replay")
+            if isinstance(replay_manifest, dict):
+                replay_manifest["dispatch_wall_time_ms"] = replay_plan[
+                    "dispatch_wall_time_ms"
+                ]
+                replay_manifest["correlation_window_end_wall_time_ms"] = replay_plan[
+                    "correlation_window_end_wall_time_ms"
+                ]
+                self.experiments.write_manifest(experiment_id, manifest)
+            replay_result = await self.js_reverse.evaluate_browser_replay(
+                spec_file,
+                result_file,
+                self._operation_deadline(
+                    deadline,
+                    20_000,
+                    "browser-context replay",
+                ),
+            )
+            if result_file.is_file():
+                try:
+                    replay_response = json.loads(
+                        result_file.read_text(encoding="utf-8")
+                    )
+                    replay_http_status = self._extract_http_status(replay_response)
+                    replay_response_content_type = self._extract_response_content_type(
+                        replay_response
+                    )
+                    observed_mode_value = self._extract_response_field(
+                        replay_response,
+                        "responseMode",
+                    )
+                    replay_observed_response_mode = (
+                        str(observed_mode_value)
+                        if observed_mode_value is not None
+                        else None
+                    )
+                except (OSError, json.JSONDecodeError) as exc:
+                    warnings.append(f"replay response status: {str(exc)[:1000]}")
+            try:
+                response_page = await self.playwright.current_page(
+                    session_id,
+                    Deadline(1_500),
+                )
+                post_response_alignment = await self.js_reverse.align_page(
+                    response_page,
+                    Deadline(1_500),
+                    page_id=(
+                        str(session["js_reverse_page_id"])
+                        if session.get("js_reverse_page_id")
+                        else None
+                    ),
+                )
+            except Exception as exc:
+                warnings.append(f"post-response alignment: {str(exc)[:1000]}")
+            step_results.append(
+                FlowStepResult(
+                    step_id="replay_request",
+                    phase="replay",
+                    status="completed",
+                    started_at=started,
+                    ended_at=utc_now(),
+                )
+            )
+        except asyncio.CancelledError:
+            step_results.append(
+                FlowStepResult(
+                    step_id="replay_request",
+                    phase="replay",
+                    status="canceled_outcome_unknown",
+                    started_at=started,
+                    ended_at=utc_now(),
+                    error="Browser-context replay was canceled after dispatch.",
+                )
+            )
+            raise
+        except Exception as exc:
+            step_results.append(
+                FlowStepResult(
+                    step_id="replay_request",
+                    phase="replay",
+                    status="failed",
+                    started_at=started,
+                    ended_at=utc_now(),
+                    error=str(exc)[:4000],
+                )
+            )
+            raise
+        for path, suffix, kind, sensitivity, credentials in [
+            (
+                spec_file,
+                "spec",
+                "replay_request_spec",
+                "credential",
+                True,
+            ),
+            (
+                diff_file,
+                "diff",
+                "replay_request_diff",
+                "private",
+                False,
+            ),
+            (
+                result_file,
+                "response",
+                "replay_response",
+                "private",
+                False,
+            ),
+        ]:
+            descriptor = self.experiments.describe_local_artifact(
+                str(path),
+                artifact_id=f"art_{experiment_id}_replay_{suffix}",
+                kind=kind,
+                sensitivity=sensitivity,
+                contains_credentials=credentials,
+            )
+            if descriptor:
+                replay_artifacts.append(descriptor)
+        return ReplayDispatchResult(
+            stream_checkpoint=stream_checkpoint,
+            first_mutation_wall_time_ms=first_mutation_wall_time_ms,
+            replay_result=replay_result,
+            replay_response=replay_response,
+            http_status=replay_http_status,
+            response_content_type=replay_response_content_type,
+            observed_response_mode=replay_observed_response_mode,
+            post_response_alignment=post_response_alignment,
+            artifacts=replay_artifacts,
+        )
+    async def _prepare_replay_dispatch_stage(
+        self,
+        *,
+        replay_plan: dict[str, Any],
+        manifest: dict[str, Any],
+        experiment_id: str,
+        experiment_dir: Path,
+        session_id: str,
+        session: dict[str, Any],
+        deadline: Deadline,
+        capture_id: int | None,
+        request_matcher: RequestMatcher,
+        stream_checkpoint: StreamCheckpoint,
+        first_mutation_wall_time_ms: int | None,
+        step_results: list[FlowStepResult],
+        wait_observations: list[dict[str, Any]],
+        alignment: AlignmentResult,
+        warnings: list[str],
+    ) -> ReplayPreparationResult:
+        replay_artifacts: list[dict[str, Any]] = []
+        pre_dispatch_alignment = alignment
+        setup_steps = replay_plan.get("_setup_flow_steps")
+        extractors = replay_plan.get("_extractors")
+        extractor_checkpoint = (
+            network_checkpoint(
+                await self._all_network_requests(
+                    self._operation_deadline(
+                        deadline,
+                        2_500,
+                        "extractor network checkpoint",
+                    )
+                ),
+                generation=self._transport_generation(),
+            )
+            if isinstance(extractors, list) and extractors
+            else None
+        )
+        if isinstance(setup_steps, list) and setup_steps:
+            (
+                stream_checkpoint,
+                first_mutation_wall_time_ms,
+            ) = await StepExecutor.execute_many(
+                self,
+                phase="setup",
+                steps=setup_steps,
+                session_id=session_id,
+                experiment_dir=experiment_dir,
+                deadline=deadline,
+                capture_id=capture_id,
+                request_matcher=request_matcher,
+                stream_checkpoint=stream_checkpoint,
+                first_mutation_wall_time_ms=first_mutation_wall_time_ms,
+                step_results=step_results,
+                wait_observations=wait_observations,
+            )
+        if isinstance(extractor_checkpoint, dict):
+            (
+                extractor_values,
+                extractor_records,
+                extractor_artifacts,
+            ) = await self._run_replay_extractors(
+                extractors=extractors,
+                checkpoint=extractor_checkpoint,
+                experiment_dir=experiment_dir,
+                deadline=self._operation_deadline(
+                    deadline,
+                    8_000,
+                    "run replay extractors",
+                ),
+            )
+            replay_artifacts.extend(extractor_artifacts)
+            for binding in replay_plan["_binding_specs"]:
+                if (
+                    binding.value_source == "extractor"
+                    and binding.extractor_id in extractor_values
+                ):
+                    replay_plan["binding_values"][binding.binding_id] = (
+                        extractor_values[str(binding.extractor_id)]
+                    )
+            resolved_bindings = [
+                item
+                for item in replay_plan["_binding_specs"]
+                if item.binding_id in replay_plan["binding_values"]
+            ]
+            unresolved = sorted(
+                item.binding_id
+                for item in replay_plan["_binding_specs"]
+                if item.binding_id not in replay_plan["binding_values"]
+            )
+            rebuilt_spec, rebuilt_diff = build_replay_spec(
+                replay_plan["_source_snapshot"],
+                replay_plan["mutations"],
+                bindings=resolved_bindings,
+                binding_values=replay_plan["binding_values"],
+                query_serialization=replay_plan["query_serialization"],
+            )
+            rebuilt_spec["responseControl"] = replay_plan["spec"]["responseControl"]
+            rebuilt_spec["transport"] = replay_plan["spec"]["transport"]
+            replay_plan["spec"] = rebuilt_spec
+            replay_plan["diff"] = rebuilt_diff
+            replay_plan["unresolved_binding_ids"] = unresolved
+            replay_plan["binding_observations"] = self._binding_observations(
+                replay_plan["_binding_specs"],
+                replay_plan["binding_values"],
+            )
+            replay_plan["extractor_observations"] = extractor_records
+            replay_plan["expected_request_body_canonical_sha256"] = (
+                request_body_canonical_sha256_from_spec(rebuilt_spec)
+            )
+            replay_manifest = manifest.get("replay")
+            if isinstance(replay_manifest, dict):
+                replay_manifest.update(
+                    {
+                        "binding_observations": replay_plan[
+                            "binding_observations"
+                        ],
+                        "unresolved_binding_ids": unresolved,
+                        "extractor_observations": extractor_records,
+                        "expected_request_body_canonical_sha256": replay_plan[
+                            "expected_request_body_canonical_sha256"
+                        ],
+                    }
+                )
+                self.experiments.write_manifest(experiment_id, manifest)
+        try:
+            setup_page = await self.playwright.current_page(
+                session_id,
+                self._operation_deadline(
+                    deadline,
+                    2_500,
+                    "pre-dispatch current page",
+                ),
+            )
+            pre_dispatch_alignment = await self.js_reverse.align_page(
+                setup_page,
+                self._operation_deadline(
+                    deadline,
+                    2_500,
+                    "pre-dispatch page alignment",
+                ),
+                page_id=(
+                    str(session["js_reverse_page_id"])
+                    if session.get("js_reverse_page_id")
+                    else None
+                ),
+            )
+        except Exception as exc:
+            warnings.append(f"pre-dispatch alignment: {str(exc)[:1000]}")
+        return ReplayPreparationResult(
+            stream_checkpoint=stream_checkpoint,
+            first_mutation_wall_time_ms=first_mutation_wall_time_ms,
+            pre_dispatch_alignment=pre_dispatch_alignment,
+            artifacts=replay_artifacts,
+        )
