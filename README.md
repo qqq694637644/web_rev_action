@@ -828,7 +828,6 @@ WEB_REV_BROWSER_CDP_URL=http://127.0.0.1:9222
 WEB_REV_EVIDENCE_DIR=C:/path/to/web_rev_action/data/analysis-workspace
 WEB_REV_PLAYWRIGHT_CLI=playwright-cli
 WEB_REV_JS_REVERSE_COMMAND=js-reverse-mcp
-WEB_REV_JS_REVERSE_EXTRA_ARGS=["--headless","false"]
 WEB_REV_WORKSPACE_SHELL=pwsh
 WEB_REV_WORKSPACE_ALLOW_NETWORK=false
 ```
@@ -907,10 +906,10 @@ tests/fakes/       adapter fakes 与 scenario builders
 
 ```powershell
 python tools/toolchain_validation.py `
-  --js-reverse-entry <js-reverse-mcp>/build/src/main.js
+  --js-reverse-entry <js-reverse-mcp>/build/src/index.js
 
 python tools/browser_action_smoke.py `
-  --js-reverse-entry <js-reverse-mcp>/build/src/main.js
+  --js-reverse-entry <js-reverse-mcp>/build/src/index.js
 ```
 
 Synthetic fixture 使用通用 resource/record/cursor 状态模型和自定义 `fixture-complete`

@@ -26,7 +26,7 @@ from toolchain_validation_server import SSE_EVENTS, start_server
 from skill_temple.browser.adapters.playwright import build_playwright_attach_args
 
 PLAYWRIGHT_PACKAGE = "@playwright/cli@0.1.17"
-JS_REVERSE_PACKAGE = "js-reverse-mcp@4.0.1"
+JS_REVERSE_COMMAND = "js-reverse-mcp"
 SESSION_NAME = "stage0-toolchain-validation"
 
 
@@ -280,7 +280,16 @@ class Stage0Validation:
 
     def _js_reverse_version(self) -> str:
         if self.js_reverse_entry is None:
-            return self._package_version(JS_REVERSE_PACKAGE)
+            command = shutil.which(JS_REVERSE_COMMAND)
+            if command is None:
+                raise RuntimeError(
+                    "js-reverse-mcp was not found on PATH; clone "
+                    "qqq694637644/js-reverse-mcp, run npm install, npm run build, "
+                    "and npm link"
+                )
+            result = run_command([command, "--version"], self.repo_root, 45.0)
+            result.require_success()
+            return result.stdout.strip()
         node = shutil.which("node")
         if node is None:
             raise RuntimeError("node is required for a local js-reverse-mcp entrypoint")
@@ -755,7 +764,7 @@ class Stage0Validation:
         if self.js_reverse_entry is not None:
             reproduction_command += (
                 " --js-reverse-entry "
-                "<path-to-js-reverse-mcp>/build/src/main.js"
+                "<path-to-js-reverse-mcp>/build/src/index.js"
             )
 
         lines = [
@@ -871,7 +880,14 @@ def build_mcp_server_parameters(
         "0",
     ]
     if js_reverse_entry is None:
-        command = build_npx_command(JS_REVERSE_PACKAGE, arguments)
+        executable = shutil.which(JS_REVERSE_COMMAND)
+        if executable is None:
+            raise RuntimeError(
+                "js-reverse-mcp was not found on PATH; clone "
+                "qqq694637644/js-reverse-mcp, run npm install, npm run build, "
+                "and npm link"
+            )
+        command = [executable, *arguments]
     else:
         node = shutil.which("node")
         if node is None:
@@ -1194,8 +1210,9 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help=(
-            "Optional local built js-reverse-mcp entrypoint. Use this to validate an "
-            "unreleased PR instead of the published npm package."
+            "Optional local built qqq694637644/js-reverse-mcp entrypoint. "
+            "Defaults to the npm-linked js-reverse-mcp command on PATH; "
+            "for example build/src/index.js."
         ),
     )
     return parser.parse_args()
