@@ -1,28 +1,29 @@
-const STAGE0_SOURCE_MARKER = "stage0-script-search-marker";
+const SYNTHETIC_SOURCE_MARKER = "synthetic-script-search-marker";
+const TERMINAL_MARKER = "fixture-complete";
 
-function stage0RequestBuilder() {
+function buildEchoRequest() {
   return {
-    marker: "stage0-request",
+    marker: "synthetic-request",
     count: 3,
-    sourceMarker: STAGE0_SOURCE_MARKER,
+    sourceMarker: SYNTHETIC_SOURCE_MARKER,
   };
 }
 
-function buildStatefulStreamRequest() {
+function buildAuthenticatedStreamRequest() {
   return {
-    stream_id: "stateful-stream-fixture",
-    variant: "fixture-variant",
-    events: [
+    job_id: "authenticated-stream-fixture",
+    profile: "fixture-profile",
+    records: [
       {
-        id: "client-event-1",
-        actor: { kind: "client" },
-        payload: {
-          type: "text",
-          parts: ["hello fixture"],
+        record_id: "client-record-1",
+        source: { kind: "client" },
+        content: {
+          format: "text",
+          segments: ["hello fixture"],
         },
       },
     ],
-    parent_event_id: "root-event",
+    cursor_id: "root-cursor",
     timezone_offset_min: 0,
     tracking_id: "tracking-only-value",
   };
@@ -37,12 +38,12 @@ function parseSseText(text) {
       .map((line) => line.slice(5).trim())
       .join("\n");
     if (!data) continue;
-    events.push(data === "[DONE]" ? data : JSON.parse(data));
+    events.push(data === TERMINAL_MARKER ? data : JSON.parse(data));
   }
   return events;
 }
 
-async function sendStatefulStream() {
+async function sendAuthenticatedStream() {
   const response = await fetch("/api/stateful-stream", {
     method: "POST",
     headers: {
@@ -50,7 +51,7 @@ async function sendStatefulStream() {
       "Content-Type": "application/json",
     },
     credentials: "include",
-    body: JSON.stringify(buildStatefulStreamRequest()),
+    body: JSON.stringify(buildAuthenticatedStreamRequest()),
   });
   const contentType = response.headers.get("content-type") || "";
   const payload = contentType.includes("text/event-stream")
@@ -67,7 +68,7 @@ async function sendEcho() {
     headers: {
       "Content-Type": "application/json",
     },
-    body: JSON.stringify(stage0RequestBuilder()),
+    body: JSON.stringify(buildEchoRequest()),
   });
   if (!response.ok) {
     throw new Error(`Echo request failed: ${response.status}`);
@@ -80,10 +81,10 @@ function collectSse() {
     const events = [];
     const source = new EventSource("/api/sse");
 
-    source.onmessage = (event) => {
+    source.addEventListener("chunk", (event) => {
       events.push(event.data);
-    };
-    source.addEventListener("done", (event) => {
+    });
+    source.addEventListener("complete", (event) => {
       events.push(event.data);
       source.close();
       resolve(events);
@@ -111,4 +112,4 @@ async function runCapture() {
 
 document.querySelector("#run-capture").addEventListener("click", runCapture);
 document.querySelector("#send-echo").addEventListener("click", sendEcho);
-document.querySelector("#send-stateful-stream").addEventListener("click", sendStatefulStream);
+document.querySelector("#send-stateful-stream").addEventListener("click", sendAuthenticatedStream);

@@ -10,9 +10,9 @@ from typing import Final
 from urllib.parse import parse_qs, urlsplit
 
 SSE_EVENTS: Final[tuple[bytes, ...]] = (
-    b'event: message\ndata: {"sequence":1,"value":"alpha"}\n\n',
-    b'event: message\ndata: {"sequence":2,"value":"beta"}\n\n',
-    b'event: done\ndata: [DONE]\n\n',
+    b'event: chunk\ndata: {"sequence":1,"value":"alpha"}\n\n',
+    b'event: chunk\ndata: {"sequence":2,"value":"beta"}\n\n',
+    b'event: complete\ndata: fixture-complete\n\n',
 )
 
 
@@ -120,28 +120,36 @@ class ToolchainValidationHandler(BaseHTTPRequestHandler):
                 HTTPStatus.BAD_REQUEST,
             )
             return
-        events = payload.get("events") if isinstance(payload, dict) else None
-        event = (
-            events[0]
-            if isinstance(events, list) and events and isinstance(events[0], dict)
+        if isinstance(payload, dict) and payload.get("profile") == "fixture-server-error":
+            self._send_json(
+                {"ok": False, "error": "synthetic-server-failure"},
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            return
+        records = payload.get("records") if isinstance(payload, dict) else None
+        record = (
+            records[0]
+            if isinstance(records, list) and records and isinstance(records[0], dict)
             else None
         )
-        actor = event.get("actor") if isinstance(event, dict) else None
-        event_payload = event.get("payload") if isinstance(event, dict) else None
-        parts = event_payload.get("parts") if isinstance(event_payload, dict) else None
+        source = record.get("source") if isinstance(record, dict) else None
+        content = record.get("content") if isinstance(record, dict) else None
+        segments = content.get("segments") if isinstance(content, dict) else None
         required = {
-            "stream_id": payload.get("stream_id")
+            "job_id": payload.get("job_id")
             if isinstance(payload, dict)
             else None,
-            "variant": payload.get("variant") if isinstance(payload, dict) else None,
-            "events[0].id": event.get("id") if isinstance(event, dict) else None,
-            "events[0].actor.kind": (
-                actor.get("kind") if isinstance(actor, dict) else None
+            "profile": payload.get("profile") if isinstance(payload, dict) else None,
+            "records[0].record_id": (
+                record.get("record_id") if isinstance(record, dict) else None
             ),
-            "events[0].payload.parts[0]": (
-                parts[0] if isinstance(parts, list) and parts else None
+            "records[0].source.kind": (
+                source.get("kind") if isinstance(source, dict) else None
             ),
-            "parent_event_id": payload.get("parent_event_id")
+            "records[0].content.segments[0]": (
+                segments[0] if isinstance(segments, list) and segments else None
+            ),
+            "cursor_id": payload.get("cursor_id")
             if isinstance(payload, dict)
             else None,
         }
@@ -156,71 +164,71 @@ class ToolchainValidationHandler(BaseHTTPRequestHandler):
                 HTTPStatus.UNPROCESSABLE_ENTITY,
             )
             return
-        stream_id = str(payload["stream_id"])
-        client_event_id = str(event["id"])
-        parent_event_id = str(payload["parent_event_id"])
-        server_event_id = f"server-{client_event_id}"
+        job_id = str(payload["job_id"])
+        client_record_id = str(record["record_id"])
+        cursor_id = str(payload["cursor_id"])
+        server_record_id = f"server-{client_record_id}"
         with self.stream_state_lock:
             state = self.stream_states.setdefault(
-                stream_id,
+                job_id,
                 {
-                    "stream_id": stream_id,
-                    "nodes": {},
-                    "current_node": parent_event_id,
+                    "job_id": job_id,
+                    "records": {},
+                    "current_cursor": cursor_id,
                 },
             )
-            nodes = state["nodes"]
-            assert isinstance(nodes, dict)
-            if client_event_id in nodes:
+            stored_records = state["records"]
+            assert isinstance(stored_records, dict)
+            if client_record_id in stored_records:
                 self._send_json(
                     {
                         "ok": False,
-                        "error": "duplicate-event-id",
-                        "field": "events[0].id",
+                        "error": "duplicate-record-id",
+                        "field": "records[0].record_id",
                     },
                     HTTPStatus.CONFLICT,
                 )
                 return
-            nodes[client_event_id] = {
-                "id": client_event_id,
-                "parent": parent_event_id,
-                "kind": actor["kind"],
-                "parts": parts,
+            stored_records[client_record_id] = {
+                "record_id": client_record_id,
+                "cursor_id": cursor_id,
+                "kind": source["kind"],
+                "segments": segments,
             }
-            nodes[server_event_id] = {
-                "id": server_event_id,
-                "parent": client_event_id,
+            stored_records[server_record_id] = {
+                "record_id": server_record_id,
+                "cursor_id": client_record_id,
                 "kind": "server",
-                "parts": ["fixture answer"],
+                "segments": ["fixture result"],
             }
-            state["current_node"] = server_event_id
+            state["current_cursor"] = server_record_id
             state_snapshot = json.loads(json.dumps(state))
-        events = (
+        output_events = (
             {
-                "type": "item_start",
-                "stream_id": stream_id,
-                "item": {
-                    "id": server_event_id,
-                    "parent_id": client_event_id,
-                    "actor": {"kind": "server"},
+                "type": "record_open",
+                "job_id": job_id,
+                "record": {
+                    "record_id": server_record_id,
+                    "cursor_id": client_record_id,
+                    "source": {"kind": "server"},
                 },
             },
             {
-                "type": "item_delta",
-                "event_id": server_event_id,
-                "delta": "fixture answer contains literal [DONE] text",
+                "type": "record_delta",
+                "record_id": server_record_id,
+                "delta": "fixture result contains custom terminal text",
             },
             {
-                "type": "stream_state",
-                "stream_id": stream_id,
-                "current_node": server_event_id,
-                "nodes": state_snapshot["nodes"],
-                "variant": payload["variant"],
+                "type": "state_snapshot",
+                "job_id": job_id,
+                "current_cursor": server_record_id,
+                "records": state_snapshot["records"],
+                "profile": payload["profile"],
                 "optional_timezone_seen": "timezone_offset_min" in payload,
                 "tracking_seen": "tracking_id" in payload,
             },
         )
-        self._send_sse_json(events)
+        self._send_sse_json(output_events)
 
     def log_message(self, format: str, *args: object) -> None:
         return
@@ -279,13 +287,13 @@ class ToolchainValidationHandler(BaseHTTPRequestHandler):
         self.end_headers()
         for index, payload in enumerate(events):
             event = (
-                f"event: message\nid: {index}\ndata: "
+                f"event: chunk\nid: {index}\ndata: "
                 f"{json.dumps(payload, separators=(',', ':'), ensure_ascii=False)}\n\n"
             ).encode()
             self.wfile.write(event)
             self.wfile.flush()
             time.sleep(0.03)
-        self.wfile.write(b"event: done\ndata: [DONE]\n\n")
+        self.wfile.write(b"event: complete\ndata: fixture-complete\n\n")
         self.wfile.flush()
         self.close_connection = True
 

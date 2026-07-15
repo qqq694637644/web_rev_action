@@ -804,8 +804,24 @@ http://127.0.0.1:8765/openapi.json
 ```powershell
 python -m ruff check .
 python -m pytest
+node --test tests/runtime/replay_runtime.test.js
 python -m skill_temple.evals evals/skill_queries.jsonl
 ```
+
+测试按能力组织：
+
+```text
+tests/browser/     capture、steps、replay、sessions、finalization、transports
+tests/evidence/    network observations 与 stream association
+tests/protocol/    mutations、matching、analyzers、evidence primitives
+tests/workspace/   inspect、search、write、PowerShell
+tests/runtime/     独立 browser replay JavaScript
+tests/smoke/       通用 authenticated stateful streaming fixture
+tests/fakes/       adapter fakes 与 scenario builders
+```
+
+详细命令和 fake 约束见 `tests/README.md`。任何新增 transport、extractor 或 analyzer 应在对应
+能力目录增加小型测试，不要重新创建单一数千行 browser test。
 
 阶段 0 真实验证：
 
@@ -816,5 +832,9 @@ python tools/toolchain_validation.py `
 python tools/browser_action_smoke.py `
   --js-reverse-entry <js-reverse-mcp>/build/src/main.js
 ```
+
+Synthetic fixture 使用通用 resource/record/cursor 状态模型和自定义 `fixture-complete`
+终止事件。它覆盖 2xx、4xx、5xx、cookie/session、stream、replay、mutation、binding、取消和
+artifact；不代表任何真实网页协议。
 
 详细路线见 `PLAN.md`，Pandora 分析方法见 `PANDORA_REPRODUCTION.md`。

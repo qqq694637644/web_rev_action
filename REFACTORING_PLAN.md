@@ -853,10 +853,10 @@ PowerShell 是否保留在核心中，根据真实分析用例决定。常用 ha
 
 #### F1. 按能力拆分测试
 
-- [ ] 将数千行浏览器测试按 capture、replay、steps、finalization、evidence、stream 和 inspection 拆分。
-- [ ] 将 protocol mutation、request matching、response analyzer 和 difference comparison 分开测试。
-- [ ] 将 workspace read/search/write/PowerShell 测试与 browser tests 分离。
-- [ ] 保持目录层次浅，优先让维护者能快速找到能力对应的测试。
+- [x] 将数千行浏览器测试按 capture、replay、steps、finalization、evidence、stream 和 inspection 拆分。
+- [x] 将 protocol mutation、request matching、response analyzer 和 difference comparison 分开测试。
+- [x] 将 workspace read/search/write/PowerShell 测试与 browser tests 分离。
+- [x] 保持目录层次浅，优先让维护者能快速找到能力对应的测试。
 
 建议形态：
 
@@ -864,9 +864,15 @@ PowerShell 是否保留在核心中，根据真实分析用例决定。常用 ha
 tests/
   browser/
     test_capture.py
-    test_replay.py
     test_steps.py
+    test_replay_execution.py
+    test_replay_comparison.py
+    test_replay_extractors.py
+    test_replay_readers.py
     test_finalization.py
+    test_sessions.py
+    test_transports.py
+    test_inspection.py
   evidence/
     test_network_observations.py
     test_streams.py
@@ -877,36 +883,65 @@ tests/
   workspace/
     test_inspect.py
     test_search.py
+    test_write.py
+    test_powershell.py
+  runtime/
+    replay_runtime.test.js
+    test_replay_runtime.py
+  smoke/
+    test_synthetic_fixture.py
   fakes/
+    browser.py
+    scenarios.py
 ```
+
+旧 `tests/test_browser_actions.py`、`tests/test_protocol_evidence.py` 和
+`tests/test_workspace_actions.py` 已删除。架构测试限制任一 Python test 文件不得重新超过
+1000 行，并验证拆分后不存在重复 test method 名称。
 
 #### F2. 复用 fake 和 scenario builder
 
-- [ ] 将 Playwright、js-reverse、stream capture 等 fake 从巨型测试文件中移到 `tests/fakes/`。
-- [ ] fake 应模拟外部 adapter 合同，不复制业务判断。
-- [ ] 使用少量可组合 scenario builder 表达 network request、stream、artifact failure、timeout 和 cancellation。
-- [ ] 增加 adapter contract tests，防止 fake 与真实 adapter 响应结构漂移。
+- [x] 将 Playwright、js-reverse、stream capture 等 fake 从巨型测试文件中移到 `tests/fakes/`。
+- [x] fake 应模拟外部 adapter 合同，不复制业务判断。
+- [x] 使用少量可组合 scenario builder 表达 network request、stream、artifact failure、timeout 和 cancellation。
+- [x] 增加 adapter contract tests，防止 fake 与真实 adapter 响应结构漂移。
+
+`tests/fakes/browser.py` 只实现 adapter surface；`tests/fakes/scenarios.py` 组合 timeout、
+cancellation、partial capture、artifact failure、network request 和 stream status 等外部事实。
+Adapter contract tests 直接比较 fake 与 Protocol 的公开方法，并验证 typed result shape。
 
 #### F3. 纯 analyzer 使用参数化测试
 
-- [ ] analyzer 测试只提供结构化输入并断言 observations/hints。
-- [ ] 明确验证 analyzer 不改变 execution status，不决定实验是否合法。
-- [ ] unknown 或证据不足是正常输出。
-- [ ] 防止字段名子串、模糊自然语言或 HTTP status 被升级为最终协议结论。
+- [x] analyzer 测试只提供结构化输入并断言 observations/hints。
+- [x] 明确验证 analyzer 不改变 execution status，不决定实验是否合法。
+- [x] unknown 或证据不足是正常输出。
+- [x] 防止字段名子串、模糊自然语言或 HTTP status 被升级为最终协议结论。
+
+参数化 analyzer contract test 明确禁止输出 `execution`、`quality`、`valid` 或
+`experiment_status`，并覆盖 weak text match、structured field reference、未知 code 和 4xx/5xx
+status 仍只产生 advisory classification 的情况。
 
 #### F4. browser replay runtime JavaScript 独立测试
 
-- [ ] 将浏览器内 replay runtime 提取为独立 `.js` 文件。
-- [ ] 使用 Node 测试 SSE、NDJSON、raw stream、abort、byte/event limit 和 termination。
-- [ ] 覆盖 LF/CRLF、多字节 UTF-8 chunk、不完整最后一行、SSE multiline data 和无固定终止标记。
-- [ ] Python 测试只验证 runtime 的加载、参数传递和结构化结果映射。
+- [x] 将浏览器内 replay runtime 提取为独立 `.js` 文件。
+- [x] 使用 Node 测试 SSE、NDJSON、raw stream、abort、byte/event limit 和 termination。
+- [x] 覆盖 LF/CRLF、多字节 UTF-8 chunk、不完整最后一行、SSE multiline data 和无固定终止标记。
+- [x] Python 测试只验证 runtime 的加载、参数传递和结构化结果映射。
+
+Runtime 位于 `src/skill_temple/browser/replay_runtime.js`，Python adapter 通过缓存 loader 加载。
+Node 原生 `node:test` suite 直接执行 runtime，Python 只验证 asset loading、adapter mapping 和
+Node suite invocation。`pyproject.toml` 将 `browser/*.js` 声明为 package data。
 
 #### F5. 保留少量通用端到端 smoke
 
-- [ ] 保留一个明确标注为 synthetic fixture 的 authenticated stateful streaming 页面。
-- [ ] smoke 覆盖页面操作、cookie/session、capture、stream、replay、mutation、setup binding、取消和 artifact。
-- [ ] fixture 可以返回 2xx、4xx、5xx，用于验证框架记录事实，而不是证明某个真实网页协议。
-- [ ] smoke 不使用 Pandora、conversation、message、parent 或固定 `[DONE]` 作为通用框架契约。
+- [x] 保留一个明确标注为 synthetic fixture 的 authenticated stateful streaming 页面。
+- [x] smoke 覆盖页面操作、cookie/session、capture、stream、replay、mutation、setup binding、取消和 artifact。
+- [x] fixture 可以返回 2xx、4xx、5xx，用于验证框架记录事实，而不是证明某个真实网页协议。
+- [x] smoke 不使用 Pandora、conversation、message、parent 或固定 `[DONE]` 作为通用框架契约。
+
+Synthetic fixture 使用 job、record、cursor、profile 和自定义 `fixture-complete` marker。
+HTTP smoke 覆盖 200、401、409、422 和 500；真实浏览器 smoke 继续覆盖页面操作、cookie、
+capture、stream、replay、mutation、setup extractor/binding、comparison、取消和 artifact inspection。
 
 #### F6. 删除产品专属结论测试
 
@@ -934,7 +969,15 @@ extractor/binding 是否按配置工作
 artifact 是否可审计
 ```
 
+- [x] 删除 preset catalog 只证明 Control/Treatment/Exploratory 命名的测试。
+- [x] Replay execution 与 comparison 测试改为直接构造通用 payload。
+- [x] 核心 test fixture 使用 resource、record、cursor 和自定义 terminal marker。
+- [x] 架构测试禁止 generic smoke 重新引入 Pandora、conversation、parent、固定 `[DONE]`
+  或 `buildConversationRequest`。
+
 阶段 F 的完成标准是：新增一个 transport、extractor 或 analyzer 时，可以在对应能力目录添加小型测试，不需要继续扩展一个数千行测试文件，也不需要把某个真实网页的业务语义写进核心测试。
+
+当前该标准由 `tests/test_stage_f_boundaries.py` 持续验证。
 
 ## 13. 推荐后续 PR 顺序
 
