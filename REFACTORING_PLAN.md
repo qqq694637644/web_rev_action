@@ -746,12 +746,12 @@ network_response_json + RequestMatcher + JSON Pointer
 
 #### E1. 重构原则
 
-- [ ] 在阶段 D 的通用 replay 模型稳定后再做大范围拆分。
-- [ ] 每次只提取一个具有明确输入、输出和失败边界的职责。
-- [ ] 提取模块时同步迁移对应测试，避免先搬代码、后补验证。
-- [ ] 不创建通用 `BaseService`、`Manager`、`Coordinator`、`Factory` 或 `Repository` 层次来包装旧复杂度。
-- [ ] 只有 Playwright、MCP、文件系统、时钟、进程和 artifact 等真实外部边界需要 Protocol 或 adapter。
-- [ ] 先减少分支和重复状态，再决定最终目录名称。
+- [x] 在阶段 D 的通用 replay 模型稳定后再做大范围拆分。
+- [x] 每次只提取一个具有明确输入、输出和失败边界的职责。
+- [x] 提取模块时同步迁移对应测试，避免先搬代码、后补验证。
+- [x] 不创建通用 `BaseService`、`Manager`、`Coordinator`、`Factory` 或 `Repository` 层次来包装旧复杂度。
+- [x] 只有 Playwright、MCP、文件系统、时钟、进程和 artifact 等真实外部边界需要 Protocol 或 adapter。
+- [x] 先减少分支和重复状态，再决定最终目录名称。
 
 #### E2. 推荐的实际职责边界
 
@@ -794,14 +794,44 @@ browser/infrastructure
 
 `browser/domain` 不是必选目录。只有 `ExperimentContext`、`NetworkObservation`、`ArtifactReference`、`ReplayRequest`、`Mutation`、`Extractor`、`Binding`、`ExecutionStatus` 和 `Completeness` 等对象已经稳定，并且确实被多个用例共享时，才放入独立 domain 层。
 
+当前落地结构保持浅层和兼容性：
+
+```text
+browser/
+  core.py                 error、deadline 和 identifier
+  artifacts.py            experiment manifest 与 artifact persistence
+  dispatcher.py           public request dispatch
+  steps.py                setup/action/verification step execution
+  replay_runtime.js       browser-context replay runtime
+  replay_runtime.py       reviewed runtime loader
+  adapters/contracts.py   Playwright、MCP、js-reverse Protocol 与 typed results
+  operations/
+    capture.py
+    replay.py
+    finalization.py
+    evidence.py
+    inspection.py
+    session.py
+
+protocol/
+  mutations.py
+  matching.py
+  analyzers/
+    response.py
+    differences.py
+```
+
+公共请求模型暂时继续保留在 `browser_models.py`，避免为了目录外观复制第二套模型。
+Workspace 原有 read/search/inspect/write/PowerShell 模块保持不变。
+
 #### E3. 推荐提取顺序
 
-- [ ] 提取 browser replay runtime JavaScript，停止把大段 JS 内嵌在 Python 字符串中。
-- [ ] 提取 finalization，统一成功、失败、超时和取消后的 collector、trace、截图、快照与 artifact 收尾。
-- [ ] 提取 evidence collection，集中处理 network、stream、console、script 和 artifact facts。
-- [ ] 提取 replay execution，隔离 source resolution、mutation、binding、transport dispatch 和 response reading。
-- [ ] 提取可选 analyzers，使其只消费事实并返回 observations/hints。
-- [ ] 最后缩小 `BrowserActionService`，使其只负责 dispatch 或保留为兼容 facade。
+- [x] 提取 browser replay runtime JavaScript，停止把大段 JS 内嵌在 Python 字符串中。
+- [x] 提取 finalization，统一成功、失败、超时和取消后的 collector、trace、截图、快照与 artifact 收尾。
+- [x] 提取 evidence collection，集中处理 network、stream、console、script 和 artifact facts。
+- [x] 提取 replay execution，隔离 source resolution、mutation、binding、transport dispatch 和 response reading。
+- [x] 提取可选 analyzers，使其只消费事实并返回 observations/hints。
+- [x] 最后缩小 `BrowserActionService`，使其只负责 dispatch 或保留为兼容 facade。
 
 #### E4. BrowserActionService 的目标
 
@@ -828,6 +858,10 @@ response 语义结论
 上千行 capture/replay 主流程
 ```
 
+当前 `BrowserActionService` 仅保留依赖构造、`run` facade 和生命周期 `close`；
+`run` 委托给 `browser/dispatcher.py`，inspect/capture/replay/finalization/evidence/session
+行为由专用 operation boundary 提供。架构测试锁定 facade 自有方法和文件尺寸，防止职责回流。
+
 #### E5. Workspace 的定位
 
 Workspace 不是可有可无的附属模块，而是人机协同分析框架的一部分。它应继续支持：
@@ -843,7 +877,14 @@ inspect synced artifacts
 
 PowerShell 是否保留在核心中，根据真实分析用例决定。常用 hash、binary summary、archive inspection 等能力可以逐步内建；只有复杂高级分析才需要通用 shell。不要为了抽象一致性删除人工和 LLM 实际需要的分析能力。
 
+- [x] 保留 workspace inspect、search、bounded read、write 和 focused PowerShell。
+- [x] 保留原始 evidence 只读和 derived output 写入边界。
+- [x] Stage E 架构测试确认 workspace routes 与 service 能力没有因 browser 拆分被删除。
+
 阶段 E 的完成标准是：新 transport、新证据来源或新 analyzer 不再要求修改同一个巨型 service，而不是代码必须符合某种固定目录模板。
+
+当前扩展点分别是 `browser/adapters/contracts.py`、`browser/operations/evidence.py` 和
+`protocol/analyzers/`；新增实现不再需要修改 `BrowserActionService` 主流程。
 
 ### 阶段 F：让测试跟随能力边界
 

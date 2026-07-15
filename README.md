@@ -41,9 +41,26 @@ web_rev_action
 ├── RuntimeCoordinator
 │   ├── browser operation reservation
 │   └── protected workspace mutation reservation
-├── Browser Orchestrator
-│   ├── PlaywrightCliAdapter
-│   └── JsReverseMcpAdapter
+├── BrowserActionService
+│   └── thin compatibility facade
+├── browser/
+│   ├── dispatcher.py
+│   ├── core.py / artifacts.py / steps.py
+│   ├── replay_runtime.js
+│   ├── adapters/contracts.py
+│   └── operations/
+│       ├── capture.py
+│       ├── replay.py
+│       ├── finalization.py
+│       ├── evidence.py
+│       ├── inspection.py
+│       └── session.py
+├── protocol/
+│   ├── mutations.py
+│   ├── matching.py
+│   └── analyzers/
+│       ├── response.py
+│       └── differences.py
 ├── ExperimentStore
 │   └── 只保存 session 和 experiment manifest
 └── AnalysisWorkspaceService
@@ -58,6 +75,30 @@ web_rev_action
 - 服务重启后的 interrupted 恢复。
 
 所有普通文件读取、搜索、编辑和脚本执行都由 6 个 workspace Action 完成。
+
+### Stage E 职责边界
+
+`BrowserActionService` 只保留依赖构造、public `run` facade 和生命周期 `close`。
+请求分派位于 `browser/dispatcher.py`；capture、replay、finalization、evidence、inspection
+和 session 各自拥有单一变化原因。Browser-context replay JavaScript 位于独立
+`browser/replay_runtime.js`，Python adapter 只加载 runtime、传入参数并映射结果。
+
+真实外部边界的 contracts 位于 `browser/adapters/contracts.py`：
+
+```text
+PlaywrightAdapter
+JsReverseAdapter
+McpToolTransport
+CommandRunner
+```
+
+新增 transport 实现不需要修改 `BrowserActionService`。Request matching、mutation
+presentation、response analyzer 和 factual difference analyzer 分别位于 `protocol/`
+边界；analyzer 只消费结构化事实，不操作 browser、manifest 或 execution status。
+
+公共 request/response Pydantic 模型暂时继续位于 `browser_models.py`，旧
+`browser_adapters.py` 和 `protocol_evidence.py` 继续兼容 re-export。这样避免一次拆分同时
+制造第二套 public model 或破坏现有调用方。
 
 ## Public GPT Actions
 

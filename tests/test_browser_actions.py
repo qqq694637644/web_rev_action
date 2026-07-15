@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 import asyncio
 import json
 import os
@@ -5504,25 +5503,14 @@ class BrowserActionTests(unittest.TestCase):
             )
 
     def test_runtime_replay_reader_handles_cr_eof_and_exact_byte_limit(self) -> None:
-        source = Path("src/skill_temple/browser_adapters.py").read_text(encoding="utf-8")
-        tree = ast.parse(source)
-        function_source: str | None = None
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.AsyncFunctionDef):
-                continue
-            if node.name != "evaluate_browser_replay":
-                continue
-            for child in ast.walk(node):
-                if not isinstance(child, ast.Assign):
-                    continue
-                if not any(
-                    isinstance(target, ast.Name) and target.id == "function"
-                    for target in child.targets
-                ):
-                    continue
-                function_source = ast.literal_eval(child.value)
-                break
-        self.assertIsNotNone(function_source)
+        function_source = Path(
+            "src/skill_temple/browser/replay_runtime.js"
+        ).read_text(encoding="utf-8")
+        adapter_source = Path("src/skill_temple/browser_adapters.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("function = load_replay_runtime()", adapter_source)
+        self.assertNotIn("async ({localFile}) => {", adapter_source)
         script = f"""
 const replay = {function_source};
 class TestHeaders {{
