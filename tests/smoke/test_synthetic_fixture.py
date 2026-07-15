@@ -51,12 +51,16 @@ def test_authenticated_stateful_stream_fixture_records_2xx_4xx_and_5xx() -> None
         cookie = page_headers["Set-Cookie"].split(";", 1)[0]
         assert page_status == 200
 
-        unauthorized_status, _, unauthorized_body = request(
-            f"{base_url}/api/stateful-stream",
-            payload=valid_payload(),
-        )
-        assert unauthorized_status == 401
-        assert json.loads(unauthorized_body)["error"] == "authentication-required"
+        for attempt in range(25):
+            unauthorized_status, _, unauthorized_body = request(
+                f"{base_url}/api/stateful-stream",
+                payload={
+                    **valid_payload(),
+                    "job_id": f"unauthorized-job-{attempt}",
+                },
+            )
+            assert unauthorized_status == 401
+            assert json.loads(unauthorized_body)["error"] == "authentication-required"
 
         invalid_status, _, invalid_body = request(
             f"{base_url}/api/stateful-stream",

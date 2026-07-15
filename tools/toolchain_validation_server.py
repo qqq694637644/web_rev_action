@@ -99,6 +99,8 @@ class ToolchainValidationHandler(BaseHTTPRequestHandler):
         )
 
     def _handle_stateful_stream(self) -> None:
+        content_length = int(self.headers.get("Content-Length", "0"))
+        raw_body = self.rfile.read(content_length)
         cookie = self.headers.get("Cookie", "")
         authorization = self.headers.get("Authorization", "")
         if (
@@ -110,8 +112,6 @@ class ToolchainValidationHandler(BaseHTTPRequestHandler):
                 HTTPStatus.UNAUTHORIZED,
             )
             return
-        content_length = int(self.headers.get("Content-Length", "0"))
-        raw_body = self.rfile.read(content_length)
         try:
             payload = json.loads(raw_body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
