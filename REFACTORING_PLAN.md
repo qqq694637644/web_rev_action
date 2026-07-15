@@ -804,6 +804,7 @@ browser/
   steps.py                setup/action/verification step execution
   replay_runtime.js       browser-context replay runtime
   replay_runtime.py       reviewed runtime loader
+  stream_state.py         pure stream request matching and checkpoint conversion
   adapters/
     contracts.py          Playwright、MCP、js-reverse Protocol 与 typed results
     command.py            subprocess command implementation
@@ -835,6 +836,11 @@ protocol/
 `browser_adapters.py` 已删除；`protocol_evidence.py` 不再 re-export mutation、matching、shape
 或 analyzer。调用方必须迁移到直接能力路径，不提供兼容 facade 或 fallback。
 Workspace 原有 read/search/inspect/write/PowerShell 模块保持不变。
+
+Operation 模块只依赖 adapter contracts，不依赖具体 Playwright、MCP 或 js-reverse 实现，也
+不通过 `browser.adapters` package facade 间接加载具体 transport。Stream status 的 request
+matching、request ID 和 checkpoint conversion 位于 `browser/stream_state.py`，由 session
+operation 与 js-reverse adapter 共同调用。
 
 #### E3. 推荐提取顺序
 

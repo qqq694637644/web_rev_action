@@ -39,7 +39,7 @@ from ...protocol_evidence import (
     response_content_type,
     response_value_from_snapshot,
 )
-from ..adapters import AlignmentResult, StreamCheckpoint
+from ..adapters.contracts import AlignmentResult, StreamCheckpoint
 from ..core import BrowserServiceError, Deadline, utc_now
 from ..steps import StepExecutor
 from .context import ReplayDispatchResult, ReplayPreparationResult

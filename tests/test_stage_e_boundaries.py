@@ -16,6 +16,10 @@ from skill_temple.browser.operations.replay import BrowserReplayOperations
 from skill_temple.browser.operations.replay_analysis import BrowserReplayAnalysisOperations
 from skill_temple.browser.operations.session import BrowserSessionOperations
 from skill_temple.browser.replay_runtime import load_replay_runtime
+from skill_temple.browser.stream_state import (
+    checkpoint_from_status,
+    request_matches_stream_request,
+)
 from skill_temple.browser_models import RequestMatcher
 from skill_temple.browser_service import BrowserActionService
 from skill_temple.protocol.analyzers.differences import (
@@ -78,6 +82,12 @@ class StageEBoundaryTests(unittest.TestCase):
     def test_operation_modules_use_explicit_imports(self) -> None:
         root = Path("src/skill_temple/browser/operations")
         self.assertFalse((root / "_support.py").exists())
+        concrete_adapters = {
+            "JsReverseMcpAdapter",
+            "PlaywrightCliAdapter",
+            "StdioMcpToolTransport",
+            "SubprocessCommandRunner",
+        }
         for path in root.glob("*.py"):
             if path.name == "__init__.py":
                 continue
@@ -88,8 +98,23 @@ class StageEBoundaryTests(unittest.TestCase):
                 if isinstance(node, ast.ImportFrom)
                 and any(alias.name == "*" for alias in node.names)
             ]
+            imported_names = {
+                alias.name
+                for node in ast.walk(tree)
+                if isinstance(node, ast.ImportFrom)
+                for alias in node.names
+            }
+            adapter_facade_imports = [
+                node
+                for node in ast.walk(tree)
+                if isinstance(node, ast.ImportFrom)
+                and node.module == "adapters"
+                and node.level == 2
+            ]
             with self.subTest(path=path.name):
                 self.assertEqual(wildcard_imports, [])
+                self.assertTrue(concrete_adapters.isdisjoint(imported_names))
+                self.assertEqual(adapter_facade_imports, [])
 
     def test_capture_flow_calls_stages_not_runtime_or_analyzers(self) -> None:
         path = Path("src/skill_temple/browser/operations/capture.py")
@@ -153,6 +178,42 @@ class StageEBoundaryTests(unittest.TestCase):
         self.assertTrue((root / "mcp.py").is_file())
         self.assertTrue((root / "js_reverse.py").is_file())
         self.assertIs(js_reverse.JsReverseMcpAdapter.__mro__[1], object)
+
+    def test_stream_state_is_shared_without_concrete_adapter_dependency(self) -> None:
+        matcher = RequestMatcher(
+            url_contains="/conversation",
+            method="POST",
+            resource_types=["fetch"],
+        )
+        request = {
+            "cdpRequestId": "request-7",
+            "url": "https://example.test/conversation",
+            "method": "POST",
+            "resourceType": "fetch",
+            "responseObserved": True,
+            "status": "finished",
+            "endedWallTimeMs": 1234,
+            "rawEventCount": 2,
+            "semanticEventCount": 1,
+            "primaryEventSource": "raw-stream",
+        }
+        self.assertTrue(request_matches_stream_request(request, matcher))
+        checkpoint = checkpoint_from_status(
+            {
+                "capture": {"version": 9},
+                "requests": [request],
+            },
+            matcher,
+        )
+        self.assertEqual(checkpoint.version, 9)
+        self.assertEqual(checkpoint.requests["request-7"].status, "finished")
+        self.assertEqual(checkpoint.requests["request-7"].raw_event_index, 1)
+
+        session_source = Path(
+            "src/skill_temple/browser/operations/session.py"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("JsReverseMcpAdapter", session_source)
+        self.assertIn("from ..adapters.contracts import", session_source)
 
     def test_breaking_legacy_import_surfaces_are_removed(self) -> None:
         self.assertIsNone(importlib.util.find_spec("skill_temple.browser_adapters"))

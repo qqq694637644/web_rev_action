@@ -14,6 +14,11 @@ from ...browser_models import (
     WaitCondition,
 )
 from ..replay_runtime import load_replay_runtime
+from ..stream_state import (
+    checkpoint_from_status,
+    request_matches_stream_request,
+    stream_request_id,
+)
 from .contracts import (
     AdapterError,
     AlignmentResult,
@@ -452,39 +457,6 @@ class JsReverseMcpAdapter:
             deadline,
         )
 
-    @staticmethod
-    def _request_matches(request: dict[str, Any], matcher: RequestMatcher) -> bool:
-        if matcher.request_id and matcher.request_id not in {
-            request.get("cdpRequestId"),
-            request.get("persistentRequestId"),
-        }:
-            return False
-        if matcher.url_contains and matcher.url_contains not in str(request.get("url", "")):
-            return False
-        if matcher.method and matcher.method != str(request.get("method", "")).upper():
-            return False
-        if matcher.resource_types and str(request.get("resourceType", "")).lower() not in {
-            value.lower() for value in matcher.resource_types
-        }:
-            return False
-        return True
-
-    @staticmethod
-    def _request_id(request: dict[str, Any]) -> str:
-        return str(request.get("cdpRequestId") or request.get("persistentRequestId") or "")
-
-    @staticmethod
-    def _request_checkpoint(request: dict[str, Any]) -> StreamRequestCheckpoint:
-        ended = request.get("endedWallTimeMs")
-        return StreamRequestCheckpoint(
-            response_observed=bool(request.get("responseObserved")),
-            status=(str(request.get("status")) if request.get("status") else None),
-            terminal_wall_time_ms=(float(ended) if isinstance(ended, (int, float)) else None),
-            raw_event_index=int(request.get("rawEventCount", 0) or 0) - 1,
-            semantic_event_index=int(request.get("semanticEventCount", 0) or 0) - 1,
-            primary_event_source=str(request.get("primaryEventSource") or "none"),
-        )
-
     @classmethod
     def _event_match_belongs_to_request(
         cls,
@@ -500,25 +472,6 @@ class JsReverseMcpAdapter:
         }
         aliases.discard("")
         return bool(matched_request_id and matched_request_id in aliases)
-
-    @classmethod
-    def checkpoint_from_status(
-        cls,
-        payload: dict[str, Any],
-        matcher: RequestMatcher,
-    ) -> StreamCheckpoint:
-        capture = payload.get("capture") if isinstance(payload.get("capture"), dict) else {}
-        requests: dict[str, StreamRequestCheckpoint] = {}
-        for request in payload.get("requests", []):
-            if not isinstance(request, dict) or not cls._request_matches(request, matcher):
-                continue
-            request_id = cls._request_id(request)
-            if request_id:
-                requests[request_id] = cls._request_checkpoint(request)
-        return StreamCheckpoint(
-            version=int(capture.get("version", 0) or 0),
-            requests=requests,
-        )
 
     @staticmethod
     def _terminal_transition(
@@ -573,11 +526,14 @@ class JsReverseMcpAdapter:
             requests = [
                 item
                 for item in payload.get("requests", [])
-                if isinstance(item, dict) and self._request_matches(item, request_matcher)
+                if isinstance(item, dict)
+                and request_matches_stream_request(item, request_matcher)
             ]
-            current_checkpoint = self.checkpoint_from_status(payload, request_matcher)
+            current_checkpoint = checkpoint_from_status(payload, request_matcher)
             request_by_id = {
-                request_id: item for item in requests if (request_id := self._request_id(item))
+                request_id: item
+                for item in requests
+                if (request_id := stream_request_id(item))
             }
             met = False
             matched_event: dict[str, Any] | None = None
@@ -734,7 +690,7 @@ class JsReverseMcpAdapter:
             capture_id=capture_id,
             capture_version=int((last_payload.get("capture") or {}).get("version", 0) or 0),
             matched_request_ids=[],
-            checkpoint=self.checkpoint_from_status(last_payload, request_matcher),
+            checkpoint=checkpoint_from_status(last_payload, request_matcher),
             status_payload=last_payload,
         )
 

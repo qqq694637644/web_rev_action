@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ...browser_models import CaptureFlowPayload, FlowStepResult
-from ..adapters import AlignmentResult, StreamCheckpoint
+from ..adapters.contracts import AlignmentResult, StreamCheckpoint
 
 
 @dataclass(slots=True)

@@ -47,6 +47,7 @@ web_rev_action
 │   ├── dispatcher.py
 │   ├── core.py / artifacts.py / steps.py
 │   ├── replay_runtime.js
+│   ├── stream_state.py
 │   ├── adapters/
 │   │   ├── contracts.py
 │   │   ├── command.py
@@ -102,6 +103,11 @@ JsReverseAdapter
 McpToolTransport
 CommandRunner
 ```
+
+Operation 模块只从 `browser/adapters/contracts.py` 导入 adapter 类型和错误，不从
+`browser.adapters` package facade 或具体 transport 实现导入。js-reverse stream status 的
+request matching 与 checkpoint 转换位于纯函数模块 `browser/stream_state.py`，session 和
+具体 js-reverse adapter 共同依赖该模块。
 
 新增 transport 实现不需要修改 `BrowserActionService`。Request matching、ordered
 mutation/binding execution、request shape、fingerprint、response analyzer 和 factual

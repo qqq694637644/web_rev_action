@@ -36,7 +36,7 @@ from ...protocol_evidence import (
     response_content_type,
     stream_request_has_complete_request_headers,
 )
-from ..adapters import AlignmentResult
+from ..adapters.contracts import AlignmentResult
 from ..core import BrowserServiceError, Deadline
 from .context import EvidenceCollectionResult, ObservationAssemblyResult
 

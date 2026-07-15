@@ -12,7 +12,7 @@ from ...protocol.mutations import (
     replay_operation_overwritten_by_later,
 )
 from ...protocol_evidence import response_content_type, response_value_from_snapshot
-from ..adapters import AlignmentResult
+from ..adapters.contracts import AlignmentResult
 from .context import ReplayAnalysisResult
 
 

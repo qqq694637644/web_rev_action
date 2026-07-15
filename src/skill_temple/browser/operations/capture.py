@@ -19,7 +19,7 @@ from ...browser_models import (
 from ...protocol.matching import (
     network_checkpoint,
 )
-from ..adapters import AlignmentResult, McpToolCallError, StreamCheckpoint
+from ..adapters.contracts import AlignmentResult, McpToolCallError, StreamCheckpoint
 from ..core import BrowserServiceError, Deadline, utc_now
 from ..steps import StepExecutor
 from .context import CaptureCompletionContext

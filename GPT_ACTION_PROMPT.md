@@ -79,6 +79,11 @@ evidence collection/observation assembly、finalization、inspection 和 session
 `protocol/analyzers/`，ordered mutation/binding 执行只修改 `protocol/mutations.py`。
 不要把逻辑重新加入 facade、capture 主流程或 `protocol_evidence.py`。
 
+Operation 层只能依赖 `browser/adapters/contracts.py`，不得导入 `JsReverseMcpAdapter`、
+`PlaywrightCliAdapter`、`StdioMcpToolTransport` 或 `SubprocessCommandRunner`。Stream request
+matching 与 status checkpoint 转换使用 `browser/stream_state.py` 的纯函数；只有 composition
+root 和 adapter package 选择具体实现。
+
 Stage E 是破坏式 import 迁移，不提供旧路径兜底：不要使用
 `skill_temple.browser_adapters`，也不要从 `protocol_evidence` 导入 matching、mutation、shape
 或 analyzer。Workspace inspect/search/read/write/PowerShell 能力属于分析框架核心，不因

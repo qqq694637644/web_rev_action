@@ -23,13 +23,13 @@ from ...browser_models import (
     WaitCondition,
 )
 from ...runtime_coordinator import RuntimeOwner, RuntimeReservationError
-from ..adapters import (
+from ..adapters.contracts import (
     AlignmentResult,
-    JsReverseMcpAdapter,
     StreamCheckpoint,
     StreamRequestCheckpoint,
 )
 from ..core import BrowserServiceError, Deadline, _safe_identifier, utc_now
+from ..stream_state import checkpoint_from_status, request_matches_stream_request
 
 
 class BrowserSessionOperations:
@@ -417,7 +417,7 @@ class BrowserSessionOperations:
         if capture_id is None:
             return StreamCheckpoint()
         status = await self.js_reverse.get_stream_status(capture_id, deadline)
-        return JsReverseMcpAdapter.checkpoint_from_status(status, matcher)
+        return checkpoint_from_status(status, matcher)
 
     @staticmethod
     def _checkpoint_from_wait_result(
@@ -502,13 +502,15 @@ class BrowserSessionOperations:
         requests = [
             item
             for item in status_payload.get("requests", [])
-            if isinstance(item, dict) and JsReverseMcpAdapter._request_matches(item, matcher)
+            if isinstance(item, dict)
+            and request_matches_stream_request(item, matcher)
         ]
         if not requests and not payload.capture.stream:
             requests = [
                 dict(item)
                 for item in network_payload.get("requests", [])
-                if isinstance(item, dict) and JsReverseMcpAdapter._request_matches(item, matcher)
+                if isinstance(item, dict)
+                and request_matches_stream_request(item, matcher)
             ]
         count_ok = (
             payload.primary_request.expected_min_matches
