@@ -10,7 +10,7 @@
 
 - Git。
 - Python 3.11 或更高版本。
-- Node.js 18 或更高版本，以及 npm。
+- Node.js 20.19 或更高版本，以及 npm。
 - PowerShell 7，命令名为 `pwsh`。
 - ripgrep，命令名为 `rg`。
 - Google Chrome 或 Microsoft Edge。
@@ -94,13 +94,49 @@ cd C:\path\to\web_rev_action
 
 ## 5. 安装浏览器工具
 
-仓库的真实工具链验证使用：
+安装 Playwright CLI：
 
 ```powershell
-npm install --global @playwright/cli@0.1.17 js-reverse-mcp@4.0.1
-
+npm install --global @playwright/cli@0.1.17
 Get-Command playwright-cli
+```
+
+本项目依赖 `qqq694637644/js-reverse-mcp` 的 `main` 分支，其中包含
+`web_rev_action` 使用的流式捕获能力。不要用 npm registry 中的同名发布包代替。
+
+把仓库克隆到与 `web_rev_action` 同级的目录，安装依赖并构建：
+
+```powershell
+cd ..
+git clone https://github.com/qqq694637644/js-reverse-mcp.git
+cd js-reverse-mcp
+git switch main
+git pull --ff-only origin main
+
+npm install
+npm run build
+npm link
+
 Get-Command js-reverse-mcp
+js-reverse-mcp --help
+```
+
+`npm link` 会根据该仓库 `package.json` 的 `bin` 配置创建全局
+`js-reverse-mcp` 命令，实际入口是：
+
+```text
+js-reverse-mcp/build/src/index.js
+```
+
+以后更新流式 MCP：
+
+```powershell
+cd C:\path\to\js-reverse-mcp
+git switch main
+git pull --ff-only origin main
+npm install
+npm run build
+npm link
 ```
 
 如果 npm 全局命令不在 `PATH`，运行：
@@ -166,8 +202,9 @@ SKILL_TEMPLE_SERVER_URL=https://your-public-host.example
 # 不设置时使用 Python package 内置的 current-site-analysis 等 Skill。
 SKILL_TEMPLE_SKILLS_DIR=C:/path/to/custom/skills
 
-# 只能追加不与 browser URL、allowed roots、artifact root 冲突的参数。
-WEB_REV_JS_REVERSE_EXTRA_ARGS=["--headless","false"]
+# 通常不需要设置。需要追加 js-reverse-mcp 参数时，必须填写 JSON 字符串数组；
+# 不能覆盖 browser URL、allowed roots 或 stream artifact root。
+# WEB_REV_JS_REVERSE_EXTRA_ARGS=["--logFile","C:/path/to/js-reverse.log"]
 ```
 
 `.env`、`.env.*` 和 `.venv/` 已被 `.gitignore` 忽略。不要把本机 token 或绝对路径提交到 Git。
@@ -231,8 +268,8 @@ python -m skill_temple.evals evals/skill_queries.jsonl
 
 ```powershell
 python tools/toolchain_validation.py `
-  --js-reverse-entry <js-reverse-mcp>/build/src/main.js
+  --js-reverse-entry <js-reverse-mcp>/build/src/index.js
 
 python tools/browser_action_smoke.py `
-  --js-reverse-entry <js-reverse-mcp>/build/src/main.js
+  --js-reverse-entry <js-reverse-mcp>/build/src/index.js
 ```

@@ -980,7 +980,7 @@ def parse_args() -> argparse.Namespace:
         "--js-reverse-entry",
         type=Path,
         required=True,
-        help="Built js-reverse-mcp entrypoint, for example build/src/main.js.",
+        help="Built js-reverse-mcp entrypoint, for example build/src/index.js.",
     )
     return parser.parse_args()
 
