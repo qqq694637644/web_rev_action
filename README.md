@@ -856,29 +856,28 @@ experiments/*/playwright/
 
 这三个关键参数始终由服务生成。`WEB_REV_JS_REVERSE_EXTRA_ARGS` 只能追加非冲突参数；尝试覆盖 browser URL、allowed roots 或 stream artifact root 会在启动时被拒绝。
 
-## Install and run
+## 安装与拉取
 
-要求：
-
-- Windows。
-- Python 3.11+。
-- Node.js 18+。
-- PowerShell 7。
-- ripgrep。
-- `playwright-cli`。
-- 当前 stream PR 版本的 `js-reverse-mcp`。
-- 已开启 remote debugging 的 Chrome/Edge。
+首次从 GitHub 拉取主线代码：
 
 ```powershell
-py -3 -m pip install -e .[dev]
-web-rev-action --host 127.0.0.1 --port 8765
+git clone https://github.com/qqq694637644/web_rev_action.git
+cd web_rev_action
+git switch main
+git pull --ff-only origin main
 ```
 
-OpenAPI：
+创建虚拟环境并安装：
 
-```text
-http://127.0.0.1:8765/openapi.json
+```powershell
+py -3 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install -e ".[dev]"
 ```
+
+完整的环境要求、SSH 拉取、更新代码、Node 工具、Chrome/Edge CDP、`.env` 配置和启动步骤见
+[INSTALL.md](INSTALL.md)。
 
 ## Validation
 
