@@ -26,7 +26,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from .browser_routes import register_browser_actions
+from .browser_routes import normalize_browser_action_openapi, register_browser_actions
 from .browser_service import (
     BrowserActionService,
     analysis_workspace_root_from_environment,
@@ -353,7 +353,7 @@ def create_app(
     original_openapi = app.openapi
 
     def openapi_with_optional_bearer_auth() -> dict[str, Any]:
-        schema = original_openapi()
+        schema = normalize_browser_action_openapi(original_openapi())
         if bearer_token:
             _add_bearer_auth_security(schema)
         return schema
