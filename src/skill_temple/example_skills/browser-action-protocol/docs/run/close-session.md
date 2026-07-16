@@ -18,7 +18,7 @@ Optional fields and defaults:
 
 - `deadline_ms`: 1000–42000; default 10000.
 
-Constraints: close only the intended session. A persisted session from another service instance may already be stale.
+Constraints: close only the intended session. A persisted session from another service instance may already be stale. A session whose status proves attach was never dispatched is closed locally with `close_outcome=not_required`; no browser command is sent.
 
 Decoded example:
 
@@ -44,7 +44,7 @@ Decoded example:
 
 Expected response handles: `session_id`, closed/stale status, and close reason.
 
-Safe retry: when dispatch started or the outcome is unknown, call `get_session` with the returned `session_id` first. A close transport loss is persisted as `close_outcome_unknown`, not as a confirmed `open` or `closed` state.
+Safe retry: when dispatch started or the outcome is unknown, call `get_session` with the returned `session_id` first. A close transport loss or post-dispatch cancellation is persisted as `close_outcome_unknown`; pre-dispatch cancellation preserves the prior session status and records `close_outcome=canceled_before_dispatch`.
 
 Typical errors: `invalid_operation_payload`, `session_not_found`, `browser_busy`, `operation_outcome_unknown`.
 

@@ -5,13 +5,84 @@ import json
 import tempfile
 from pathlib import Path
 
-from skill_temple.browser.adapters.contracts import AdapterError
+from skill_temple.browser.adapters.contracts import AdapterError, AlignmentResult
 from skill_temple.browser_models import ReplayRequestRequest
 from tests.browser.common import BrowserActionTestCase
 from tests.fakes.browser import FakeJsReverse
 
 
 class ReplayExecutionBrowserTests(BrowserActionTestCase):
+    def test_replay_pre_dispatch_alignment_failure_never_sends_replay(self) -> None:
+        class SetupBreaksAlignmentJs(FakeJsReverse):
+            async def align_page(
+                self,
+                page: object,
+                deadline: object,
+                page_id: str | None = None,
+            ) -> AlignmentResult:
+                if "playwright.step:setup_change_page" in self.events:
+                    self.events.append("js.align.replay_blocked")
+                    return AlignmentResult(
+                        status="not_aligned",
+                        playwright_page=page,
+                        warnings=["setup moved to an unmatched page"],
+                    )
+                return await super().align_page(page, deadline, page_id)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            client, events, _ = self.make_client(root, include_supporting_failure=False)
+            with client:
+                self.open_session(client)
+                source_id, source_evidence, _ = self.capture_replay_source(client, root)
+                service = client.app.state.browser_action_service
+                service.js_reverse = SetupBreaksAlignmentJs(
+                    events,
+                    root,
+                    include_supporting_failure=False,
+                )
+                response = client.post(
+                    "/v1/browser/run",
+                    json=self.browser_request(
+                        "replay_request",
+                        {
+                            "session_id": "session_one",
+                            "objective": "do not replay on an unaligned setup page",
+                            "source": {
+                                "experiment_id": source_id,
+                                "evidence_id": source_evidence["evidence_id"],
+                            },
+                            "setup_flow": [
+                                {
+                                    "step_id": "setup_change_page",
+                                    "action": "navigate",
+                                    "value": "https://example.test/other",
+                                }
+                            ],
+                            "execution_mode": "sync",
+                            "deadline_ms": 10_000,
+                        },
+                    ),
+                )
+
+            self.assertEqual(response.status_code, 409, response.text)
+            error = response.json()["error"]
+            self.assertEqual(error["code"], "replay_pre_dispatch_alignment_failed")
+            self.assertFalse(error["dispatch_started"])
+            self.assertNotIn("js.replay", events)
+            manifest = json.loads(
+                (root / error["manifest_relative_path"]).read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["status"], "failed")
+            self.assertEqual(manifest["replay"]["dispatch_status"], "not_started")
+            self.assertEqual(
+                manifest["replay"]["pre_dispatch_alignment"]["status"],
+                "not_aligned",
+            )
+            self.assertTrue(
+                any(item["step_id"] == "setup_change_page" for item in manifest["steps"])
+            )
+
     def test_replay_cancellation_uses_adapter_dispatch_fact(self) -> None:
         for sent, expected_status in [
             (False, "canceled"),

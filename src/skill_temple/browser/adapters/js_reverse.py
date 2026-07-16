@@ -67,19 +67,37 @@ class JsReverseMcpAdapter:
         return await self.transport.call_tool(name, arguments, deadline)
 
     @staticmethod
-    def _invalid_response(tool: str, path: str, expected: str) -> AdapterError:
+    def _invalid_response(
+        tool: str,
+        path: str,
+        expected: str,
+        *,
+        consequential: bool = False,
+    ) -> AdapterError:
         return AdapterError(
             f"Invalid adapter response from {tool} at {path}: expected {expected}",
             dispatch_started=True,
-            outcome_unknown=False,
+            outcome_unknown=consequential,
             code="invalid_adapter_response",
         )
 
     @classmethod
-    def _require_object(cls, payload: dict[str, Any], tool: str, key: str) -> dict[str, Any]:
+    def _require_object(
+        cls,
+        payload: dict[str, Any],
+        tool: str,
+        key: str,
+        *,
+        consequential: bool = False,
+    ) -> dict[str, Any]:
         value = payload.get(key)
         if not isinstance(value, dict):
-            raise cls._invalid_response(tool, f"/{key}", "object")
+            raise cls._invalid_response(
+                tool,
+                f"/{key}",
+                "object",
+                consequential=consequential,
+            )
         return value
 
     @classmethod
@@ -97,22 +115,112 @@ class JsReverseMcpAdapter:
         return list(value)
 
     @classmethod
-    def _require_pagination(cls, payload: dict[str, Any], tool: str) -> dict[str, Any]:
+    def _require_pagination(
+        cls,
+        payload: dict[str, Any],
+        tool: str,
+        expected_page_idx: int,
+    ) -> dict[str, Any]:
         pagination = cls._require_object(payload, tool, "pagination")
+        page_idx = pagination.get("pageIdx")
+        if (
+            not isinstance(page_idx, int)
+            or isinstance(page_idx, bool)
+            or page_idx != expected_page_idx
+        ):
+            raise cls._invalid_response(
+                tool,
+                "/pagination/pageIdx",
+                f"integer equal to requested page {expected_page_idx}",
+            )
         if not isinstance(pagination.get("hasNextPage"), bool):
             raise cls._invalid_response(tool, "/pagination/hasNextPage", "boolean")
         total_pages = pagination.get("totalPages")
         if not isinstance(total_pages, int) or isinstance(total_pages, bool) or total_pages < 1:
             raise cls._invalid_response(tool, "/pagination/totalPages", "positive integer")
+        if page_idx >= total_pages:
+            raise cls._invalid_response(
+                tool,
+                "/pagination/pageIdx",
+                "page index smaller than totalPages",
+            )
+        expected_has_next = page_idx + 1 < total_pages
+        if pagination["hasNextPage"] != expected_has_next:
+            raise cls._invalid_response(
+                tool,
+                "/pagination/hasNextPage",
+                f"{expected_has_next!r} for pageIdx={page_idx}, totalPages={total_pages}",
+            )
         return pagination
 
     @classmethod
-    def _require_capture(cls, payload: dict[str, Any], tool: str) -> dict[str, Any]:
-        capture = cls._require_object(payload, tool, "capture")
+    def _require_capture(
+        cls,
+        payload: dict[str, Any],
+        tool: str,
+        *,
+        expected_capture_id: int | None = None,
+        consequential: bool = False,
+    ) -> dict[str, Any]:
+        capture = cls._require_object(
+            payload,
+            tool,
+            "capture",
+            consequential=consequential,
+        )
         capture_id = capture.get("captureId")
         if not isinstance(capture_id, int) or isinstance(capture_id, bool) or capture_id < 1:
-            raise cls._invalid_response(tool, "/capture/captureId", "positive integer")
+            raise cls._invalid_response(
+                tool,
+                "/capture/captureId",
+                "positive integer",
+                consequential=consequential,
+            )
+        if expected_capture_id is not None and capture_id != expected_capture_id:
+            raise cls._invalid_response(
+                tool,
+                "/capture/captureId",
+                f"integer equal to requested capture {expected_capture_id}",
+                consequential=consequential,
+            )
         return capture
+
+    @classmethod
+    def _require_selected_page(
+        cls,
+        payload: dict[str, Any],
+        *,
+        page_id: str | None,
+        page_idx: int | None,
+    ) -> dict[str, Any]:
+        selected = cls._require_object(
+            payload,
+            "select_page",
+            "selected",
+            consequential=True,
+        )
+        if page_id is not None:
+            if selected.get("pageId") != page_id:
+                raise cls._invalid_response(
+                    "select_page",
+                    "/selected/pageId",
+                    f"string equal to requested pageId {page_id!r}",
+                    consequential=True,
+                )
+        elif page_idx is not None:
+            selected_idx = selected.get("pageIdx")
+            if (
+                not isinstance(selected_idx, int)
+                or isinstance(selected_idx, bool)
+                or selected_idx != page_idx
+            ):
+                raise cls._invalid_response(
+                    "select_page",
+                    "/selected/pageIdx",
+                    f"integer equal to requested pageIdx {page_idx}",
+                    consequential=True,
+                )
+        return selected
 
     async def align_page(
         self,
@@ -151,7 +259,10 @@ class JsReverseMcpAdapter:
                     js_reverse_page_id=page_id,
                     warnings=["The saved pageId now points to a different URL."],
                 )
-            await self._call("select_page", {"pageId": page_id, "pageSize": 100}, deadline)
+            selection = await self._call(
+                "select_page", {"pageId": page_id, "pageSize": 100}, deadline
+            )
+            self._require_selected_page(selection, page_id=page_id, page_idx=None)
             return AlignmentResult(
                 status="aligned",
                 playwright_page=page,
@@ -188,7 +299,12 @@ class JsReverseMcpAdapter:
         selector["pageId" if selected_page_id else "pageIdx"] = (
             selected_page_id if selected_page_id else page_index
         )
-        await self._call("select_page", selector, deadline)
+        selection = await self._call("select_page", selector, deadline)
+        self._require_selected_page(
+            selection,
+            page_id=selected_page_id,
+            page_idx=(None if selected_page_id else page_index),
+        )
         return AlignmentResult(
             status="aligned",
             playwright_page=page,
@@ -221,7 +337,11 @@ class JsReverseMcpAdapter:
         if matcher.mime_types:
             arguments["mimeTypes"] = matcher.mime_types
         payload = await self._call("start_stream_capture", arguments, deadline)
-        self._require_capture(payload, "start_stream_capture")
+        self._require_capture(
+            payload,
+            "start_stream_capture",
+            consequential=True,
+        )
         return payload
 
     async def get_stream_status(
@@ -270,7 +390,11 @@ class JsReverseMcpAdapter:
                 arguments_for(0),
                 deadline,
             )
-            self._require_capture(payload, "get_stream_status")
+            self._require_capture(
+                payload,
+                "get_stream_status",
+                expected_capture_id=capture_id,
+            )
             request = payload.get("request")
             if request is not None and not isinstance(request, dict):
                 raise self._invalid_response(
@@ -290,7 +414,11 @@ class JsReverseMcpAdapter:
                 arguments_for(page_idx),
                 deadline,
             )
-            self._require_capture(page, "get_stream_status")
+            self._require_capture(
+                page,
+                "get_stream_status",
+                expected_capture_id=capture_id,
+            )
             if not combined:
                 combined = {
                     key: value
@@ -301,12 +429,14 @@ class JsReverseMcpAdapter:
                 page, "get_stream_status", "requests"
             )
             requests.extend(page_requests)
-            pagination = self._require_pagination(page, "get_stream_status")
+            pagination = self._require_pagination(
+                page,
+                "get_stream_status",
+                page_idx,
+            )
             if not pagination.get("hasNextPage"):
                 break
             page_idx += 1
-            if page_idx >= int(pagination.get("totalPages", page_idx + 1)):
-                break
         combined["requests"] = requests
         combined["pagination"] = {
             "pageIdx": 0,
@@ -352,12 +482,14 @@ class JsReverseMcpAdapter:
                 page, "list_network_requests", "requests"
             )
             requests.extend(page_requests)
-            pagination = self._require_pagination(page, "list_network_requests")
+            pagination = self._require_pagination(
+                page,
+                "list_network_requests",
+                page_idx,
+            )
             if not pagination.get("hasNextPage"):
                 break
             page_idx += 1
-            if page_idx >= int(pagination.get("totalPages", page_idx + 1)):
-                break
         combined["requests"] = requests
         combined["pagination"] = {
             "pageIdx": 0,
@@ -497,12 +629,14 @@ class JsReverseMcpAdapter:
                 page, "list_console_messages", "messages"
             )
             messages.extend(page_messages)
-            pagination = self._require_pagination(page, "list_console_messages")
+            pagination = self._require_pagination(
+                page,
+                "list_console_messages",
+                page_idx,
+            )
             if not pagination.get("hasNextPage"):
                 break
             page_idx += 1
-            if page_idx >= int(pagination.get("totalPages", page_idx + 1)):
-                break
         combined["messages"] = messages
         combined["pagination"] = {
             "pageIdx": 0,
@@ -531,12 +665,14 @@ class JsReverseMcpAdapter:
             )
             values = self._require_object_list(page, "list_network_requests", "cookieFlow")
             entries.extend(values)
-            pagination = self._require_pagination(page, "list_network_requests")
+            pagination = self._require_pagination(
+                page,
+                "list_network_requests",
+                page_idx,
+            )
             if not pagination.get("hasNextPage"):
                 break
             page_idx += 1
-            if page_idx >= int(pagination.get("totalPages", page_idx + 1)):
-                break
         return {"cookieName": cookie_name, "cookieFlow": entries}
 
     async def evaluate_browser_replay(
@@ -546,7 +682,7 @@ class JsReverseMcpAdapter:
         deadline: DeadlineLike,
     ) -> dict[str, Any]:
         function = load_replay_runtime()
-        return await self._call(
+        payload = await self._call(
             "evaluate_script",
             {
                 "confirm": True,
@@ -558,6 +694,26 @@ class JsReverseMcpAdapter:
             },
             deadline,
         )
+        if not isinstance(payload.get("filename"), str):
+            raise self._invalid_response(
+                "evaluate_script",
+                "/filename",
+                "string",
+                consequential=True,
+            )
+        byte_length = payload.get("byteLength")
+        if (
+            not isinstance(byte_length, int)
+            or isinstance(byte_length, bool)
+            or byte_length < 0
+        ):
+            raise self._invalid_response(
+                "evaluate_script",
+                "/byteLength",
+                "non-negative integer",
+                consequential=True,
+            )
+        return payload
 
     @classmethod
     def _event_match_belongs_to_request(
@@ -803,7 +959,12 @@ class JsReverseMcpAdapter:
             {"captureId": capture_id, "finalizeTimeoutMs": remaining_ms},
             deadline,
         )
-        self._require_capture(payload, "stop_stream_capture")
+        self._require_capture(
+            payload,
+            "stop_stream_capture",
+            expected_capture_id=capture_id,
+            consequential=True,
+        )
         return payload
 
     async def close(self) -> None:

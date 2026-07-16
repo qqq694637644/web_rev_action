@@ -34,12 +34,36 @@ from ..core import (
     service_error_from_adapter,
     utc_now,
 )
-from ..session_states import TERMINAL_CLOSED
+from ..session_states import NO_ATTACHMENT_STATES, REUSABLE_SESSION_STATES, TERMINAL_CLOSED
 from ..stream_state import checkpoint_from_status, request_matches_stream_request
 
 
 class BrowserSessionOperations:
     """Own session behavior while the public service remains a facade."""
+
+    @staticmethod
+    def _cancel_dispatch_started(exc: asyncio.CancelledError) -> bool:
+        return bool(
+            getattr(exc, "adapter_dispatch_started", False)
+            or getattr(exc, "mcp_outcome_unknown", False)
+        )
+
+    @staticmethod
+    def _record_open_stage_outcome(
+        session: dict[str, Any],
+        *,
+        stage: str,
+        outcome: str,
+        attached: bool,
+    ) -> None:
+        if attached:
+            session["attach_outcome"] = "confirmed"
+        if stage == "attach":
+            session["attach_outcome"] = outcome
+        elif stage in {"navigation", "current_page", "page_selection"}:
+            session["page_selection_outcome"] = outcome
+        else:
+            session["alignment_outcome"] = outcome
 
     def _session_lock(self, session_id: str) -> asyncio.Lock:
         return self._session_locks.setdefault(session_id, asyncio.Lock())
@@ -246,7 +270,7 @@ class BrowserSessionOperations:
             existing = self.sessions.get(session_id) or self.experiments.load_session(
                 session_id
             )
-            if existing and existing.get("status") not in TERMINAL_CLOSED:
+            if existing and existing.get("status") not in REUSABLE_SESSION_STATES:
                 raise BrowserServiceError(
                     "session_id_in_use",
                     f"Session ID is already in use with status {existing.get('status')!r}",
@@ -321,26 +345,64 @@ class BrowserSessionOperations:
                 session["updated_at"] = utc_now()
                 self.experiments.save_session(session)
                 alignment = await self.js_reverse.align_page(page, deadline)
+            except asyncio.CancelledError as exc:
+                failure_stage = str(getattr(exc, "playwright_stage", stage))
+                attached = bool(getattr(exc, "session_attached", page is not None))
+                dispatch_started = self._cancel_dispatch_started(exc)
+                outcome = "unknown" if dispatch_started else "canceled"
+                self._record_open_stage_outcome(
+                    session,
+                    stage=failure_stage,
+                    outcome=outcome,
+                    attached=attached,
+                )
+                session.update(
+                    {
+                        "status": (
+                            "open_unaligned"
+                            if attached
+                            else (
+                                "open_outcome_unknown"
+                                if dispatch_started
+                                else "open_canceled_before_dispatch"
+                            )
+                        ),
+                        "open_error": {
+                            "code": "operation_canceled",
+                            "message": (
+                                "Open session was canceled after adapter dispatch."
+                                if dispatch_started
+                                else "Open session was canceled before adapter dispatch."
+                            ),
+                            "dispatch_started": dispatch_started,
+                            "outcome": "unknown" if dispatch_started else "canceled",
+                            "stage": failure_stage,
+                        },
+                        "updated_at": utc_now(),
+                    }
+                )
+                self.experiments.save_session(session)
+                raise
             except AdapterError as exc:
+                failure_stage = str(getattr(exc, "playwright_stage", stage))
+                attached = bool(getattr(exc, "session_attached", page is not None))
                 service_error = service_error_from_adapter(
                     exc,
                     "open browser session",
                     consequential=True,
                 ).with_context(session_id=session_id)
                 unknown = service_error.code == "operation_outcome_unknown"
-                if stage == "attach":
-                    session["attach_outcome"] = "unknown" if unknown else "failed"
-                elif stage == "page_selection":
-                    session["page_selection_outcome"] = (
-                        "unknown" if unknown else "failed"
-                    )
-                else:
-                    session["alignment_outcome"] = "unknown" if unknown else "failed"
+                self._record_open_stage_outcome(
+                    session,
+                    stage=failure_stage,
+                    outcome="unknown" if unknown else "failed",
+                    attached=attached,
+                )
                 session.update(
                     {
                         "status": (
                             "open_unaligned"
-                            if page is not None
+                            if attached
                             else (
                                 "open_outcome_unknown"
                                 if unknown
@@ -356,6 +418,7 @@ class BrowserSessionOperations:
                             "message": str(service_error),
                             "dispatch_started": service_error.dispatch_started,
                             "outcome": service_error.outcome,
+                            "stage": failure_stage,
                         },
                         "updated_at": utc_now(),
                     }
@@ -378,6 +441,33 @@ class BrowserSessionOperations:
                     session["updated_at"] = utc_now()
                     self.experiments.save_session(session)
                     await self.playwright.close_session(session_id, deadline)
+                except asyncio.CancelledError as exc:
+                    dispatch_started = self._cancel_dispatch_started(exc)
+                    session.update(
+                        {
+                            "status": (
+                                "close_outcome_unknown"
+                                if dispatch_started
+                                else "alignment_failed"
+                            ),
+                            "close_outcome": (
+                                "unknown" if dispatch_started else "canceled_before_dispatch"
+                            ),
+                            "close_error": {
+                                "code": "operation_canceled",
+                                "message": (
+                                    "Alignment cleanup close was canceled after dispatch."
+                                    if dispatch_started
+                                    else "Alignment cleanup close was canceled before dispatch."
+                                ),
+                                "dispatch_started": dispatch_started,
+                                "outcome": "unknown" if dispatch_started else "canceled",
+                            },
+                            "updated_at": utc_now(),
+                        }
+                    )
+                    self.experiments.save_session(session)
+                    raise
                 except AdapterError as exc:
                     service_error = service_error_from_adapter(
                         exc,
@@ -447,12 +537,49 @@ class BrowserSessionOperations:
         session_id = request.payload.session_id
         async with self._locked_browser_session(session_id, deadline):
             session = self._get_session(session_id)
-            if session.get("status") not in {"closed", "closed_after_alignment_failure"}:
+            if session.get("status") in NO_ATTACHMENT_STATES:
+                session["status"] = "closed"
+                session["close_outcome"] = "not_required"
+                session["updated_at"] = utc_now()
+            elif session.get("status") not in TERMINAL_CLOSED:
+                previous_status = str(session.get("status") or "unknown")
                 try:
                     session["close_outcome"] = "pending"
                     session["updated_at"] = utc_now()
                     self.experiments.save_session(session)
                     await self.playwright.close_session(session_id, deadline)
+                except asyncio.CancelledError as exc:
+                    dispatch_started = self._cancel_dispatch_started(exc)
+                    session.update(
+                        {
+                            "status": (
+                                "close_outcome_unknown"
+                                if dispatch_started
+                                else previous_status
+                            ),
+                            "previous_status": previous_status,
+                            "close_outcome": (
+                                "unknown" if dispatch_started else "canceled_before_dispatch"
+                            ),
+                            "close_error": {
+                                "code": "operation_canceled",
+                                "message": (
+                                    "Close session was canceled after adapter dispatch."
+                                    if dispatch_started
+                                    else "Close session was canceled before adapter dispatch."
+                                ),
+                                "dispatch_started": dispatch_started,
+                                "outcome": "unknown" if dispatch_started else "canceled",
+                            },
+                            "updated_at": utc_now(),
+                        }
+                    )
+                    if request.action_binding is not None:
+                        session["last_action_contract"] = request.action_binding.model_dump(
+                            mode="json"
+                        )
+                    self.experiments.save_session(session)
+                    raise
                 except AdapterError as exc:
                     service_error = service_error_from_adapter(
                         exc,
@@ -486,8 +613,10 @@ class BrowserSessionOperations:
                         )
                     self.experiments.save_session(session)
                     raise service_error from exc
-            session["status"] = "closed"
-            session["close_outcome"] = "confirmed"
+            if session.get("status") not in TERMINAL_CLOSED:
+                session["status"] = "closed"
+                if session.get("close_outcome") != "not_required":
+                    session["close_outcome"] = "confirmed"
             session["updated_at"] = utc_now()
             if request.action_binding is not None:
                 session["last_action_contract"] = request.action_binding.model_dump(mode="json")

@@ -71,18 +71,33 @@ class PlaywrightCliAdapter:
         start_url: str | None,
         deadline: DeadlineLike,
     ) -> PageState:
-        await self.runner.run(
-            [
-                *self.command_prefix,
-                *build_playwright_attach_args(browser_endpoint, session_ref),
-            ],
-            deadline=deadline,
-            cwd=self.cwd,
-        )
+        try:
+            await self.runner.run(
+                [
+                    *self.command_prefix,
+                    *build_playwright_attach_args(browser_endpoint, session_ref),
+                ],
+                deadline=deadline,
+                cwd=self.cwd,
+            )
+        except (AdapterError, asyncio.CancelledError) as exc:
+            exc.playwright_stage = "attach"
+            exc.session_attached = False
+            raise
         self._selected_page_index[session_ref] = 0
         if start_url:
-            await self._run(session_ref, "goto", start_url, deadline=deadline)
-        return await self.current_page(session_ref, deadline)
+            try:
+                await self._run(session_ref, "goto", start_url, deadline=deadline)
+            except (AdapterError, asyncio.CancelledError) as exc:
+                exc.playwright_stage = "navigation"
+                exc.session_attached = True
+                raise
+        try:
+            return await self.current_page(session_ref, deadline)
+        except (AdapterError, asyncio.CancelledError) as exc:
+            exc.playwright_stage = "current_page"
+            exc.session_attached = True
+            raise
 
     async def current_page(self, session_ref: str, deadline: DeadlineLike) -> PageState:
         expression = "JSON.stringify({url:location.href,title:document.title})"

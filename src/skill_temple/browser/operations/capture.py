@@ -472,7 +472,8 @@ class BrowserCaptureOperations:
                                 manifest,
                                 warnings,
                             )
-                            if stream_start_status == "outcome_unknown"
+                            if stream_start_status
+                            in {"outcome_unknown", "failed_after_dispatch"}
                             else None
                         )
                         if discovered:
@@ -685,6 +686,7 @@ class BrowserCaptureOperations:
                     "operation_outcome_unknown",
                     "browser_adapter_failed",
                     "invalid_adapter_response",
+                    "replay_pre_dispatch_alignment_failed",
                 }:
                     terminal_service_error = exc
                 errors.append(str(exc)[:4000])

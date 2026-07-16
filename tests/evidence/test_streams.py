@@ -53,7 +53,7 @@ class StreamsBrowserTests(BrowserActionTestCase):
                             "semanticEventCount": 1,
                         }
                     ],
-                    "pagination": {"hasNextPage": False, "totalPages": 1},
+                    "pagination": {"pageIdx": 0, "hasNextPage": False, "totalPages": 1},
                 }
 
             async def close(self) -> None:
@@ -130,7 +130,11 @@ class StreamsBrowserTests(BrowserActionTestCase):
                             "semanticEventCount": 0,
                         }
                     ],
-                    "pagination": {"hasNextPage": False, "totalPages": 1},
+                    "pagination": {
+                        "pageIdx": 0,
+                        "hasNextPage": False,
+                        "totalPages": 1,
+                    },
                 }
 
             async def close(self) -> None:
@@ -386,7 +390,11 @@ class StreamsBrowserTests(BrowserActionTestCase):
                             "primaryEventSource": "raw-stream",
                         },
                     ],
-                    "pagination": {"hasNextPage": False, "totalPages": 1},
+                    "pagination": {
+                        "pageIdx": 0,
+                        "hasNextPage": False,
+                        "totalPages": 1,
+                    },
                 }
 
             async def close(self) -> None:
@@ -460,7 +468,11 @@ class StreamsBrowserTests(BrowserActionTestCase):
                 return {
                     "capture": {"captureId": 10, "version": 22},
                     "requests": [request],
-                    "pagination": {"hasNextPage": False, "totalPages": 1},
+                    "pagination": {
+                        "pageIdx": 0,
+                        "hasNextPage": False,
+                        "totalPages": 1,
+                    },
                 }
 
             async def close(self) -> None:
@@ -520,6 +532,7 @@ class StreamsBrowserTests(BrowserActionTestCase):
                 return {
                     "requests": requests,
                     "pagination": {
+                        "pageIdx": page,
                         "hasNextPage": has_next,
                         "totalPages": 2,
                     },

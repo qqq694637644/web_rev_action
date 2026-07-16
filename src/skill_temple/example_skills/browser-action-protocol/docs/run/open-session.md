@@ -19,7 +19,7 @@ Optional fields and defaults:
 - `target`: page selector with optional `start_url`, `expected_url_contains`, or `page_index`.
 - `deadline_ms`: 1000–42000; default 15000.
 
-Constraints: when the private MCP endpoint is configured, `browser_endpoint` must match it. Prefer page selection over navigation unless navigation is intentional. A supplied `session_id` already present in any nonterminal state is rejected with `session_id_in_use` before adapter dispatch.
+Constraints: when the private MCP endpoint is configured, `browser_endpoint` must match it. Prefer page selection over navigation unless navigation is intentional. A supplied `session_id` that may still hold an attachment is rejected with `session_id_in_use` before adapter dispatch. IDs whose prior status proves attach was never sent (`open_failed_before_dispatch` or `open_canceled_before_dispatch`) may be reused.
 
 Decoded example:
 
@@ -43,7 +43,7 @@ Decoded example:
 ```
 ## Result and recovery
 
-Expected response handles: `session_id`, session status, selected page metadata, and alignment metadata. The session record is created before adapter dispatch and may expose `opening`, `aligning`, `open_failed_before_dispatch`, `open_failed`, `open_unaligned`, `open_outcome_unknown`, `alignment_failed`, `close_failed`, or `close_outcome_unknown` when setup does not reach a confirmed open state. Separate `attach_outcome`, `page_selection_outcome`, `alignment_outcome`, and `close_outcome` fields preserve confirmed stage facts.
+Expected response handles: `session_id`, session status, selected page metadata, and alignment metadata. The session record is created before adapter dispatch and may expose `opening`, `aligning`, `open_failed_before_dispatch`, `open_canceled_before_dispatch`, `open_failed`, `open_unaligned`, `open_outcome_unknown`, `alignment_failed`, `close_failed`, or `close_outcome_unknown` when setup does not reach a confirmed open state. Separate `attach_outcome`, `page_selection_outcome`, `alignment_outcome`, and `close_outcome` fields preserve confirmed stage facts. Attach success remains confirmed when later navigation, current-page inspection, page selection, or alignment fails or is canceled.
 
 Safe retry: correct validation errors only when `dispatch_started=false`. If dispatch started or the outcome is unknown, use the returned `session_id` with `get_session` before deciding whether to retry.
 

@@ -25,7 +25,7 @@ Optional fields and defaults:
 - `query_serialization`: `preserve_raw` by default or `normalize`.
 - `transport`, `response_reader`, `termination`, `comparison`, `capture`, `requirements`, `network_evidence`, and `series`.
 
-Constraints: `execution_context` is always `browser_context`; `target.start_url` is forbidden; setup and verification step IDs must be unique; extractor and binding IDs must be unique; browser-managed headers cannot be mutated; `replay_request` is a reserved selector ID.
+Constraints: `execution_context` is always `browser_context`; `target.start_url` is forbidden; setup and verification step IDs must be unique; extractor and binding IDs must be unique; browser-managed headers cannot be mutated; `replay_request` is a reserved selector ID. After setup and extractor work, the current Playwright page must realign to js-reverse with `status=aligned` before the replay request is dispatched.
 
 Decoded example:
 
@@ -51,9 +51,9 @@ Decoded example:
 
 Expected response handles: `experiment_id`, replay network evidence ID in the terminal manifest, mutation/binding observations, optional comparison results, and response artifacts.
 
-Safe retry: poll `get_experiment` for job mode. Never repeat a state-changing replay when dispatch started or outcome is unknown; inspect the experiment, exact replay evidence, and persistent state first. Cancellation before MCP send is `canceled`; cancellation after the transport records send is `canceled_outcome_unknown`.
+Safe retry: poll `get_experiment` for job mode. Never repeat a state-changing replay when dispatch started or outcome is unknown; inspect the experiment, exact replay evidence, and persistent state first. Cancellation before MCP send is `canceled`; cancellation after the transport records send is `canceled_outcome_unknown`. `replay_pre_dispatch_alignment_failed` means setup/extractor evidence is preserved but `evaluate_script` was not called and replay dispatch did not start.
 
-Typical errors: `invalid_operation_payload`, `source_evidence_not_found`, `source_snapshot_incomplete`, `session_busy`, `browser_busy`, `invalid_adapter_response`, `operation_outcome_unknown`.
+Typical errors: `invalid_operation_payload`, `source_evidence_not_found`, `source_snapshot_incomplete`, `session_busy`, `browser_busy`, `replay_pre_dispatch_alignment_failed`, `invalid_adapter_response`, `operation_outcome_unknown`.
 
 Next recommended inspect operations: `get_experiment`, `list_evidence`, and `get_network_evidence` for the exact replay request.
 

@@ -4,6 +4,15 @@ from __future__ import annotations
 
 TERMINAL_CLOSED = frozenset({"closed", "closed_after_alignment_failure"})
 
+NO_ATTACHMENT_STATES = frozenset(
+    {
+        "open_failed_before_dispatch",
+        "open_canceled_before_dispatch",
+    }
+)
+
+REUSABLE_SESSION_STATES = TERMINAL_CLOSED | NO_ATTACHMENT_STATES
+
 MAY_HOLD_ATTACHMENT = frozenset(
     {
         "opening",

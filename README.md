@@ -118,9 +118,10 @@ browser.adapters.js_reverse.JsReverseMcpAdapter
 
 Adapter 错误显式区分事实边界：命令或 MCP call 未发送时
 `dispatch_started=false`；已发送且收到可信失败结果时
-`dispatch_started=true, outcome=failed`；只有已发送但未获得可信终态的超时、连接中断
-或 transport 崩溃才返回 `operation_outcome_unknown`、`dispatch_started=true`、
-`outcome=unknown`。Route 不根据异常类型猜测该状态。
+`dispatch_started=true, outcome=failed`；已发送但未获得可信终态的超时、连接中断、
+transport 崩溃或 consequential operation 损坏响应返回
+`operation_outcome_unknown`、`dispatch_started=true`、`outcome=unknown`。只读 operation
+的损坏响应仍是 `invalid_adapter_response, outcome=failed`。Route 不根据异常类型猜测该状态。
 
 当 session 或 experiment 句柄已经创建，结构化错误同时返回可用的 `session_id`、
 `experiment_id` 和 `manifest_relative_path`。Session 在 browser attach 前保存 provisional
@@ -327,6 +328,7 @@ reader、termination 和 comparison；后端只负责执行、观察和保存。
 → 运行可选 setup_flow
 → 独立运行 extractor 并记录每项 completed / failed
 → 将成功 extractor 输出注入对应 binding
+→ 重新读取当前 Playwright page 并确认 js-reverse alignment=aligned
 → 在当前 browser context 执行 fetch
 → 保存 ordinary network、stream、artifact 和 wire observation
 → 运行可选 verification_flow
@@ -586,7 +588,15 @@ page或认证上下文时不能用 `None == None` 冒充相等。
 
 Header和query mutation比较完整有序值列表并记录 multiplicity；不会只取第一个同名值。
 
-Stream 和普通 network status 都会读取全部分页，并在执行 event predicate 前锁定具体 primary request ID；`matchedRequestId` 不属于该 request 时不会满足等待。同一 session 重复提交实验返回 `409 session_busy`，其他 browser operation 返回 `409 browser_busy`。重复 `open_session` 使用仍处于非终态的同名 session 时，在任何 adapter dispatch 前返回 `session_id_in_use`；后端不会覆盖、复用或自动关闭原记录。Protected workspace mutation 与 browser operation 通过同一 RuntimeCoordinator 双向互斥，避免 TOCTOU。
+Stream 和普通 network status 都会读取全部分页，并验证响应 page index、`totalPages`、
+`hasNextPage` 与请求一致；矛盾分页不会被合成为完整结果。Stream get/stop 必须返回与
+请求相同的 capture ID，page selection 必须确认实际选中的 page ID/index。执行 event
+predicate 前锁定具体 primary request ID；`matchedRequestId` 不属于该 request 时不会满足
+等待。同一 session 重复提交实验返回 `409 session_busy`，其他 browser operation 返回
+`409 browser_busy`。重复 `open_session` 使用可能持有 attachment 的同名 session 时，在
+任何 adapter dispatch 前返回 `session_id_in_use`；已确认未发送 attach 的
+`open_failed_before_dispatch` / `open_canceled_before_dispatch` 可以本地关闭或直接复用。
+Protected workspace mutation 与 browser operation 通过同一 RuntimeCoordinator 双向互斥，避免 TOCTOU。
 
 ## Background job
 
@@ -705,11 +715,25 @@ Stream start 显式建模为：
 not_attempted | failed_before_send | failed_after_dispatch | confirmed | outcome_unknown
 ```
 
-Start 已 dispatch 但调用超时、取消或返回无效结构时，后端扫描 experiment namespace 中的 `capture.json` 恢复持久身份。未发现可信 capture handle 时记录 `collector_stopped=false`、`collector_cleanup=unknown`；发现同 generation handle 时尝试现有 stop 路径。无效成功响应标记为 `failed_after_dispatch`，不会写成未发送。
+Start 已 dispatch 但调用超时、取消或返回无效结构时，后端按 unknown outcome 处理，并
+扫描 experiment namespace 中的 `capture.json` 恢复持久身份。未发现可信 capture
+handle 时记录 `collector_stopped=false`、`collector_cleanup=unknown`；发现同 generation
+handle 时尝试现有 stop 路径。该错误不会被写成确定失败或未发送。
 
-Playwright 的 `selector_hidden` 和 `request_log_stable` 只有在 CLI 命令成功后才判断页面条件；任意非零退出直接成为 adapter error。js-reverse 的 page listing、stream/network/console 分页和 stream start 都在各自 adapter 方法边界验证关键字段，缺失或类型错误返回 `invalid_adapter_response`，不会被解释为零结果、分页结束或 collector 未启动。
+Playwright 的 `selector_hidden` 和 `request_log_stable` 只有在 CLI 命令成功后才判断页面
+条件；任意非零退出直接成为 adapter error。js-reverse 的 page listing/selection、
+stream/network/console 分页、capture identity 和 stream start/stop 都在各自 adapter
+方法边界验证关键字段及关联一致性。只读响应损坏返回 `invalid_adapter_response`；
+consequential 响应损坏返回 `operation_outcome_unknown`，不会被解释为零结果、分页结束、
+选页成功或 collector 确定未启动。
 
-Session 生命周期使用三个简单集合共享 shutdown/restart 判断：可能持有 attachment 的状态会在当前进程关闭时尝试 detach；来自旧 service instance 的同类状态在读取时标记为 `stale` 并保留 `previous_status`。Session 还分别保存 `attach_outcome`、`page_selection_outcome`、`alignment_outcome` 和 `close_outcome`；attach 已确认但 alignment 结果未知时保持 `open_unaligned`，并记录 `alignment_outcome=unknown`。
+Session 生命周期使用简单集合共享 shutdown/restart/reuse 判断：可能持有 attachment 的
+状态会在当前进程关闭时尝试 detach；来自旧 service instance 的同类状态在读取时标记为
+`stale` 并保留 `previous_status`。Session 分别保存 `attach_outcome`、
+`page_selection_outcome`、`alignment_outcome` 和 `close_outcome`。Playwright attach 成功后
+的 navigation/current-page 失败不会回写为 attach 失败；attach 已确认但 alignment 结果
+未知时保持 `open_unaligned` 并记录 `alignment_outcome=unknown`。Open/close 取消同样按
+adapter 是否已发送写入 canceled 或 unknown，而不留下永久 pending。
 
 Objective 可以分别声明：
 

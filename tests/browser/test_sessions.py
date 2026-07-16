@@ -422,6 +422,185 @@ class SessionsBrowserTests(BrowserActionTestCase):
             self.assertEqual(error.session_id, "duplicate_session")
             self.assertEqual(events.count("playwright.open"), 1)
 
+    def test_open_cancellation_persists_dispatch_boundary_and_reuse_fact(self) -> None:
+        class CanceledOpenPlaywright(FakePlaywright):
+            def __init__(
+                self,
+                events: list[str],
+                *,
+                sent: bool,
+                attached: bool,
+                stage: str,
+            ) -> None:
+                super().__init__(events)
+                self.sent = sent
+                self.attached = attached
+                self.stage = stage
+
+            async def open_session(
+                self,
+                session_ref: str,
+                browser_endpoint: str,
+                start_url: str | None,
+                deadline: Deadline,
+            ) -> PageState:
+                error = asyncio.CancelledError()
+                error.adapter_dispatch_started = self.sent
+                error.session_attached = self.attached
+                error.playwright_stage = self.stage
+                raise error
+
+        for sent, attached, stage, expected_status, expected_attach, expected_page in [
+            (
+                False,
+                False,
+                "attach",
+                "open_canceled_before_dispatch",
+                "canceled",
+                "not_started",
+            ),
+            (
+                True,
+                True,
+                "current_page",
+                "open_unaligned",
+                "confirmed",
+                "unknown",
+            ),
+        ]:
+            with (
+                self.subTest(sent=sent, stage=stage),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                events: list[str] = []
+                service = BrowserActionService(
+                    playwright=CanceledOpenPlaywright(
+                        events,
+                        sent=sent,
+                        attached=attached,
+                        stage=stage,
+                    ),
+                    js_reverse=FakeJsReverse(events, root),
+                    experiments=ExperimentStore(root),
+                    default_browser_endpoint="http://127.0.0.1:9222",
+                )
+
+                async def exercise(
+                    service: BrowserActionService = service,
+                    sent: bool = sent,
+                    events: list[str] = events,
+                ) -> dict[str, Any]:
+                    with self.assertRaises(asyncio.CancelledError):
+                        await service.run(
+                            OpenSessionRequest(
+                                operation="open_session",
+                                payload={"session_id": "canceled_open"},
+                            )
+                        )
+                    saved = service.experiments.load_session("canceled_open")
+                    assert saved is not None
+                    if not sent:
+                        service.playwright = FakePlaywright(events)
+                        reopened = await service.run(
+                            OpenSessionRequest(
+                                operation="open_session",
+                                payload={"session_id": "canceled_open"},
+                            )
+                        )
+                        self.assertEqual(reopened.status, "completed")
+                    return saved
+
+                saved = asyncio.run(exercise())
+                self.assertEqual(saved["status"], expected_status)
+                self.assertEqual(saved["attach_outcome"], expected_attach)
+                self.assertEqual(saved["page_selection_outcome"], expected_page)
+
+    def test_close_cancellation_persists_before_and_after_dispatch_facts(self) -> None:
+        class CanceledClosePlaywright(FakePlaywright):
+            def __init__(self, events: list[str], *, sent: bool) -> None:
+                super().__init__(events)
+                self.sent = sent
+
+            async def close_session(self, session_ref: str, deadline: Deadline) -> None:
+                error = asyncio.CancelledError()
+                error.adapter_dispatch_started = self.sent
+                raise error
+
+        for sent, expected_status, expected_outcome in [
+            (False, "open", "canceled_before_dispatch"),
+            (True, "close_outcome_unknown", "unknown"),
+        ]:
+            with self.subTest(sent=sent), tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                events: list[str] = []
+                playwright = CanceledClosePlaywright(events, sent=sent)
+                service = BrowserActionService(
+                    playwright=playwright,
+                    js_reverse=FakeJsReverse(events, root),
+                    experiments=ExperimentStore(root),
+                    default_browser_endpoint="http://127.0.0.1:9222",
+                )
+
+                async def exercise(
+                    service: BrowserActionService = service,
+                ) -> dict[str, Any]:
+                    await service.run(
+                        OpenSessionRequest(
+                            operation="open_session",
+                            payload={"session_id": "canceled_close"},
+                        )
+                    )
+                    with self.assertRaises(asyncio.CancelledError):
+                        await service.run(
+                            CloseSessionRequest(
+                                operation="close_session",
+                                payload={"session_id": "canceled_close"},
+                            )
+                        )
+                    saved = service.experiments.load_session("canceled_close")
+                    assert saved is not None
+                    return saved
+
+                saved = asyncio.run(exercise())
+                self.assertEqual(saved["status"], expected_status)
+                self.assertEqual(saved["close_outcome"], expected_outcome)
+
+    def test_no_attachment_session_closes_locally_without_adapter_dispatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            events: list[str] = []
+            store = ExperimentStore(root)
+            service = BrowserActionService(
+                playwright=FakePlaywright(events),
+                js_reverse=FakeJsReverse(events, root),
+                experiments=store,
+                default_browser_endpoint="http://127.0.0.1:9222",
+            )
+            session = {
+                "session_id": "never_attached",
+                "status": "open_failed_before_dispatch",
+                "service_instance_id": service.service_instance_id,
+                "updated_at": service.process_started_at,
+            }
+            service.sessions["never_attached"] = session
+            store.save_session(session)
+
+            response = asyncio.run(
+                service.run(
+                    CloseSessionRequest(
+                        operation="close_session",
+                        payload={"session_id": "never_attached"},
+                    )
+                )
+            )
+            saved = store.load_session("never_attached")
+            assert saved is not None
+            self.assertEqual(response.status, "completed")
+            self.assertEqual(saved["status"], "closed")
+            self.assertEqual(saved["close_outcome"], "not_required")
+            self.assertNotIn("playwright.close", events)
+
     def test_runtime_coordinator_atomically_blocks_browser_and_workspace_operations(self) -> None:
         class BlockingOpenPlaywright(FakePlaywright):
             def __init__(self, events: list[str]) -> None:

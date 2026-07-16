@@ -214,6 +214,7 @@ class TransportsBrowserTests(BrowserActionTestCase):
                             }
                         ],
                         "pagination": {
+                            "pageIdx": 0,
                             "hasNextPage": False,
                             "totalPages": 1,
                         },

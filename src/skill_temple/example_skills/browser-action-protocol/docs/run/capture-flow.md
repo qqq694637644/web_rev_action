@@ -52,7 +52,7 @@ Decoded example:
 
 Expected response handles: `experiment_id`, `session_id`, status, bounded experiment summary, and manifest relative path.
 
-Safe retry: a `running` response is not a failure; poll `get_experiment`. When dispatch started or outcome is unknown, inspect the returned/known experiment and session instead of repeating the flow. A canceled mutation is `canceled` when no adapter dispatch was confirmed and `canceled_outcome_unknown` only when the adapter recorded a sent command.
+Safe retry: a `running` response is not a failure; poll `get_experiment`. When dispatch started or outcome is unknown, inspect the returned/known experiment and session instead of repeating the flow. A canceled mutation is `canceled` when no adapter dispatch was confirmed and `canceled_outcome_unknown` only when the adapter recorded a sent command. A malformed stream-start response is an unknown consequential outcome; the backend searches the experiment namespace for `capture.json` and uses an exact same-generation handle for cleanup when available.
 
 Typical errors: `invalid_operation_payload`, `session_not_found`, `session_busy`, `browser_busy`, `page_alignment_failed`, `invalid_adapter_response`, `operation_outcome_unknown`.
 

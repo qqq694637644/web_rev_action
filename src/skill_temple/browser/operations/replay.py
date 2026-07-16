@@ -998,7 +998,86 @@ class BrowserReplayOperations:
                 ),
             )
         except Exception as exc:
-            warnings.append(f"pre-dispatch alignment: {str(exc)[:1000]}")
+            message = f"Replay pre-dispatch alignment failed: {str(exc)[:1000]}"
+            step_results.append(
+                FlowStepResult(
+                    step_id="replay_pre_dispatch_alignment",
+                    phase="replay",
+                    status="failed",
+                    started_at=utc_now(),
+                    ended_at=utc_now(),
+                    error=message,
+                )
+            )
+            replay_manifest = manifest.get("replay")
+            if isinstance(replay_manifest, dict):
+                replay_manifest.update(
+                    {
+                        "dispatch_status": "not_started",
+                        "pre_dispatch_alignment": {
+                            "status": "failed",
+                            "error": message,
+                        },
+                    }
+                )
+                self.experiments.write_manifest(experiment_id, manifest)
+            raise BrowserServiceError(
+                "replay_pre_dispatch_alignment_failed",
+                message,
+                409,
+                dispatch_started=False,
+                outcome="failed",
+                session_id=session_id,
+                experiment_id=experiment_id,
+                manifest_relative_path=self._manifest_relative_path(experiment_id),
+            ) from exc
+        if pre_dispatch_alignment.status != "aligned":
+            message = (
+                "; ".join(pre_dispatch_alignment.warnings)
+                or "Replay page did not align with the selected js-reverse page."
+            )
+            step_results.append(
+                FlowStepResult(
+                    step_id="replay_pre_dispatch_alignment",
+                    phase="replay",
+                    status="failed",
+                    started_at=utc_now(),
+                    ended_at=utc_now(),
+                    error=message,
+                )
+            )
+            replay_manifest = manifest.get("replay")
+            if isinstance(replay_manifest, dict):
+                replay_manifest.update(
+                    {
+                        "dispatch_status": "not_started",
+                        "pre_dispatch_alignment": {
+                            "status": pre_dispatch_alignment.status,
+                            "warnings": list(pre_dispatch_alignment.warnings),
+                        },
+                    }
+                )
+                self.experiments.write_manifest(experiment_id, manifest)
+            raise BrowserServiceError(
+                "replay_pre_dispatch_alignment_failed",
+                message,
+                409,
+                dispatch_started=False,
+                outcome="failed",
+                session_id=session_id,
+                experiment_id=experiment_id,
+                manifest_relative_path=self._manifest_relative_path(experiment_id),
+            )
+        replay_manifest = manifest.get("replay")
+        if isinstance(replay_manifest, dict):
+            replay_manifest["pre_dispatch_alignment"] = {
+                "status": pre_dispatch_alignment.status,
+                "js_reverse_page_id": pre_dispatch_alignment.js_reverse_page_id,
+                "js_reverse_page_index": pre_dispatch_alignment.js_reverse_page_index,
+                "js_reverse_page_url": pre_dispatch_alignment.js_reverse_page_url,
+                "warnings": list(pre_dispatch_alignment.warnings),
+            }
+            self.experiments.write_manifest(experiment_id, manifest)
         return ReplayPreparationResult(
             stream_checkpoint=stream_checkpoint,
             first_mutation_wall_time_ms=first_mutation_wall_time_ms,
