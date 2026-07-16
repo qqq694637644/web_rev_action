@@ -22,11 +22,7 @@ SCAN_ROOTS = [
     "validation",
     ".github",
 ]
-HISTORICAL_PLAN_FILES = {
-    "PLAN.md",
-    "REFACTORING_PLAN.md",
-    "SKILL_DRIVEN_ACTION_REFACTORING_PLAN.md",
-}
+CURRENT_IMPLEMENTATION_PLAN = "SKILL_DRIVEN_ACTION_REFACTORING_PLAN.md"
 SKIP_FILES = {
     "src/skill_temple/dead_code_audit.py",
     "tools/dead_code_audit.py",
@@ -70,7 +66,7 @@ def _files(root: Path) -> list[Path]:
         for child in root.iterdir()
         if child.is_file()
         and child.suffix.lower() in TEXT_SUFFIXES
-        and child.name not in HISTORICAL_PLAN_FILES
+        and child.name != CURRENT_IMPLEMENTATION_PLAN
     )
     return sorted(set(selected))
 

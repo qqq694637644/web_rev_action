@@ -5,12 +5,9 @@ from __future__ import annotations
 from importlib import resources
 
 from ..content_hash import text_content_hash
-from .registry import OPERATION_REGISTRY, OperationSpec
+from .registry import ACTION_TRANSPORT_VERSION, OPERATION_REGISTRY, OperationSpec
 
 PROTOCOL_SKILL_ID = "browser-action-protocol"
-ACTION_TRANSPORT_VERSION = "2.0"
-
-
 def protocol_skill_content_hash() -> str:
     """Hash the exact packaged browser protocol Skill entrypoint."""
 

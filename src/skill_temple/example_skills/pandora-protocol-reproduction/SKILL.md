@@ -31,8 +31,10 @@ Read these files when the corresponding stage begins:
 - `docs/experiment-matrix.md` for the six scenario sequence and mutation matrix.
 - `docs/evidence-contract.md` before interpreting or citing evidence.
 - `docs/report-templates.md` before generating final reports and schemas.
-- From `browser-action-protocol`, read `docs/transport-envelope.md`,
-  `docs/operation-index.md`, and the selected run/inspect operation files.
+- From `browser-action-protocol`, read
+  `browser-action-protocol/docs/transport-envelope.md`,
+  `browser-action-protocol/docs/operation-index.md`, and the selected run/inspect
+  operation files.
 - Load `browser-session-capture` for baseline/session work,
   `browser-evidence-inspection` for exact evidence selection,
   `browser-request-replay` for one-variable tests, `browser-script-tracing` for source
@@ -265,7 +267,9 @@ Use `list_evidence` to discover stable IDs. Use workspace tools only when the ac
 
 ### 7. Produce the reproduction package
 
-Create the outputs in `docs/report-templates.md`. Reports and scripts belong under `reports/`, `schemas/`, `scripts/`, or `notes/`; never modify original evidence.
+Create the outputs in `docs/report-templates.md`. Reports and scripts belong in the
+analysis workspace report, schema, script, or note directories; never modify original
+evidence.
 
 The generated HTTP replay script must use placeholders or environment variables for credentials. Browser-context replay remains the source of truth for authenticated behavior.
 

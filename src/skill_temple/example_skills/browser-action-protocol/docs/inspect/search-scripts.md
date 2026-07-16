@@ -37,9 +37,9 @@ Decoded example:
 {
   "contract_version": "2.0",
   "operation": "search_scripts",
-  "operation_contract_hash": "sha256:8fc4808bd71079c56e601f2cd37e4aabb65e6a6120189a86a816a1ca996fb097",
+  "operation_contract_hash": "sha256:2b7ccf6dbfa18f1f2928629dbbaadfcb222efc5feb0740e264ecdc1ee209641a",
   "payload_json": "{\"max_results\":20,\"query\":\"parent_message_id\",\"session_id\":\"analysis-main\"}",
-  "skill_content_hash": "sha256:786f2331d061583e44fc9dc7344bae933a380d13006b65d1e88f4ae31ad64e6e",
+  "skill_content_hash": "sha256:c946be3a448d82b76d66ab102a92b09185bf02beda384e1db695c229ab3a45ba",
   "skill_id": "browser-action-protocol"
 }
 ```
@@ -53,67 +53,14 @@ Typical errors: `invalid_operation_payload`, `session_not_found`, `page_alignmen
 
 Next recommended inspect operation: `get_script_source` for one selected exact script and bounded range.
 
-Contract hash: `sha256:8fc4808bd71079c56e601f2cd37e4aabb65e6a6120189a86a816a1ca996fb097`. Send it in `operation_contract_hash`.
+Contract hash: `sha256:2b7ccf6dbfa18f1f2928629dbbaadfcb222efc5feb0740e264ecdc1ee209641a`. Send it in `operation_contract_hash`.
 
 <!-- BEGIN GENERATED CONTRACT -->
-## Generated structural contract
+## Contract binding
 
-> Generated from `OperationRegistry` and Pydantic. Do not edit this block.
+> Generated from the public operation contract. Do not edit this block.
 
-- Request model: `SearchScriptsRequest`
-- Payload model: `SearchScriptsPayload`
-- Registry handler: `_inspect_search_scripts`
+- Action: `inspect`
 - Consequential: `false`
-- Operation contract hash: `sha256:8fc4808bd71079c56e601f2cd37e4aabb65e6a6120189a86a816a1ca996fb097`
-
-```json
-{
-  "additionalProperties": false,
-  "properties": {
-    "exclude_minified": {
-      "default": false,
-      "title": "Exclude Minified",
-      "type": "boolean"
-    },
-    "max_results": {
-      "default": 30,
-      "maximum": 100,
-      "minimum": 1,
-      "title": "Max Results",
-      "type": "integer"
-    },
-    "query": {
-      "maxLength": 4096,
-      "minLength": 1,
-      "title": "Query",
-      "type": "string"
-    },
-    "session_id": {
-      "maxLength": 128,
-      "pattern": "^[a-zA-Z0-9_.-]+$",
-      "title": "Session Id",
-      "type": "string"
-    },
-    "url_filter": {
-      "anyOf": [
-        {
-          "maxLength": 4096,
-          "type": "string"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Url Filter"
-    }
-  },
-  "required": [
-    "session_id",
-    "query"
-  ],
-  "title": "SearchScriptsPayload",
-  "type": "object"
-}
-```
+- Operation contract hash: `sha256:2b7ccf6dbfa18f1f2928629dbbaadfcb222efc5feb0740e264ecdc1ee209641a`
 <!-- END GENERATED CONTRACT -->

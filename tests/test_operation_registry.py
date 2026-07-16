@@ -4,11 +4,14 @@ import hashlib
 import json
 import shutil
 import tempfile
+from dataclasses import replace
 from pathlib import Path
+
+from pydantic import BaseModel
 
 from skill_temple.browser import dispatcher
 from skill_temple.browser.contracts import expected_binding, protocol_skill_content_hash
-from skill_temple.browser.registry import OPERATION_REGISTRY
+from skill_temple.browser.registry import OPERATION_REGISTRY, OperationSpec
 from skill_temple.browser_service import BrowserActionService
 from skill_temple.content_hash import file_content_hash
 from skill_temple.contract_builder import build_contracts
@@ -83,6 +86,15 @@ def test_generated_registry_catalog_matches_committed_artifact() -> None:
         OPERATION_REGISTRY.specs()[0]
     )["skill_content_hash"]
     assert committed == expected
+    assert committed["format"] == "browser-operation-registry-v2"
+    for item in committed["operations"]:
+        assert set(item) == {
+            "operation",
+            "action",
+            "consequential",
+            "contract_doc_path",
+            "operation_contract_hash",
+        }
 
 
 def test_packaged_protocol_hash_matches_runtime_hash() -> None:
@@ -149,16 +161,35 @@ def test_contract_generation_ignores_skill_line_ending_style() -> None:
         assert catalog["protocol_skill_content_hash"] == expected_skill_hash
 
 
-def test_operation_hash_changes_when_structural_metadata_changes() -> None:
+def test_operation_hash_ignores_internal_metadata() -> None:
     spec = OPERATION_REGISTRY.require("get_session")
-    original = spec.contract_hash
-    generated = spec.generated_contract()
-    generated["handler_name"] = "different_handler"
-    canonical = json.dumps(
-        generated,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    changed = f"sha256:{hashlib.sha256(canonical).hexdigest()}"
-    assert changed != original
+    assert replace(spec, handler_name="different_handler").contract_hash == spec.contract_hash
+    assert replace(spec, contract_doc_path="docs/moved.md").contract_hash == spec.contract_hash
+
+
+def test_operation_hash_ignores_pydantic_class_names_but_tracks_public_schema() -> None:
+    class FirstPayload(BaseModel):
+        value: str
+
+    class RenamedPayload(BaseModel):
+        value: str
+
+    class ChangedPayload(BaseModel):
+        value: int
+
+    class RequestModel(BaseModel):
+        operation: str
+
+    first = OperationSpec(
+        "example",
+        "inspect",
+        RequestModel,
+        FirstPayload,
+        "first_handler",
+        False,
+        "docs/first.md",
+    )
+    renamed = replace(first, payload_model=RenamedPayload)
+    changed = replace(first, payload_model=ChangedPayload)
+    assert renamed.contract_hash == first.contract_hash
+    assert changed.contract_hash != first.contract_hash

@@ -47,6 +47,47 @@ from ..browser_models import (
 )
 
 ActionKind = Literal["run", "inspect"]
+ACTION_TRANSPORT_VERSION = "2.0"
+
+
+def _public_schema(model: type[BaseModel]) -> dict[str, object]:
+    """Return JSON Schema without Pydantic class-name metadata."""
+
+    schema = model.model_json_schema(mode="validation")
+    definitions = schema.get("$defs", {})
+
+    def normalize(value: object, stack: tuple[str, ...] = ()) -> object:
+        if isinstance(value, list):
+            return [normalize(item, stack) for item in value]
+        if not isinstance(value, dict):
+            return value
+        reference = value.get("$ref")
+        if isinstance(reference, str) and reference.startswith("#/$defs/"):
+            name = reference.removeprefix("#/$defs/")
+            if name in stack:
+                raise ValueError(f"Recursive payload schema is unsupported: {name}")
+            target = definitions.get(name)
+            if not isinstance(target, dict):
+                raise ValueError(f"Unresolved payload schema reference: {reference}")
+            merged = {
+                key: item
+                for key, item in value.items()
+                if key != "$ref"
+            }
+            resolved = normalize(target, (*stack, name))
+            if not isinstance(resolved, dict):
+                raise ValueError(f"Invalid payload schema definition: {name}")
+            return {**resolved, **normalize(merged, stack)}
+        return {
+            key: normalize(item, stack)
+            for key, item in value.items()
+            if key not in {"title", "$defs"}
+        }
+
+    normalized = normalize(schema)
+    if not isinstance(normalized, dict):
+        raise ValueError("Payload JSON Schema must be an object")
+    return normalized
 
 
 @dataclass(frozen=True)
@@ -61,24 +102,30 @@ class OperationSpec:
     consequential: bool
     contract_doc_path: str
 
-    def generated_contract(self) -> dict[str, object]:
-        """Return canonical structural contract data used for docs, tests, and hashing."""
+    def public_contract(self) -> dict[str, object]:
+        """Return only fields that affect the public Browser Action contract."""
 
         return {
             "operation": self.name,
             "action": self.action,
-            "request_model": self.request_model.__name__,
-            "payload_model": self.payload_model.__name__,
-            "handler_name": self.handler_name,
+            "consequential": self.consequential,
+            "payload_schema": _public_schema(self.payload_model),
+            "transport_version": ACTION_TRANSPORT_VERSION,
+        }
+
+    def catalog_entry(self) -> dict[str, object]:
+        return {
+            "operation": self.name,
+            "action": self.action,
             "consequential": self.consequential,
             "contract_doc_path": self.contract_doc_path,
-            "payload_schema": self.payload_model.model_json_schema(mode="validation"),
+            "operation_contract_hash": self.contract_hash,
         }
 
     @property
     def contract_hash(self) -> str:
         canonical = json.dumps(
-            self.generated_contract(),
+            self.public_contract(),
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
@@ -130,14 +177,9 @@ class OperationRegistry:
 
     def generated_catalog(self) -> dict[str, object]:
         return {
-            "format": "browser-operation-registry-v1",
-            "operations": [
-                {
-                    **spec.generated_contract(),
-                    "operation_contract_hash": spec.contract_hash,
-                }
-                for spec in self._specs
-            ],
+            "format": "browser-operation-registry-v2",
+            "transport_version": ACTION_TRANSPORT_VERSION,
+            "operations": [spec.catalog_entry() for spec in self._specs],
         }
 
 

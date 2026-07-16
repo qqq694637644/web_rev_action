@@ -30,9 +30,9 @@ Decoded example:
 {
   "contract_version": "2.0",
   "operation": "get_session",
-  "operation_contract_hash": "sha256:678486890fadfab343752c0a7feefd89339b0de41082648ddd59746259eb7031",
+  "operation_contract_hash": "sha256:050522a6e549f9ad84ae9959e5c6b1f8955fd46ef3e5b10a25e48d7633e5bd29",
   "payload_json": "{\"session_id\":\"analysis-main\"}",
-  "skill_content_hash": "sha256:786f2331d061583e44fc9dc7344bae933a380d13006b65d1e88f4ae31ad64e6e",
+  "skill_content_hash": "sha256:c946be3a448d82b76d66ab102a92b09185bf02beda384e1db695c229ab3a45ba",
   "skill_id": "browser-action-protocol"
 }
 ```
@@ -46,35 +46,14 @@ Typical errors: `invalid_operation_payload`, `session_not_found`.
 
 Next recommended operation: `open_session` when absent/closed, otherwise the intended capture or inspection operation.
 
-Contract hash: `sha256:678486890fadfab343752c0a7feefd89339b0de41082648ddd59746259eb7031`. Send it in `operation_contract_hash`.
+Contract hash: `sha256:050522a6e549f9ad84ae9959e5c6b1f8955fd46ef3e5b10a25e48d7633e5bd29`. Send it in `operation_contract_hash`.
 
 <!-- BEGIN GENERATED CONTRACT -->
-## Generated structural contract
+## Contract binding
 
-> Generated from `OperationRegistry` and Pydantic. Do not edit this block.
+> Generated from the public operation contract. Do not edit this block.
 
-- Request model: `GetSessionRequest`
-- Payload model: `GetSessionPayload`
-- Registry handler: `_inspect_get_session`
+- Action: `inspect`
 - Consequential: `false`
-- Operation contract hash: `sha256:678486890fadfab343752c0a7feefd89339b0de41082648ddd59746259eb7031`
-
-```json
-{
-  "additionalProperties": false,
-  "properties": {
-    "session_id": {
-      "maxLength": 128,
-      "pattern": "^[a-zA-Z0-9_.-]+$",
-      "title": "Session Id",
-      "type": "string"
-    }
-  },
-  "required": [
-    "session_id"
-  ],
-  "title": "GetSessionPayload",
-  "type": "object"
-}
-```
+- Operation contract hash: `sha256:050522a6e549f9ad84ae9959e5c6b1f8955fd46ef3e5b10a25e48d7633e5bd29`
 <!-- END GENERATED CONTRACT -->

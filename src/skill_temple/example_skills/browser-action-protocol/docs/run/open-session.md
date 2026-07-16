@@ -35,9 +35,9 @@ Decoded example:
 {
   "contract_version": "2.0",
   "operation": "open_session",
-  "operation_contract_hash": "sha256:4d59376ce04dad1ac0455239ddbb20d5a2dea63c5cd147ac7dbd196ea1f4ad60",
+  "operation_contract_hash": "sha256:ffad1100a262f17bb106b9584a2d7d839a1b1d0e6b3d6e863dbe9b279639c941",
   "payload_json": "{\"deadline_ms\":15000,\"session_id\":\"analysis-main\",\"target\":{\"page_index\":0}}",
-  "skill_content_hash": "sha256:786f2331d061583e44fc9dc7344bae933a380d13006b65d1e88f4ae31ad64e6e",
+  "skill_content_hash": "sha256:c946be3a448d82b76d66ab102a92b09185bf02beda384e1db695c229ab3a45ba",
   "skill_id": "browser-action-protocol"
 }
 ```
@@ -51,112 +51,14 @@ Typical errors: `invalid_operation_payload`, `browser_endpoint_mismatch`, `brows
 
 Next recommended inspect operation: `get_session`.
 
-Contract hash: `sha256:4d59376ce04dad1ac0455239ddbb20d5a2dea63c5cd147ac7dbd196ea1f4ad60`. Send it in `operation_contract_hash`.
+Contract hash: `sha256:ffad1100a262f17bb106b9584a2d7d839a1b1d0e6b3d6e863dbe9b279639c941`. Send it in `operation_contract_hash`.
 
 <!-- BEGIN GENERATED CONTRACT -->
-## Generated structural contract
+## Contract binding
 
-> Generated from `OperationRegistry` and Pydantic. Do not edit this block.
+> Generated from the public operation contract. Do not edit this block.
 
-- Request model: `OpenSessionRequest`
-- Payload model: `OpenSessionPayload`
-- Registry handler: `dispatch_open_session`
+- Action: `run`
 - Consequential: `true`
-- Operation contract hash: `sha256:4d59376ce04dad1ac0455239ddbb20d5a2dea63c5cd147ac7dbd196ea1f4ad60`
-
-```json
-{
-  "$defs": {
-    "BrowserTarget": {
-      "additionalProperties": false,
-      "properties": {
-        "expected_url_contains": {
-          "anyOf": [
-            {
-              "maxLength": 4096,
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Expected Url Contains"
-        },
-        "page_index": {
-          "anyOf": [
-            {
-              "maximum": 100,
-              "minimum": 0,
-              "type": "integer"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Page Index"
-        },
-        "start_url": {
-          "anyOf": [
-            {
-              "maxLength": 8192,
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "title": "Start Url"
-        }
-      },
-      "title": "BrowserTarget",
-      "type": "object"
-    }
-  },
-  "additionalProperties": false,
-  "properties": {
-    "browser_endpoint": {
-      "anyOf": [
-        {
-          "maxLength": 8192,
-          "type": "string"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Browser Endpoint"
-    },
-    "deadline_ms": {
-      "default": 15000,
-      "maximum": 42000,
-      "minimum": 1000,
-      "title": "Deadline Ms",
-      "type": "integer"
-    },
-    "session_id": {
-      "anyOf": [
-        {
-          "maxLength": 128,
-          "pattern": "^[a-zA-Z0-9_.-]+$",
-          "type": "string"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Session Id"
-    },
-    "target": {
-      "$ref": "#/$defs/BrowserTarget"
-    }
-  },
-  "title": "OpenSessionPayload",
-  "type": "object"
-}
-```
+- Operation contract hash: `sha256:ffad1100a262f17bb106b9584a2d7d839a1b1d0e6b3d6e863dbe9b279639c941`
 <!-- END GENERATED CONTRACT -->

@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
+from skill_temple.browser_service import BrowserServiceError
 from tests.browser.common import BrowserActionTestCase
 
 
@@ -154,13 +155,45 @@ class BrowserTransportEnvelopeTests(BrowserActionTestCase):
             "capture" + "_baseline",
         )
 
-    def test_runtime_failure_after_dispatch_reports_unknown_outcome(self) -> None:
+    def test_unclassified_runtime_failure_is_not_rewritten_as_dispatched(self) -> None:
+        def failing_service(
+            exception_type: type[Exception],
+        ) -> object:
+            async def fail_before_dispatch(_request: object) -> object:
+                raise exception_type("failure before dispatch")
+
+            return fail_before_dispatch
+
+        for error_type in (RuntimeError, OSError):
+            with (
+                self.subTest(error_type=error_type.__name__),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                client, _, _ = self.make_client(Path(temp_dir))
+                service = client.app.state.browser_action_service
+                service.run = failing_service(error_type)
+                with self.assertRaisesRegex(error_type, "before dispatch"):
+                    client.post(
+                        "/v1/browser/run",
+                        json=self.browser_request(
+                            "open_session",
+                            {"session_id": "session_one"},
+                        ),
+                    )
+
+    def test_explicit_unknown_outcome_preserves_service_dispatch_state(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             client, _, _ = self.make_client(Path(temp_dir))
             service = client.app.state.browser_action_service
 
             async def fail_after_dispatch(_request: object) -> object:
-                raise RuntimeError("connection lost after browser dispatch")
+                raise BrowserServiceError(
+                    "operation_outcome_unknown",
+                    "connection lost after browser dispatch",
+                    502,
+                    dispatch_started=True,
+                    outcome="unknown",
+                )
 
             service.run = fail_after_dispatch
             response = client.post(

@@ -17,6 +17,7 @@ from skill_temple.runtime import (
     DEFAULT_MAX_SKILLS,
     SKILL_DESCRIPTION_MAX_CHARS,
     SKILL_NAME_MAX_CHARS,
+    SkillLineLimitError,
     SkillNotFoundError,
     SkillPathError,
     SkillRuntime,
@@ -163,7 +164,7 @@ class RuntimeTests(unittest.TestCase):
                 lf_hash,
             )
 
-    def test_read_does_not_lose_one_oversized_line(self) -> None:
+    def test_read_rejects_one_oversized_line(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir) / "skills"
             long_line = "X" * 100
@@ -174,9 +175,61 @@ class RuntimeTests(unittest.TestCase):
                 "# Demo",
                 {"docs/long.txt": long_line},
             )
-            result = SkillRuntime(root).read("demo", "docs/long.txt", max_chars=10)
-            self.assertEqual(result["content"], long_line)
-            self.assertFalse(result["truncated"])
+            with self.assertRaises(SkillLineLimitError) as raised:
+                SkillRuntime(root).read("demo", "docs/long.txt", max_chars=10)
+            self.assertEqual(raised.exception.line_number, 1)
+            self.assertEqual(raised.exception.actual_chars, 100)
+            self.assertEqual(raised.exception.max_chars, 10)
+
+    def test_read_action_reports_oversized_line_details(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skills = Path(temp_dir) / "skills"
+            shutil.copytree(Path("src/skill_temple/example_skills"), skills)
+            protocol_root = skills / "browser-action-protocol"
+            (protocol_root / "docs/long.txt").write_text("X" * 32_001, encoding="utf-8")
+            skill_path = protocol_root / "SKILL.md"
+            skill_path.write_text(
+                skill_path.read_text(encoding="utf-8") + "\n- `docs/long.txt`\n",
+                encoding="utf-8",
+            )
+
+            with TestClient(create_app(skills_dir=skills)) as client:
+                response = client.post(
+                    "/v1/skills/read",
+                    json={
+                        "skill_id": "browser-action-protocol",
+                        "path": "docs/long.txt",
+                    },
+                )
+
+        self.assertEqual(response.status_code, 422, response.text)
+        error = response.json()["detail"]["error"]
+        self.assertEqual(error["code"], "skill_line_exceeds_limit")
+        self.assertEqual(error["line_number"], 1)
+        self.assertEqual(error["actual_chars"], 32_001)
+        self.assertEqual(error["max_chars"], 32_000)
+
+    def test_skill_references_fail_fast_for_missing_unsafe_and_directory_paths(self) -> None:
+        cases = [
+            ("`docs/missing.md`", "Missing Skill reference"),
+            ("[unsafe](../outside.md)", "Unsafe Skill reference"),
+            ("`docs/`", "Skill reference is not a file"),
+        ]
+        for body, message in cases:
+            with self.subTest(body=body), tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir) / "skills"
+                skill_root = _write_skill(
+                    root,
+                    "demo",
+                    "Use for strict reference tests.",
+                    f"# Demo\n\n{body}",
+                )
+                (skill_root / "docs").mkdir(exist_ok=True)
+                with self.assertRaisesRegex(
+                    SkillRuntimeError,
+                    f"{message}.*skill_id='demo'.*source='SKILL.md'",
+                ):
+                    SkillRuntime(root)
 
     def test_runtime_loads_skills_from_cwd_dotenv(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -350,14 +403,21 @@ class RuntimeTests(unittest.TestCase):
             "/v1/skills/read",
             json={"skill_id": "browser-action-protocol", "path": "../README.md"},
         )
+        hidden_catalog = client.get("/v1/skills")
         console = client.get("/console")
+        console_load = client.post(
+            "/console/load",
+            json={"skill_ids": ["browser-action-protocol"]},
+        )
         self.assertEqual(loaded.status_code, 200, loaded.text)
         self.assertEqual(loaded.json()["loaded_skill_ids"], ["browser-action-protocol"])
         self.assertEqual(read.status_code, 200, read.text)
         self.assertEqual(missing.status_code, 404)
         self.assertEqual(missing.json()["detail"]["error"]["code"], "skill_not_found")
         self.assertEqual(unsafe.status_code, 404)
-        self.assertIn("does not route or search", console.text)
+        self.assertEqual(hidden_catalog.status_code, 404)
+        self.assertEqual(console.status_code, 404)
+        self.assertEqual(console_load.status_code, 404)
 
         with patch.dict(
             os.environ,

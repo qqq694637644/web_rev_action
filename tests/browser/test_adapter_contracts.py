@@ -11,7 +11,7 @@ from skill_temple.browser.adapters.contracts import (
     PageState,
     PlaywrightAdapter,
 )
-from skill_temple.browser_service import Deadline
+from skill_temple.browser_service import BrowserActionService, BrowserServiceError, Deadline
 from tests.fakes.browser import FakeJsReverse, FakePlaywright
 from tests.fakes.scenarios import (
     BrowserScenario,
@@ -74,3 +74,24 @@ def test_scenario_builders_express_failures_without_business_semantics() -> None
     assert request["status"] == 429
     assert status["requests"][0]["rawEventCount"] == 2
     assert status["requests"][0]["semanticEventCount"] == 1
+
+
+def test_wait_checkpoint_rejects_invalid_adapter_shapes_without_fallback() -> None:
+    invalid_values = [
+        ({}, "/checkpoint"),
+        ({"checkpoint": []}, "/checkpoint"),
+        ({"checkpoint": {"version": 1, "requests": []}}, "/checkpoint/requests"),
+        (
+            {"checkpoint": {"version": 1, "requests": {"req-1": "invalid"}}},
+            "/checkpoint/requests/req-1",
+        ),
+    ]
+    for value, path in invalid_values:
+        try:
+            BrowserActionService._checkpoint_from_wait_result(value)
+        except BrowserServiceError as exc:
+            assert exc.code == "invalid_adapter_response"
+            assert exc.dispatch_started is True
+            assert path in str(exc)
+        else:
+            raise AssertionError(f"invalid checkpoint accepted: {value!r}")

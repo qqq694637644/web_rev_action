@@ -14,7 +14,7 @@ from typing import Any, BinaryIO
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from .browser_routes import register_browser_actions
@@ -25,6 +25,7 @@ from .browser_service import (
 )
 from .runtime import (
     DEFAULT_MAX_SKILLS,
+    SkillLineLimitError,
     SkillNotFoundError,
     SkillPathError,
     SkillRuntimeError,
@@ -32,7 +33,6 @@ from .runtime import (
     load_runtime,
 )
 from .runtime_coordinator import RuntimeCoordinator
-from .telemetry import TelemetryRecorder
 from .workspace_routes import register_workspace_actions
 from .workspace_service import AnalysisWorkspaceService
 
@@ -121,6 +121,9 @@ class ErrorDetail(BaseModel):
     code: str
     message: str
     suggested_next_action: str
+    line_number: int | None = None
+    actual_chars: int | None = None
+    max_chars: int | None = None
 
 
 class StructuredErrorResponse(BaseModel):
@@ -194,7 +197,7 @@ def _normalize_bearer_token(token: str | None) -> str | None:
 
 
 def _requires_bearer_auth(path: str) -> bool:
-    return path.startswith("/v1/") or path == "/console/load"
+    return path.startswith("/v1/")
 
 
 def _valid_bearer_authorization(authorization: str | None, expected_token: str) -> bool:
@@ -244,7 +247,6 @@ def create_app(
         if browser_service is not None
         else analysis_workspace_root_from_environment()
     )
-    telemetry = TelemetryRecorder(evidence_root)
     configured_server_url = _normalize_server_url(
         server_url or env_value_from_environment_or_dotenv("SKILL_TEMPLE_SERVER_URL")
     )
@@ -262,8 +264,6 @@ def create_app(
         openapi_url=None,
         servers=([{"url": configured_server_url}] if configured_server_url else None),
     )
-    app.state.telemetry = telemetry
-
     original_openapi = app.openapi
 
     def openapi_with_optional_bearer_auth() -> dict[str, Any]:
@@ -317,38 +317,6 @@ def create_app(
     def health_check() -> dict[str, object]:
         return {"status": "ok", "skills_dir": str(runtime.skills_dir)}
 
-    @app.get("/v1/skills", include_in_schema=False)
-    def list_skills() -> dict[str, object]:
-        return runtime.list_skills()
-
-    @app.get("/console", response_class=HTMLResponse, include_in_schema=False)
-    def console() -> HTMLResponse:
-        return HTMLResponse(CONSOLE_HTML)
-
-    @app.post("/console/load", include_in_schema=False)
-    def console_load(request: LoadSkillsRequest) -> dict[str, object]:
-        try:
-            result = runtime.load_skills(request.skill_ids)
-            telemetry.record(
-                "skill_load_completed",
-                loaded_skill_count=len(result["loaded_skill_ids"]),
-                loaded_skill_ids=result["loaded_skill_ids"],
-                surface="console",
-            )
-            return result
-        except SkillNotFoundError as exc:
-            telemetry.record(
-                "skill_load_error",
-                code="skill_not_found",
-                requested_skill_count=len(request.skill_ids),
-                surface="console",
-            )
-            detail = structured_error("skill_not_found", str(exc), "check_skill_id")
-            raise HTTPException(status_code=404, detail=detail) from exc
-        except SkillRuntimeError as exc:
-            detail = structured_error("invalid_skill_request", str(exc), "reduce_skill_ids")
-            raise HTTPException(status_code=422, detail=detail) from exc
-
     @app.post(
         "/v1/skills/load",
         operation_id="loadSkills",
@@ -364,20 +332,8 @@ def create_app(
     def load_skills(request: LoadSkillsRequest) -> LoadSkillsResponse:
         try:
             result = runtime.load_skills(request.skill_ids)
-            telemetry.record(
-                "skill_load_completed",
-                loaded_skill_count=len(result["loaded_skill_ids"]),
-                loaded_skill_ids=result["loaded_skill_ids"],
-                surface="action",
-            )
             return LoadSkillsResponse.model_validate(result)
         except SkillNotFoundError as exc:
-            telemetry.record(
-                "skill_load_error",
-                code="skill_not_found",
-                requested_skill_count=len(request.skill_ids),
-                surface="action",
-            )
             detail = structured_error("skill_not_found", str(exc), "check_skill_id")
             raise HTTPException(status_code=404, detail=detail) from exc
         except SkillRuntimeError as exc:
@@ -401,29 +357,25 @@ def create_app(
                 start_line=request.start_line,
                 max_lines=request.max_lines,
             )
-            telemetry.record(
-                "skill_read_completed",
-                skill_id=request.skill_id,
-                path=request.path,
-                truncated=result["truncated"],
-            )
             return ReadSkillContentResponse.model_validate(result)
         except SkillNotFoundError as exc:
-            telemetry.record(
-                "skill_read_error",
-                code="skill_not_found",
-                skill_id=request.skill_id,
-                path=request.path,
-            )
             detail = structured_error("skill_not_found", str(exc), "check_skill_id")
             raise HTTPException(status_code=404, detail=detail) from exc
+        except SkillLineLimitError as exc:
+            detail = {
+                "error": {
+                    "code": "skill_line_exceeds_limit",
+                    "message": str(exc),
+                    "suggested_next_action": (
+                        "Use Workspace tools for this file or split the oversized line."
+                    ),
+                    "line_number": exc.line_number,
+                    "actual_chars": exc.actual_chars,
+                    "max_chars": exc.max_chars,
+                }
+            }
+            raise HTTPException(status_code=422, detail=detail) from exc
         except SkillPathError as exc:
-            telemetry.record(
-                "skill_read_error",
-                code="unsafe_or_missing_path",
-                skill_id=request.skill_id,
-                path=request.path,
-            )
             detail = structured_error("unsafe_or_missing_path", str(exc), "check_path")
             raise HTTPException(status_code=404, detail=detail) from exc
 
@@ -447,7 +399,6 @@ def create_app(
     register_browser_actions(
         app,
         resolved_browser_service,
-        telemetry=telemetry,
         protocol_skill_content_hash=protocol_skill_content_hash,
     )
     resolved_workspace_service = workspace_service or AnalysisWorkspaceService(
@@ -470,41 +421,6 @@ def create_app(
 
     app.router.add_event_handler("shutdown", close_browser_service)
     return app
-
-
-CONSOLE_HTML = """<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Skill Temple Console</title>
-</head>
-<body>
-  <h1>Skill Temple Console</h1>
-  <p>This hidden development console loads exact Skill IDs. It does not route or search.</p>
-  <label for="token">Bearer token</label>
-  <input id="token" type="password" />
-  <label for="skills">Skill ids, comma-separated</label>
-  <input id="skills" type="text" value="current-site-analysis,browser-action-protocol" />
-  <button id="run">Load</button>
-  <pre id="result">Ready.</pre>
-  <script>
-    document.getElementById('run').addEventListener('click', async () => {
-      const skillIds = document.getElementById('skills').value
-        .split(',').map(value => value.trim()).filter(Boolean);
-      const token = document.getElementById('token').value.trim();
-      const headers = {'Content-Type': 'application/json'};
-      if (token) headers.Authorization = `Bearer ${token}`;
-      const response = await fetch('/console/load', {
-        method: 'POST', headers, body: JSON.stringify({skill_ids: skillIds})
-      });
-      document.getElementById('result').textContent =
-        JSON.stringify(await response.json(), null, 2);
-    });
-  </script>
-</body>
-</html>
-"""
 
 
 app = create_app()

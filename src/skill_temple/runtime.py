@@ -15,7 +15,7 @@ from .content_hash import file_content_hash
 
 _SKILL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_BACKTICK_PATH_RE = re.compile(r"`((?:docs|references|scripts|assets)/[^`\r\n]+)`")
+_BACKTICK_PATH_RE = re.compile(r"`((?:docs|references|scripts|assets)/[^`\r\n]*)`")
 _MARKDOWN_LINK_RE = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
 
 DEFAULT_MAX_SKILLS = 3
@@ -37,6 +37,20 @@ class SkillPathError(SkillRuntimeError):
     """Raised when a requested Skill path is invalid, unsafe, or unavailable."""
 
 
+class SkillLineLimitError(SkillRuntimeError):
+    """Raised when one line cannot fit inside the bounded Skill read contract."""
+
+    def __init__(self, *, path: str, line_number: int, actual_chars: int, max_chars: int) -> None:
+        super().__init__(
+            f"Skill line exceeds read limit: path={path!r}, line={line_number}, "
+            f"actual_chars={actual_chars}, max_chars={max_chars}"
+        )
+        self.path = path
+        self.line_number = line_number
+        self.actual_chars = actual_chars
+        self.max_chars = max_chars
+
+
 @dataclass(frozen=True)
 class Skill:
     """A discovered SKILL.md entrypoint."""
@@ -46,6 +60,7 @@ class Skill:
     name: str
     description: str
     content_hash: str
+    referenced_paths: tuple[str, ...] = ()
 
     @property
     def entrypoint(self) -> str:
@@ -218,12 +233,22 @@ class SkillRuntime:
                 f"{SKILL_DESCRIPTION_MAX_CHARS} characters: {manifest_path}"
             )
         skill_id = _safe_skill_id(name)
-        return Skill(
+        skill = Skill(
             skill_id=skill_id,
             root=manifest_path.parent.resolve(),
             name=name,
             description=description,
             content_hash=_content_hash(manifest_path),
+        )
+        return Skill(
+            skill_id=skill.skill_id,
+            root=skill.root,
+            name=skill.name,
+            description=skill.description,
+            content_hash=skill.content_hash,
+            referenced_paths=tuple(
+                self._referenced_paths(skill, text, source_path=skill.entrypoint)
+            ),
         )
 
     def list_skills(self) -> dict[str, Any]:
@@ -266,7 +291,7 @@ class SkillRuntime:
                     "source_path": skill.source_path,
                     "content": context,
                     "content_hash": skill.content_hash,
-                    "referenced_paths": self._referenced_paths(skill, raw_content),
+                    "referenced_paths": list(skill.referenced_paths),
                 }
             )
         return {"skills": loaded, "loaded_skill_ids": selected_ids}
@@ -312,12 +337,15 @@ class SkillRuntime:
         max_end = min(len(lines), start + max_lines - 1)
         for line_number in range(start, max_end + 1):
             line = lines[line_number - 1]
+            if len(line) > max_chars:
+                raise SkillLineLimitError(
+                    path=path,
+                    line_number=line_number,
+                    actual_chars=len(line),
+                    max_chars=max_chars,
+                )
             added = len(line) + (1 if selected else 0)
             if selected and char_count + added > max_chars:
-                break
-            if not selected and len(line) > max_chars:
-                selected.append(line)
-                end = line_number
                 break
             selected.append(line)
             char_count += added
@@ -356,7 +384,13 @@ class SkillRuntime:
             raise SkillPathError(f"Unsafe skill path: {path!r}") from exc
         return candidate
 
-    def _referenced_paths(self, skill: Skill, text: str) -> list[str]:
+    def _referenced_paths(
+        self,
+        skill: Skill,
+        text: str,
+        *,
+        source_path: str,
+    ) -> list[str]:
         candidates = list(_BACKTICK_PATH_RE.findall(text))
         for target in _MARKDOWN_LINK_RE.findall(text):
             target = target.split("#", 1)[0].strip()
@@ -366,13 +400,28 @@ class SkillRuntime:
         result: list[str] = []
         for candidate in _unique_preserve_order(candidates):
             if "<" in candidate or ">" in candidate:
-                continue
+                raise SkillRuntimeError(
+                    f"Invalid Skill reference: skill_id={skill.skill_id!r}, "
+                    f"source={source_path!r}, path={candidate!r}"
+                )
             try:
                 file_path = self._resolve_path(skill, candidate)
-            except SkillPathError:
-                continue
-            if file_path.exists() and file_path.is_file():
-                result.append(candidate)
+            except SkillPathError as exc:
+                raise SkillRuntimeError(
+                    f"Unsafe Skill reference: skill_id={skill.skill_id!r}, "
+                    f"source={source_path!r}, path={candidate!r}"
+                ) from exc
+            if not file_path.exists():
+                raise SkillRuntimeError(
+                    f"Missing Skill reference: skill_id={skill.skill_id!r}, "
+                    f"source={source_path!r}, path={candidate!r}"
+                )
+            if not file_path.is_file():
+                raise SkillRuntimeError(
+                    f"Skill reference is not a file: skill_id={skill.skill_id!r}, "
+                    f"source={source_path!r}, path={candidate!r}"
+                )
+            result.append(candidate)
         return result
 
     @staticmethod

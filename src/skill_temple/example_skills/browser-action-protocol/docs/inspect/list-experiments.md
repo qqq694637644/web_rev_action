@@ -31,9 +31,9 @@ Decoded example:
 {
   "contract_version": "2.0",
   "operation": "list_experiments",
-  "operation_contract_hash": "sha256:d24fcb46ac1f983990cedbcf388b62a5a8011be54e8dbeb7bd1cfc09f555ef17",
+  "operation_contract_hash": "sha256:c25eb04e31f242889cf19123558bc7131f7ed1ca1056851ab4e380f547edfc05",
   "payload_json": "{\"limit\":20,\"session_id\":\"analysis-main\"}",
-  "skill_content_hash": "sha256:786f2331d061583e44fc9dc7344bae933a380d13006b65d1e88f4ae31ad64e6e",
+  "skill_content_hash": "sha256:c946be3a448d82b76d66ab102a92b09185bf02beda384e1db695c229ab3a45ba",
   "skill_id": "browser-action-protocol"
 }
 ```
@@ -47,47 +47,14 @@ Typical errors: `invalid_operation_payload`.
 
 Next recommended inspect operation: `get_experiment` for one selected exact ID.
 
-Contract hash: `sha256:d24fcb46ac1f983990cedbcf388b62a5a8011be54e8dbeb7bd1cfc09f555ef17`. Send it in `operation_contract_hash`.
+Contract hash: `sha256:c25eb04e31f242889cf19123558bc7131f7ed1ca1056851ab4e380f547edfc05`. Send it in `operation_contract_hash`.
 
 <!-- BEGIN GENERATED CONTRACT -->
-## Generated structural contract
+## Contract binding
 
-> Generated from `OperationRegistry` and Pydantic. Do not edit this block.
+> Generated from the public operation contract. Do not edit this block.
 
-- Request model: `ListExperimentsRequest`
-- Payload model: `ListExperimentsPayload`
-- Registry handler: `_inspect_list_experiments`
+- Action: `inspect`
 - Consequential: `false`
-- Operation contract hash: `sha256:d24fcb46ac1f983990cedbcf388b62a5a8011be54e8dbeb7bd1cfc09f555ef17`
-
-```json
-{
-  "additionalProperties": false,
-  "properties": {
-    "limit": {
-      "default": 50,
-      "maximum": 200,
-      "minimum": 1,
-      "title": "Limit",
-      "type": "integer"
-    },
-    "session_id": {
-      "anyOf": [
-        {
-          "maxLength": 128,
-          "pattern": "^[a-zA-Z0-9_.-]+$",
-          "type": "string"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Session Id"
-    }
-  },
-  "title": "ListExperimentsPayload",
-  "type": "object"
-}
-```
+- Operation contract hash: `sha256:c25eb04e31f242889cf19123558bc7131f7ed1ca1056851ab4e380f547edfc05`
 <!-- END GENERATED CONTRACT -->

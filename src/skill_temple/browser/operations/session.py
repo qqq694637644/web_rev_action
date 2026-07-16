@@ -428,51 +428,77 @@ class BrowserSessionOperations:
     @staticmethod
     def _checkpoint_from_wait_result(
         result: dict[str, Any],
-        fallback: StreamCheckpoint,
     ) -> StreamCheckpoint:
+        def invalid(path: str) -> BrowserServiceError:
+            return BrowserServiceError(
+                "invalid_adapter_response",
+                f"Invalid adapter response at {path}",
+                502,
+                dispatch_started=True,
+            )
+
         value = result.get("checkpoint")
         if not isinstance(value, dict):
-            return fallback
+            raise invalid("/checkpoint")
+        if set(value) != {"version", "requests"}:
+            raise invalid("/checkpoint")
+        version = value.get("version")
+        if not isinstance(version, int) or isinstance(version, bool) or version < 0:
+            raise invalid("/checkpoint/version")
         requests_value = value.get("requests")
+        if not isinstance(requests_value, dict):
+            raise invalid("/checkpoint/requests")
         requests: dict[str, StreamRequestCheckpoint] = {}
-        if isinstance(requests_value, dict):
-            for request_id, request_value in requests_value.items():
-                if not isinstance(request_value, dict):
-                    continue
-                requests[str(request_id)] = StreamRequestCheckpoint(
-                    response_observed=bool(request_value.get("response_observed", False)),
-                    status=(
-                        str(request_value["status"])
-                        if request_value.get("status") is not None
-                        else None
-                    ),
-                    terminal_wall_time_ms=(
-                        float(request_value["terminal_wall_time_ms"])
-                        if isinstance(
-                            request_value.get("terminal_wall_time_ms"),
-                            (int, float),
-                        )
-                        else None
-                    ),
-                    raw_event_index=(
-                        int(request_value["raw_event_index"])
-                        if isinstance(request_value.get("raw_event_index"), int)
-                        else -1
-                    ),
-                    semantic_event_index=(
-                        int(request_value["semantic_event_index"])
-                        if isinstance(request_value.get("semantic_event_index"), int)
-                        else -1
-                    ),
-                    primary_event_source=str(request_value.get("primary_event_source") or "none"),
-                )
-        return StreamCheckpoint(
-            version=max(
-                fallback.version,
-                int(value.get("version", result.get("capture_version", 0)) or 0),
-            ),
-            requests=requests or fallback.requests,
-        )
+        expected_fields = {
+            "response_observed",
+            "status",
+            "terminal_wall_time_ms",
+            "raw_event_index",
+            "semantic_event_index",
+            "primary_event_source",
+        }
+        for request_id, request_value in requests_value.items():
+            request_path = f"/checkpoint/requests/{request_id}"
+            if not isinstance(request_id, str) or not request_id:
+                raise invalid("/checkpoint/requests")
+            if not isinstance(request_value, dict) or set(request_value) != expected_fields:
+                raise invalid(request_path)
+            response_observed = request_value["response_observed"]
+            status = request_value["status"]
+            terminal_wall_time_ms = request_value["terminal_wall_time_ms"]
+            raw_event_index = request_value["raw_event_index"]
+            semantic_event_index = request_value["semantic_event_index"]
+            primary_event_source = request_value["primary_event_source"]
+            if not isinstance(response_observed, bool):
+                raise invalid(f"{request_path}/response_observed")
+            if status is not None and not isinstance(status, str):
+                raise invalid(f"{request_path}/status")
+            if terminal_wall_time_ms is not None and (
+                not isinstance(terminal_wall_time_ms, (int, float))
+                or isinstance(terminal_wall_time_ms, bool)
+            ):
+                raise invalid(f"{request_path}/terminal_wall_time_ms")
+            if not isinstance(raw_event_index, int) or isinstance(raw_event_index, bool):
+                raise invalid(f"{request_path}/raw_event_index")
+            if not isinstance(semantic_event_index, int) or isinstance(
+                semantic_event_index, bool
+            ):
+                raise invalid(f"{request_path}/semantic_event_index")
+            if not isinstance(primary_event_source, str):
+                raise invalid(f"{request_path}/primary_event_source")
+            requests[request_id] = StreamRequestCheckpoint(
+                response_observed=response_observed,
+                status=status,
+                terminal_wall_time_ms=(
+                    float(terminal_wall_time_ms)
+                    if terminal_wall_time_ms is not None
+                    else None
+                ),
+                raw_event_index=raw_event_index,
+                semantic_event_index=semantic_event_index,
+                primary_event_source=primary_event_source,
+            )
+        return StreamCheckpoint(version=version, requests=requests)
 
     def _ensure_finalize_reserve(self, deadline: Deadline, operation: str) -> None:
         if deadline.remaining_ms() <= self.FINALIZE_RESERVE_MS:

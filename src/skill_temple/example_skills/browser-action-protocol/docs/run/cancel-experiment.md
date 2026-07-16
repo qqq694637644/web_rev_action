@@ -33,9 +33,9 @@ Decoded example:
 {
   "contract_version": "2.0",
   "operation": "cancel_experiment",
-  "operation_contract_hash": "sha256:a7421f7619f8113fbfd5ee71ebf8bf3a9f9c07fa66756d71c801eb29c8b70a74",
+  "operation_contract_hash": "sha256:543ebcf7a9fa084976d4dddfd305a6d6b7cf4d7ea911edb71fe478452eb1f86c",
   "payload_json": "{\"experiment_id\":\"exp_running\",\"session_id\":\"analysis-main\"}",
-  "skill_content_hash": "sha256:786f2331d061583e44fc9dc7344bae933a380d13006b65d1e88f4ae31ad64e6e",
+  "skill_content_hash": "sha256:c946be3a448d82b76d66ab102a92b09185bf02beda384e1db695c229ab3a45ba",
   "skill_id": "browser-action-protocol"
 }
 ```
@@ -49,42 +49,14 @@ Typical errors: `invalid_operation_payload`, `experiment_not_found`, `experiment
 
 Next recommended inspect operation: `get_experiment`.
 
-Contract hash: `sha256:a7421f7619f8113fbfd5ee71ebf8bf3a9f9c07fa66756d71c801eb29c8b70a74`. Send it in `operation_contract_hash`.
+Contract hash: `sha256:543ebcf7a9fa084976d4dddfd305a6d6b7cf4d7ea911edb71fe478452eb1f86c`. Send it in `operation_contract_hash`.
 
 <!-- BEGIN GENERATED CONTRACT -->
-## Generated structural contract
+## Contract binding
 
-> Generated from `OperationRegistry` and Pydantic. Do not edit this block.
+> Generated from the public operation contract. Do not edit this block.
 
-- Request model: `CancelExperimentRequest`
-- Payload model: `CancelExperimentPayload`
-- Registry handler: `dispatch_cancel_experiment`
+- Action: `run`
 - Consequential: `true`
-- Operation contract hash: `sha256:a7421f7619f8113fbfd5ee71ebf8bf3a9f9c07fa66756d71c801eb29c8b70a74`
-
-```json
-{
-  "additionalProperties": false,
-  "properties": {
-    "experiment_id": {
-      "maxLength": 128,
-      "pattern": "^[a-zA-Z0-9_.-]+$",
-      "title": "Experiment Id",
-      "type": "string"
-    },
-    "session_id": {
-      "maxLength": 128,
-      "pattern": "^[a-zA-Z0-9_.-]+$",
-      "title": "Session Id",
-      "type": "string"
-    }
-  },
-  "required": [
-    "experiment_id",
-    "session_id"
-  ],
-  "title": "CancelExperimentPayload",
-  "type": "object"
-}
-```
+- Operation contract hash: `sha256:543ebcf7a9fa084976d4dddfd305a6d6b7cf4d7ea911edb71fe478452eb1f86c`
 <!-- END GENERATED CONTRACT -->

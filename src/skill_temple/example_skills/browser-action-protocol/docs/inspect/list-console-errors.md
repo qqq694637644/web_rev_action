@@ -32,9 +32,9 @@ Decoded example:
 {
   "contract_version": "2.0",
   "operation": "list_console_errors",
-  "operation_contract_hash": "sha256:379c6f18f81509c5a8d0d3de32e1aede8eff3f3fca5fc9eabd70f3078b93b8dd",
+  "operation_contract_hash": "sha256:eb17de31b00a3bce940d691c4b29530ae193fc2d61bcc32273ab3dff336b7826",
   "payload_json": "{\"experiment_id\":\"exp_capture\",\"limit\":100}",
-  "skill_content_hash": "sha256:786f2331d061583e44fc9dc7344bae933a380d13006b65d1e88f4ae31ad64e6e",
+  "skill_content_hash": "sha256:c946be3a448d82b76d66ab102a92b09185bf02beda384e1db695c229ab3a45ba",
   "skill_id": "browser-action-protocol"
 }
 ```
@@ -48,42 +48,14 @@ Typical errors: `invalid_operation_payload`, `experiment_not_found`.
 
 Next recommended inspect operation: `get_experiment` or the evidence operation relevant to the error's associated request/script.
 
-Contract hash: `sha256:379c6f18f81509c5a8d0d3de32e1aede8eff3f3fca5fc9eabd70f3078b93b8dd`. Send it in `operation_contract_hash`.
+Contract hash: `sha256:eb17de31b00a3bce940d691c4b29530ae193fc2d61bcc32273ab3dff336b7826`. Send it in `operation_contract_hash`.
 
 <!-- BEGIN GENERATED CONTRACT -->
-## Generated structural contract
+## Contract binding
 
-> Generated from `OperationRegistry` and Pydantic. Do not edit this block.
+> Generated from the public operation contract. Do not edit this block.
 
-- Request model: `ListConsoleErrorsRequest`
-- Payload model: `ListConsoleErrorsPayload`
-- Registry handler: `_inspect_list_console_errors`
+- Action: `inspect`
 - Consequential: `false`
-- Operation contract hash: `sha256:379c6f18f81509c5a8d0d3de32e1aede8eff3f3fca5fc9eabd70f3078b93b8dd`
-
-```json
-{
-  "additionalProperties": false,
-  "properties": {
-    "experiment_id": {
-      "maxLength": 128,
-      "pattern": "^[a-zA-Z0-9_.-]+$",
-      "title": "Experiment Id",
-      "type": "string"
-    },
-    "limit": {
-      "default": 100,
-      "maximum": 500,
-      "minimum": 1,
-      "title": "Limit",
-      "type": "integer"
-    }
-  },
-  "required": [
-    "experiment_id"
-  ],
-  "title": "ListConsoleErrorsPayload",
-  "type": "object"
-}
-```
+- Operation contract hash: `sha256:eb17de31b00a3bce940d691c4b29530ae193fc2d61bcc32273ab3dff336b7826`
 <!-- END GENERATED CONTRACT -->

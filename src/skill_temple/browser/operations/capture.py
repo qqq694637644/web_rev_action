@@ -566,7 +566,6 @@ class BrowserCaptureOperations:
                     )
                     stream_checkpoint = self._checkpoint_from_wait_result(
                         wait_result,
-                        stream_checkpoint,
                     )
                     wait_observations.append(
                         {

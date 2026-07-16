@@ -33,9 +33,9 @@ Decoded example:
 {
   "contract_version": "2.0",
   "operation": "list_evidence",
-  "operation_contract_hash": "sha256:f98fc845165362d1e76f45faaa9c403e4607db2c5df930c87fdc017a4ca740f9",
+  "operation_contract_hash": "sha256:562bef93cea0a9ad9502a97e1b31b6e240000834f9e4adeeaaad9a8992c4b073",
   "payload_json": "{\"experiment_id\":\"exp_capture\",\"kind\":\"network_request\",\"limit\":100}",
-  "skill_content_hash": "sha256:786f2331d061583e44fc9dc7344bae933a380d13006b65d1e88f4ae31ad64e6e",
+  "skill_content_hash": "sha256:c946be3a448d82b76d66ab102a92b09185bf02beda384e1db695c229ab3a45ba",
   "skill_id": "browser-action-protocol"
 }
 ```
@@ -49,55 +49,14 @@ Typical errors: `invalid_operation_payload`, `experiment_not_found`.
 
 Next recommended inspect operation: the exact evidence reader such as `get_network_evidence`, `get_request_shape`, or `get_request_initiator`.
 
-Contract hash: `sha256:f98fc845165362d1e76f45faaa9c403e4607db2c5df930c87fdc017a4ca740f9`. Send it in `operation_contract_hash`.
+Contract hash: `sha256:562bef93cea0a9ad9502a97e1b31b6e240000834f9e4adeeaaad9a8992c4b073`. Send it in `operation_contract_hash`.
 
 <!-- BEGIN GENERATED CONTRACT -->
-## Generated structural contract
+## Contract binding
 
-> Generated from `OperationRegistry` and Pydantic. Do not edit this block.
+> Generated from the public operation contract. Do not edit this block.
 
-- Request model: `ListEvidenceRequest`
-- Payload model: `ListEvidencePayload`
-- Registry handler: `_inspect_list_evidence`
+- Action: `inspect`
 - Consequential: `false`
-- Operation contract hash: `sha256:f98fc845165362d1e76f45faaa9c403e4607db2c5df930c87fdc017a4ca740f9`
-
-```json
-{
-  "additionalProperties": false,
-  "properties": {
-    "experiment_id": {
-      "maxLength": 128,
-      "pattern": "^[a-zA-Z0-9_.-]+$",
-      "title": "Experiment Id",
-      "type": "string"
-    },
-    "kind": {
-      "anyOf": [
-        {
-          "maxLength": 128,
-          "type": "string"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Kind"
-    },
-    "limit": {
-      "default": 100,
-      "maximum": 500,
-      "minimum": 1,
-      "title": "Limit",
-      "type": "integer"
-    }
-  },
-  "required": [
-    "experiment_id"
-  ],
-  "title": "ListEvidencePayload",
-  "type": "object"
-}
-```
+- Operation contract hash: `sha256:562bef93cea0a9ad9502a97e1b31b6e240000834f9e4adeeaaad9a8992c4b073`
 <!-- END GENERATED CONTRACT -->

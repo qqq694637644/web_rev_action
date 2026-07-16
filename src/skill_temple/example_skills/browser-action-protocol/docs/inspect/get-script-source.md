@@ -36,9 +36,9 @@ Decoded example:
 {
   "contract_version": "2.0",
   "operation": "get_script_source",
-  "operation_contract_hash": "sha256:2723c7359395284ac7be6e5d57a7a6378a9f72c7f3a688b751c2a8cf8a9bc308",
+  "operation_contract_hash": "sha256:aab8f48653050d5584cc62659e38daa0895ac6f4a928e0761fd27e3844861b96",
   "payload_json": "{\"length\":4000,\"offset\":0,\"script_id\":\"script-17\",\"session_id\":\"analysis-main\"}",
-  "skill_content_hash": "sha256:786f2331d061583e44fc9dc7344bae933a380d13006b65d1e88f4ae31ad64e6e",
+  "skill_content_hash": "sha256:c946be3a448d82b76d66ab102a92b09185bf02beda384e1db695c229ab3a45ba",
   "skill_id": "browser-action-protocol"
 }
 ```
@@ -52,114 +52,14 @@ Typical errors: `invalid_operation_payload`, `session_not_found`, `page_alignmen
 
 Next recommended operation: `save_script_source` when the source region supports a claim.
 
-Contract hash: `sha256:2723c7359395284ac7be6e5d57a7a6378a9f72c7f3a688b751c2a8cf8a9bc308`. Send it in `operation_contract_hash`.
+Contract hash: `sha256:aab8f48653050d5584cc62659e38daa0895ac6f4a928e0761fd27e3844861b96`. Send it in `operation_contract_hash`.
 
 <!-- BEGIN GENERATED CONTRACT -->
-## Generated structural contract
+## Contract binding
 
-> Generated from `OperationRegistry` and Pydantic. Do not edit this block.
+> Generated from the public operation contract. Do not edit this block.
 
-- Request model: `GetScriptSourceRequest`
-- Payload model: `GetScriptSourcePayload`
-- Registry handler: `_inspect_get_script_source`
+- Action: `inspect`
 - Consequential: `false`
-- Operation contract hash: `sha256:2723c7359395284ac7be6e5d57a7a6378a9f72c7f3a688b751c2a8cf8a9bc308`
-
-```json
-{
-  "additionalProperties": false,
-  "properties": {
-    "end_line": {
-      "anyOf": [
-        {
-          "minimum": 1,
-          "type": "integer"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "End Line"
-    },
-    "length": {
-      "anyOf": [
-        {
-          "maximum": 200000,
-          "minimum": 1,
-          "type": "integer"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Length"
-    },
-    "offset": {
-      "anyOf": [
-        {
-          "minimum": 0,
-          "type": "integer"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Offset"
-    },
-    "script_id": {
-      "anyOf": [
-        {
-          "maxLength": 512,
-          "type": "string"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Script Id"
-    },
-    "session_id": {
-      "maxLength": 128,
-      "pattern": "^[a-zA-Z0-9_.-]+$",
-      "title": "Session Id",
-      "type": "string"
-    },
-    "start_line": {
-      "anyOf": [
-        {
-          "minimum": 1,
-          "type": "integer"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Start Line"
-    },
-    "url": {
-      "anyOf": [
-        {
-          "maxLength": 8192,
-          "type": "string"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Url"
-    }
-  },
-  "required": [
-    "session_id"
-  ],
-  "title": "GetScriptSourcePayload",
-  "type": "object"
-}
-```
+- Operation contract hash: `sha256:aab8f48653050d5584cc62659e38daa0895ac6f4a928e0761fd27e3844861b96`
 <!-- END GENERATED CONTRACT -->

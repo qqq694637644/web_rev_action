@@ -69,7 +69,6 @@ class StepExecutor:
                     )
                     stream_checkpoint = service._checkpoint_from_wait_result(
                         result,
-                        stream_checkpoint,
                     )
                     wait_observations.append(
                         {

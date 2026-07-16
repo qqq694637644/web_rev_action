@@ -1233,6 +1233,20 @@ OperationRegistry + Pydantic model_json_schema()
 
 生成。
 
+`operation_contract_hash` 只绑定公共合同：
+
+```text
+operation
+action
+consequential
+transport version
+规范化后的 payload JSON Schema
+```
+
+Python request/payload 类名、handler 名和文档路径不参与 hash。生成器只维护简短
+operation 文档中的完整 envelope/hash，以及一个精简 operation 索引；不把完整 Schema
+重复写入 Markdown、逐 operation JSON 和 aggregate catalog。
+
 人工维护：
 
 ```text
@@ -1602,8 +1616,7 @@ P0-A、P0-B、P0-C 必须放在同一个 PR 中合并，形成一个原子破坏
 - operation contract hash；
 - manifest 绑定；
 - stale contract；
-- 按 eval 决定 `browser-experiment-recovery`；
-- telemetry。
+- 按 eval 决定 `browser-experiment-recovery`。
 
 ## P3：发布固化与死代码审计
 
@@ -1668,7 +1681,6 @@ skill/contract hash
 manifest
 stale contract
 recovery
-telemetry
 ```
 
 ---

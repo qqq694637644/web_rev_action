@@ -31,9 +31,9 @@ Decoded example:
 {
   "contract_version": "2.0",
   "operation": "get_network_evidence",
-  "operation_contract_hash": "sha256:45fe0f176119a664fd872bfe1fa61fe0e3b1814021a3a2cb8ded59acd452ba46",
+  "operation_contract_hash": "sha256:c36fae4a178b20cbe8576ce6269877fc0cb41be81645e4d031f9d086fb8a10ce",
   "payload_json": "{\"evidence_id\":\"ev_network_request\",\"experiment_id\":\"exp_capture\"}",
-  "skill_content_hash": "sha256:786f2331d061583e44fc9dc7344bae933a380d13006b65d1e88f4ae31ad64e6e",
+  "skill_content_hash": "sha256:c946be3a448d82b76d66ab102a92b09185bf02beda384e1db695c229ab3a45ba",
   "skill_id": "browser-action-protocol"
 }
 ```
@@ -47,42 +47,14 @@ Typical errors: `invalid_operation_payload`, `experiment_not_found`, `evidence_n
 
 Next recommended inspect operations: `get_request_shape` and `get_request_initiator` for the same exact evidence ID.
 
-Contract hash: `sha256:45fe0f176119a664fd872bfe1fa61fe0e3b1814021a3a2cb8ded59acd452ba46`. Send it in `operation_contract_hash`.
+Contract hash: `sha256:c36fae4a178b20cbe8576ce6269877fc0cb41be81645e4d031f9d086fb8a10ce`. Send it in `operation_contract_hash`.
 
 <!-- BEGIN GENERATED CONTRACT -->
-## Generated structural contract
+## Contract binding
 
-> Generated from `OperationRegistry` and Pydantic. Do not edit this block.
+> Generated from the public operation contract. Do not edit this block.
 
-- Request model: `GetNetworkEvidenceRequest`
-- Payload model: `GetNetworkEvidencePayload`
-- Registry handler: `_inspect_get_network_evidence`
+- Action: `inspect`
 - Consequential: `false`
-- Operation contract hash: `sha256:45fe0f176119a664fd872bfe1fa61fe0e3b1814021a3a2cb8ded59acd452ba46`
-
-```json
-{
-  "additionalProperties": false,
-  "properties": {
-    "evidence_id": {
-      "maxLength": 256,
-      "pattern": "^[a-zA-Z0-9_.-]+$",
-      "title": "Evidence Id",
-      "type": "string"
-    },
-    "experiment_id": {
-      "maxLength": 128,
-      "pattern": "^[a-zA-Z0-9_.-]+$",
-      "title": "Experiment Id",
-      "type": "string"
-    }
-  },
-  "required": [
-    "experiment_id",
-    "evidence_id"
-  ],
-  "title": "GetNetworkEvidencePayload",
-  "type": "object"
-}
-```
+- Operation contract hash: `sha256:c36fae4a178b20cbe8576ce6269877fc0cb41be81645e4d031f9d086fb8a10ce`
 <!-- END GENERATED CONTRACT -->

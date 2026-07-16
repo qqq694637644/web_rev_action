@@ -173,9 +173,11 @@ skill-temple-build-prompt `
 选择精确 ID，再调用 `loadSkills`；入口明确引用的资料才通过 `readSkillContent` 读取。
 
 Browser operation 的唯一结构来源是 `browser/registry.py`。Registry 同时驱动 Action
-分类、内部 request model、dispatcher handler、协议文档路径、生成 JSON Schema 和
-`operation_contract_hash`。`skill-temple-build-contracts` 生成逐 operation 合同和
-`docs/generated/operation-contracts.json`；CI 会在生成结果与提交内容不一致时失败。
+分类、内部 request model、dispatcher handler和协议文档路径。`operation_contract_hash`
+只绑定 operation、Action 分类、consequential、transport version 和规范化后的公共
+payload JSON Schema，不绑定 Python 类名、handler 名或文档路径。
+`skill-temple-build-contracts` 只刷新简短 operation 文档中的 envelope/hash 与精简的
+`docs/generated/operation-contracts.json` 索引；不再生成重复的逐 operation schema JSON。
 
 发布前先运行本地 Builder preflight：
 
@@ -364,19 +366,6 @@ action_transport_version
 skill_id
 skill_content_hash
 operation_contract_hash
-```
-
-## Privacy-safe telemetry
-
-服务在 analysis workspace 的 `telemetry/action-events.jsonl` 记录 bounded metadata：Skill
-加载数量、operation、验证结果、dispatch state、terminal status 和错误 code。它不记录
-`payload_json`、请求/响应正文或凭据；记录器只接受预定义事件、字段和标量类型，未批准
-字段会直接报错且不会写入文件。生成汇总：
-
-```powershell
-skill-temple-telemetry-report `
-  data/analysis-workspace/telemetry/action-events.jsonl `
-  --output data/analysis-workspace/reports/action-telemetry-summary.json
 ```
 
 `replay_protocol` 和其 hash 表示应用默认值及 stream 自动升级后的有效配置，包括最终
@@ -993,4 +982,5 @@ Synthetic fixture 使用通用 resource/record/cursor 状态模型和自定义 `
 终止事件。它覆盖 2xx、4xx、5xx、cookie/session、stream、replay、mutation、binding、取消和
 artifact；不代表任何真实网页协议。
 
-详细路线见 `PLAN.md`，Pandora 分析方法见 `PANDORA_REPRODUCTION.md`。
+当前重构路线见 `SKILL_DRIVEN_ACTION_REFACTORING_PLAN.md`，Pandora 分析方法见
+`PANDORA_REPRODUCTION.md`。

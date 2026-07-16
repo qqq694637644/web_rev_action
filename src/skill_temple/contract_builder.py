@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -82,23 +83,16 @@ def _envelope(
 
 
 def _generated_block(spec: OperationSpec) -> str:
-    schema = spec.payload_model.model_json_schema(mode="validation")
     return "\n".join(
         [
             _GENERATED_START,
-            "## Generated structural contract",
+            "## Contract binding",
             "",
-            "> Generated from `OperationRegistry` and Pydantic. Do not edit this block.",
+            "> Generated from the public operation contract. Do not edit this block.",
             "",
-            f"- Request model: `{spec.request_model.__name__}`",
-            f"- Payload model: `{spec.payload_model.__name__}`",
-            f"- Registry handler: `{spec.handler_name}`",
+            f"- Action: `{spec.action}`",
             f"- Consequential: `{'true' if spec.consequential else 'false'}`",
             f"- Operation contract hash: `{spec.contract_hash}`",
-            "",
-            "```json",
-            _json(schema),
-            "```",
             _GENERATED_END,
         ]
     )
@@ -176,6 +170,9 @@ def build_contracts(protocol_root: str | Path) -> list[Path]:
     written: list[Path] = []
     generated_root = root / "docs" / "generated"
     generated_root.mkdir(parents=True, exist_ok=True)
+    for obsolete_dir in (generated_root / "run", generated_root / "inspect"):
+        if obsolete_dir.exists():
+            shutil.rmtree(obsolete_dir)
 
     catalog = OPERATION_REGISTRY.generated_catalog()
     catalog["protocol_skill_content_hash"] = skill_content_hash
@@ -194,20 +191,6 @@ def build_contracts(protocol_root: str | Path) -> list[Path]:
         )
         doc_path.write_text(rendered, encoding="utf-8", newline="\n")
         written.append(doc_path)
-
-        structural_path = (
-            generated_root / spec.action / f"{spec.name.replace('_', '-')}.json"
-        )
-        structural_path.parent.mkdir(parents=True, exist_ok=True)
-        structural = {
-            **spec.generated_contract(),
-            "operation_contract_hash": spec.contract_hash,
-            "protocol_skill_content_hash": skill_content_hash,
-        }
-        structural_path.write_text(
-            _json(structural) + "\n", encoding="utf-8", newline="\n"
-        )
-        written.append(structural_path)
 
     index_path = root / "docs" / "operation-index.md"
     index_text = index_path.read_text(encoding="utf-8")

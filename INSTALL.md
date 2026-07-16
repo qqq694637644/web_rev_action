@@ -357,13 +357,6 @@ python -m skill_temple.builder_preflight --root .
 git diff --exit-code -- src/skill_temple/example_skills/browser-action-protocol
 ```
 
-Telemetry 只保存 metadata，不保存 payload 或凭据。查看汇总：
-
-```powershell
-skill-temple-telemetry-report `
-  .\data\analysis-workspace\telemetry\action-events.jsonl
-```
-
 真实浏览器工具链验证：
 
 ```powershell

@@ -20,7 +20,6 @@ from .browser_models import (
     RunBrowserExperimentEnvelope,
 )
 from .browser_service import BrowserActionService, BrowserServiceError
-from .telemetry import TelemetryRecorder
 
 _BROWSER_PATHS = {"/v1/browser/inspect", "/v1/browser/run"}
 
@@ -58,7 +57,6 @@ def _browser_error(
 def register_browser_actions(
     app: FastAPI,
     service: BrowserActionService,
-    telemetry: TelemetryRecorder | None = None,
     protocol_skill_content_hash: str | None = None,
 ) -> None:
     app.state.browser_action_service = service
@@ -107,53 +105,17 @@ def register_browser_actions(
     async def inspect_browser_evidence(
         envelope: InspectBrowserEvidenceEnvelope,
     ) -> BrowserActionResponse | JSONResponse:
-        if telemetry is not None:
-            telemetry.record(
-                "browser_request_received",
-                action="inspect",
-                operation=envelope.operation,
-            )
         try:
             request = decode_inspect_envelope(
                 envelope,
                 skill_content_hash=protocol_skill_content_hash,
             )
         except BrowserTransportError as exc:
-            if telemetry is not None:
-                telemetry.record(
-                    "browser_request_error",
-                    action="inspect",
-                    operation=envelope.operation,
-                    code=exc.code,
-                    dispatch_started=False,
-                )
             return JSONResponse(status_code=exc.status_code, content=exc.response_content())
-        if telemetry is not None:
-            telemetry.record(
-                "browser_request_valid",
-                action="inspect",
-                operation=envelope.operation,
-            )
         try:
             response = await service.inspect(request)
-            if telemetry is not None:
-                telemetry.record(
-                    "browser_request_completed",
-                    action="inspect",
-                    operation=envelope.operation,
-                    status=response.status,
-                )
             return response
         except BrowserServiceError as exc:
-            if telemetry is not None:
-                telemetry.record(
-                    "browser_request_error",
-                    action="inspect",
-                    operation=envelope.operation,
-                    code=exc.code,
-                    dispatch_started=exc.dispatch_started,
-                    outcome=exc.outcome,
-                )
             return JSONResponse(
                 status_code=exc.status_code,
                 content=_browser_error(
@@ -183,53 +145,17 @@ def register_browser_actions(
     async def run_browser_experiment(
         envelope: RunBrowserExperimentEnvelope,
     ) -> BrowserActionResponse | JSONResponse:
-        if telemetry is not None:
-            telemetry.record(
-                "browser_request_received",
-                action="run",
-                operation=envelope.operation,
-            )
         try:
             request = decode_run_envelope(
                 envelope,
                 skill_content_hash=protocol_skill_content_hash,
             )
         except BrowserTransportError as exc:
-            if telemetry is not None:
-                telemetry.record(
-                    "browser_request_error",
-                    action="run",
-                    operation=envelope.operation,
-                    code=exc.code,
-                    dispatch_started=False,
-                )
             return JSONResponse(status_code=exc.status_code, content=exc.response_content())
-        if telemetry is not None:
-            telemetry.record(
-                "browser_request_valid",
-                action="run",
-                operation=envelope.operation,
-            )
         try:
             response = await service.run(request)
-            if telemetry is not None:
-                telemetry.record(
-                    "browser_request_completed",
-                    action="run",
-                    operation=envelope.operation,
-                    status=response.status,
-                )
             return response
         except BrowserServiceError as exc:
-            if telemetry is not None:
-                telemetry.record(
-                    "browser_request_error",
-                    action="run",
-                    operation=envelope.operation,
-                    code=exc.code,
-                    dispatch_started=exc.dispatch_started,
-                    outcome=exc.outcome,
-                )
             return JSONResponse(
                 status_code=exc.status_code,
                 content=_browser_error(
@@ -239,32 +165,8 @@ def register_browser_actions(
                     dispatch_started=exc.dispatch_started,
                     outcome=exc.outcome,
                     suggested_next_action=(
-                        "Inspect the session or experiment before retrying when "
-                        "dispatch_started is true."
-                    ),
-                ),
-            )
-        except (RuntimeError, OSError) as exc:
-            if telemetry is not None:
-                telemetry.record(
-                    "browser_request_error",
-                    action="run",
-                    operation=envelope.operation,
-                    code="operation_outcome_unknown",
-                    dispatch_started=True,
-                    outcome="unknown",
-                )
-            return JSONResponse(
-                status_code=502,
-                content=_browser_error(
-                    code="operation_outcome_unknown",
-                    operation=envelope.operation,
-                    message=str(exc)[:4000],
-                    dispatch_started=True,
-                    outcome="unknown",
-                    suggested_next_action=(
-                        "Inspect the session or experiment terminal state; do not "
-                        "repeat the run operation."
+                        "Inspect the session or experiment; do not repeat the operation "
+                        "while dispatch_started is true and the outcome is unresolved."
                     ),
                 ),
             )

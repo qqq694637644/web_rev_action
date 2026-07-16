@@ -34,21 +34,21 @@ contract paths, and operation contract hashes.
 
 | Operation | Action | Consequential | Contract path | Contract hash |
 |---|---|---:|---|---|
-| `cancel_experiment` | `run` | `true` | `docs/run/cancel-experiment.md` | `sha256:a7421f7619f8113fbfd5ee71ebf8bf3a9f9c07fa66756d71c801eb29c8b70a74` |
-| `capture_flow` | `run` | `true` | `docs/run/capture-flow.md` | `sha256:90fcbfeab8fbabfd4ed9ab01a138cec718d2322dfd5e815be5ced5757b0f5b7e` |
-| `close_session` | `run` | `true` | `docs/run/close-session.md` | `sha256:bc79ed315e19856450b20815474760de328baa3562bdd092495c6d5ace9f6593` |
-| `get_experiment` | `inspect` | `false` | `docs/inspect/get-experiment.md` | `sha256:90218fa0eeadf8306cbdaad27449244d9d25a31ae8f6ae192eefe0f7e35a6e51` |
-| `get_network_evidence` | `inspect` | `false` | `docs/inspect/get-network-evidence.md` | `sha256:45fe0f176119a664fd872bfe1fa61fe0e3b1814021a3a2cb8ded59acd452ba46` |
-| `get_request_initiator` | `inspect` | `false` | `docs/inspect/get-request-initiator.md` | `sha256:ea6094207fd9c0dc02c6af6e1567be8378918597c8eb717e1462bd9fc6fcffc2` |
-| `get_request_shape` | `inspect` | `false` | `docs/inspect/get-request-shape.md` | `sha256:c45c7c6374acbf91a7c66ce3baa9e10f609900a8f8c51212158541edaeb60ce5` |
-| `get_script_source` | `inspect` | `false` | `docs/inspect/get-script-source.md` | `sha256:2723c7359395284ac7be6e5d57a7a6378a9f72c7f3a688b751c2a8cf8a9bc308` |
-| `get_session` | `inspect` | `false` | `docs/inspect/get-session.md` | `sha256:678486890fadfab343752c0a7feefd89339b0de41082648ddd59746259eb7031` |
-| `get_stream_status` | `inspect` | `false` | `docs/inspect/get-stream-status.md` | `sha256:290b0bd401b56a90a309e9879ee2aecf7f5a0add672c034bcefc301ae1f9aaad` |
-| `list_console_errors` | `inspect` | `false` | `docs/inspect/list-console-errors.md` | `sha256:379c6f18f81509c5a8d0d3de32e1aede8eff3f3fca5fc9eabd70f3078b93b8dd` |
-| `list_evidence` | `inspect` | `false` | `docs/inspect/list-evidence.md` | `sha256:f98fc845165362d1e76f45faaa9c403e4607db2c5df930c87fdc017a4ca740f9` |
-| `list_experiments` | `inspect` | `false` | `docs/inspect/list-experiments.md` | `sha256:d24fcb46ac1f983990cedbcf388b62a5a8011be54e8dbeb7bd1cfc09f555ef17` |
-| `open_session` | `run` | `true` | `docs/run/open-session.md` | `sha256:4d59376ce04dad1ac0455239ddbb20d5a2dea63c5cd147ac7dbd196ea1f4ad60` |
-| `replay_request` | `run` | `true` | `docs/run/replay-request.md` | `sha256:a1d821f01a9b7d5bfc1bf88c445c4b34c93531f116fe63dea8e82e80ef35c693` |
-| `save_script_source` | `run` | `true` | `docs/run/save-script-source.md` | `sha256:e644aa04a4da9d3e8cc35e0aa0180499b7adb594e1a71a951d934fe3214166d6` |
-| `search_scripts` | `inspect` | `false` | `docs/inspect/search-scripts.md` | `sha256:8fc4808bd71079c56e601f2cd37e4aabb65e6a6120189a86a816a1ca996fb097` |
+| `cancel_experiment` | `run` | `true` | `docs/run/cancel-experiment.md` | `sha256:543ebcf7a9fa084976d4dddfd305a6d6b7cf4d7ea911edb71fe478452eb1f86c` |
+| `capture_flow` | `run` | `true` | `docs/run/capture-flow.md` | `sha256:aeebdec176e744912811b9ccddf74643c07af5a0c430dcc4fb6e655228cd0d0b` |
+| `close_session` | `run` | `true` | `docs/run/close-session.md` | `sha256:2a89746555a4222c4d3c8c703645de9add82c3582f2bf95b75cf71cd86795983` |
+| `get_experiment` | `inspect` | `false` | `docs/inspect/get-experiment.md` | `sha256:21eea9b220bf312f26fc0d04b91696db3c670c9766397d1768e3b95859e43cd3` |
+| `get_network_evidence` | `inspect` | `false` | `docs/inspect/get-network-evidence.md` | `sha256:c36fae4a178b20cbe8576ce6269877fc0cb41be81645e4d031f9d086fb8a10ce` |
+| `get_request_initiator` | `inspect` | `false` | `docs/inspect/get-request-initiator.md` | `sha256:840368a8b4e8bfc424e6ff6ba7fdf099741a3a4ae727d23a65a30c8885b60699` |
+| `get_request_shape` | `inspect` | `false` | `docs/inspect/get-request-shape.md` | `sha256:e6ce42c0b0d3be8ce4910547a11b7a137153bb17b4ff38c99bbfc0cdeddaa2c2` |
+| `get_script_source` | `inspect` | `false` | `docs/inspect/get-script-source.md` | `sha256:aab8f48653050d5584cc62659e38daa0895ac6f4a928e0761fd27e3844861b96` |
+| `get_session` | `inspect` | `false` | `docs/inspect/get-session.md` | `sha256:050522a6e549f9ad84ae9959e5c6b1f8955fd46ef3e5b10a25e48d7633e5bd29` |
+| `get_stream_status` | `inspect` | `false` | `docs/inspect/get-stream-status.md` | `sha256:6685b4128e1f0a2d19b2abe1a5e2afef9d48b4ff4c357bb4a328928732140278` |
+| `list_console_errors` | `inspect` | `false` | `docs/inspect/list-console-errors.md` | `sha256:eb17de31b00a3bce940d691c4b29530ae193fc2d61bcc32273ab3dff336b7826` |
+| `list_evidence` | `inspect` | `false` | `docs/inspect/list-evidence.md` | `sha256:562bef93cea0a9ad9502a97e1b31b6e240000834f9e4adeeaaad9a8992c4b073` |
+| `list_experiments` | `inspect` | `false` | `docs/inspect/list-experiments.md` | `sha256:c25eb04e31f242889cf19123558bc7131f7ed1ca1056851ab4e380f547edfc05` |
+| `open_session` | `run` | `true` | `docs/run/open-session.md` | `sha256:ffad1100a262f17bb106b9584a2d7d839a1b1d0e6b3d6e863dbe9b279639c941` |
+| `replay_request` | `run` | `true` | `docs/run/replay-request.md` | `sha256:659a7a6590b724450d4a209514ae1c00b818ffeb43a8d7ec5ad69092d3815203` |
+| `save_script_source` | `run` | `true` | `docs/run/save-script-source.md` | `sha256:1437910f39f4b14bceb15d9a8dcff9e7b06781f2d5e2e2b5a503183f0574ccd1` |
+| `search_scripts` | `inspect` | `false` | `docs/inspect/search-scripts.md` | `sha256:2b7ccf6dbfa18f1f2928629dbbaadfcb222efc5feb0740e264ecdc1ee209641a` |
 <!-- END GENERATED OPERATION TABLE -->

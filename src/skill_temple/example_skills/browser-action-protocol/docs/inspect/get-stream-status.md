@@ -34,9 +34,9 @@ Decoded example:
 {
   "contract_version": "2.0",
   "operation": "get_stream_status",
-  "operation_contract_hash": "sha256:290b0bd401b56a90a309e9879ee2aecf7f5a0add672c034bcefc301ae1f9aaad",
+  "operation_contract_hash": "sha256:6685b4128e1f0a2d19b2abe1a5e2afef9d48b4ff4c357bb4a328928732140278",
   "payload_json": "{\"experiment_id\":\"exp_capture\"}",
-  "skill_content_hash": "sha256:786f2331d061583e44fc9dc7344bae933a380d13006b65d1e88f4ae31ad64e6e",
+  "skill_content_hash": "sha256:c946be3a448d82b76d66ab102a92b09185bf02beda384e1db695c229ab3a45ba",
   "skill_id": "browser-action-protocol"
 }
 ```
@@ -50,48 +50,14 @@ Typical errors: `invalid_operation_payload`, `experiment_not_found`, `capture_uu
 
 Next recommended inspect operation: `get_experiment` for overall terminal/quality state, then `list_evidence` for persisted stream evidence.
 
-Contract hash: `sha256:290b0bd401b56a90a309e9879ee2aecf7f5a0add672c034bcefc301ae1f9aaad`. Send it in `operation_contract_hash`.
+Contract hash: `sha256:6685b4128e1f0a2d19b2abe1a5e2afef9d48b4ff4c357bb4a328928732140278`. Send it in `operation_contract_hash`.
 
 <!-- BEGIN GENERATED CONTRACT -->
-## Generated structural contract
+## Contract binding
 
-> Generated from `OperationRegistry` and Pydantic. Do not edit this block.
+> Generated from the public operation contract. Do not edit this block.
 
-- Request model: `GetStreamStatusRequest`
-- Payload model: `GetStreamStatusPayload`
-- Registry handler: `_inspect_get_stream_status`
+- Action: `inspect`
 - Consequential: `false`
-- Operation contract hash: `sha256:290b0bd401b56a90a309e9879ee2aecf7f5a0add672c034bcefc301ae1f9aaad`
-
-```json
-{
-  "additionalProperties": false,
-  "properties": {
-    "capture_uuid": {
-      "anyOf": [
-        {
-          "maxLength": 128,
-          "type": "string"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Capture Uuid"
-    },
-    "experiment_id": {
-      "maxLength": 128,
-      "pattern": "^[a-zA-Z0-9_.-]+$",
-      "title": "Experiment Id",
-      "type": "string"
-    }
-  },
-  "required": [
-    "experiment_id"
-  ],
-  "title": "GetStreamStatusPayload",
-  "type": "object"
-}
-```
+- Operation contract hash: `sha256:6685b4128e1f0a2d19b2abe1a5e2afef9d48b4ff4c357bb4a328928732140278`
 <!-- END GENERATED CONTRACT -->

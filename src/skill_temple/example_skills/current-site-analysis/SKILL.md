@@ -27,8 +27,10 @@ Read these files when the matching stage begins:
 - `docs/inventory-checklist.md` before planning experiments.
 - `docs/experiment-design.md` before replay, mutation, or termination configuration.
 - `docs/report-contract.md` before producing final artifacts.
-- From `browser-action-protocol`, read `docs/transport-envelope.md`,
-  `docs/operation-index.md`, and only the operation files used by the experiment.
+- From `browser-action-protocol`, read
+  `browser-action-protocol/docs/transport-envelope.md`,
+  `browser-action-protocol/docs/operation-index.md`, and only the operation files
+  used by the experiment.
 
 Load supporting workflow Skills only when their stage begins, keeping each load to the
 minimum set:

@@ -29,7 +29,6 @@ web-rev-action = "skill_temple.app:main"
 skill-temple-eval = "skill_temple.evals:main"
 skill-temple-build-prompt = "skill_temple.prompt_builder:main"
 skill-temple-build-contracts = "skill_temple.contract_builder:main"
-skill-temple-telemetry-report = "skill_temple.telemetry:main"
 skill-temple-dead-code-audit = "skill_temple.dead_code_audit:main"
 skill-temple-builder-preflight = "skill_temple.builder_preflight:main"
 
@@ -53,8 +52,6 @@ skill_temple = [
     "example_skills/*/docs/run/*.md",
     "example_skills/*/docs/inspect/*.md",
     "example_skills/*/docs/generated/*.json",
-    "example_skills/*/docs/generated/run/*.json",
-    "example_skills/*/docs/generated/inspect/*.json",
 ]
 
 [tool.pytest.ini_options]

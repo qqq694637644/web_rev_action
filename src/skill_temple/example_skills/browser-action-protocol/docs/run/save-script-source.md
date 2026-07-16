@@ -38,9 +38,9 @@ Decoded example:
 {
   "contract_version": "2.0",
   "operation": "save_script_source",
-  "operation_contract_hash": "sha256:e644aa04a4da9d3e8cc35e0aa0180499b7adb594e1a71a951d934fe3214166d6",
+  "operation_contract_hash": "sha256:1437910f39f4b14bceb15d9a8dcff9e7b06781f2d5e2e2b5a503183f0574ccd1",
   "payload_json": "{\"length\":4000,\"offset\":0,\"script_id\":\"script-17\",\"session_id\":\"analysis-main\",\"target_experiment_id\":\"exp_capture\"}",
-  "skill_content_hash": "sha256:786f2331d061583e44fc9dc7344bae933a380d13006b65d1e88f4ae31ad64e6e",
+  "skill_content_hash": "sha256:c946be3a448d82b76d66ab102a92b09185bf02beda384e1db695c229ab3a45ba",
   "skill_id": "browser-action-protocol"
 }
 ```
@@ -54,148 +54,14 @@ Typical errors: `invalid_operation_payload`, `script_target_session_mismatch`, `
 
 Next recommended inspect operation: `list_evidence` filtered to `script_source`.
 
-Contract hash: `sha256:e644aa04a4da9d3e8cc35e0aa0180499b7adb594e1a71a951d934fe3214166d6`. Send it in `operation_contract_hash`.
+Contract hash: `sha256:1437910f39f4b14bceb15d9a8dcff9e7b06781f2d5e2e2b5a503183f0574ccd1`. Send it in `operation_contract_hash`.
 
 <!-- BEGIN GENERATED CONTRACT -->
-## Generated structural contract
+## Contract binding
 
-> Generated from `OperationRegistry` and Pydantic. Do not edit this block.
+> Generated from the public operation contract. Do not edit this block.
 
-- Request model: `SaveScriptSourceRequest`
-- Payload model: `SaveScriptSourcePayload`
-- Registry handler: `dispatch_save_script_source`
+- Action: `run`
 - Consequential: `true`
-- Operation contract hash: `sha256:e644aa04a4da9d3e8cc35e0aa0180499b7adb594e1a71a951d934fe3214166d6`
-
-```json
-{
-  "additionalProperties": false,
-  "properties": {
-    "end_line": {
-      "anyOf": [
-        {
-          "minimum": 1,
-          "type": "integer"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "End Line"
-    },
-    "evidence_label": {
-      "anyOf": [
-        {
-          "maxLength": 128,
-          "type": "string"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Evidence Label"
-    },
-    "initiator_evidence_id": {
-      "anyOf": [
-        {
-          "maxLength": 256,
-          "pattern": "^[a-zA-Z0-9_.-]+$",
-          "type": "string"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Initiator Evidence Id"
-    },
-    "length": {
-      "anyOf": [
-        {
-          "maximum": 200000,
-          "minimum": 1,
-          "type": "integer"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Length"
-    },
-    "offset": {
-      "anyOf": [
-        {
-          "minimum": 0,
-          "type": "integer"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Offset"
-    },
-    "script_id": {
-      "anyOf": [
-        {
-          "maxLength": 512,
-          "type": "string"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Script Id"
-    },
-    "session_id": {
-      "maxLength": 128,
-      "pattern": "^[a-zA-Z0-9_.-]+$",
-      "title": "Session Id",
-      "type": "string"
-    },
-    "start_line": {
-      "anyOf": [
-        {
-          "minimum": 1,
-          "type": "integer"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Start Line"
-    },
-    "target_experiment_id": {
-      "maxLength": 128,
-      "pattern": "^[a-zA-Z0-9_.-]+$",
-      "title": "Target Experiment Id",
-      "type": "string"
-    },
-    "url": {
-      "anyOf": [
-        {
-          "maxLength": 8192,
-          "type": "string"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "default": null,
-      "title": "Url"
-    }
-  },
-  "required": [
-    "session_id",
-    "target_experiment_id"
-  ],
-  "title": "SaveScriptSourcePayload",
-  "type": "object"
-}
-```
+- Operation contract hash: `sha256:1437910f39f4b14bceb15d9a8dcff9e7b06781f2d5e2e2b5a503183f0574ccd1`
 <!-- END GENERATED CONTRACT -->

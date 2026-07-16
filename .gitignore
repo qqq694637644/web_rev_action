@@ -13,7 +13,6 @@ build/
 dist/
 artifacts/
 .playwright-cli/
-data/analysis-workspace/telemetry/
 
 # Virtual environments
 .venv/

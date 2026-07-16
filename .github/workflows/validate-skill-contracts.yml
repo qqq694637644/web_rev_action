@@ -119,6 +119,12 @@ jobs:
               "skill_temple/example_skills/pandora-protocol-reproduction/SKILL.md",
           }
           missing = sorted(required - names)
+          forbidden_generated_duplicates = sorted(
+              name
+              for name in names
+              if "/docs/generated/run/" in name
+              or "/docs/generated/inspect/" in name
+          )
 
           entry_points_path = next(
               (name for name in names if name.endswith(".dist-info/entry_points.txt")),
@@ -137,13 +143,20 @@ jobs:
               "skill-temple-eval": "skill_temple.evals:main",
               "skill-temple-build-prompt": "skill_temple.prompt_builder:main",
               "skill-temple-build-contracts": "skill_temple.contract_builder:main",
-              "skill-temple-telemetry-report": "skill_temple.telemetry:main",
               "skill-temple-dead-code-audit": "skill_temple.dead_code_audit:main",
               "skill-temple-builder-preflight": "skill_temple.builder_preflight:main",
           }
           print(f"missing_package_data={missing!r}")
+          print(
+              "forbidden_generated_duplicates="
+              f"{forbidden_generated_duplicates!r}"
+          )
           print(f"console_scripts={actual_scripts!r}")
-          if missing or actual_scripts != expected_scripts:
+          if (
+              missing
+              or forbidden_generated_duplicates
+              or actual_scripts != expected_scripts
+          ):
               raise SystemExit(1)
           '@
           python -c $script $wheel.FullName

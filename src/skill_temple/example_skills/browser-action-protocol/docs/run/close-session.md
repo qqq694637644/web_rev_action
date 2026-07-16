@@ -34,9 +34,9 @@ Decoded example:
 {
   "contract_version": "2.0",
   "operation": "close_session",
-  "operation_contract_hash": "sha256:bc79ed315e19856450b20815474760de328baa3562bdd092495c6d5ace9f6593",
+  "operation_contract_hash": "sha256:2a89746555a4222c4d3c8c703645de9add82c3582f2bf95b75cf71cd86795983",
   "payload_json": "{\"deadline_ms\":10000,\"session_id\":\"analysis-main\"}",
-  "skill_content_hash": "sha256:786f2331d061583e44fc9dc7344bae933a380d13006b65d1e88f4ae31ad64e6e",
+  "skill_content_hash": "sha256:c946be3a448d82b76d66ab102a92b09185bf02beda384e1db695c229ab3a45ba",
   "skill_id": "browser-action-protocol"
 }
 ```
@@ -50,42 +50,14 @@ Typical errors: `invalid_operation_payload`, `session_not_found`, `browser_busy`
 
 Next recommended inspect operation: `get_session`.
 
-Contract hash: `sha256:bc79ed315e19856450b20815474760de328baa3562bdd092495c6d5ace9f6593`. Send it in `operation_contract_hash`.
+Contract hash: `sha256:2a89746555a4222c4d3c8c703645de9add82c3582f2bf95b75cf71cd86795983`. Send it in `operation_contract_hash`.
 
 <!-- BEGIN GENERATED CONTRACT -->
-## Generated structural contract
+## Contract binding
 
-> Generated from `OperationRegistry` and Pydantic. Do not edit this block.
+> Generated from the public operation contract. Do not edit this block.
 
-- Request model: `CloseSessionRequest`
-- Payload model: `CloseSessionPayload`
-- Registry handler: `dispatch_close_session`
+- Action: `run`
 - Consequential: `true`
-- Operation contract hash: `sha256:bc79ed315e19856450b20815474760de328baa3562bdd092495c6d5ace9f6593`
-
-```json
-{
-  "additionalProperties": false,
-  "properties": {
-    "deadline_ms": {
-      "default": 10000,
-      "maximum": 42000,
-      "minimum": 1000,
-      "title": "Deadline Ms",
-      "type": "integer"
-    },
-    "session_id": {
-      "maxLength": 128,
-      "pattern": "^[a-zA-Z0-9_.-]+$",
-      "title": "Session Id",
-      "type": "string"
-    }
-  },
-  "required": [
-    "session_id"
-  ],
-  "title": "CloseSessionPayload",
-  "type": "object"
-}
-```
+- Operation contract hash: `sha256:2a89746555a4222c4d3c8c703645de9add82c3582f2bf95b75cf71cd86795983`
 <!-- END GENERATED CONTRACT -->

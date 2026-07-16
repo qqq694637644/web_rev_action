@@ -13,7 +13,7 @@ with a workflow Skill such as `current-site-analysis` for experiment design.
 
 1. Read `docs/transport-envelope.md` once before the first Browser Action call.
 2. Read `docs/operation-index.md` and select the exact operation.
-3. Read only the selected operation contract under `docs/run/` or `docs/inspect/`.
+3. From the operation index, read only the exact operation contract it names.
 4. Read `docs/json-encoding.md` when constructing or correcting `payload_json`.
 5. Read `docs/error-recovery.md` only after a Browser Action error.
 

@@ -53,8 +53,7 @@ Record:
 
 1. Confirm factual claims cite exact session, experiment, evidence, and artifact handles.
 2. Confirm Cookie, Authorization, CSRF, session, and private payload values do not appear
-   in chat, telemetry, generated reports, or copied Action arguments.
-3. Confirm telemetry contains metadata only and the summary command succeeds.
+   in chat, generated reports, logs, or copied Action arguments.
 
 ## Result
 
