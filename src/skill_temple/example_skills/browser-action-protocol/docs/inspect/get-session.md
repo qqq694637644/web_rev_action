@@ -38,7 +38,7 @@ Decoded example:
 ```
 ## Result and recovery
 
-Expected response handles: `session_id`, status, service instance ownership, selected page, timestamps, and stale reason when applicable.
+Expected response handles: `session_id`, factual lifecycle status, service instance ownership, selected page data when known, timestamps, adapter error metadata when present, and stale reason when applicable. Provisional and unknown open/close states remain inspectable.
 
 Safe retry: read-only; validation errors with `dispatch_started=false` may be corrected. A not-found result means the caller may choose `open_session` rather than retrying inspection.
 

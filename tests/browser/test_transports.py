@@ -8,6 +8,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
@@ -17,6 +18,7 @@ from skill_temple.app import create_app
 from skill_temple.browser.adapters.command import SubprocessCommandRunner
 from skill_temple.browser.adapters.contracts import (
     AdapterError,
+    CommandResult,
     StreamCheckpoint,
     StreamRequestCheckpoint,
     StreamWaitResult,
@@ -45,6 +47,47 @@ from tests.fakes.browser import FakeJsReverse, FakePlaywright
 
 
 class TransportsBrowserTests(BrowserActionTestCase):
+    def test_playwright_raw_page_output_does_not_fallback_to_cli_text(self) -> None:
+        class TextOnlyRunner:
+            async def run(
+                self,
+                argv: list[str],
+                *,
+                deadline: Deadline,
+                cwd: Path | None = None,
+                allow_failure: bool = False,
+            ) -> CommandResult:
+                return CommandResult(
+                    argv=argv,
+                    returncode=0,
+                    stdout="- Page URL: https://example.test\n- Page Title: Example\n",
+                    stderr="",
+                )
+
+        adapter = PlaywrightCliAdapter(runner=TextOnlyRunner())
+        with self.assertRaises(AdapterError) as raised:
+            asyncio.run(adapter.current_page("strict-output", Deadline(1_000)))
+        self.assertIn("not valid JSON", str(raised.exception))
+        self.assertTrue(raised.exception.dispatch_started)
+        self.assertFalse(raised.exception.outcome_unknown)
+
+    def test_mcp_result_without_json_object_fails_instead_of_returning_empty_object(self) -> None:
+        class TextBlock:
+            text = "not-json"
+
+        result = SimpleNamespace(
+            isError=False,
+            structuredContent=None,
+            content=[TextBlock()],
+        )
+
+        with self.assertRaises(AdapterError) as raised:
+            StdioMcpToolTransport._normalize_result("search_scripts", result)
+        self.assertIn("search_scripts", str(raised.exception))
+        self.assertIn("TextBlock", str(raised.exception))
+        self.assertTrue(raised.exception.dispatch_started)
+        self.assertFalse(raised.exception.outcome_unknown)
+
     def test_environment_builder_binds_mcp_to_workspace_and_same_cdp_endpoint(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             with patch.dict(

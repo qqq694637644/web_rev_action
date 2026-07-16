@@ -19,13 +19,11 @@ from skill_temple.browser.adapters.js_reverse import JsReverseMcpAdapter
 from skill_temple.browser_models import (
     CaptureFlowRequest,
     ExactDataPredicate,
-    OpenSessionRequest,
     RequestMatcher,
     WaitCondition,
 )
 from skill_temple.browser_service import (
     BrowserActionService,
-    BrowserServiceError,
     Deadline,
     ExperimentStore,
 )
@@ -725,34 +723,41 @@ class StreamsBrowserTests(BrowserActionTestCase):
                 default_browser_endpoint="http://127.0.0.1:9222",
             )
 
-            async def exercise() -> tuple[dict[str, Any], BrowserServiceError]:
-                await service.run(
-                    OpenSessionRequest(
-                        operation="open_session",
-                        payload={"session_id": "unknown_start"},
-                    )
+            client = TestClient(create_app(browser_service=service))
+            with client:
+                opened = client.post(
+                    "/v1/browser/run",
+                    json=self.browser_request(
+                        "open_session",
+                        {"session_id": "unknown_start"},
+                    ),
                 )
-                request = CaptureFlowRequest(
-                    operation="capture_flow",
-                    payload={
-                        "session_id": "unknown_start",
-                        "objective": "unknown start",
-                        "primary_request": {"expected_min_matches": 0},
-                        "execution_mode": "sync",
-                        "deadline_ms": 10_000,
-                    },
+                response = client.post(
+                    "/v1/browser/run",
+                    json=self.browser_request(
+                        "capture_flow",
+                        {
+                            "session_id": "unknown_start",
+                            "objective": "unknown start",
+                            "primary_request": {"expected_min_matches": 0},
+                            "execution_mode": "sync",
+                            "deadline_ms": 10_000,
+                        },
+                    ),
                 )
-                with self.assertRaises(BrowserServiceError) as raised:
-                    await service.run(request)
-                experiment = next(service.experiments.experiments_dir.iterdir())
-                manifest = service.experiments.load_manifest(experiment.name)
-                await service.close()
-                return manifest, raised.exception
-
-            manifest, error = asyncio.run(exercise())
-            self.assertEqual(error.code, "operation_outcome_unknown")
-            self.assertTrue(error.dispatch_started)
-            self.assertEqual(error.outcome, "unknown")
+            self.assertEqual(opened.status_code, 200, opened.text)
+            self.assertEqual(response.status_code, 502, response.text)
+            error = response.json()["error"]
+            manifest = service.experiments.load_manifest(error["experiment_id"])
+            self.assertEqual(error["code"], "operation_outcome_unknown")
+            self.assertTrue(error["dispatch_started"])
+            self.assertEqual(error["outcome"], "unknown")
+            self.assertEqual(error["session_id"], "unknown_start")
+            self.assertEqual(error["experiment_id"], manifest["experiment_id"])
+            self.assertEqual(
+                error["manifest_relative_path"],
+                f"experiments/{manifest['experiment_id']}/manifest.json",
+            )
             self.assertEqual(manifest["status"], "partial")
             self.assertEqual(manifest["operation_outcome"], "unknown")
             self.assertEqual(manifest["execution"]["status"], "unknown")

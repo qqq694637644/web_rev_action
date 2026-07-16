@@ -245,7 +245,9 @@ class StdioMcpToolTransport:
                 raise AdapterError(str(error.get("message") or f"MCP tool failed: {name}"))
             data = structured.get("data")
             return data if isinstance(data, dict) else structured
+        content_types: list[str] = []
         for block in getattr(result, "content", []):
+            content_types.append(type(block).__name__)
             text = getattr(block, "text", None)
             if not isinstance(text, str):
                 continue
@@ -254,8 +256,15 @@ class StdioMcpToolTransport:
             except json.JSONDecodeError:
                 continue
             if isinstance(parsed, dict):
-                return parsed.get("data", parsed)
-        return {}
+                data = parsed.get("data")
+                return data if isinstance(data, dict) else parsed
+        summary = ",".join(content_types[:10]) or "none"
+        raise AdapterError(
+            f"MCP tool {name} returned no structured JSON object; "
+            f"content_types={summary}",
+            dispatch_started=True,
+            outcome_unknown=False,
+        )
 
     async def call_tool(
         self, name: str, arguments: dict[str, Any], deadline: DeadlineLike

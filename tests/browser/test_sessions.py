@@ -7,11 +7,14 @@ from pathlib import Path
 from typing import Any
 
 from skill_temple.browser.adapters.contracts import (
+    AdapterError,
     PageState,
 )
 from skill_temple.browser_models import (
     CaptureFlowRequest,
+    CloseSessionRequest,
     FlowStep,
+    GetSessionRequest,
     OpenSessionRequest,
 )
 from skill_temple.browser_service import (
@@ -29,6 +32,146 @@ from tests.fakes.browser import FakeJsReverse, FakePlaywright
 
 
 class SessionsBrowserTests(BrowserActionTestCase):
+    def test_open_unknown_persists_provisional_session_and_context(self) -> None:
+        class UnknownOpenPlaywright(FakePlaywright):
+            async def open_session(
+                self,
+                session_ref: str,
+                browser_endpoint: str,
+                start_url: str | None,
+                deadline: Deadline,
+            ) -> PageState:
+                raise AdapterError(
+                    "attach transport disconnected",
+                    dispatch_started=True,
+                    outcome_unknown=True,
+                )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            events: list[str] = []
+            service = BrowserActionService(
+                playwright=UnknownOpenPlaywright(events),
+                js_reverse=FakeJsReverse(events, root),
+                experiments=ExperimentStore(root),
+                default_browser_endpoint="http://127.0.0.1:9222",
+            )
+
+            async def exercise() -> tuple[BrowserServiceError, dict[str, Any], dict[str, Any]]:
+                with self.assertRaises(BrowserServiceError) as raised:
+                    await service.run(
+                        OpenSessionRequest(
+                            operation="open_session",
+                            payload={"session_id": "open_unknown"},
+                        )
+                    )
+                inspected = await service.inspect(
+                    GetSessionRequest(
+                        operation="get_session",
+                        payload={"session_id": "open_unknown"},
+                    )
+                )
+                saved = service.experiments.load_session("open_unknown")
+                assert saved is not None
+                return raised.exception, inspected.result["session"], saved
+
+            error, inspected, saved = asyncio.run(exercise())
+            self.assertEqual(error.code, "operation_outcome_unknown")
+            self.assertEqual(error.session_id, "open_unknown")
+            self.assertEqual(inspected["status"], "open_outcome_unknown")
+            self.assertEqual(saved["status"], "open_outcome_unknown")
+
+    def test_confirmed_attach_with_alignment_failure_is_inspectable_as_unaligned(self) -> None:
+        class FailedAlignJs(FakeJsReverse):
+            async def align_page(
+                self,
+                page: PageState,
+                deadline: Deadline,
+                page_id: str | None = None,
+            ) -> Any:
+                raise AdapterError(
+                    "alignment transport failed",
+                    dispatch_started=True,
+                    outcome_unknown=False,
+                )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            events: list[str] = []
+            service = BrowserActionService(
+                playwright=FakePlaywright(events),
+                js_reverse=FailedAlignJs(events, root),
+                experiments=ExperimentStore(root),
+                default_browser_endpoint="http://127.0.0.1:9222",
+            )
+
+            async def exercise() -> tuple[BrowserServiceError, dict[str, Any]]:
+                with self.assertRaises(BrowserServiceError) as raised:
+                    await service.run(
+                        OpenSessionRequest(
+                            operation="open_session",
+                            payload={"session_id": "open_unaligned"},
+                        )
+                    )
+                saved = service.experiments.load_session("open_unaligned")
+                assert saved is not None
+                return raised.exception, saved
+
+            error, saved = asyncio.run(exercise())
+            self.assertEqual(error.code, "browser_adapter_failed")
+            self.assertEqual(error.session_id, "open_unaligned")
+            self.assertEqual(saved["status"], "open_unaligned")
+            self.assertEqual(saved["playwright_page_url"], "https://example.test/app")
+
+    def test_close_unknown_persists_non_open_state_and_context(self) -> None:
+        class UnknownClosePlaywright(FakePlaywright):
+            fail_close = False
+
+            async def close_session(self, session_ref: str, deadline: Deadline) -> None:
+                if self.fail_close:
+                    raise AdapterError(
+                        "detach transport disconnected",
+                        dispatch_started=True,
+                        outcome_unknown=True,
+                    )
+                await super().close_session(session_ref, deadline)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            events: list[str] = []
+            playwright = UnknownClosePlaywright(events)
+            service = BrowserActionService(
+                playwright=playwright,
+                js_reverse=FakeJsReverse(events, root),
+                experiments=ExperimentStore(root),
+                default_browser_endpoint="http://127.0.0.1:9222",
+            )
+
+            async def exercise() -> tuple[BrowserServiceError, dict[str, Any]]:
+                await service.run(
+                    OpenSessionRequest(
+                        operation="open_session",
+                        payload={"session_id": "close_unknown"},
+                    )
+                )
+                playwright.fail_close = True
+                with self.assertRaises(BrowserServiceError) as raised:
+                    await service.run(
+                        CloseSessionRequest(
+                            operation="close_session",
+                            payload={"session_id": "close_unknown"},
+                        )
+                    )
+                saved = service.experiments.load_session("close_unknown")
+                assert saved is not None
+                return raised.exception, saved
+
+            error, saved = asyncio.run(exercise())
+            self.assertEqual(error.code, "operation_outcome_unknown")
+            self.assertEqual(error.session_id, "close_unknown")
+            self.assertEqual(saved["status"], "close_outcome_unknown")
+            self.assertNotEqual(saved["status"], "open")
+
     def test_same_session_rejects_a_second_background_job(self) -> None:
         class BlockingPlaywright(FakePlaywright):
             def __init__(self, events: list[str]) -> None:

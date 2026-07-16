@@ -176,6 +176,7 @@ class BrowserCaptureOperations:
         errors: list[str],
     ) -> None:
         unknown = error.code == "operation_outcome_unknown"
+        session_id = str(manifest.get("session_id") or "") or None
         manifest.update(
             {
                 "status": "partial" if unknown else "failed",
@@ -210,6 +211,11 @@ class BrowserCaptureOperations:
             }
         )
         self.experiments.write_manifest(experiment_id, manifest)
+        error.with_context(
+            session_id=session_id,
+            experiment_id=experiment_id,
+            manifest_relative_path=self._manifest_relative_path(experiment_id),
+        )
         raise error
 
     async def wait_for_job(self, experiment_id: str) -> None:
@@ -404,7 +410,11 @@ class BrowserCaptureOperations:
                             else "failed_before_send"
                         )
                         discovered = (
-                            self._discover_capture_metadata(experiment_id)
+                            self._discover_capture_metadata(
+                                experiment_id,
+                                manifest,
+                                warnings,
+                            )
                             if stream_start_status == "outcome_unknown"
                             else None
                         )
@@ -456,7 +466,11 @@ class BrowserCaptureOperations:
                             )
                         )
                         discovered = (
-                            self._discover_capture_metadata(experiment_id)
+                            self._discover_capture_metadata(
+                                experiment_id,
+                                manifest,
+                                warnings,
+                            )
                             if stream_start_status == "outcome_unknown"
                             else None
                         )

@@ -755,6 +755,11 @@ class BrowserReplayOperations:
                 }
             )
             self.experiments.write_manifest(experiment_id, manifest)
+            service_error.with_context(
+                session_id=session_id,
+                experiment_id=experiment_id,
+                manifest_relative_path=self._manifest_relative_path(experiment_id),
+            )
             raise service_error from exc
         except asyncio.CancelledError:
             step_results.append(

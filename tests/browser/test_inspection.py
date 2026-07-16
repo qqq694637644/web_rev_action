@@ -4,15 +4,83 @@ import json
 import tempfile
 from pathlib import Path
 
+from skill_temple.browser.adapters.contracts import AdapterError
 from skill_temple.browser.artifacts import ExperimentStore
 from skill_temple.browser.core import BrowserServiceError, Deadline
 from skill_temple.browser_service import (
     BrowserActionService,
 )
 from tests.browser.common import BrowserActionTestCase
+from tests.fakes.browser import FakeJsReverse, FakePlaywright
 
 
 class InspectionBrowserTests(BrowserActionTestCase):
+    def test_real_inspect_adapter_error_is_structured_without_state_guessing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client, _, _ = self.make_client(Path(temp_dir))
+            with client:
+                self.open_session(client)
+                service = client.app.state.browser_action_service
+
+                async def fail_current_page(session_id: str, deadline: Deadline) -> object:
+                    raise AdapterError(
+                        "inspect transport failed",
+                        dispatch_started=True,
+                        outcome_unknown=True,
+                    )
+
+                service.playwright.current_page = fail_current_page
+                response = client.post(
+                    "/v1/browser/inspect",
+                    json=self.browser_request(
+                        "search_scripts",
+                        {"session_id": "session_one", "query": "fetch"},
+                    ),
+                )
+
+            self.assertEqual(response.status_code, 502, response.text)
+            error = response.json()["error"]
+            self.assertEqual(error["code"], "browser_adapter_failed")
+            self.assertTrue(error["dispatch_started"])
+            self.assertEqual(error["outcome"], "failed")
+            self.assertEqual(error["session_id"], "session_one")
+
+    def test_invalid_capture_metadata_is_written_as_manifest_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            events: list[str] = []
+            store = ExperimentStore(root)
+            service = BrowserActionService(
+                playwright=FakePlaywright(events),
+                js_reverse=FakeJsReverse(events, root),
+                experiments=store,
+                default_browser_endpoint="http://127.0.0.1:9222",
+            )
+            experiment_id, directory, manifest = store.create_experiment(
+                session_id="session_one",
+                operation="capture_flow",
+                objective="discover malformed capture metadata",
+                deadline=Deadline(1_000),
+                experiment_id="exp_bad_capture",
+            )
+            metadata = directory / "js-reverse" / "capture-bad" / "capture.json"
+            metadata.parent.mkdir(parents=True)
+            metadata.write_text("{broken", encoding="utf-8")
+            runtime_warnings: list[str] = []
+
+            discovered = service._discover_capture_metadata(
+                experiment_id,
+                manifest,
+                runtime_warnings,
+            )
+            saved = store.load_manifest(experiment_id)
+
+            self.assertIsNone(discovered)
+            self.assertEqual(len(runtime_warnings), 1)
+            self.assertIn("capture-bad/capture.json", runtime_warnings[0])
+            self.assertIn("JSONDecodeError", runtime_warnings[0])
+            self.assertIn(runtime_warnings[0], saved["warnings"])
+
     def test_invalid_manifest_is_visible_without_hiding_valid_experiments(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

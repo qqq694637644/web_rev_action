@@ -19,9 +19,6 @@ from .contracts import (
     PageState,
 )
 
-_PAGE_URL_RE = re.compile(r"^- Page URL:\s*(.+)$", re.MULTILINE)
-_PAGE_TITLE_RE = re.compile(r"^- Page Title:\s*(.+)$", re.MULTILINE)
-
 _SNAPSHOT_RE = re.compile(r"\[Snapshot\]\(([^)]+)\)")
 
 def build_playwright_attach_args(endpoint: str, session_ref: str) -> list[str]:
@@ -101,21 +98,29 @@ class PlaywrightCliAdapter:
             parsed = json.loads(raw)
             if isinstance(parsed, str):
                 parsed = json.loads(parsed)
-            if isinstance(parsed, dict):
-                return PageState(
-                    url=str(parsed.get("url", "")),
-                    title=str(parsed.get("title", "")),
-                    page_index=self._selected_page_index.get(session_ref, 0),
-                )
-        except json.JSONDecodeError:
-            pass
-        url_match = _PAGE_URL_RE.search(result.stdout)
-        title_match = _PAGE_TITLE_RE.search(result.stdout)
-        if not url_match:
-            raise AdapterError("playwright-cli did not return the current page URL")
+        except json.JSONDecodeError as exc:
+            raise AdapterError(
+                "playwright-cli --raw current-page output was not valid JSON",
+                dispatch_started=True,
+                outcome_unknown=False,
+            ) from exc
+        if not isinstance(parsed, dict):
+            raise AdapterError(
+                "playwright-cli --raw current-page output was not a JSON object",
+                dispatch_started=True,
+                outcome_unknown=False,
+            )
+        url = parsed.get("url")
+        title = parsed.get("title")
+        if not isinstance(url, str) or not isinstance(title, str):
+            raise AdapterError(
+                "playwright-cli current-page JSON must contain string url and title fields",
+                dispatch_started=True,
+                outcome_unknown=False,
+            )
         return PageState(
-            url=url_match.group(1).strip(),
-            title=title_match.group(1).strip() if title_match else "",
+            url=url,
+            title=title,
             page_index=self._selected_page_index.get(session_ref, 0),
         )
 
@@ -339,5 +344,5 @@ class PlaywrightCliAdapter:
         return filename.as_posix()
 
     async def close_session(self, session_ref: str, deadline: DeadlineLike) -> None:
-        await self._run(session_ref, "detach", deadline=deadline, allow_failure=True)
+        await self._run(session_ref, "detach", deadline=deadline)
         self._selected_page_index.pop(session_ref, None)

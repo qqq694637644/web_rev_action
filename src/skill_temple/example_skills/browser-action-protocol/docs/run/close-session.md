@@ -44,7 +44,7 @@ Decoded example:
 
 Expected response handles: `session_id`, closed/stale status, and close reason.
 
-Safe retry: when dispatch started or the outcome is unknown, call `get_session` first. Do not repeatedly close without inspecting current state.
+Safe retry: when dispatch started or the outcome is unknown, call `get_session` with the returned `session_id` first. A close transport loss is persisted as `close_outcome_unknown`, not as a confirmed `open` or `closed` state.
 
 Typical errors: `invalid_operation_payload`, `session_not_found`, `browser_busy`, `operation_outcome_unknown`.
 

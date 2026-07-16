@@ -65,12 +65,19 @@ class ReplayExecutionBrowserTests(BrowserActionTestCase):
                         ),
                     )
                 self.assertEqual(response.status_code, 502, response.text)
-                self.assertEqual(response.json()["error"]["code"], expected_code)
-                self.assertEqual(response.json()["error"]["dispatch_started"], dispatch_started)
+                error = response.json()["error"]
+                self.assertEqual(error["code"], expected_code)
+                self.assertEqual(error["dispatch_started"], dispatch_started)
+                self.assertEqual(error["session_id"], "session_one")
+                self.assertTrue(error["experiment_id"].startswith("exp_"))
+                self.assertEqual(
+                    error["manifest_relative_path"],
+                    f"experiments/{error['experiment_id']}/manifest.json",
+                )
                 created = list(set((root / "experiments").iterdir()) - before)
-                self.assertEqual(len(created), 1)
+                self.assertEqual([item.name for item in created], [error["experiment_id"]])
                 manifest = json.loads(
-                    (created[0] / "manifest.json").read_text(encoding="utf-8")
+                    (root / error["manifest_relative_path"]).read_text(encoding="utf-8")
                 )
                 self.assertEqual(manifest["status"], expected_status)
                 self.assertEqual(

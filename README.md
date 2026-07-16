@@ -122,6 +122,15 @@ Adapter 错误显式区分事实边界：命令或 MCP call 未发送时
 或 transport 崩溃才返回 `operation_outcome_unknown`、`dispatch_started=true`、
 `outcome=unknown`。Route 不根据异常类型猜测该状态。
 
+当 session 或 experiment 句柄已经创建，结构化错误同时返回可用的 `session_id`、
+`experiment_id` 和 `manifest_relative_path`。Session 在 browser attach 前保存 provisional
+记录；open/close 结果未知时保存 `open_outcome_unknown` 或
+`close_outcome_unknown`，而不是继续声称确定的 `open`。Inspect adapter 失败同样返回
+结构化 `browser_adapter_failed`，不会退化为框架 500。
+
+Playwright `--raw` 输出必须是预期 JSON object；MCP tool 必须返回结构化 JSON object。
+文本格式猜测、无法解析 content block 和隐式空对象不再被当作成功结果。
+
 Operation 模块只从 `browser/adapters/contracts.py` 导入 adapter 类型和错误，不从
 `browser.adapters` package facade 或具体 transport 实现导入。js-reverse stream status 的
 request matching 与 checkpoint 转换位于纯函数模块 `browser/stream_state.py`，session 和

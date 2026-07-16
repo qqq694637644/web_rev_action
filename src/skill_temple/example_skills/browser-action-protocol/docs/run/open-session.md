@@ -43,9 +43,9 @@ Decoded example:
 ```
 ## Result and recovery
 
-Expected response handles: `session_id`, session status, selected page metadata, and alignment metadata.
+Expected response handles: `session_id`, session status, selected page metadata, and alignment metadata. The session record is created before adapter dispatch and may expose `opening`, `aligning`, `open_failed_before_dispatch`, `open_failed`, `open_unaligned`, `open_outcome_unknown`, `alignment_failed`, `close_failed`, or `close_outcome_unknown` when setup does not reach a confirmed open state.
 
-Safe retry: correct validation errors only when `dispatch_started=false`. If dispatch started or the outcome is unknown, call `get_session` with the intended ID before deciding whether to retry.
+Safe retry: correct validation errors only when `dispatch_started=false`. If dispatch started or the outcome is unknown, use the returned `session_id` with `get_session` before deciding whether to retry.
 
 Typical errors: `invalid_operation_payload`, `browser_endpoint_mismatch`, `browser_busy`, `page_alignment_failed`, `operation_outcome_unknown`.
 

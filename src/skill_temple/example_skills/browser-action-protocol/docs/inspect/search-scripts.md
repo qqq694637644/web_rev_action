@@ -49,7 +49,7 @@ Expected response handles: bounded matches with script URL/ID, line or offset hi
 
 Safe retry: read-only. Refine the query or URL filter rather than expanding blindly. Correlate candidates with initiator evidence.
 
-Typical errors: `invalid_operation_payload`, `session_not_found`, `page_alignment_failed`, `browser_busy`.
+Typical errors: `invalid_operation_payload`, `session_not_found`, `page_alignment_failed`, `browser_busy`, `browser_adapter_failed`.
 
 Next recommended inspect operation: `get_script_source` for one selected exact script and bounded range.
 

@@ -40,6 +40,9 @@ def _browser_error(
     suggested_next_action: str,
     outcome: str | None = None,
     issues: list[dict[str, str]] | None = None,
+    session_id: str | None = None,
+    experiment_id: str | None = None,
+    manifest_relative_path: str | None = None,
 ) -> dict[str, Any]:
     error: dict[str, Any] = {
         "code": code,
@@ -52,6 +55,12 @@ def _browser_error(
         error["outcome"] = outcome
     if issues:
         error["issues"] = issues
+    if session_id is not None:
+        error["session_id"] = session_id
+    if experiment_id is not None:
+        error["experiment_id"] = experiment_id
+    if manifest_relative_path is not None:
+        error["manifest_relative_path"] = manifest_relative_path
     return {"error": error}
 
 
@@ -141,6 +150,9 @@ def register_browser_actions(
                     message=str(exc),
                     dispatch_started=exc.dispatch_started,
                     outcome=exc.outcome,
+                    session_id=exc.session_id,
+                    experiment_id=exc.experiment_id,
+                    manifest_relative_path=exc.manifest_relative_path,
                     suggested_next_action=(
                         "Inspect the referenced session, experiment, or evidence handle."
                     ),
@@ -181,6 +193,9 @@ def register_browser_actions(
                     message=str(exc),
                     dispatch_started=exc.dispatch_started,
                     outcome=exc.outcome,
+                    session_id=exc.session_id,
+                    experiment_id=exc.experiment_id,
+                    manifest_relative_path=exc.manifest_relative_path,
                     suggested_next_action=(
                         "Inspect the session or experiment; do not repeat the operation "
                         "while dispatch_started is true and the outcome is unresolved."

@@ -2,7 +2,9 @@
 
 Transport and validation failures return a structured error with `code`,
 `operation`, `message`, `dispatch_started`, and `suggested_next_action`. Validation
-errors may include JSON Pointer `issues`.
+errors may include JSON Pointer `issues`. Errors created after a session or experiment
+handle exists also return the available `session_id`, `experiment_id`, and
+`manifest_relative_path` so inspection does not depend on guessing local directories.
 
 Recovery rules:
 
@@ -16,7 +18,7 @@ Recovery rules:
   not start.
 - `browser_busy` or `session_busy`: inspect state and wait for the current owner.
 - `operation_outcome_unknown`, `dispatch_started=true`, or `outcome=unknown`: do not
-  repeat the consequential call. Inspect the session and experiment terminal state.
+  repeat the consequential call. Inspect the returned session and experiment handles.
 
 Only retry automatically when `dispatch_started=false` and the correction is purely
 syntactic or contractual.

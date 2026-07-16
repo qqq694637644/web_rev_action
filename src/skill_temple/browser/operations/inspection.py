@@ -181,7 +181,12 @@ class BrowserInspectionOperations:
     def _transport_generation(self) -> int:
         return int(getattr(self.js_reverse, "transport_generation", 0))
 
-    def _discover_capture_metadata(self, experiment_id: str) -> dict[str, Any] | None:
+    def _discover_capture_metadata(
+        self,
+        experiment_id: str,
+        manifest: dict[str, Any] | None = None,
+        runtime_warnings: list[str] | None = None,
+    ) -> dict[str, Any] | None:
         base = self.experiments.experiment_dir(experiment_id) / "js-reverse"
         candidates = sorted(
             base.glob("capture-*/capture.json"),
@@ -191,9 +196,39 @@ class BrowserInspectionOperations:
         for path in candidates:
             try:
                 value = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
+            except (OSError, json.JSONDecodeError) as exc:
+                relative = self.experiments.relative_path(str(path)) or path.as_posix()
+                warning = (
+                    f"capture metadata invalid: {relative}: "
+                    f"{type(exc).__name__}: {str(exc)[:1000]}"
+                )
+                if runtime_warnings is not None and warning not in runtime_warnings:
+                    runtime_warnings.append(warning)
+                if manifest is not None:
+                    warnings = manifest.get("warnings")
+                    if not isinstance(warnings, list):
+                        warnings = []
+                        manifest["warnings"] = warnings
+                    if warning not in warnings:
+                        warnings.append(warning)
+                        self.experiments.write_manifest(experiment_id, manifest)
                 continue
             if not isinstance(value, dict):
+                relative = self.experiments.relative_path(str(path)) or path.as_posix()
+                warning = (
+                    f"capture metadata invalid: {relative}: "
+                    "TypeError: expected JSON object"
+                )
+                if runtime_warnings is not None and warning not in runtime_warnings:
+                    runtime_warnings.append(warning)
+                if manifest is not None:
+                    warnings = manifest.get("warnings")
+                    if not isinstance(warnings, list):
+                        warnings = []
+                        manifest["warnings"] = warnings
+                    if warning not in warnings:
+                        warnings.append(warning)
+                        self.experiments.write_manifest(experiment_id, manifest)
                 continue
             relative = self.experiments.relative_path(str(path.parent))
             return {

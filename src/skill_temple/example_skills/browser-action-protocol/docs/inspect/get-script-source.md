@@ -48,7 +48,7 @@ Expected response handles: bounded source text and script/range metadata. This r
 
 Safe retry: read-only. Refine the range when output is too broad; if the script is no longer loaded, recapture the initiator and script handle.
 
-Typical errors: `invalid_operation_payload`, `session_not_found`, `page_alignment_failed`, `browser_busy`, source unavailable.
+Typical errors: `invalid_operation_payload`, `session_not_found`, `page_alignment_failed`, `browser_busy`, `browser_adapter_failed`, source unavailable.
 
 Next recommended operation: `save_script_source` when the source region supports a claim.
 

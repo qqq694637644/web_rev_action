@@ -154,9 +154,12 @@ class BrowserSessionOperations:
                             dispatch_started=True,
                         )
                     return await callback(deadline)
-                except BrowserServiceError as exc:
-                    exc.dispatch_started = True
-                    raise
+                except AdapterError as exc:
+                    raise service_error_from_adapter(
+                        exc,
+                        operation,
+                        consequential=False,
+                    ).with_context(session_id=session_id) from exc
         finally:
             await self._release_browser_operation(owner_id)
 
@@ -239,47 +242,12 @@ class BrowserSessionOperations:
                 409,
             )
         async with self._locked_browser_session(session_id, deadline):
-            try:
-                page = await self.playwright.open_session(
-                    session_id, endpoint, payload.target.start_url, deadline
-                )
-                if (
-                    payload.target.page_index is not None
-                    and payload.target.page_index != page.page_index
-                ):
-                    page = await self.playwright.select_page(
-                        session_id,
-                        payload.target.page_index,
-                        deadline,
-                    )
-                alignment = await self.js_reverse.align_page(page, deadline)
-            except AdapterError as exc:
-                raise service_error_from_adapter(
-                    exc,
-                    "open browser session",
-                    consequential=True,
-                ) from exc
-            if alignment.status != "aligned":
-                await self.playwright.close_session(session_id, deadline)
-                raise BrowserServiceError(
-                    "page_alignment_failed",
-                    "; ".join(alignment.warnings) or "Could not align browser page",
-                    409,
-                    dispatch_started=True,
-                )
             now = utc_now()
-            session = {
+            session: dict[str, Any] = {
                 "session_id": session_id,
-                "status": "open",
+                "status": "opening",
                 "browser_endpoint_ref": endpoint,
                 "playwright_session_ref": session_id,
-                "playwright_page_index": page.page_index,
-                "playwright_page_url": page.url,
-                "playwright_page_title": page.title,
-                "js_reverse_page_index": alignment.js_reverse_page_index,
-                "js_reverse_page_id": alignment.js_reverse_page_id,
-                "js_reverse_page_url": alignment.js_reverse_page_url,
-                "page_alignment_status": alignment.status,
                 "evidence_store": "local",
                 "evidence_root_ref": ".",
                 "service_instance_id": self.service_instance_id,
@@ -290,6 +258,133 @@ class BrowserSessionOperations:
             if request.action_binding is not None:
                 session["action_contract"] = request.action_binding.model_dump(mode="json")
             self.sessions[session_id] = session
+            self.experiments.save_session(session)
+            page = None
+            try:
+                page = await self.playwright.open_session(
+                    session_id, endpoint, payload.target.start_url, deadline
+                )
+                session.update(
+                    {
+                        "status": "aligning",
+                        "playwright_page_index": page.page_index,
+                        "playwright_page_url": page.url,
+                        "playwright_page_title": page.title,
+                        "updated_at": utc_now(),
+                    }
+                )
+                self.experiments.save_session(session)
+                if (
+                    payload.target.page_index is not None
+                    and payload.target.page_index != page.page_index
+                ):
+                    page = await self.playwright.select_page(
+                        session_id,
+                        payload.target.page_index,
+                        deadline,
+                    )
+                    session.update(
+                        {
+                            "playwright_page_index": page.page_index,
+                            "playwright_page_url": page.url,
+                            "playwright_page_title": page.title,
+                            "updated_at": utc_now(),
+                        }
+                    )
+                    self.experiments.save_session(session)
+                alignment = await self.js_reverse.align_page(page, deadline)
+            except AdapterError as exc:
+                service_error = service_error_from_adapter(
+                    exc,
+                    "open browser session",
+                    consequential=True,
+                ).with_context(session_id=session_id)
+                session.update(
+                    {
+                        "status": (
+                            "open_outcome_unknown"
+                            if service_error.code == "operation_outcome_unknown"
+                            else (
+                                "open_unaligned"
+                                if page is not None
+                                else (
+                                    "open_failed"
+                                    if service_error.dispatch_started
+                                    else "open_failed_before_dispatch"
+                                )
+                            )
+                        ),
+                        "open_error": {
+                            "code": service_error.code,
+                            "message": str(service_error),
+                            "dispatch_started": service_error.dispatch_started,
+                            "outcome": service_error.outcome,
+                        },
+                        "updated_at": utc_now(),
+                    }
+                )
+                self.experiments.save_session(session)
+                raise service_error from exc
+            if alignment.status != "aligned":
+                session.update(
+                    {
+                        "status": "alignment_failed",
+                        "page_alignment_status": alignment.status,
+                        "alignment_warnings": alignment.warnings,
+                        "updated_at": utc_now(),
+                    }
+                )
+                self.experiments.save_session(session)
+                try:
+                    await self.playwright.close_session(session_id, deadline)
+                except AdapterError as exc:
+                    service_error = service_error_from_adapter(
+                        exc,
+                        "close browser session after alignment failure",
+                        consequential=True,
+                    ).with_context(session_id=session_id)
+                    session.update(
+                        {
+                            "status": (
+                                "close_outcome_unknown"
+                                if service_error.code == "operation_outcome_unknown"
+                                else "close_failed"
+                            ),
+                            "close_error": {
+                                "code": service_error.code,
+                                "message": str(service_error),
+                                "dispatch_started": service_error.dispatch_started,
+                                "outcome": service_error.outcome,
+                            },
+                            "updated_at": utc_now(),
+                        }
+                    )
+                    self.experiments.save_session(session)
+                    raise service_error from exc
+                session["status"] = "closed_after_alignment_failure"
+                session["updated_at"] = utc_now()
+                self.experiments.save_session(session)
+                raise BrowserServiceError(
+                    "page_alignment_failed",
+                    "; ".join(alignment.warnings) or "Could not align browser page",
+                    409,
+                    dispatch_started=True,
+                    outcome="failed",
+                    session_id=session_id,
+                )
+            session.update(
+                {
+                    "status": "open",
+                    "playwright_page_index": page.page_index,
+                    "playwright_page_url": page.url,
+                    "playwright_page_title": page.title,
+                    "js_reverse_page_index": alignment.js_reverse_page_index,
+                    "js_reverse_page_id": alignment.js_reverse_page_id,
+                    "js_reverse_page_url": alignment.js_reverse_page_url,
+                    "page_alignment_status": alignment.status,
+                    "updated_at": utc_now(),
+                }
+            )
             self.experiments.save_session(session)
         return BrowserActionResponse(
             operation=request.operation,
@@ -304,15 +399,37 @@ class BrowserSessionOperations:
         session_id = request.payload.session_id
         async with self._locked_browser_session(session_id, deadline):
             session = self._get_session(session_id)
-            if session.get("status") == "open":
+            if session.get("status") not in {"closed", "closed_after_alignment_failure"}:
                 try:
                     await self.playwright.close_session(session_id, deadline)
                 except AdapterError as exc:
-                    raise service_error_from_adapter(
+                    service_error = service_error_from_adapter(
                         exc,
                         "close browser session",
                         consequential=True,
-                    ) from exc
+                    ).with_context(session_id=session_id)
+                    session.update(
+                        {
+                            "status": (
+                                "close_outcome_unknown"
+                                if service_error.code == "operation_outcome_unknown"
+                                else "close_failed"
+                            ),
+                            "close_error": {
+                                "code": service_error.code,
+                                "message": str(service_error),
+                                "dispatch_started": service_error.dispatch_started,
+                                "outcome": service_error.outcome,
+                            },
+                            "updated_at": utc_now(),
+                        }
+                    )
+                    if request.action_binding is not None:
+                        session["last_action_contract"] = request.action_binding.model_dump(
+                            mode="json"
+                        )
+                    self.experiments.save_session(session)
+                    raise service_error from exc
             session["status"] = "closed"
             session["updated_at"] = utc_now()
             if request.action_binding is not None:

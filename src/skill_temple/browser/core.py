@@ -19,12 +19,33 @@ class BrowserServiceError(RuntimeError):
         *,
         dispatch_started: bool = False,
         outcome: str | None = None,
+        session_id: str | None = None,
+        experiment_id: str | None = None,
+        manifest_relative_path: str | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.status_code = status_code
         self.dispatch_started = dispatch_started
         self.outcome = outcome
+        self.session_id = session_id
+        self.experiment_id = experiment_id
+        self.manifest_relative_path = manifest_relative_path
+
+    def with_context(
+        self,
+        *,
+        session_id: str | None = None,
+        experiment_id: str | None = None,
+        manifest_relative_path: str | None = None,
+    ) -> BrowserServiceError:
+        if session_id is not None:
+            self.session_id = session_id
+        if experiment_id is not None:
+            self.experiment_id = experiment_id
+        if manifest_relative_path is not None:
+            self.manifest_relative_path = manifest_relative_path
+        return self
 
 
 def service_error_from_adapter(
