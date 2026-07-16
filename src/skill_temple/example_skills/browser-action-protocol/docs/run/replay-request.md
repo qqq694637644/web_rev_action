@@ -43,7 +43,7 @@ Decoded example:
   "operation": "replay_request",
   "operation_contract_hash": "sha256:a1d821f01a9b7d5bfc1bf88c445c4b34c93531f116fe63dea8e82e80ef35c693",
   "payload_json": "{\"bindings\":[],\"comparison\":null,\"execution_mode\":\"sync\",\"extractors\":[],\"mutations\":[],\"objective\":\"zero-mutation baseline replay\",\"response_reader\":{\"mode\":\"auto\"},\"session_id\":\"analysis-main\",\"source\":{\"evidence_id\":\"ev_network_source\",\"experiment_id\":\"exp_source\"},\"termination\":{\"conditions\":[{\"type\":\"network_close\"}]}}",
-  "skill_content_hash": "sha256:786f2331d061583e44fc9dc7344bae933a380d13006b65d1e88f4ae31ad64e6e",
+  "skill_content_hash": "sha256:f66c3d13f268880a753a0f46098997becee5f0b3ef299232d63f7fe0ef5f7d24",
   "skill_id": "browser-action-protocol"
 }
 ```

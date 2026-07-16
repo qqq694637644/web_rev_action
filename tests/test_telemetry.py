@@ -63,6 +63,31 @@ class TelemetryIntegrationTests(BrowserActionTestCase):
                 )
             )
 
+    def test_recorder_rejects_unapproved_fields_and_nested_values(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            recorder = TelemetryRecorder(temp_dir)
+
+            with self.assertRaisesRegex(ValueError, "unsupported fields"):
+                recorder.record(
+                    "browser_request_error",
+                    action="run",
+                    operation="capture_flow",
+                    code="invalid_operation_payload",
+                    dispatch_started=False,
+                    payload_json='{"authorization":"secret"}',
+                    authorization="Bearer secret",
+                    cookie="session=secret",
+                    csrf="secret",
+                )
+            with self.assertRaisesRegex(ValueError, "must be a non-empty string"):
+                recorder.record(
+                    "browser_request_received",
+                    action="run",
+                    operation={"authorization": "secret"},
+                )
+
+            self.assertFalse(recorder.path.exists())
+
     def test_capture_manifest_binds_transport_skill_and_operation_hashes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

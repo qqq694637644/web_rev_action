@@ -351,9 +351,9 @@ python -m pytest
 node --test tests/runtime/replay_runtime.test.js
 python -m skill_temple.evals evals/skill_queries.jsonl
 python -m skill_temple.dead_code_audit --root .
-python -m skill_temple.builder_preflight --root .
 skill-temple-build-contracts --protocol-root src/skill_temple/example_skills/browser-action-protocol
 skill-temple-build-prompt --skills-dir src/skill_temple/example_skills --template GPT_ACTION_PROMPT.md --output dist/GPT_INSTRUCTIONS.md
+python -m skill_temple.builder_preflight --root .
 git diff --exit-code -- src/skill_temple/example_skills/browser-action-protocol
 ```
 

@@ -65,11 +65,11 @@ Browser protocol:
 Workspace evidence:
 
 - `workspaceInspect`
+- `workspaceSearch`
 - `workspaceReadFiles`
 - `workspaceExecPwsh`
 - `workspaceWriteFile`
 - `workspaceApplyPatch`
-- `workspaceListArtifacts`
 
 Use the smallest set of Actions needed to reach a verifiable result. Preserve unknown,
 missing, partial, and ambiguous evidence instead of guessing.

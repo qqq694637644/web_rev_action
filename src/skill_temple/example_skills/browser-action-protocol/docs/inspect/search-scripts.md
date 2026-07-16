@@ -39,7 +39,7 @@ Decoded example:
   "operation": "search_scripts",
   "operation_contract_hash": "sha256:8fc4808bd71079c56e601f2cd37e4aabb65e6a6120189a86a816a1ca996fb097",
   "payload_json": "{\"max_results\":20,\"query\":\"parent_message_id\",\"session_id\":\"analysis-main\"}",
-  "skill_content_hash": "sha256:786f2331d061583e44fc9dc7344bae933a380d13006b65d1e88f4ae31ad64e6e",
+  "skill_content_hash": "sha256:f66c3d13f268880a753a0f46098997becee5f0b3ef299232d63f7fe0ef5f7d24",
   "skill_id": "browser-action-protocol"
 }
 ```

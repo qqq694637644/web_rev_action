@@ -156,7 +156,8 @@ network observation；`browser_adapters.py` 已删除。公共 request/response 
 | `workspaceExecPwsh` | true | 在分析目录运行 PowerShell 7。 |
 
 Skill 发现来自构建时静态 catalog。`GPT_ACTION_PROMPT.md` 是模板，发布给 GPT Builder 的
-最终 Instructions 生成到被忽略的 `dist/GPT_INSTRUCTIONS.md`，不作为仓库源文件提交：
+最终 Instructions 生成到被忽略的 `dist/GPT_INSTRUCTIONS.md`；仓库提交
+`GPT_INSTRUCTIONS.sha256` 作为可审计漂移门禁：
 
 ```powershell
 skill-temple-build-contracts `
@@ -367,7 +368,8 @@ operation_contract_hash
 
 服务在 analysis workspace 的 `telemetry/action-events.jsonl` 记录 bounded metadata：Skill
 加载数量、operation、验证结果、dispatch state、terminal status 和错误 code。它不记录
-`payload_json`、请求/响应正文或凭据。生成汇总：
+`payload_json`、请求/响应正文或凭据；记录器只接受预定义事件、字段和标量类型，未批准
+字段会直接报错且不会写入文件。生成汇总：
 
 ```powershell
 skill-temple-telemetry-report `

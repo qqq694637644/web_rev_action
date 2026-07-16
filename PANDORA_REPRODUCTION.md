@@ -707,7 +707,7 @@ reports/pandora-comparison.md
 ## 16. 最小闭环
 
 ```text
-capture_baseline
+capture_flow: baseline objective + 空 flow 或最小 snapshot/wait flow
   ↓
 capture_flow: 第一轮消息
   ↓

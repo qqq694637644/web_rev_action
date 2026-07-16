@@ -33,3 +33,21 @@ def test_builder_preflight_detects_invalid_instructions_template() -> None:
         report = run_preflight(repository_root=root)
     assert report["ok"] is False
     assert report["checks"]["generated_instructions"]["ok"] is False
+
+
+def test_builder_preflight_detects_committed_instructions_drift() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        source_skills = ROOT / "src/skill_temple/example_skills"
+        target_skills = root / "src/skill_temple/example_skills"
+        shutil.copytree(source_skills, target_skills)
+        shutil.copy(ROOT / "GPT_ACTION_PROMPT.md", root / "GPT_ACTION_PROMPT.md")
+        shutil.copy(ROOT / "BUILDER_SMOKE_CHECKLIST.md", root / "BUILDER_SMOKE_CHECKLIST.md")
+        (root / "GPT_INSTRUCTIONS.sha256").write_text("0" * 64 + "\n", encoding="utf-8")
+
+        report = run_preflight(repository_root=root)
+
+    generated = report["checks"]["generated_instructions"]
+    assert report["ok"] is False
+    assert generated["matches_expected"] is False
+    assert generated["generated_sha256"] != generated["expected_sha256"]

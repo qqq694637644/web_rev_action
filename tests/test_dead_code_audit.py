@@ -41,3 +41,19 @@ def test_audit_detects_removed_skill_action_identifier() -> None:
         item["reason"] == "removed public Skill retrieval operation"
         for item in report["violations"]
     )
+
+
+def test_audit_scans_current_root_documents() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        (root / "PANDORA_REPRODUCTION.md").write_text(
+            "legacy alias: " + "capture" + "_baseline\n",
+            encoding="utf-8",
+        )
+        report = audit_repository(root)
+
+    assert any(
+        item["path"] == "PANDORA_REPRODUCTION.md"
+        and item["reason"] == "removed Browser alias"
+        for item in report["violations"]
+    )

@@ -32,7 +32,7 @@ Decoded example:
   "operation": "get_experiment",
   "operation_contract_hash": "sha256:90218fa0eeadf8306cbdaad27449244d9d25a31ae8f6ae192eefe0f7e35a6e51",
   "payload_json": "{\"experiment_id\":\"exp_capture\"}",
-  "skill_content_hash": "sha256:786f2331d061583e44fc9dc7344bae933a380d13006b65d1e88f4ae31ad64e6e",
+  "skill_content_hash": "sha256:f66c3d13f268880a753a0f46098997becee5f0b3ef299232d63f7fe0ef5f7d24",
   "skill_id": "browser-action-protocol"
 }
 ```

@@ -5,12 +5,14 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import tempfile
 from pathlib import Path
 from typing import Any
 
 from .app import create_app
 from .browser.registry import OPERATION_REGISTRY
-from .runtime import SkillRuntime
+from .prompt_builder import build_instructions
+from .runtime import SkillRuntime, load_runtime
 
 TEXT_SUFFIXES = {".py", ".md", ".json", ".yml", ".yaml", ".toml"}
 SCAN_ROOTS = [
@@ -19,10 +21,12 @@ SCAN_ROOTS = [
     "tools",
     "validation",
     ".github",
-    "README.md",
-    "INSTALL.md",
-    "GPT_ACTION_PROMPT.md",
 ]
+HISTORICAL_PLAN_FILES = {
+    "PLAN.md",
+    "REFACTORING_PLAN.md",
+    "SKILL_DRIVEN_ACTION_REFACTORING_PLAN.md",
+}
 SKIP_FILES = {
     "src/skill_temple/dead_code_audit.py",
     "tools/dead_code_audit.py",
@@ -40,6 +44,8 @@ PUBLIC_DOC_PATHS = [
     "README.md",
     "INSTALL.md",
     "GPT_ACTION_PROMPT.md",
+    "BUILDER_SMOKE_CHECKLIST.md",
+    "PANDORA_REPRODUCTION.md",
 ]
 _NESTED_PAYLOAD_RE = re.compile(r"[\"']payload[\"']\s*:")
 
@@ -59,6 +65,13 @@ def _files(root: Path) -> list[Path]:
                 and ".venv" not in child.parts
                 and "__pycache__" not in child.parts
             )
+    selected.extend(
+        child
+        for child in root.iterdir()
+        if child.is_file()
+        and child.suffix.lower() in TEXT_SUFFIXES
+        and child.name not in HISTORICAL_PLAN_FILES
+    )
     return sorted(set(selected))
 
 
@@ -66,6 +79,18 @@ def audit_repository(root: str | Path) -> dict[str, Any]:
     repository = Path(root).expanduser().resolve()
     violations: list[dict[str, Any]] = []
     files = _files(repository)
+    generated_instructions: str | None = None
+    template_path = repository / "GPT_ACTION_PROMPT.md"
+    skills_path = repository / "src/skill_temple/example_skills"
+    if template_path.is_file() and skills_path.is_dir():
+        with tempfile.TemporaryDirectory() as temp_dir:
+            generated_path = Path(temp_dir) / "GPT_INSTRUCTIONS.md"
+            build_instructions(
+                runtime=load_runtime(skills_path),
+                template_path=template_path,
+                output_path=generated_path,
+            )
+            generated_instructions = generated_path.read_text(encoding="utf-8")
     for path in files:
         relative = path.relative_to(repository).as_posix()
         if relative in SKIP_FILES:
@@ -86,8 +111,33 @@ def audit_repository(root: str | Path) -> dict[str, Any]:
                         }
                     )
 
+    if generated_instructions is not None:
+        for token, reason in FORBIDDEN_TEXT.items():
+            for line_number, line in enumerate(generated_instructions.splitlines(), start=1):
+                if token in line:
+                    violations.append(
+                        {
+                            "path": "<generated>/GPT_INSTRUCTIONS.md",
+                            "line": line_number,
+                            "token": token,
+                            "reason": reason,
+                        }
+                    )
+        for line_number, line in enumerate(generated_instructions.splitlines(), start=1):
+            if _NESTED_PAYLOAD_RE.search(line):
+                violations.append(
+                    {
+                        "path": "<generated>/GPT_INSTRUCTIONS.md",
+                        "line": line_number,
+                        "token": '"payload":',
+                        "reason": "removed public Browser nested payload transport",
+                    }
+                )
+
     for relative_root in PUBLIC_DOC_PATHS:
         public_path = repository / relative_root
+        if not public_path.exists():
+            continue
         public_files = (
             [public_path]
             if public_path.is_file()
@@ -206,7 +256,7 @@ def audit_repository(root: str | Path) -> dict[str, Any]:
 
     return {
         "format": "web-rev-action-dead-code-audit-v1",
-        "scanned_file_count": len(files),
+        "scanned_file_count": len(files) + (1 if generated_instructions is not None else 0),
         "violation_count": len(violations),
         "violations": violations,
     }

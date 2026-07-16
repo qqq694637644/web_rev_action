@@ -20,6 +20,8 @@ def test_gpt56_action_prompt_routes_details_to_skills() -> None:
     assert "loadSkills" in content
     assert "readSkillContent" in content
     assert "browser-action-protocol" in content
+    assert "workspaceSearch" in content
+    assert "workspaceListArtifacts" not in content
     assert "retrieve" + "SkillContext" not in content
     assert "search" + "SkillDocs" not in content
 

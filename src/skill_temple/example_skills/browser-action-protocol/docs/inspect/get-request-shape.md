@@ -42,7 +42,7 @@ Decoded example:
   "operation": "get_request_shape",
   "operation_contract_hash": "sha256:c45c7c6374acbf91a7c66ce3baa9e10f609900a8f8c51212158541edaeb60ce5",
   "payload_json": "{\"evidence_id\":\"ev_network_request\",\"experiment_id\":\"exp_capture\",\"page_size\":50,\"path_prefix\":\"/messages\"}",
-  "skill_content_hash": "sha256:786f2331d061583e44fc9dc7344bae933a380d13006b65d1e88f4ae31ad64e6e",
+  "skill_content_hash": "sha256:f66c3d13f268880a753a0f46098997becee5f0b3ef299232d63f7fe0ef5f7d24",
   "skill_id": "browser-action-protocol"
 }
 ```

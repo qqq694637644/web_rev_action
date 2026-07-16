@@ -79,7 +79,10 @@ def run_preflight(
     generated_ok = False
     placeholder_absent = False
     generated_sha256: str | None = None
+    expected_sha256: str | None = None
+    matches_expected = False
     generation_error: str | None = None
+    hash_path = root / "GPT_INSTRUCTIONS.sha256"
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
             generated = Path(temp_dir) / "GPT_INSTRUCTIONS.md"
@@ -92,14 +95,20 @@ def run_preflight(
             generated_ok = bool(generated_bytes)
             placeholder_absent = b"{{SKILL_CATALOG}}" not in generated_bytes
             generated_sha256 = hashlib.sha256(generated_bytes).hexdigest()
+            if hash_path.is_file():
+                expected_sha256 = hash_path.read_text(encoding="utf-8").strip()
+                matches_expected = expected_sha256 == generated_sha256
     except (OSError, ValueError) as exc:
         generation_error = str(exc)
     checks["generated_instructions"] = {
-        "ok": generated_ok and placeholder_absent,
+        "ok": generated_ok and placeholder_absent and matches_expected,
         "catalog_skill_count": len(catalog_ids),
         "catalog_skill_ids": catalog_ids,
         "placeholder_absent": placeholder_absent,
-        "sha256": generated_sha256,
+        "generated_sha256": generated_sha256,
+        "expected_sha256": expected_sha256,
+        "matches_expected": matches_expected,
+        "hash_path": "GPT_INSTRUCTIONS.sha256",
         "error": generation_error,
     }
 

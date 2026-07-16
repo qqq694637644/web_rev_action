@@ -9,7 +9,9 @@ on:
       - "tools/**"
       - "evals/**"
       - "GPT_ACTION_PROMPT.md"
+      - "GPT_INSTRUCTIONS.sha256"
       - "BUILDER_SMOKE_CHECKLIST.md"
+      - "PANDORA_REPRODUCTION.md"
       - "pyproject.toml"
       - "README.md"
       - "INSTALL.md"
@@ -40,6 +42,12 @@ jobs:
       - name: Install project and development dependencies
         run: python -m pip install -e ".[dev]"
 
+      - name: Install required workspace search dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ripgrep
+          rg --version
+
       - name: Regenerate Browser operation contracts
         run: >-
           python -m skill_temple.contract_builder
@@ -54,6 +62,14 @@ jobs:
 
       - name: Fail on generated artifact drift
         run: git diff --exit-code -- src/skill_temple/example_skills/browser-action-protocol
+
+      - name: Verify generated Instructions hash
+        run: >-
+          python -c "from pathlib import Path; import hashlib;
+          expected=Path('GPT_INSTRUCTIONS.sha256').read_text(encoding='utf-8').strip();
+          actual=hashlib.sha256(Path('dist/GPT_INSTRUCTIONS.md').read_bytes()).hexdigest();
+          print(f'expected={expected} actual={actual}');
+          raise SystemExit(0 if actual == expected else 1)"
 
       - name: Audit removed compatibility surfaces
         run: python -m skill_temple.dead_code_audit --root .
@@ -82,4 +98,52 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $wheel = Get-ChildItem $wheelDir -Filter '*.whl' | Select-Object -First 1
           if (-not $wheel) { throw 'wheel not created' }
-          python -c "import sys,zipfile; z=zipfile.ZipFile(sys.argv[1]); names=set(z.namelist()); required=['skill_temple/example_skills/browser-action-protocol/SKILL.md','skill_temple/example_skills/browser-action-protocol/docs/generated/operation-contracts.json','skill_temple/example_skills/browser-session-capture/SKILL.md','skill_temple/example_skills/browser-evidence-inspection/SKILL.md','skill_temple/example_skills/browser-request-replay/SKILL.md','skill_temple/example_skills/browser-script-tracing/SKILL.md','skill_temple/example_skills/browser-stream-diagnostics/SKILL.md','skill_temple/example_skills/browser-experiment-recovery/SKILL.md']; missing=[x for x in required if x not in names]; print('missing=' + repr(missing)); raise SystemExit(1 if missing else 0)" $wheel.FullName
+          $script = @'
+          import configparser
+          import io
+          import sys
+          import zipfile
+
+          wheel = zipfile.ZipFile(sys.argv[1])
+          names = set(wheel.namelist())
+          required = {
+              "skill_temple/example_skills/browser-action-protocol/SKILL.md",
+              "skill_temple/example_skills/browser-action-protocol/docs/generated/operation-contracts.json",
+              "skill_temple/example_skills/browser-session-capture/SKILL.md",
+              "skill_temple/example_skills/browser-evidence-inspection/SKILL.md",
+              "skill_temple/example_skills/browser-request-replay/SKILL.md",
+              "skill_temple/example_skills/browser-script-tracing/SKILL.md",
+              "skill_temple/example_skills/browser-stream-diagnostics/SKILL.md",
+              "skill_temple/example_skills/browser-experiment-recovery/SKILL.md",
+              "skill_temple/example_skills/current-site-analysis/SKILL.md",
+              "skill_temple/example_skills/pandora-protocol-reproduction/SKILL.md",
+          }
+          missing = sorted(required - names)
+
+          entry_points_path = next(
+              (name for name in names if name.endswith(".dist-info/entry_points.txt")),
+              None,
+          )
+          if entry_points_path is None:
+              raise SystemExit("wheel is missing entry_points.txt")
+          parser = configparser.ConfigParser()
+          parser.read_file(
+              io.StringIO(wheel.read(entry_points_path).decode("utf-8"))
+          )
+          actual_scripts = dict(parser.items("console_scripts"))
+          expected_scripts = {
+              "skill-temple": "skill_temple.app:main",
+              "web-rev-action": "skill_temple.app:main",
+              "skill-temple-eval": "skill_temple.evals:main",
+              "skill-temple-build-prompt": "skill_temple.prompt_builder:main",
+              "skill-temple-build-contracts": "skill_temple.contract_builder:main",
+              "skill-temple-telemetry-report": "skill_temple.telemetry:main",
+              "skill-temple-dead-code-audit": "skill_temple.dead_code_audit:main",
+              "skill-temple-builder-preflight": "skill_temple.builder_preflight:main",
+          }
+          print(f"missing_package_data={missing!r}")
+          print(f"console_scripts={actual_scripts!r}")
+          if missing or actual_scripts != expected_scripts:
+              raise SystemExit(1)
+          '@
+          python -c $script $wheel.FullName

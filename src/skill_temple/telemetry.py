@@ -11,6 +11,43 @@ from typing import Any
 
 from .browser.core import utc_now
 
+EVENT_FIELDS = {
+    "skill_load_completed": frozenset(
+        {"loaded_skill_count", "loaded_skill_ids", "surface"}
+    ),
+    "skill_load_error": frozenset({"code", "requested_skill_count", "surface"}),
+    "skill_read_completed": frozenset({"skill_id", "path", "truncated"}),
+    "skill_read_error": frozenset({"code", "skill_id", "path"}),
+    "browser_request_received": frozenset({"action", "operation"}),
+    "browser_request_valid": frozenset({"action", "operation"}),
+    "browser_request_completed": frozenset({"action", "operation", "status"}),
+    "browser_request_error": frozenset(
+        {"action", "operation", "code", "dispatch_started", "outcome"}
+    ),
+}
+_INTEGER_FIELDS = {"loaded_skill_count", "requested_skill_count"}
+_BOOLEAN_FIELDS = {"truncated", "dispatch_started"}
+_STRING_LIST_FIELDS = {"loaded_skill_ids"}
+
+
+def _validate_field_value(field: str, value: Any) -> None:
+    if field in _INTEGER_FIELDS:
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError(f"Telemetry field {field!r} must be a non-negative integer")
+        return
+    if field in _BOOLEAN_FIELDS:
+        if not isinstance(value, bool):
+            raise ValueError(f"Telemetry field {field!r} must be a boolean")
+        return
+    if field in _STRING_LIST_FIELDS:
+        if not isinstance(value, list) or not all(
+            isinstance(item, str) and item for item in value
+        ):
+            raise ValueError(f"Telemetry field {field!r} must be a list of strings")
+        return
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"Telemetry field {field!r} must be a non-empty string")
+
 
 class TelemetryRecorder:
     """Append bounded JSONL events without payloads, credentials, or evidence content."""
@@ -21,10 +58,21 @@ class TelemetryRecorder:
         self._lock = threading.Lock()
 
     def record(self, event: str, **fields: Any) -> None:
+        allowed_fields = EVENT_FIELDS.get(event)
+        if allowed_fields is None:
+            raise ValueError(f"Unsupported telemetry event: {event!r}")
+        present_fields = {key: value for key, value in fields.items() if value is not None}
+        unexpected = sorted(set(present_fields) - allowed_fields)
+        if unexpected:
+            raise ValueError(
+                f"Telemetry event {event!r} contains unsupported fields: {unexpected}"
+            )
+        for key, value in present_fields.items():
+            _validate_field_value(key, value)
         safe = {
             "timestamp": utc_now(),
             "event": event,
-            **{key: value for key, value in fields.items() if value is not None},
+            **present_fields,
         }
         encoded = json.dumps(safe, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         if len(encoded) > 16_384:

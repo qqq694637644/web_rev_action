@@ -36,7 +36,7 @@ Decoded example:
   "operation": "close_session",
   "operation_contract_hash": "sha256:bc79ed315e19856450b20815474760de328baa3562bdd092495c6d5ace9f6593",
   "payload_json": "{\"deadline_ms\":10000,\"session_id\":\"analysis-main\"}",
-  "skill_content_hash": "sha256:786f2331d061583e44fc9dc7344bae933a380d13006b65d1e88f4ae31ad64e6e",
+  "skill_content_hash": "sha256:f66c3d13f268880a753a0f46098997becee5f0b3ef299232d63f7fe0ef5f7d24",
   "skill_id": "browser-action-protocol"
 }
 ```
