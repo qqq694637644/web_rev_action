@@ -7,7 +7,7 @@ from tests.browser.common import BrowserActionTestCase
 
 
 class ContractsBrowserTests(BrowserActionTestCase):
-    def test_openapi_has_two_browser_actions_and_discriminated_unions(self) -> None:
+    def test_openapi_has_gpt_actions_compatible_browser_request_objects(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             client, _, _ = self.make_client(Path(temp_dir))
             schema = client.get("/openapi.json").json()
@@ -17,24 +17,40 @@ class ContractsBrowserTests(BrowserActionTestCase):
         self.assertIs(inspect["x-openai-isConsequential"], False)
         run_schema = run["requestBody"]["content"]["application/json"]["schema"]
         inspect_schema = inspect["requestBody"]["content"]["application/json"]["schema"]
-        self.assertIn("oneOf", run_schema)
-        self.assertIn("discriminator", run_schema)
-        self.assertIn("oneOf", inspect_schema)
-        self.assertIn("discriminator", inspect_schema)
-        run_variants = str(run_schema)
-        inspect_variants = str(inspect_schema)
-        self.assertIn("CancelExperimentRequest", run_variants)
-        self.assertIn("ReplayRequestRequest", run_variants)
-        self.assertIn("SaveScriptSourceRequest", run_variants)
-        self.assertIn("GetStreamStatusRequest", inspect_variants)
+        self.assertEqual(run_schema["type"], "object")
+        self.assertEqual(inspect_schema["type"], "object")
+        self.assertEqual(set(run_schema["required"]), {"operation", "payload"})
+        self.assertEqual(set(inspect_schema["required"]), {"operation", "payload"})
+        self.assertEqual(
+            set(run_schema["properties"]),
+            {"contract_version", "operation", "payload", "skill_binding"},
+        )
+        self.assertEqual(
+            set(inspect_schema["properties"]),
+            {"contract_version", "operation", "payload"},
+        )
+        self.assertNotIn("oneOf", run_schema)
+        self.assertNotIn("discriminator", run_schema)
+        self.assertNotIn("oneOf", inspect_schema)
+        self.assertNotIn("discriminator", inspect_schema)
+        self.assertEqual(run_schema["properties"]["payload"]["type"], "object")
+        self.assertEqual(inspect_schema["properties"]["payload"]["type"], "object")
+        self.assertIn("oneOf", run_schema["properties"]["payload"])
+        self.assertIn("oneOf", inspect_schema["properties"]["payload"])
+        run_variants = str(run_schema["properties"]["payload"])
+        inspect_variants = str(inspect_schema["properties"]["payload"])
+        self.assertIn("CancelExperimentPayload", run_variants)
+        self.assertIn("ReplayRequestPayload", run_variants)
+        self.assertIn("SaveScriptSourcePayload", run_variants)
+        self.assertIn("GetStreamStatusPayload", inspect_variants)
         for variant in [
-            "ListEvidenceRequest",
-            "GetNetworkEvidenceRequest",
-            "GetRequestShapeRequest",
-            "GetRequestInitiatorRequest",
-            "SearchScriptsRequest",
-            "GetScriptSourceRequest",
-            "ListConsoleErrorsRequest",
+            "ListEvidencePayload",
+            "GetNetworkEvidencePayload",
+            "GetRequestShapePayload",
+            "GetRequestInitiatorPayload",
+            "SearchScriptsPayload",
+            "GetScriptSourcePayload",
+            "ListConsoleErrorsPayload",
         ]:
             self.assertIn(variant, inspect_variants)
         status_payload = schema["components"]["schemas"]["GetStreamStatusPayload"]
