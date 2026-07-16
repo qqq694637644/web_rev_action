@@ -132,6 +132,10 @@ jobs:
       - name: Install Chromium for Python shared-CDP launcher
         run: python -m playwright install chromium
 
+      - name: Expose Python Playwright Chromium to Browser Action smoke
+        run: |
+          echo "WEB_REV_CHROME_EXECUTABLE=$(python -c 'from playwright.sync_api import sync_playwright; p=sync_playwright().start(); print(p.chromium.executable_path); p.stop()')" >> "$GITHUB_ENV"
+
       - name: Run shared-CDP validation
         run: python validation/dual-cdp/run_validation.py
 

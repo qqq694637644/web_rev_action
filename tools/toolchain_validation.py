@@ -939,6 +939,15 @@ def find_free_port() -> int:
 
 
 def find_chrome() -> Path:
+    configured = os.environ.get("WEB_REV_CHROME_EXECUTABLE", "").strip()
+    if configured:
+        candidate = Path(configured).expanduser().resolve()
+        if candidate.is_file():
+            return candidate
+        raise RuntimeError(
+            f"WEB_REV_CHROME_EXECUTABLE does not point to a file: {candidate}"
+        )
+
     candidates = [
         Path(os.environ.get("PROGRAMFILES", ""))
         / "Google"
@@ -951,10 +960,21 @@ def find_chrome() -> Path:
         / "Application"
         / "chrome.exe",
     ]
+    for command in (
+        "google-chrome",
+        "google-chrome-stable",
+        "chromium",
+        "chromium-browser",
+    ):
+        resolved = shutil.which(command)
+        if resolved:
+            candidates.append(Path(resolved))
     for candidate in candidates:
         if candidate.is_file():
             return candidate
-    raise RuntimeError("Google Chrome executable was not found.")
+    raise RuntimeError(
+        "Chrome/Chromium executable was not found. Set WEB_REV_CHROME_EXECUTABLE."
+    )
 
 
 def start_chrome(port: int, profile_path: Path) -> subprocess.Popen[bytes]:

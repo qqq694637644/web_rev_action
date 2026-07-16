@@ -208,7 +208,11 @@ WEB_REV_WORKSPACE_ALLOW_NETWORK=false
 
 ```dotenv
 WEB_REV_PLAYWRIGHT_CLI_ENTRY=C:/path/to/playwright-cli/playwright-cli.js
+WEB_REV_CHROME_EXECUTABLE=C:/path/to/chrome.exe
 ```
+
+`WEB_REV_CHROME_EXECUTABLE` 也可指向 Playwright 安装的 Chromium；Linux CI 会从 Python
+Playwright 的固定 runtime 自动写入该值。
 
 可选配置：
 
