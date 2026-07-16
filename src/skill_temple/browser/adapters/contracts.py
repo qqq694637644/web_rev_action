@@ -18,16 +18,31 @@ from ...browser_models import (
 class AdapterError(RuntimeError):
     """Raised when a private browser adapter cannot complete an operation."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        dispatch_started: bool = False,
+        outcome_unknown: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.dispatch_started = dispatch_started
+        self.outcome_unknown = outcome_unknown
+
 class McpToolCallError(AdapterError):
     def __init__(
         self,
         message: str,
         *,
         outcome_unknown: bool,
+        dispatch_started: bool,
         transport_generation: int,
     ) -> None:
-        super().__init__(message)
-        self.outcome_unknown = outcome_unknown
+        super().__init__(
+            message,
+            dispatch_started=dispatch_started,
+            outcome_unknown=outcome_unknown,
+        )
         self.transport_generation = transport_generation
 
 class McpTransportError(AdapterError):

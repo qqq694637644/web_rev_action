@@ -40,12 +40,14 @@ class BrowserFinalizationOperations:
             "network_payload": {},
             "collector_stopped": (
                 not payload.capture.stream
-                or stream_start_status in {"not_attempted", "failed_before_send"}
+                or stream_start_status
+                in {"not_attempted", "failed_before_send", "failed_after_dispatch"}
             ),
             "collector_cleanup": (
                 "not_required"
                 if not payload.capture.stream
-                or stream_start_status in {"not_attempted", "failed_before_send"}
+                or stream_start_status
+                in {"not_attempted", "failed_before_send", "failed_after_dispatch"}
                 else "unknown"
             ),
             "orphan_capture_id": None,

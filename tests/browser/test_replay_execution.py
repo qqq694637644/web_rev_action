@@ -4,10 +4,87 @@ import json
 import tempfile
 from pathlib import Path
 
+from skill_temple.browser.adapters.contracts import AdapterError
 from tests.browser.common import BrowserActionTestCase
+from tests.fakes.browser import FakeJsReverse
 
 
 class ReplayExecutionBrowserTests(BrowserActionTestCase):
+    def test_replay_adapter_failure_preserves_real_dispatch_fact_and_manifest(self) -> None:
+        for dispatch_started, outcome_unknown, expected_code, expected_status in [
+            (False, False, "browser_adapter_failed", "failed"),
+            (True, True, "operation_outcome_unknown", "partial"),
+        ]:
+            with (
+                self.subTest(dispatch_started=dispatch_started),
+                tempfile.TemporaryDirectory() as temp_dir,
+            ):
+                root = Path(temp_dir)
+                client, events, _ = self.make_client(root, include_supporting_failure=False)
+                with client:
+                    self.open_session(client)
+                    source_id, source_evidence, _ = self.capture_replay_source(client, root)
+
+                    class FailingReplayJs(FakeJsReverse):
+                        sent = dispatch_started
+                        unknown = outcome_unknown
+
+                        async def evaluate_browser_replay(
+                            self,
+                            spec_file: Path,
+                            output_file: Path,
+                            deadline: object,
+                        ) -> dict[str, object]:
+                            raise AdapterError(
+                                "fake replay transport failure",
+                                dispatch_started=self.sent,
+                                outcome_unknown=self.unknown,
+                            )
+
+                    service = client.app.state.browser_action_service
+                    service.js_reverse = FailingReplayJs(
+                        events,
+                        root,
+                        include_supporting_failure=False,
+                    )
+                    before = set((root / "experiments").iterdir())
+                    response = client.post(
+                        "/v1/browser/run",
+                        json=self.browser_request(
+                            "replay_request",
+                            {
+                                "session_id": "session_one",
+                                "objective": "classify replay dispatch boundary",
+                                "source": {
+                                    "experiment_id": source_id,
+                                    "evidence_id": source_evidence["evidence_id"],
+                                },
+                                "execution_mode": "sync",
+                                "deadline_ms": 10_000,
+                            },
+                        ),
+                    )
+                self.assertEqual(response.status_code, 502, response.text)
+                self.assertEqual(response.json()["error"]["code"], expected_code)
+                self.assertEqual(response.json()["error"]["dispatch_started"], dispatch_started)
+                created = list(set((root / "experiments").iterdir()) - before)
+                self.assertEqual(len(created), 1)
+                manifest = json.loads(
+                    (created[0] / "manifest.json").read_text(encoding="utf-8")
+                )
+                self.assertEqual(manifest["status"], expected_status)
+                self.assertEqual(
+                    manifest["operation_outcome"],
+                    "unknown" if outcome_unknown else "failed",
+                )
+                replay_step = next(
+                    item for item in manifest["steps"] if item["step_id"] == "replay_request"
+                )
+                self.assertEqual(
+                    replay_step["status"],
+                    "outcome_unknown" if outcome_unknown else "failed",
+                )
+
     def test_generic_replay_supports_bindings_and_multiple_mutations(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

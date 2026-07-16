@@ -116,6 +116,12 @@ browser.adapters.js_reverse.JsReverseMcpAdapter
 
 只有 `browser_service.py` composition root 负责组装这些实现。
 
+Adapter 错误显式区分事实边界：命令或 MCP call 未发送时
+`dispatch_started=false`；已发送且收到可信失败结果时
+`dispatch_started=true, outcome=failed`；只有已发送但未获得可信终态的超时、连接中断
+或 transport 崩溃才返回 `operation_outcome_unknown`、`dispatch_started=true`、
+`outcome=unknown`。Route 不根据异常类型猜测该状态。
+
 Operation 模块只从 `browser/adapters/contracts.py` 导入 adapter 类型和错误，不从
 `browser.adapters` package facade 或具体 transport 实现导入。js-reverse stream status 的
 request matching 与 checkpoint 转换位于纯函数模块 `browser/stream_state.py`，session 和
@@ -170,7 +176,8 @@ skill-temple-build-prompt `
 ```
 
 服务端不会根据 query 选择 Skill，也不提供 Skill 文档全文搜索。模型根据静态 description
-选择精确 ID，再调用 `loadSkills`；入口明确引用的资料才通过 `readSkillContent` 读取。
+选择精确 ID，再调用 `loadSkills`。`referenced_paths` 是推荐阅读入口，不是访问 allowlist；
+`readSkillContent` 可以读取该 Skill 目录内任意安全普通文件。
 
 Browser operation 的唯一结构来源是 `browser/registry.py`。Registry 同时驱动 Action
 分类、内部 request model、dispatcher handler和协议文档路径。`operation_contract_hash`
@@ -449,6 +456,11 @@ get_script_source
 list_console_errors
 ```
 
+`list_experiments` 将可解析实验放在 `experiments`，将损坏 manifest 的相对路径、错误
+类型和消息放在独立的 `manifest_errors`。坏文件不会从列表中消失，也不会占用正常实验
+的 `limit`；`get_experiment` 精确读取该实验时返回 `manifest_invalid`，其他实验和
+Workspace 路径仍可继续使用。
+
 公开 `get_stream_status` 使用：
 
 ```text
@@ -681,7 +693,7 @@ Collector 同时维护 source-specific `event index → JSONL byte offset`。每
 Stream start 显式建模为：
 
 ```text
-not_attempted | failed_before_send | confirmed | outcome_unknown
+not_attempted | failed_before_send | failed_after_dispatch | confirmed | outcome_unknown
 ```
 
 Start 已 dispatch 但调用超时或取消时，后端扫描 experiment namespace 中的 `capture.json` 恢复持久身份，但 `collector_stopped=false`、`collector_cleanup=unknown`，不会把旧数字 ID 当作新 MCP generation 中的 live capture。

@@ -487,13 +487,20 @@ class BrowserInspectionOperations:
                 result={"session": session},
             )
         if isinstance(request, ListExperimentsRequest):
-            items = self.experiments.list_experiments(
+            listing = self.experiments.list_experiments(
                 request.payload.session_id, request.payload.limit
             )
+            items = listing["experiments"]
+            manifest_errors = listing["manifest_errors"]
             return BrowserActionResponse(
                 operation=request.operation,
                 status="completed",
-                result={"experiments": items, "count": len(items)},
+                result={
+                    "experiments": items,
+                    "count": len(items),
+                    "manifest_errors": manifest_errors,
+                    "manifest_error_count": len(manifest_errors),
+                },
             )
         if isinstance(request, GetExperimentRequest):
             manifest = self.experiments.load_manifest(request.payload.experiment_id)

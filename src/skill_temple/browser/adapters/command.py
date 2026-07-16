@@ -103,20 +103,31 @@ class SubprocessCommandRunner:
     ) -> CommandResult:
         deadline.ensure_remaining("subprocess")
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
-        process = await asyncio.create_subprocess_exec(
-            *argv,
-            cwd=str(cwd) if cwd else None,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            creationflags=creationflags,
-        )
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *argv,
+                cwd=str(cwd) if cwd else None,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                creationflags=creationflags,
+            )
+        except OSError as exc:
+            raise AdapterError(
+                f"Command could not be started: {argv[0]}: {exc}",
+                dispatch_started=False,
+                outcome_unknown=False,
+            ) from exc
         try:
             stdout, stderr, truncated = await self._collect_output(
                 process,
                 deadline.remaining_seconds(),
             )
         except TimeoutError as exc:
-            raise AdapterError(f"Command timed out: {argv[0]} {argv[-1]}") from exc
+            raise AdapterError(
+                f"Command timed out: {argv[0]} {argv[-1]}",
+                dispatch_started=True,
+                outcome_unknown=True,
+            ) from exc
         result = CommandResult(
             argv=argv,
             returncode=process.returncode or 0,
@@ -126,5 +137,9 @@ class SubprocessCommandRunner:
         )
         if result.returncode != 0 and not allow_failure:
             message = (result.stderr or result.stdout).strip()[-4000:]
-            raise AdapterError(f"Command failed ({result.returncode}): {message}")
+            raise AdapterError(
+                f"Command failed ({result.returncode}): {message}",
+                dispatch_started=True,
+                outcome_unknown=False,
+            )
         return result

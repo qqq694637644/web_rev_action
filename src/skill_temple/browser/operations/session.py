@@ -22,11 +22,18 @@ from ...browser_models import (
 )
 from ...runtime_coordinator import RuntimeOwner, RuntimeReservationError
 from ..adapters.contracts import (
+    AdapterError,
     AlignmentResult,
     StreamCheckpoint,
     StreamRequestCheckpoint,
 )
-from ..core import BrowserServiceError, Deadline, _safe_identifier, utc_now
+from ..core import (
+    BrowserServiceError,
+    Deadline,
+    _safe_identifier,
+    service_error_from_adapter,
+    utc_now,
+)
 from ..stream_state import checkpoint_from_status, request_matches_stream_request
 
 
@@ -232,19 +239,26 @@ class BrowserSessionOperations:
                 409,
             )
         async with self._locked_browser_session(session_id, deadline):
-            page = await self.playwright.open_session(
-                session_id, endpoint, payload.target.start_url, deadline
-            )
-            if (
-                payload.target.page_index is not None
-                and payload.target.page_index != page.page_index
-            ):
-                page = await self.playwright.select_page(
-                    session_id,
-                    payload.target.page_index,
-                    deadline,
+            try:
+                page = await self.playwright.open_session(
+                    session_id, endpoint, payload.target.start_url, deadline
                 )
-            alignment = await self.js_reverse.align_page(page, deadline)
+                if (
+                    payload.target.page_index is not None
+                    and payload.target.page_index != page.page_index
+                ):
+                    page = await self.playwright.select_page(
+                        session_id,
+                        payload.target.page_index,
+                        deadline,
+                    )
+                alignment = await self.js_reverse.align_page(page, deadline)
+            except AdapterError as exc:
+                raise service_error_from_adapter(
+                    exc,
+                    "open browser session",
+                    consequential=True,
+                ) from exc
             if alignment.status != "aligned":
                 await self.playwright.close_session(session_id, deadline)
                 raise BrowserServiceError(
@@ -291,7 +305,14 @@ class BrowserSessionOperations:
         async with self._locked_browser_session(session_id, deadline):
             session = self._get_session(session_id)
             if session.get("status") == "open":
-                await self.playwright.close_session(session_id, deadline)
+                try:
+                    await self.playwright.close_session(session_id, deadline)
+                except AdapterError as exc:
+                    raise service_error_from_adapter(
+                        exc,
+                        "close browser session",
+                        consequential=True,
+                    ) from exc
             session["status"] = "closed"
             session["updated_at"] = utc_now()
             if request.action_binding is not None:

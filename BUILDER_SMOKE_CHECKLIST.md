@@ -32,7 +32,8 @@ Record:
 2. Confirm the model selects `current-site-analysis` from the static catalog.
 3. Confirm it calls `loadSkills` with exact IDs and does not query a Skill directory.
 4. Confirm it loads `browser-action-protocol` before a Browser Action.
-5. Confirm it calls `readSkillContent` only for paths explicitly referenced by loaded Skills.
+5. Treat each Skill's `referenced_paths` as recommended entry points. Confirm any other
+   requested path remains inside the selected Skill directory.
 6. Confirm it copies the current protocol Skill hash and the exact operation contract hash.
 
 ## Browser transport and recovery

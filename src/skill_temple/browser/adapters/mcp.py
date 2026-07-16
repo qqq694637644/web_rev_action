@@ -40,6 +40,7 @@ class StdioMcpToolTransport:
             "pause_or_resume",
             "start_stream_capture",
             "stop_stream_capture",
+            "evaluate_script",
         }
     )
 
@@ -185,13 +186,25 @@ class StdioMcpToolTransport:
                         delivered: BaseException = exc
                         if transport_failure:
                             delivered = McpTransportError(
-                                f"MCP transport failed during {call.name}: {exc}"
+                                f"MCP transport failed during {call.name}: {exc}",
+                                dispatch_started=call.sent,
+                                outcome_unknown=(
+                                    call.sent and call.name in self.SIDE_EFFECTING_TOOLS
+                                ),
                             )
+                            delivered.transport_generation = generation
                         elif call.name in self.SIDE_EFFECTING_TOOLS:
                             delivered = McpToolCallError(
                                 f"MCP tool failed after dispatch: {call.name}: {exc}",
-                                outcome_unknown=call.sent,
+                                outcome_unknown=False,
+                                dispatch_started=call.sent,
                                 transport_generation=generation,
+                            )
+                        else:
+                            delivered = AdapterError(
+                                f"MCP tool failed after dispatch: {call.name}: {exc}",
+                                dispatch_started=call.sent,
+                                outcome_unknown=False,
                             )
                         if not call.future.done():
                             call.future.set_exception(delivered)
@@ -275,7 +288,8 @@ class StdioMcpToolTransport:
                 await self._abort_worker()
             raise McpToolCallError(
                 f"MCP tool timed out: {name}",
-                outcome_unknown=call.sent,
+                outcome_unknown=(call.sent and name in self.SIDE_EFFECTING_TOOLS),
+                dispatch_started=call.sent,
                 transport_generation=call.generation,
             ) from exc
         except asyncio.CancelledError as exc:
@@ -292,9 +306,15 @@ class StdioMcpToolTransport:
         except BaseException as exc:
             if self._is_transport_failure(exc):
                 await self._abort_worker()
-                raise AdapterError(
-                    f"MCP transport failed and was restarted: {name}: {exc}"
-                ) from exc
+                if isinstance(exc, AdapterError):
+                    raise
+                error = McpTransportError(
+                    f"MCP transport failed and was restarted: {name}: {exc}",
+                    dispatch_started=call.sent,
+                    outcome_unknown=(call.sent and name in self.SIDE_EFFECTING_TOOLS),
+                )
+                error.transport_generation = call.generation
+                raise error from exc
             raise
 
     async def _abort_worker(self) -> None:

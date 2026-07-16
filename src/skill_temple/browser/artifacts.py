@@ -89,20 +89,69 @@ class ExperimentStore:
         manifest["updated_at"] = utc_now()
         self._atomic_json(self.experiment_dir(experiment_id) / "manifest.json", manifest)
 
+    def _load_manifest_path(self, path: Path) -> dict[str, Any]:
+        relative = path.relative_to(self.root).as_posix()
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise BrowserServiceError(
+                "manifest_invalid",
+                f"Invalid experiment manifest {relative}: {type(exc).__name__}: {exc}",
+                500,
+            ) from exc
+        if not isinstance(value, dict):
+            raise BrowserServiceError(
+                "manifest_invalid",
+                f"Invalid experiment manifest {relative}: TypeError: expected JSON object",
+                500,
+            )
+        return value
+
+    def _invalid_manifest_summary(
+        self,
+        path: Path,
+        exc: BrowserServiceError,
+    ) -> dict[str, Any]:
+        relative = path.relative_to(self.root).as_posix()
+        cause = exc.__cause__
+        error_type = type(cause).__name__ if cause is not None else "TypeError"
+        return {
+            "experiment_id": path.parent.name,
+            "session_id": None,
+            "operation": None,
+            "objective": None,
+            "status": "manifest_invalid",
+            "created_at": None,
+            "execution": None,
+            "quality_summary": None,
+            "manifest_relative_path": relative,
+            "manifest_error": {
+                "code": "manifest_invalid",
+                "path": relative,
+                "error_type": error_type,
+                "message": str(exc),
+            },
+        }
+
     def load_manifest(self, experiment_id: str) -> dict[str, Any]:
         path = self.experiment_dir(experiment_id) / "manifest.json"
         if not path.is_file():
             raise BrowserServiceError("experiment_not_found", "Experiment was not found", 404)
-        return json.loads(path.read_text(encoding="utf-8"))
+        return self._load_manifest_path(path)
 
-    def list_experiments(self, session_id: str | None, limit: int) -> list[dict[str, Any]]:
+    def list_experiments(self, session_id: str | None, limit: int) -> dict[str, Any]:
         items: list[dict[str, Any]] = []
+        manifest_errors: list[dict[str, Any]] = []
         for path in sorted(self.experiments_dir.glob("*/manifest.json"), reverse=True):
             try:
-                manifest = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
+                manifest = self._load_manifest_path(path)
+            except BrowserServiceError as exc:
+                if len(manifest_errors) < limit:
+                    manifest_errors.append(self._invalid_manifest_summary(path, exc))
                 continue
             if session_id and manifest.get("session_id") != session_id:
+                continue
+            if len(items) >= limit:
                 continue
             items.append(
                 {
@@ -116,16 +165,17 @@ class ExperimentStore:
                     "quality_summary": manifest.get("quality_summary"),
                 }
             )
-            if len(items) >= limit:
-                break
-        return items
+        return {
+            "experiments": items,
+            "manifest_errors": manifest_errors,
+        }
 
     def recover_interrupted_experiments(self) -> int:
         recovered = 0
         for path in self.experiments_dir.glob("*/manifest.json"):
             try:
-                manifest = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
+                manifest = self._load_manifest_path(path)
+            except BrowserServiceError:
                 continue
             if manifest.get("status") != "running":
                 continue

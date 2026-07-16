@@ -39,7 +39,11 @@ Decoded example:
 ```
 ## Result and recovery
 
-Expected response handles: bounded experiment summaries, exact `experiment_id` values, status, session association, and count.
+Expected response handles: bounded valid experiment summaries in `experiments`, plus a
+separate bounded `manifest_errors` list containing the relative path and parse error for
+each unreadable manifest. Invalid manifests do not hide valid experiments. A session
+filter applies only to readable manifests because an invalid manifest has no trustworthy
+session association.
 
 Safe retry: read-only; correct validation errors when `dispatch_started=false`.
 

@@ -8,8 +8,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ..browser_models import FlowStep, FlowStepResult, RequestMatcher
-from .adapters import StreamCheckpoint
-from .core import BrowserServiceError, Deadline, utc_now
+from .adapters import AdapterError, StreamCheckpoint
+from .core import BrowserServiceError, Deadline, service_error_from_adapter, utc_now
 
 if TYPE_CHECKING:
     from ..browser_service import BrowserActionService
@@ -118,6 +118,27 @@ class StepExecutor:
                         snapshot_ref=snapshot_ref,
                     )
                 )
+            except AdapterError as exc:
+                service_error = service_error_from_adapter(
+                    exc,
+                    f"{phase} step {step.step_id}",
+                    consequential=step.action not in cls.READ_ONLY_ACTIONS,
+                )
+                step_results.append(
+                    FlowStepResult(
+                        step_id=step.step_id,
+                        phase=phase,
+                        status=(
+                            "outcome_unknown"
+                            if service_error.code == "operation_outcome_unknown"
+                            else "failed"
+                        ),
+                        started_at=started,
+                        ended_at=utc_now(),
+                        error=str(service_error)[:4000],
+                    )
+                )
+                raise service_error from exc
             except asyncio.CancelledError:
                 canceled_status = (
                     "canceled"

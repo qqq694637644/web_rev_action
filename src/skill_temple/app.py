@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, BinaryIO
 from urllib.parse import urlparse
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -321,7 +321,10 @@ def create_app(
         "/v1/skills/load",
         operation_id="loadSkills",
         response_model=LoadSkillsResponse,
-        responses={404: {"model": StructuredErrorResponse}},
+        responses={
+            404: {"model": StructuredErrorResponse},
+            422: {"model": StructuredErrorResponse},
+        },
         summary="Load complete Skills by exact id.",
         description=(
             "Load up to three exact skill_ids selected from the compiled "
@@ -329,27 +332,35 @@ def create_app(
         ),
         openapi_extra={"x-openai-isConsequential": False},
     )
-    def load_skills(request: LoadSkillsRequest) -> LoadSkillsResponse:
+    def load_skills(request: LoadSkillsRequest) -> LoadSkillsResponse | JSONResponse:
         try:
             result = runtime.load_skills(request.skill_ids)
             return LoadSkillsResponse.model_validate(result)
         except SkillNotFoundError as exc:
             detail = structured_error("skill_not_found", str(exc), "check_skill_id")
-            raise HTTPException(status_code=404, detail=detail) from exc
+            return JSONResponse(status_code=404, content=detail)
         except SkillRuntimeError as exc:
             detail = structured_error("invalid_skill_request", str(exc), "reduce_skill_ids")
-            raise HTTPException(status_code=422, detail=detail) from exc
+            return JSONResponse(status_code=422, content=detail)
 
     @app.post(
         "/v1/skills/read",
         operation_id="readSkillContent",
         response_model=ReadSkillContentResponse,
-        responses={404: {"model": StructuredErrorResponse}},
+        responses={
+            404: {"model": StructuredErrorResponse},
+            422: {"model": StructuredErrorResponse},
+        },
         summary="Read a Skill file by exact safe relative path.",
-        description="Read one exact path explicitly referenced by a loaded SKILL.md.",
+        description=(
+            "Read one exact safe file path inside the selected Skill directory. "
+            "Use referenced_paths as recommended entry points, not as an access allowlist."
+        ),
         openapi_extra={"x-openai-isConsequential": False},
     )
-    def read_skill_content(request: ReadSkillContentRequest) -> ReadSkillContentResponse:
+    def read_skill_content(
+        request: ReadSkillContentRequest,
+    ) -> ReadSkillContentResponse | JSONResponse:
         try:
             result = runtime.read(
                 skill_id=request.skill_id,
@@ -360,7 +371,7 @@ def create_app(
             return ReadSkillContentResponse.model_validate(result)
         except SkillNotFoundError as exc:
             detail = structured_error("skill_not_found", str(exc), "check_skill_id")
-            raise HTTPException(status_code=404, detail=detail) from exc
+            return JSONResponse(status_code=404, content=detail)
         except SkillLineLimitError as exc:
             detail = {
                 "error": {
@@ -374,10 +385,10 @@ def create_app(
                     "max_chars": exc.max_chars,
                 }
             }
-            raise HTTPException(status_code=422, detail=detail) from exc
+            return JSONResponse(status_code=422, content=detail)
         except SkillPathError as exc:
             detail = structured_error("unsafe_or_missing_path", str(exc), "check_path")
-            raise HTTPException(status_code=404, detail=detail) from exc
+            return JSONResponse(status_code=404, content=detail)
 
     guard_key: str | None = None
     coordinator = (

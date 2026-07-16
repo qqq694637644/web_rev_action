@@ -1088,6 +1088,7 @@ class FlowStepResult(StrictModel):
     status: Literal[
         "completed",
         "failed",
+        "outcome_unknown",
         "skipped",
         "timed_out",
         "canceled",

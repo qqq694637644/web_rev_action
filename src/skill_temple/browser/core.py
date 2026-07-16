@@ -7,6 +7,8 @@ import time
 from datetime import UTC, datetime
 from typing import Any
 
+from .adapters.contracts import AdapterError
+
 
 class BrowserServiceError(RuntimeError):
     def __init__(
@@ -23,6 +25,31 @@ class BrowserServiceError(RuntimeError):
         self.status_code = status_code
         self.dispatch_started = dispatch_started
         self.outcome = outcome
+
+
+def service_error_from_adapter(
+    exc: AdapterError,
+    operation: str,
+    *,
+    consequential: bool,
+) -> BrowserServiceError:
+    dispatch_started = bool(exc.dispatch_started)
+    outcome_unknown = bool(exc.outcome_unknown) if consequential else False
+    if outcome_unknown:
+        return BrowserServiceError(
+            "operation_outcome_unknown",
+            f"{operation} was dispatched but no trustworthy terminal result was received: {exc}",
+            502,
+            dispatch_started=True,
+            outcome="unknown",
+        )
+    return BrowserServiceError(
+        "browser_adapter_failed",
+        f"{operation} failed at the browser adapter boundary: {exc}",
+        502,
+        dispatch_started=dispatch_started,
+        outcome="failed",
+    )
 
 
 class Deadline:

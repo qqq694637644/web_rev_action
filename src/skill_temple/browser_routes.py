@@ -22,6 +22,7 @@ from .browser_models import (
 from .browser_service import BrowserActionService, BrowserServiceError
 
 _BROWSER_PATHS = {"/v1/browser/inspect", "/v1/browser/run"}
+_SKILL_PATHS = {"/v1/skills/load", "/v1/skills/read"}
 
 
 def _validation_path(loc: tuple[Any, ...]) -> str:
@@ -66,6 +67,22 @@ def register_browser_actions(
         request: Request,
         exc: RequestValidationError,
     ) -> JSONResponse:
+        if request.url.path in _SKILL_PATHS:
+            details = "; ".join(
+                f"{_validation_path(tuple(error.get('loc', ())))}: "
+                f"{error.get('msg', 'invalid value')}"
+                for error in exc.errors()[:10]
+            )
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "error": {
+                        "code": "invalid_skill_request",
+                        "message": f"Skill Action request is invalid. {details}".strip(),
+                        "suggested_next_action": "check_request_fields",
+                    }
+                },
+            )
         if request.url.path not in _BROWSER_PATHS:
             return await request_validation_exception_handler(request, exc)
         body = exc.body if isinstance(exc.body, dict) else {}

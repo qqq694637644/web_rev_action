@@ -18,8 +18,8 @@ from ...browser_models import (
 from ...protocol.matching import (
     network_checkpoint,
 )
-from ..adapters.contracts import AlignmentResult, McpToolCallError, StreamCheckpoint
-from ..core import BrowserServiceError, Deadline, utc_now
+from ..adapters.contracts import AdapterError, AlignmentResult, StreamCheckpoint
+from ..core import BrowserServiceError, Deadline, service_error_from_adapter, utc_now
 from ..steps import StepExecutor
 from .context import CaptureCompletionContext
 
@@ -131,6 +131,20 @@ class BrowserCaptureOperations:
                 ]
                 self.experiments.write_manifest(experiment_id, manifest)
                 raise
+            except BrowserServiceError as exc:
+                manifest = self.experiments.load_manifest(experiment_id)
+                unknown = exc.code == "operation_outcome_unknown"
+                manifest["status"] = "partial" if unknown else "failed"
+                manifest["operation_outcome"] = "unknown" if unknown else "failed"
+                manifest["execution"] = {
+                    "status": "unknown" if unknown else "failed",
+                    "errors": [str(exc)[:4000]],
+                }
+                manifest["errors"] = [
+                    *(manifest.get("errors") if isinstance(manifest.get("errors"), list) else []),
+                    str(exc)[:4000],
+                ]
+                self.experiments.write_manifest(experiment_id, manifest)
             except Exception as exc:
                 manifest = self.experiments.load_manifest(experiment_id)
                 manifest["status"] = "failed"
@@ -141,6 +155,62 @@ class BrowserCaptureOperations:
                 self.experiments.write_manifest(experiment_id, manifest)
         finally:
             await self._release_browser_operation(experiment_id)
+
+    def _raise_terminal_service_error(
+        self,
+        *,
+        experiment_id: str,
+        manifest: dict[str, Any],
+        error: BrowserServiceError,
+        step_results: list[FlowStepResult],
+        stream_start_status: str,
+        capture_id: int | None,
+        capture_uuid: str | None,
+        capture_relative_dir: str | None,
+        capture_metadata_artifact_id: str | None,
+        capture_transport_generation: int | None,
+        collector_stopped: bool,
+        cleanup_result: dict[str, Any],
+        stream_requested: bool,
+        warnings: list[str],
+        errors: list[str],
+    ) -> None:
+        unknown = error.code == "operation_outcome_unknown"
+        manifest.update(
+            {
+                "status": "partial" if unknown else "failed",
+                "operation_outcome": "unknown" if unknown else "failed",
+                "steps": [item.model_dump(mode="json") for item in step_results],
+                "stream_runtime": {
+                    "start_status": stream_start_status,
+                    "capture_id": capture_id,
+                    "capture_uuid": capture_uuid,
+                    "capture_relative_dir": capture_relative_dir,
+                    "capture_metadata_artifact_id": capture_metadata_artifact_id,
+                    "transport_generation": capture_transport_generation,
+                    "capture_namespace": experiment_id,
+                },
+                "capture_health": {
+                    "stream_start_status": stream_start_status,
+                    "collector_stopped": collector_stopped,
+                    "collector_cleanup": cleanup_result.get(
+                        "collector_cleanup",
+                        "unknown" if stream_requested else "not_required",
+                    ),
+                    "orphan_capture_id": cleanup_result.get("orphan_capture_id"),
+                    "capture_uuid": capture_uuid,
+                    "capture_namespace": experiment_id,
+                },
+                "execution": {
+                    "status": "unknown" if unknown else "failed",
+                    "errors": errors,
+                },
+                "warnings": warnings,
+                "errors": errors,
+            }
+        )
+        self.experiments.write_manifest(experiment_id, manifest)
+        raise error
 
     async def wait_for_job(self, experiment_id: str) -> None:
         task = self._jobs.get(experiment_id)
@@ -272,6 +342,7 @@ class BrowserCaptureOperations:
             collector_start_wall_time_ms: int | None = None
             first_mutation_wall_time_ms: int | None = None
             cancelled_error: asyncio.CancelledError | None = None
+            terminal_service_error: BrowserServiceError | None = None
             cleanup_result: dict[str, Any] = {}
             try:
                 if payload.capture.network or payload.network_evidence:
@@ -367,10 +438,22 @@ class BrowserCaptureOperations:
                             transport_generation=capture_transport_generation,
                         )
                         raise
-                    except McpToolCallError as exc:
-                        capture_transport_generation = exc.transport_generation
+                    except AdapterError as exc:
+                        capture_transport_generation = int(
+                            getattr(
+                                exc,
+                                "transport_generation",
+                                self._transport_generation(),
+                            )
+                        )
                         stream_start_status = (
-                            "outcome_unknown" if exc.outcome_unknown else "failed_before_send"
+                            "outcome_unknown"
+                            if exc.outcome_unknown
+                            else (
+                                "failed_after_dispatch"
+                                if exc.dispatch_started
+                                else "failed_before_send"
+                            )
                         )
                         discovered = (
                             self._discover_capture_metadata(experiment_id)
@@ -406,7 +489,11 @@ class BrowserCaptureOperations:
                             ),
                             transport_generation=capture_transport_generation,
                         )
-                        raise
+                        raise service_error_from_adapter(
+                            exc,
+                            "stream capture start",
+                            consequential=True,
+                        ) from exc
                     capture = start_payload.get("capture")
                     if not isinstance(capture, dict) or not capture.get("captureId"):
                         raise BrowserServiceError(
@@ -582,6 +669,13 @@ class BrowserCaptureOperations:
             except asyncio.CancelledError as exc:
                 cancelled_error = exc
                 errors.append("Experiment task was canceled; finalization was attempted.")
+            except BrowserServiceError as exc:
+                if exc.code in {
+                    "operation_outcome_unknown",
+                    "browser_adapter_failed",
+                }:
+                    terminal_service_error = exc
+                errors.append(str(exc)[:4000])
             except Exception as exc:
                 errors.append(str(exc)[:4000])
             finally:
@@ -618,6 +712,25 @@ class BrowserCaptureOperations:
                 collector_stopped = bool(cleanup_result.get("collector_stopped"))
                 warnings.extend(str(item) for item in cleanup_result.get("warnings", []))
                 errors.extend(str(item) for item in cleanup_result.get("errors", []))
+
+            if terminal_service_error is not None:
+                self._raise_terminal_service_error(
+                    experiment_id=experiment_id,
+                    manifest=manifest,
+                    error=terminal_service_error,
+                    step_results=step_results,
+                    stream_start_status=stream_start_status,
+                    capture_id=capture_id,
+                    capture_uuid=capture_uuid,
+                    capture_relative_dir=capture_relative_dir,
+                    capture_metadata_artifact_id=capture_metadata_artifact_id,
+                    capture_transport_generation=capture_transport_generation,
+                    collector_stopped=collector_stopped,
+                    cleanup_result=cleanup_result,
+                    stream_requested=payload.capture.stream,
+                    warnings=warnings,
+                    errors=errors,
+                )
 
             post_alignment = AlignmentResult(
                 status=(

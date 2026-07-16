@@ -203,7 +203,7 @@ class RuntimeTests(unittest.TestCase):
                 )
 
         self.assertEqual(response.status_code, 422, response.text)
-        error = response.json()["detail"]["error"]
+        error = response.json()["error"]
         self.assertEqual(error["code"], "skill_line_exceeds_limit")
         self.assertEqual(error["line_number"], 1)
         self.assertEqual(error["actual_chars"], 32_001)
@@ -403,6 +403,10 @@ class RuntimeTests(unittest.TestCase):
             "/v1/skills/read",
             json={"skill_id": "browser-action-protocol", "path": "../README.md"},
         )
+        invalid = client.post(
+            "/v1/skills/read",
+            json={"skill_id": "browser-action-protocol"},
+        )
         hidden_catalog = client.get("/v1/skills")
         console = client.get("/console")
         console_load = client.post(
@@ -413,12 +417,39 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(loaded.json()["loaded_skill_ids"], ["browser-action-protocol"])
         self.assertEqual(read.status_code, 200, read.text)
         self.assertEqual(missing.status_code, 404)
-        self.assertEqual(missing.json()["detail"]["error"]["code"], "skill_not_found")
+        self.assertEqual(missing.json()["error"]["code"], "skill_not_found")
         self.assertEqual(unsafe.status_code, 404)
+        self.assertEqual(unsafe.json()["error"]["code"], "unsafe_or_missing_path")
+        self.assertEqual(invalid.status_code, 422)
+        self.assertEqual(invalid.json()["error"]["code"], "invalid_skill_request")
+        self.assertIn("/path", invalid.json()["error"]["message"])
+        self.assertNotIn("detail", invalid.json())
         self.assertEqual(hidden_catalog.status_code, 404)
         self.assertEqual(console.status_code, 404)
         self.assertEqual(console_load.status_code, 404)
 
+        read_responses = create_app().openapi()["paths"]["/v1/skills/read"]["post"]["responses"]
+        self.assertIn("404", read_responses)
+        self.assertIn("422", read_responses)
+
+    def test_read_allows_unreferenced_safe_skill_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skills = Path(temp_dir) / "skills"
+            shutil.copytree(Path("src/skill_temple/example_skills"), skills)
+            extra = skills / "browser-action-protocol" / "docs" / "manual-note.md"
+            extra.write_text("# Manual note\n", encoding="utf-8")
+            with TestClient(create_app(skills_dir=skills)) as client:
+                response = client.post(
+                    "/v1/skills/read",
+                    json={
+                        "skill_id": "browser-action-protocol",
+                        "path": "docs/manual-note.md",
+                    },
+                )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIn("Manual note", response.json()["content"])
+
+    def test_optional_bearer_auth(self) -> None:
         with patch.dict(
             os.environ,
             {"SKILL_TEMPLE_BEARER_TOKEN": "secret-token"},

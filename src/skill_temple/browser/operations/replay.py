@@ -39,8 +39,8 @@ from ...protocol_evidence import (
     response_content_type,
     response_value_from_snapshot,
 )
-from ..adapters.contracts import AlignmentResult, StreamCheckpoint
-from ..core import BrowserServiceError, Deadline, utc_now
+from ..adapters.contracts import AdapterError, AlignmentResult, StreamCheckpoint
+from ..core import BrowserServiceError, Deadline, service_error_from_adapter, utc_now
 from ..steps import StepExecutor
 from .context import ReplayDispatchResult, ReplayPreparationResult
 
@@ -720,6 +720,42 @@ class BrowserReplayOperations:
                     ended_at=utc_now(),
                 )
             )
+        except AdapterError as exc:
+            service_error = service_error_from_adapter(
+                exc,
+                "browser-context replay",
+                consequential=True,
+            )
+            unknown = service_error.code == "operation_outcome_unknown"
+            step_results.append(
+                FlowStepResult(
+                    step_id="replay_request",
+                    phase="replay",
+                    status="outcome_unknown" if unknown else "failed",
+                    started_at=started,
+                    ended_at=utc_now(),
+                    error=str(service_error)[:4000],
+                )
+            )
+            replay_manifest = manifest.get("replay")
+            if isinstance(replay_manifest, dict):
+                replay_manifest["dispatch_status"] = (
+                    "outcome_unknown" if unknown else "failed_before_completion"
+                )
+            manifest.update(
+                {
+                    "status": "partial" if unknown else "failed",
+                    "operation_outcome": "unknown" if unknown else "failed",
+                    "steps": [item.model_dump(mode="json") for item in step_results],
+                    "execution": {
+                        "status": "unknown" if unknown else "failed",
+                        "errors": [str(service_error)[:4000]],
+                    },
+                    "errors": [str(service_error)[:4000]],
+                }
+            )
+            self.experiments.write_manifest(experiment_id, manifest)
+            raise service_error from exc
         except asyncio.CancelledError:
             step_results.append(
                 FlowStepResult(
