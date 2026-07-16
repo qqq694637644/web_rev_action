@@ -140,6 +140,29 @@ class RuntimeTests(unittest.TestCase):
                 with self.assertRaises(SkillPathError):
                     runtime.read("browser-action-protocol", path)
 
+    def test_skill_content_hash_ignores_line_ending_style(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "skills"
+            skill_root = _write_skill(
+                root,
+                "demo",
+                "Use for line-ending tests.",
+                "# Demo\n\nExact content.",
+            )
+            skill_path = skill_root / "SKILL.md"
+            lf_text = skill_path.read_text(encoding="utf-8").replace("\r\n", "\n")
+            lf_hash = SkillRuntime(root).list_skills()["skills"][0]["content_hash"]
+
+            skill_path.write_bytes(lf_text.replace("\n", "\r\n").encode("utf-8"))
+            crlf_runtime = SkillRuntime(root)
+            crlf_hash = crlf_runtime.list_skills()["skills"][0]["content_hash"]
+
+            self.assertEqual(crlf_hash, lf_hash)
+            self.assertEqual(
+                crlf_runtime.read("demo", "SKILL.md")["content_hash"],
+                lf_hash,
+            )
+
     def test_read_does_not_lose_one_oversized_line(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir) / "skills"

@@ -44,7 +44,7 @@ Decoded example:
   "operation": "capture_flow",
   "operation_contract_hash": "sha256:90fcbfeab8fbabfd4ed9ab01a138cec718d2322dfd5e815be5ced5757b0f5b7e",
   "payload_json": "{\"execution_mode\":\"sync\",\"flow\":[{\"action\":\"snapshot\",\"step_id\":\"before\"}],\"objective\":\"capture current page baseline\",\"primary_request\":{\"expected_max_matches\":100,\"expected_min_matches\":0},\"session_id\":\"analysis-main\"}",
-  "skill_content_hash": "sha256:f66c3d13f268880a753a0f46098997becee5f0b3ef299232d63f7fe0ef5f7d24",
+  "skill_content_hash": "sha256:786f2331d061583e44fc9dc7344bae933a380d13006b65d1e88f4ae31ad64e6e",
   "skill_id": "browser-action-protocol"
 }
 ```

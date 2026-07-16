@@ -35,7 +35,7 @@ Decoded example:
   "operation": "list_evidence",
   "operation_contract_hash": "sha256:f98fc845165362d1e76f45faaa9c403e4607db2c5df930c87fdc017a4ca740f9",
   "payload_json": "{\"experiment_id\":\"exp_capture\",\"kind\":\"network_request\",\"limit\":100}",
-  "skill_content_hash": "sha256:f66c3d13f268880a753a0f46098997becee5f0b3ef299232d63f7fe0ef5f7d24",
+  "skill_content_hash": "sha256:786f2331d061583e44fc9dc7344bae933a380d13006b65d1e88f4ae31ad64e6e",
   "skill_id": "browser-action-protocol"
 }
 ```

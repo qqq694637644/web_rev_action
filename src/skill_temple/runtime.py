@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import os
 import re
 from dataclasses import dataclass
@@ -11,6 +10,8 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+
+from .content_hash import file_content_hash
 
 _SKILL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -133,7 +134,7 @@ def _unique_preserve_order(items: list[str]) -> list[str]:
 
 
 def _content_hash(path: Path) -> str:
-    return f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}"
+    return file_content_hash(path)
 
 
 def _parse_frontmatter(text: str) -> tuple[dict[str, Any], str]:

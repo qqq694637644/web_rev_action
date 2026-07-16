@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import hashlib
 from importlib import resources
 
+from ..content_hash import text_content_hash
 from .registry import OPERATION_REGISTRY, OperationSpec
 
 PROTOCOL_SKILL_ID = "browser-action-protocol"
 ACTION_TRANSPORT_VERSION = "2.0"
-_HASH_PREFIX = "sha256:"
 
 
 def protocol_skill_content_hash() -> str:
@@ -18,9 +17,9 @@ def protocol_skill_content_hash() -> str:
     content = (
         resources.files("skill_temple")
         .joinpath("example_skills", PROTOCOL_SKILL_ID, "SKILL.md")
-        .read_bytes()
+        .read_text(encoding="utf-8")
     )
-    return f"{_HASH_PREFIX}{hashlib.sha256(content).hexdigest()}"
+    return text_content_hash(content)
 
 
 def expected_binding(

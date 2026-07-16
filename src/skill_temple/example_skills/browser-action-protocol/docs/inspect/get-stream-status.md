@@ -36,7 +36,7 @@ Decoded example:
   "operation": "get_stream_status",
   "operation_contract_hash": "sha256:290b0bd401b56a90a309e9879ee2aecf7f5a0add672c034bcefc301ae1f9aaad",
   "payload_json": "{\"experiment_id\":\"exp_capture\"}",
-  "skill_content_hash": "sha256:f66c3d13f268880a753a0f46098997becee5f0b3ef299232d63f7fe0ef5f7d24",
+  "skill_content_hash": "sha256:786f2331d061583e44fc9dc7344bae933a380d13006b65d1e88f4ae31ad64e6e",
   "skill_id": "browser-action-protocol"
 }
 ```

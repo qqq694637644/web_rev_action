@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import re
 from pathlib import Path
@@ -13,6 +12,7 @@ from pydantic import ValidationError
 
 from .browser.contracts import ACTION_TRANSPORT_VERSION, expected_binding
 from .browser.registry import OPERATION_REGISTRY, OperationSpec
+from .content_hash import file_content_hash
 
 _GENERATED_START = "<!-- BEGIN GENERATED CONTRACT -->"
 _GENERATED_END = "<!-- END GENERATED CONTRACT -->"
@@ -172,7 +172,7 @@ def build_contracts(protocol_root: str | Path) -> list[Path]:
     skill_path = root / "SKILL.md"
     if not skill_path.is_file():
         raise FileNotFoundError(f"Protocol Skill entrypoint not found: {skill_path}")
-    skill_content_hash = f"sha256:{hashlib.sha256(skill_path.read_bytes()).hexdigest()}"
+    skill_content_hash = file_content_hash(skill_path)
     written: list[Path] = []
     generated_root = root / "docs" / "generated"
     generated_root.mkdir(parents=True, exist_ok=True)

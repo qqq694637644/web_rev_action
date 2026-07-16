@@ -260,6 +260,8 @@ Infinity、额外字段、错误 Action 或错误 operation payload 都在 dispa
 `skill_content_hash` 必须来自本次加载的 `browser-action-protocol`，operation hash 必须来自
 所选 operation 的生成合同。任一绑定不匹配会在 dispatch 前返回
 `stale_operation_contract`，并给出服务端期望的 hashes。
+Skill 文本 hash 在计算前统一规范化为 LF，因此 Windows CRLF checkout 与 CI 的 Linux
+checkout 使用相同绑定值。
 
 一次 `capture_flow` 由后端原子执行：
 
