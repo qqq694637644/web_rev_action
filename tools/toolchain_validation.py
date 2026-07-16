@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -21,9 +22,16 @@ from urllib.request import urlopen
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-from toolchain_validation_server import SSE_EVENTS, start_server
 
 from skill_temple.browser.adapters.playwright import build_playwright_attach_args
+
+_server_module = importlib.import_module(
+    "tools.toolchain_validation_server"
+    if __package__
+    else "toolchain_validation_server"
+)
+SSE_EVENTS = _server_module.SSE_EVENTS
+start_server = _server_module.start_server
 
 PLAYWRIGHT_PACKAGE = "@playwright/cli@0.1.17"
 JS_REVERSE_COMMAND = "js-reverse-mcp"
@@ -977,18 +985,32 @@ def find_chrome() -> Path:
     )
 
 
-def start_chrome(port: int, profile_path: Path) -> subprocess.Popen[bytes]:
-    chrome = find_chrome()
+def build_chrome_args(
+    chrome: Path,
+    port: int,
+    profile_path: Path,
+    *,
+    platform_name: str = os.name,
+) -> list[str]:
     args = [
         str(chrome),
         "--headless=new",
+        "--remote-debugging-address=127.0.0.1",
         f"--remote-debugging-port={port}",
         f"--user-data-dir={profile_path}",
         "--no-first-run",
         "--no-default-browser-check",
         "--disable-gpu",
-        "about:blank",
     ]
+    if platform_name != "nt":
+        args.extend(["--no-sandbox", "--disable-dev-shm-usage"])
+    args.append("about:blank")
+    return args
+
+
+def start_chrome(port: int, profile_path: Path) -> subprocess.Popen[bytes]:
+    chrome = find_chrome()
+    args = build_chrome_args(chrome, port, profile_path)
     return subprocess.Popen(
         args,
         stdout=subprocess.DEVNULL,
