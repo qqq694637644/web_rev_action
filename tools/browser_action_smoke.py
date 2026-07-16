@@ -116,6 +116,40 @@ def find_field(value: Any, field: str) -> Any:
 
 
 def process_matches(patterns: list[str], excluded_pid: int) -> list[str]:
+    if os.name != "nt":
+        completed = subprocess.run(
+            ["ps", "-eo", "pid=,comm=,args="],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(completed.stderr or completed.stdout)
+        lowered_patterns = [item.lower() for item in patterns if item]
+        matches: list[str] = []
+        for line in completed.stdout.splitlines():
+            fields = line.strip().split(None, 2)
+            if len(fields) != 3:
+                continue
+            pid_text, name, command_line = fields
+            try:
+                pid = int(pid_text)
+            except ValueError:
+                continue
+            lowered_command = command_line.lower()
+            if (
+                pid == excluded_pid
+                or name.lower().startswith("pwsh")
+                or "browser_action_smoke.py" in lowered_command
+            ):
+                continue
+            if any(pattern in lowered_command for pattern in lowered_patterns):
+                matches.append(f"{pid}|{name}|{command_line}")
+        return matches
+
     escaped = [item.replace("'", "''") for item in patterns]
     pattern_array = ",".join(f"'{item}'" for item in escaped)
     script = f"""
