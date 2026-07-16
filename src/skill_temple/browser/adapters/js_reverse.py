@@ -193,17 +193,32 @@ class JsReverseMcpAdapter:
         page_id: str | None,
         page_idx: int | None,
     ) -> dict[str, Any]:
-        selected = cls._require_object(
-            payload,
-            "select_page",
-            "selected",
-            consequential=True,
-        )
+        pages = cls._require_object_list(payload, "select_page", "pages")
+        selected_pages: list[dict[str, Any]] = []
+        for index, candidate in enumerate(pages):
+            selected_value = candidate.get("selected")
+            if not isinstance(selected_value, bool):
+                raise cls._invalid_response(
+                    "select_page",
+                    f"/pages/{index}/selected",
+                    "boolean",
+                    consequential=True,
+                )
+            if selected_value:
+                selected_pages.append(candidate)
+        if len(selected_pages) != 1:
+            raise cls._invalid_response(
+                "select_page",
+                "/pages",
+                "exactly one page with selected=true",
+                consequential=True,
+            )
+        selected = selected_pages[0]
         if page_id is not None:
             if selected.get("pageId") != page_id:
                 raise cls._invalid_response(
                     "select_page",
-                    "/selected/pageId",
+                    "/pages/*/pageId",
                     f"string equal to requested pageId {page_id!r}",
                     consequential=True,
                 )
@@ -216,7 +231,7 @@ class JsReverseMcpAdapter:
             ):
                 raise cls._invalid_response(
                     "select_page",
-                    "/selected/pageIdx",
+                    "/pages/*/pageIdx",
                     f"integer equal to requested pageIdx {page_idx}",
                     consequential=True,
                 )
@@ -518,18 +533,21 @@ class JsReverseMcpAdapter:
             },
             deadline,
         )
-        if not isinstance(payload.get("filename"), str):
+        exported = self._require_object(payload, "list_network_requests", "export")
+        if not isinstance(exported.get("filename"), str):
             raise self._invalid_response(
-                "list_network_requests", "/filename", "string"
+                "list_network_requests", "/export/filename", "string"
             )
-        byte_length = payload.get("byteLength")
+        byte_length = exported.get("byteLength")
         if (
             not isinstance(byte_length, int)
             or isinstance(byte_length, bool)
             or byte_length < 0
         ):
             raise self._invalid_response(
-                "list_network_requests", "/byteLength", "non-negative integer"
+                "list_network_requests",
+                "/export/byteLength",
+                "non-negative integer",
             )
         return payload
 
@@ -539,7 +557,19 @@ class JsReverseMcpAdapter:
             {"requestId": reqid},
             deadline,
         )
-        self._require_object(payload, "get_request_initiator", "initiator")
+        if payload.get("requestId") != reqid:
+            raise self._invalid_response(
+                "get_request_initiator",
+                "/requestId",
+                f"integer equal to requested request {reqid}",
+            )
+        initiator = payload.get("initiator")
+        if initiator is not None and not isinstance(initiator, dict):
+            raise self._invalid_response(
+                "get_request_initiator",
+                "/initiator",
+                "object or null",
+            )
         return payload
 
     async def search_scripts(
@@ -596,6 +626,32 @@ class JsReverseMcpAdapter:
         if length is not None:
             arguments["length"] = length
         payload = await self._call("get_script_source", arguments, deadline)
+        source_type = payload.get("sourceType")
+        if source_type == "wasm":
+            byte_length = payload.get("byteLength")
+            if (
+                not isinstance(byte_length, int)
+                or isinstance(byte_length, bool)
+                or byte_length < 0
+            ):
+                raise self._invalid_response(
+                    "get_script_source",
+                    "/byteLength",
+                    "non-negative integer for sourceType=wasm",
+                )
+            if not isinstance(payload.get("scriptId"), str):
+                raise self._invalid_response(
+                    "get_script_source",
+                    "/scriptId",
+                    "string for sourceType=wasm",
+                )
+            return payload
+        if source_type != "javascript":
+            raise self._invalid_response(
+                "get_script_source",
+                "/sourceType",
+                "javascript or wasm",
+            )
         if not isinstance(payload.get("source"), str):
             raise self._invalid_response("get_script_source", "/source", "string")
         return payload

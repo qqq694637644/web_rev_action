@@ -540,7 +540,14 @@ class FakeJsReverse:
             output_file.write_bytes(snapshot[key]["text"].encode("utf-8"))
         else:
             output_file.write_text(json.dumps(snapshot), encoding="utf-8")
-        return {"filename": output_file.as_posix(), "byteLength": output_file.stat().st_size}
+        return {
+            "reqid": reqid,
+            "export": {
+                "outputPart": output_part,
+                "filename": output_file.as_posix(),
+                "byteLength": output_file.stat().st_size,
+            },
+        }
 
     async def get_request_initiator(self, reqid: int, deadline: Deadline) -> dict[str, Any]:
         return {
@@ -578,7 +585,13 @@ class FakeJsReverse:
         deadline: Deadline,
         **kwargs: Any,
     ) -> dict[str, Any]:
-        return {"source": "function buildResourceRequest(payload) { return payload; }"}
+        return {
+            "scriptId": "script-1",
+            "sourceType": "javascript",
+            "totalChars": 58,
+            "source": "function buildResourceRequest(payload) { return payload; }",
+            "truncated": False,
+        }
 
     async def list_console_messages(
         self,

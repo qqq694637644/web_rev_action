@@ -22,6 +22,8 @@ class BrowserServiceError(RuntimeError):
         session_id: str | None = None,
         experiment_id: str | None = None,
         manifest_relative_path: str | None = None,
+        adapter_error_code: str | None = None,
+        retryable: bool | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
@@ -31,6 +33,8 @@ class BrowserServiceError(RuntimeError):
         self.session_id = session_id
         self.experiment_id = experiment_id
         self.manifest_relative_path = manifest_relative_path
+        self.adapter_error_code = adapter_error_code
+        self.retryable = retryable
 
     def with_context(
         self,
@@ -63,6 +67,8 @@ def service_error_from_adapter(
             502,
             dispatch_started=True,
             outcome="unknown",
+            adapter_error_code=exc.remote_code,
+            retryable=exc.retryable,
         )
     return BrowserServiceError(
         exc.code,
@@ -70,6 +76,8 @@ def service_error_from_adapter(
         502,
         dispatch_started=dispatch_started,
         outcome="failed",
+        adapter_error_code=exc.remote_code,
+        retryable=exc.retryable,
     )
 
 

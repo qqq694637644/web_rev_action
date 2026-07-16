@@ -25,11 +25,15 @@ class AdapterError(RuntimeError):
         dispatch_started: bool = False,
         outcome_unknown: bool = False,
         code: str = "browser_adapter_failed",
+        remote_code: str | None = None,
+        retryable: bool | None = None,
     ) -> None:
         super().__init__(message)
         self.dispatch_started = dispatch_started
         self.outcome_unknown = outcome_unknown
         self.code = code
+        self.remote_code = remote_code
+        self.retryable = retryable
 
 class McpToolCallError(AdapterError):
     def __init__(

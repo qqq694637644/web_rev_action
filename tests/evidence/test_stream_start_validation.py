@@ -37,10 +37,20 @@ class StreamStartValidationTests(BrowserActionTestCase):
                                     "pageIdx": 0,
                                     "pageId": "page-0",
                                     "url": "https://example.test/app",
+                                    "selected": True,
                                 }
                             ]
                         }
-                    return {"selected": {"pageId": "page-0"}}
+                    return {
+                        "pages": [
+                            {
+                                "pageIdx": 0,
+                                "pageId": "page-0",
+                                "url": "https://example.test/app",
+                                "selected": True,
+                            }
+                        ]
+                    }
                 if name == "start_stream_capture":
                     experiment_id = str(arguments["artifactNamespace"])
                     metadata = (

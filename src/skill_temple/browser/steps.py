@@ -18,6 +18,20 @@ class StepExecutor:
     """Execute setup, action, and verification steps with one lifecycle."""
 
     READ_ONLY_ACTIONS = {"wait", "assert", "snapshot"}
+    STREAM_WAIT_TYPES = {
+        "request_observed",
+        "response_observed",
+        "first_event",
+        "event_predicate",
+        "default_done_marker",
+        "network_finished",
+        "network_canceled",
+        "failed",
+    }
+
+    @classmethod
+    def uses_stream_checkpoint(cls, condition_type: str | None) -> bool:
+        return condition_type in cls.STREAM_WAIT_TYPES
 
     @classmethod
     async def execute_many(
@@ -67,9 +81,12 @@ class StepExecutor:
                         checkpoint=stream_checkpoint,
                         deadline=step_deadline,
                     )
-                    stream_checkpoint = service._checkpoint_from_wait_result(
-                        result,
-                    )
+                    if cls.uses_stream_checkpoint(
+                        step.condition.type if step.condition else None
+                    ):
+                        stream_checkpoint = service._checkpoint_from_wait_result(
+                            result,
+                        )
                     wait_observations.append(
                         {
                             "phase": phase,

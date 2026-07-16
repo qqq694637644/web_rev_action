@@ -193,6 +193,10 @@ class StdioMcpToolTransport:
                                 ),
                             )
                             delivered.transport_generation = generation
+                        elif isinstance(exc, AdapterError):
+                            delivered = exc
+                            delivered.dispatch_started = call.sent
+                            delivered.transport_generation = generation
                         elif call.name in self.SIDE_EFFECTING_TOOLS:
                             delivered = McpToolCallError(
                                 f"MCP tool failed after dispatch: {call.name}: {exc}",
@@ -234,17 +238,42 @@ class StdioMcpToolTransport:
 
     @staticmethod
     def _normalize_result(name: str, result: Any) -> dict[str, Any]:
-        if getattr(result, "isError", False) or getattr(result, "is_error", False):
-            raise AdapterError(f"MCP tool failed: {name}")
         structured = getattr(result, "structuredContent", None)
         if structured is None:
             structured = getattr(result, "structured_content", None)
         if isinstance(structured, dict):
             if structured.get("ok") is False:
-                error = structured.get("error") or {}
-                raise AdapterError(str(error.get("message") or f"MCP tool failed: {name}"))
+                error = structured.get("error")
+                remote_code = None
+                retryable = None
+                message = f"MCP tool failed: {name}"
+                if isinstance(error, dict):
+                    raw_code = error.get("code")
+                    raw_message = error.get("message")
+                    raw_retryable = error.get("retryable")
+                    if isinstance(raw_code, str):
+                        remote_code = raw_code[:128]
+                    if isinstance(raw_message, str):
+                        message = raw_message[:2000]
+                    if isinstance(raw_retryable, bool):
+                        retryable = raw_retryable
+                raise AdapterError(
+                    f"MCP tool {name} failed"
+                    + (f" [{remote_code}]" if remote_code else "")
+                    + f": {message}",
+                    dispatch_started=True,
+                    outcome_unknown=False,
+                    remote_code=remote_code,
+                    retryable=retryable,
+                )
             data = structured.get("data")
             return data if isinstance(data, dict) else structured
+        if getattr(result, "isError", False) or getattr(result, "is_error", False):
+            raise AdapterError(
+                f"MCP tool failed without structured error details: {name}",
+                dispatch_started=True,
+                outcome_unknown=False,
+            )
         content_types: list[str] = []
         for block in getattr(result, "content", []):
             content_types.append(type(block).__name__)

@@ -5,6 +5,9 @@ Transport and validation failures return a structured error with `code`,
 errors may include JSON Pointer `issues`. Errors created after a session or experiment
 handle exists also return the available `session_id`, `experiment_id`, and
 `manifest_relative_path` so inspection does not depend on guessing local directories.
+When the fork returns a structured MCP error, the response also preserves
+`adapter_error_code` and `retryable` when available; the bounded fork message remains in
+the normal error `message`.
 
 Recovery rules:
 

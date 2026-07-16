@@ -88,6 +88,36 @@ class TransportsBrowserTests(BrowserActionTestCase):
         self.assertTrue(raised.exception.dispatch_started)
         self.assertFalse(raised.exception.outcome_unknown)
 
+    def test_mcp_structured_error_preserves_fork_code_message_and_retryability(self) -> None:
+        result = SimpleNamespace(
+            isError=True,
+            structuredContent={
+                "ok": False,
+                "tool": "get_request_initiator",
+                "summary": "Request was not retained",
+                "error": {
+                    "code": "NOT_FOUND",
+                    "message": "Request 12 was not found in the retained queue.",
+                    "retryable": False,
+                },
+            },
+            content=[],
+        )
+
+        with self.assertRaises(AdapterError) as raised:
+            StdioMcpToolTransport._normalize_result("get_request_initiator", result)
+        self.assertIn("[NOT_FOUND]", str(raised.exception))
+        self.assertIn("Request 12", str(raised.exception))
+        self.assertEqual(raised.exception.remote_code, "NOT_FOUND")
+        self.assertFalse(raised.exception.retryable)
+        classified = service_error_from_adapter(
+            raised.exception,
+            "get request initiator",
+            consequential=False,
+        )
+        self.assertEqual(classified.adapter_error_code, "NOT_FOUND")
+        self.assertFalse(classified.retryable)
+
     def test_environment_builder_binds_mcp_to_workspace_and_same_cdp_endpoint(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             with patch.dict(

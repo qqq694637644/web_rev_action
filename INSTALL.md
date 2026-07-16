@@ -100,10 +100,14 @@ cd C:\path\to\web_rev_action
 
 ## 5. 安装浏览器工具
 
-安装 Playwright CLI：
+安装项目验证过的 Playwright CLI fork：
 
 ```powershell
-npm install --global @playwright/cli@0.1.17
+git clone https://github.com/qqq694637644/playwright-cli.git
+cd playwright-cli
+git checkout 793cfb32572733cbcb401e6f28d05a7a914ce408
+npm ci
+npm link
 Get-Command playwright-cli
 ```
 
@@ -116,10 +120,9 @@ Get-Command playwright-cli
 cd ..
 git clone https://github.com/qqq694637644/js-reverse-mcp.git
 cd js-reverse-mcp
-git switch main
-git pull --ff-only origin main
+git checkout 5e4d61aced29636f8249d5c3bce168ab3aaa6588
 
-npm install
+npm ci
 npm run build
 npm link
 
@@ -134,13 +137,15 @@ js-reverse-mcp --help
 js-reverse-mcp/build/src/index.js
 ```
 
-以后更新流式 MCP：
+更新 fork commit 前，必须先在 `web_rev_action` 的真实三仓验证中修改固定 SHA 并通过
+`browser_action_smoke.py`。不要仅安装 npm registry 的同名版本来代替 fork 合同。
+
+重新构建当前固定版本：
 
 ```powershell
 cd C:\path\to\js-reverse-mcp
-git switch main
-git pull --ff-only origin main
-npm install
+git checkout 5e4d61aced29636f8249d5c3bce168ab3aaa6588
+npm ci
 npm run build
 npm link
 ```
@@ -197,6 +202,12 @@ WEB_REV_PLAYWRIGHT_CLI=playwright-cli
 WEB_REV_JS_REVERSE_COMMAND=js-reverse-mcp
 WEB_REV_WORKSPACE_SHELL=pwsh
 WEB_REV_WORKSPACE_ALLOW_NETWORK=false
+```
+
+真实三仓验证可额外指定 fork 的精确 Node 入口，避免 `npx` 从 registry 解析包：
+
+```dotenv
+WEB_REV_PLAYWRIGHT_CLI_ENTRY=C:/path/to/playwright-cli/playwright-cli.js
 ```
 
 可选配置：

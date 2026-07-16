@@ -225,10 +225,20 @@ class AdapterValidationBrowserTests(BrowserActionTestCase):
                                     "pageIdx": 0,
                                     "pageId": "page-expected",
                                     "url": "https://example.test/app",
+                                    "selected": False,
                                 }
                             ]
                         },
-                        {"selected": {"pageId": "page-other"}},
+                        {
+                            "pages": [
+                                {
+                                    "pageIdx": 1,
+                                    "pageId": "page-other",
+                                    "url": "https://example.test/other",
+                                    "selected": True,
+                                }
+                            ]
+                        },
                     ]
                 )
             )
@@ -274,7 +284,7 @@ class AdapterValidationBrowserTests(BrowserActionTestCase):
             await adapter.list_network_requests(RequestMatcher(), Deadline(1_000))
 
         for operation, expected_path, unknown in [
-            (mismatched_selection, "/selected/pageId", True),
+            (mismatched_selection, "/pages/*/pageId", True),
             (mismatched_capture_status, "/capture/captureId", False),
             (contradictory_pagination, "/pagination/hasNextPage", False),
         ]:
@@ -282,3 +292,80 @@ class AdapterValidationBrowserTests(BrowserActionTestCase):
                 asyncio.run(operation())
             self.assertIn(expected_path, str(raised.exception))
             self.assertEqual(raised.exception.outcome_unknown, unknown)
+
+    def test_js_reverse_accepts_exact_fork_response_shapes(self) -> None:
+        class ForkTransport:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            @property
+            def generation(self) -> int:
+                return 1
+
+            async def call_tool(
+                self, name: str, arguments: dict[str, Any], deadline: Deadline
+            ) -> dict[str, Any]:
+                self.calls.append(name)
+                if name == "select_page":
+                    return {
+                        "pages": [
+                            {
+                                "pageIdx": 0,
+                                "pageId": "page-0",
+                                "url": "https://example.test/app",
+                                "selected": True,
+                            }
+                        ],
+                        "pagination": {
+                            "pageIdx": 0,
+                            "hasNextPage": False,
+                            "totalPages": 1,
+                        },
+                    }
+                if name == "list_network_requests":
+                    return {
+                        "reqid": 12,
+                        "export": {
+                            "outputPart": "all",
+                            "filename": "/tmp/request.json",
+                            "byteLength": 123,
+                        },
+                    }
+                if name == "get_request_initiator":
+                    return {"requestId": 12, "initiator": None}
+                if name == "get_script_source":
+                    return {
+                        "scriptId": "wasm-1",
+                        "sourceType": "wasm",
+                        "byteLength": 321,
+                    }
+                raise AssertionError(name)
+
+            async def close(self) -> None:
+                return None
+
+        async def exercise() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+            adapter = JsReverseMcpAdapter(ForkTransport())
+            alignment = await adapter.align_page(
+                PageState(url="https://example.test/app", page_index=0),
+                Deadline(1_000),
+            )
+            self.assertEqual(alignment.status, "aligned")
+            self.assertEqual(alignment.js_reverse_page_id, "page-0")
+            exported = await adapter.export_network_request(
+                12,
+                Path("request.json"),
+                "all",
+                Deadline(1_000),
+            )
+            initiator = await adapter.get_request_initiator(12, Deadline(1_000))
+            source = await adapter.get_script_source(
+                Deadline(1_000),
+                script_id="wasm-1",
+            )
+            return exported, initiator, source
+
+        exported, initiator, source = asyncio.run(exercise())
+        self.assertEqual(exported["export"]["filename"], "/tmp/request.json")
+        self.assertIsNone(initiator["initiator"])
+        self.assertEqual(source["sourceType"], "wasm")

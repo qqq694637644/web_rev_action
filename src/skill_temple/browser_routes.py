@@ -43,6 +43,8 @@ def _browser_error(
     session_id: str | None = None,
     experiment_id: str | None = None,
     manifest_relative_path: str | None = None,
+    adapter_error_code: str | None = None,
+    retryable: bool | None = None,
 ) -> dict[str, Any]:
     error: dict[str, Any] = {
         "code": code,
@@ -61,6 +63,10 @@ def _browser_error(
         error["experiment_id"] = experiment_id
     if manifest_relative_path is not None:
         error["manifest_relative_path"] = manifest_relative_path
+    if adapter_error_code is not None:
+        error["adapter_error_code"] = adapter_error_code
+    if retryable is not None:
+        error["retryable"] = retryable
     return {"error": error}
 
 
@@ -153,6 +159,8 @@ def register_browser_actions(
                     session_id=exc.session_id,
                     experiment_id=exc.experiment_id,
                     manifest_relative_path=exc.manifest_relative_path,
+                    adapter_error_code=exc.adapter_error_code,
+                    retryable=exc.retryable,
                     suggested_next_action=(
                         "Inspect the referenced session, experiment, or evidence handle."
                     ),
@@ -196,6 +204,8 @@ def register_browser_actions(
                     session_id=exc.session_id,
                     experiment_id=exc.experiment_id,
                     manifest_relative_path=exc.manifest_relative_path,
+                    adapter_error_code=exc.adapter_error_code,
+                    retryable=exc.retryable,
                     suggested_next_action=(
                         "Inspect the session or experiment; do not repeat the operation "
                         "while dispatch_started is true and the outcome is unresolved."

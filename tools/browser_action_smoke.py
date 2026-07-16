@@ -620,13 +620,25 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
                     },
                 )
             )
-            if replay.status != "completed":
-                raise AssertionError(replay.model_dump())
             replay_manifest = json.loads(
                 (
                     evidence_root / "experiments" / str(replay.experiment_id) / "manifest.json"
                 ).read_text(encoding="utf-8")
             )
+            if replay.status not in {"completed", "partial"}:
+                raise AssertionError(replay.model_dump())
+            execution = replay_manifest.get("execution")
+            if not isinstance(execution, dict) or execution.get("status") != "complete":
+                raise AssertionError(replay_manifest)
+            if replay.status == "partial":
+                quality = replay_manifest.get("quality_summary")
+                missing = (
+                    set(quality.get("missing_evidence", []))
+                    if isinstance(quality, dict)
+                    else set()
+                )
+                if missing - {"request_headers"}:
+                    raise AssertionError(replay_manifest)
             response_artifact = artifact_by_kind(replay_manifest, "replay_response")
             response_value = json.loads(
                 (evidence_root / relative_path(response_artifact)).read_text(encoding="utf-8")
@@ -759,8 +771,6 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
                 },
             )
         )
-        if duplicate_replay.status != "completed":
-            raise AssertionError(duplicate_replay.model_dump())
         duplicate_manifest = json.loads(
             (
                 evidence_root
@@ -769,6 +779,23 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
                 / "manifest.json"
             ).read_text(encoding="utf-8")
         )
+        if duplicate_replay.status not in {"completed", "partial"}:
+            raise AssertionError(duplicate_replay.model_dump())
+        duplicate_execution = duplicate_manifest.get("execution")
+        if (
+            not isinstance(duplicate_execution, dict)
+            or duplicate_execution.get("status") != "complete"
+        ):
+            raise AssertionError(duplicate_manifest)
+        if duplicate_replay.status == "partial":
+            duplicate_quality = duplicate_manifest.get("quality_summary")
+            duplicate_missing = (
+                set(duplicate_quality.get("missing_evidence", []))
+                if isinstance(duplicate_quality, dict)
+                else set()
+            )
+            if duplicate_missing - {"request_headers"}:
+                raise AssertionError(duplicate_manifest)
         if duplicate_manifest.get("replay_http_status") != 409:
             raise AssertionError(duplicate_manifest)
         duplicate_analysis = replay_response_analysis(duplicate_manifest)

@@ -663,9 +663,10 @@ class BrowserCaptureOperations:
                         checkpoint=stream_checkpoint,
                         deadline=wait_deadline,
                     )
-                    stream_checkpoint = self._checkpoint_from_wait_result(
-                        wait_result,
-                    )
+                    if StepExecutor.uses_stream_checkpoint(payload.wait_for.type):
+                        stream_checkpoint = self._checkpoint_from_wait_result(
+                            wait_result,
+                        )
                     wait_observations.append(
                         {
                             "step_id": "__final_wait__",

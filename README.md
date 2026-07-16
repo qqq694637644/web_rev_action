@@ -131,6 +131,19 @@ transport 崩溃或 consequential operation 损坏响应返回
 
 Playwright `--raw` 输出必须是预期 JSON object；MCP tool 必须返回结构化 JSON object。
 文本格式猜测、无法解析 content block 和隐式空对象不再被当作成功结果。
+js-reverse fork 的结构化错误会保留有限长度的 `adapter_error_code`、message 和
+`retryable`，例如 `NOT_FOUND`、`INVALID_ARGUMENT` 或 `PRECONDITION_FAILED`，供人和模型
+判断是否需要重新触发请求、修正参数或停止重试。
+
+真实 adapter 合同以 CI 固定的两个 fork commit 为准：
+
+```text
+qqq694637644/playwright-cli  793cfb32572733cbcb401e6f28d05a7a914ce408
+qqq694637644/js-reverse-mcp  5e4d61aced29636f8249d5c3bce168ab3aaa6588
+```
+
+`validate-dual-cdp.yml` 会直接 checkout/build 这两个 commit，并同时运行 shared-CDP
+validation 与 `browser_action_smoke.py`；adapter 或 browser operation 改动会触发该门禁。
 
 Operation 模块只从 `browser/adapters/contracts.py` 导入 adapter 类型和错误，不从
 `browser.adapters` package facade 或具体 transport 实现导入。js-reverse stream status 的

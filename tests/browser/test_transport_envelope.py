@@ -193,6 +193,8 @@ class BrowserTransportEnvelopeTests(BrowserActionTestCase):
                     502,
                     dispatch_started=True,
                     outcome="unknown",
+                    adapter_error_code="PRECONDITION_FAILED",
+                    retryable=False,
                 )
 
             service.run = fail_after_dispatch
@@ -208,4 +210,6 @@ class BrowserTransportEnvelopeTests(BrowserActionTestCase):
         self.assertEqual(body["code"], "operation_outcome_unknown")
         self.assertTrue(body["dispatch_started"])
         self.assertEqual(body["outcome"], "unknown")
+        self.assertEqual(body["adapter_error_code"], "PRECONDITION_FAILED")
+        self.assertFalse(body["retryable"])
         self.assertIn("do not repeat", body["suggested_next_action"].lower())
