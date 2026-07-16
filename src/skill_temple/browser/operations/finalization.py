@@ -8,7 +8,11 @@ from pathlib import Path
 from typing import Any
 
 from ...browser_models import BrowserActionResponse, CaptureFlowPayload, RequestMatcher
-from ...protocol_evidence import aggregate_observation_completeness, evidence_id
+from ...protocol_evidence import (
+    aggregate_observation_completeness,
+    evidence_id,
+    public_network_request_summary,
+)
 from ..core import Deadline, utc_now
 from .context import CaptureCompletionContext
 
@@ -567,6 +571,14 @@ class BrowserFinalizationOperations:
                     },
                 }
             )
+        public_network_payload = {
+            **network_payload,
+            "requests": [
+                public_network_request_summary(item)
+                for item in network_payload.get("requests", [])
+                if isinstance(item, dict)
+            ],
+        }
         manifest.update(
             {
                 "status": response_status,
@@ -598,7 +610,7 @@ class BrowserFinalizationOperations:
                 "post_flow_alignment": asdict(post_alignment),
                 "capture_health": capture_health,
                 "network_checkpoint": network_checkpoint_value,
-                "network_summary": network_payload,
+                "network_summary": public_network_payload,
                 "console_checkpoint": console_checkpoint_value,
                 "screenshot_paths": relative_screenshot_paths,
                 "snapshot_paths": relative_snapshot_paths,

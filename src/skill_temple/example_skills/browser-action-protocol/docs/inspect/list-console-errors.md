@@ -40,7 +40,7 @@ Decoded example:
 ```
 ## Result and recovery
 
-Expected response handles: bounded console-message evidence, timestamps, severity/source metadata, artifact IDs when available, and count.
+Expected response handles: console-message evidence captured after the experiment checkpoint, keyed by the fork's stable `consoleMessageStableId`, with `type`, `message`, `argCount`, artifact IDs when available, and count. Messages present before the checkpoint are not returned as new experiment errors.
 
 Safe retry: read-only. Increase the limit only when needed and preserve experiment association.
 

@@ -18,7 +18,7 @@ Required fields:
 Optional fields and defaults:
 
 - `target`: current-page selector; `start_url` is forbidden for capture.
-- `primary_request`: request matcher and expected count bounds.
+- `primary_request`: request matcher and expected count bounds. `mime_types` is enforced against the normalized response MIME exposed by the pinned js-reverse fork; a request with a missing or different MIME does not match.
 - `flow`: up to 100 typed steps.
 - `wait_for`: one terminal wait condition.
 - `execution_mode`: `job` or `sync`; default `job`.
@@ -50,7 +50,7 @@ Decoded example:
 ```
 ## Result and recovery
 
-Expected response handles: `experiment_id`, `session_id`, status, bounded experiment summary, and manifest relative path.
+Expected response handles: `experiment_id`, `session_id`, status, bounded experiment summary, and manifest relative path. Public network summaries preserve scheme, host, path, query parameter names, order, and repeats while replacing every query value and removing fragments.
 
 Safe retry: a `running` response is not a failure; poll `get_experiment`. When dispatch started or outcome is unknown, inspect the returned/known experiment and session instead of repeating the flow. A canceled mutation is `canceled` when no adapter dispatch was confirmed and `canceled_outcome_unknown` only when the adapter recorded a sent command. A malformed stream-start response is an unknown consequential outcome; the backend searches the experiment namespace for `capture.json` and uses an exact same-generation handle for cleanup when available.
 

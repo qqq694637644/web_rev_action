@@ -41,12 +41,13 @@ class MatchingProtocolTests(ProtocolTestCase):
         self.assertEqual([item["reqid"] for item in included], [2, 3])
         self.assertEqual(checkpoint["collector_generation"], 7)
 
-    def test_network_matcher_uses_stable_reqid_url_method_and_resource_type(self) -> None:
+    def test_network_matcher_uses_stable_reqid_url_method_resource_type_and_mime(self) -> None:
         request = {
             "reqid": 12,
             "url": "https://example.test/api/resource/123",
             "method": "POST",
             "resourceType": "fetch",
+            "mimeType": "Application/JSON; charset=utf-8",
         }
         self.assertTrue(
             network_request_matches(
@@ -56,6 +57,7 @@ class MatchingProtocolTests(ProtocolTestCase):
                     url_contains="/api/resource/",
                     method="POST",
                     resource_types=["fetch"],
+                    mime_types=["application/json"],
                 ),
             )
         )
@@ -63,5 +65,17 @@ class MatchingProtocolTests(ProtocolTestCase):
             network_request_matches(
                 request,
                 RequestMatcher(request_id="13"),
+            )
+        )
+        self.assertFalse(
+            network_request_matches(
+                request,
+                RequestMatcher(mime_types=["text/event-stream"]),
+            )
+        )
+        self.assertFalse(
+            network_request_matches(
+                {key: value for key, value in request.items() if key != "mimeType"},
+                RequestMatcher(mime_types=["application/json"]),
             )
         )

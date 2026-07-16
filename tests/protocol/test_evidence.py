@@ -117,7 +117,13 @@ class EvidenceProtocolTests(ProtocolTestCase):
         self.assertEqual(missing, ["semantic_stream"])
 
     def test_public_network_summary_redacts_credentials_and_omits_bodies(self) -> None:
-        summary = public_network_summary(self.snapshot())
+        snapshot = self.snapshot()
+        snapshot["url"] = (
+            "https://example.test/api/resource?access_token=token-secret"
+            "&signature=sig-secret&session=session-secret&csrf=csrf-secret"
+            "&api_key=key-secret&tag=one&tag=two#private-fragment"
+        )
+        summary = public_network_summary(snapshot)
         request_headers = {
             item["name"].lower(): item["value"] for item in summary["request_headers"]
         }
@@ -128,6 +134,21 @@ class EvidenceProtocolTests(ProtocolTestCase):
         self.assertEqual(request_headers["authorization"], "<redacted>")
         self.assertEqual(request_headers["cookie"], "<redacted>")
         self.assertEqual(response_headers["set-cookie"], "<redacted>")
+        self.assertEqual(
+            summary["url"],
+            "https://example.test/api/resource?access_token=<value>"
+            "&signature=<value>&session=<value>&csrf=<value>"
+            "&api_key=<value>&tag=<value>&tag=<value>",
+        )
+        for secret in [
+            "token-secret",
+            "sig-secret",
+            "session-secret",
+            "csrf-secret",
+            "key-secret",
+            "private-fragment",
+        ]:
+            self.assertNotIn(secret, json.dumps(summary))
         self.assertNotIn("text", summary["request_body"])
         self.assertNotIn("text", summary["response_body"])
         self.assertIn("/records/0/id", summary["request_shape"]["paths"])

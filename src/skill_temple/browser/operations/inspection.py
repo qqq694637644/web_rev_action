@@ -74,6 +74,19 @@ class BrowserInspectionOperations:
             operation=request.operation,
             callback=source,
         )
+        if result.get("sourceType") == "wasm":
+            raise BrowserServiceError(
+                "wasm_source_not_saved",
+                "save_script_source does not persist WASM metadata as JavaScript. "
+                "Use the pinned js-reverse-mcp save_script_source tool to save real .wasm bytes.",
+                409,
+                dispatch_started=False,
+                session_id=payload.session_id,
+                experiment_id=payload.target_experiment_id,
+                manifest_relative_path=self._manifest_relative_path(
+                    payload.target_experiment_id
+                ),
+            )
         source_text = result.get("source") or result.get("scriptSource")
         if not isinstance(source_text, str):
             source_text = json.dumps(result, ensure_ascii=False, indent=2)

@@ -333,6 +333,7 @@ class FakeJsReverse:
                     "url": "https://example.test/telemetry",
                     "method": "POST",
                     "resourceType": "fetch",
+                    "mimeType": "text/plain",
                     "status": "failed",
                     "integrityStatus": "failed",
                 }
@@ -393,6 +394,7 @@ class FakeJsReverse:
                     "url": "https://example.test/api/resource",
                     "method": "POST",
                     "resourceType": "fetch",
+                    "mimeType": self.network_response_content_type,
                     "status": "[success - 200]",
                     "pending": False,
                 }
@@ -415,11 +417,13 @@ class FakeJsReverse:
                     "url": "https://example.test/api/setup-resource",
                     "method": "POST",
                     "resourceType": "fetch",
+                    "mimeType": "application/json",
                     "status": "[success - 200]",
                     "pending": False,
                 }
             )
         for reqid in sorted(self.replay_specs):
+            replay_spec = self.replay_specs[reqid]
             requests.append(
                 {
                     "reqid": reqid,
@@ -427,9 +431,13 @@ class FakeJsReverse:
                     "cdpRequestId": f"cdp-{reqid}",
                     "persistentRequestId": f"persistent-{reqid}",
                     "collectorGeneration": 1,
-                    "url": "https://example.test/api/resource",
+                    "url": str(
+                        replay_spec.get("url")
+                        or "https://example.test/api/resource"
+                    ),
                     "method": "POST",
                     "resourceType": "fetch",
+                    "mimeType": self.network_response_content_type,
                     "status": "[success - 200]",
                     "pending": False,
                 }
@@ -603,20 +611,19 @@ class FakeJsReverse:
         self.console_calls += 1
         messages = [
             {
-                "msgid": 1,
+                "consoleMessageStableId": 1,
                 "type": "warn",
-                "text": "old warning",
-                "url": "https://example.test/app.js",
+                "message": "old warning",
+                "argCount": 1,
             }
         ]
         if self.console_calls > 1:
             messages.append(
                 {
-                    "msgid": 2,
+                    "consoleMessageStableId": 2,
                     "type": "error",
-                    "text": "new error",
-                    "url": "https://example.test/app.js",
-                    "lineNumber": 20,
+                    "message": "new error",
+                    "argCount": 1,
                 }
             )
         return {"messages": messages, "pagination": {"hasNextPage": False}}

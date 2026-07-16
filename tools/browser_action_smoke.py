@@ -30,10 +30,11 @@ from skill_temple.browser_models import (
     CaptureFlowRequest,
     CloseSessionRequest,
     GetRequestShapeRequest,
+    ListConsoleErrorsRequest,
     OpenSessionRequest,
     ReplayRequestRequest,
 )
-from skill_temple.browser_service import BrowserActionService, ExperimentStore
+from skill_temple.browser_service import BrowserActionService, Deadline, ExperimentStore
 from skill_temple.workspace_models import (
     WorkspaceExecPwshRequest,
     WorkspaceInspectRequest,
@@ -405,6 +406,116 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
             raise AssertionError(binary.stdout)
         if f"sha256={expected_sha}" not in binary.stdout:
             raise AssertionError(binary.stdout)
+
+        initial_console = await service.js_reverse.list_console_messages(
+            Deadline(5_000),
+            types=["error", "warn"],
+        )
+        if initial_console.get("messages"):
+            raise AssertionError(initial_console)
+        await transport.call_tool(
+            "click_element",
+            {
+                "confirm": True,
+                "selector": "#emit-warning",
+            },
+            Deadline(10_000),
+        )
+
+        async def emit_console_error_during_capture() -> None:
+            await asyncio.sleep(3.0)
+            await transport.call_tool(
+                "click_element",
+                {
+                    "confirm": True,
+                    "selector": "#emit-error",
+                },
+                Deadline(10_000),
+            )
+
+        console_emitter = asyncio.create_task(emit_console_error_during_capture())
+        console_capture = await service.run(
+            CaptureFlowRequest(
+                operation="capture_flow",
+                payload={
+                    "session_id": SESSION_ID,
+                    "objective": "capture only console errors after the current checkpoint",
+                    "primary_request": {
+                        "expected_min_matches": 0,
+                        "expected_max_matches": 1,
+                    },
+                    "flow": [
+                        {
+                            "step_id": "wait_for_console_error_marker",
+                            "action": "wait",
+                            "condition": {
+                                "type": "selector_visible",
+                                "locator": {"css": "#console-error-emitted"},
+                                "timeout_ms": 15_000,
+                            },
+                        }
+                    ],
+                    "execution_mode": "sync",
+                    "deadline_ms": 30_000,
+                    "capture": {
+                        "network": False,
+                        "stream": False,
+                        "trace": False,
+                        "screenshots": False,
+                        "page_snapshots": False,
+                        "console_errors": True,
+                    },
+                    "requirements": {
+                        "require_raw_capture": False,
+                        "require_semantic_parse": False,
+                        "require_request_snapshot": False,
+                        "require_artifacts": True,
+                    },
+                },
+            )
+        )
+        await console_emitter
+        if console_capture.status != "completed":
+            raise AssertionError(console_capture.model_dump())
+        console_manifest = json.loads(
+            (
+                evidence_root
+                / str(console_capture.result["manifest_relative_path"])
+            ).read_text(encoding="utf-8")
+        )
+        console_evidence = [
+            item
+            for item in console_manifest.get("evidence", [])
+            if isinstance(item, dict) and item.get("kind") == "console_message"
+        ]
+        if len(console_evidence) != 1:
+            live_console = await service.js_reverse.list_console_messages(
+                Deadline(5_000),
+                include_preserved_messages=True,
+            )
+            raise AssertionError(
+                {
+                    "evidence": console_evidence,
+                    "checkpoint": console_manifest.get("console_checkpoint"),
+                    "live_console": live_console,
+                }
+            )
+        if console_evidence[0].get("summary", {}).get("message") != (
+            "fixture-console-after-checkpoint"
+        ):
+            raise AssertionError(console_evidence)
+        listed_console = await service.inspect(
+            ListConsoleErrorsRequest(
+                operation="list_console_errors",
+                payload={"experiment_id": console_capture.experiment_id},
+            )
+        )
+        listed_errors = listed_console.result.get("console_errors", [])
+        if len(listed_errors) != 1 or (
+            listed_errors[0].get("summary", {}).get("message")
+            != "fixture-console-after-checkpoint"
+        ):
+            raise AssertionError(listed_console.model_dump())
 
         stateful_capture = await service.run(
             CaptureFlowRequest(

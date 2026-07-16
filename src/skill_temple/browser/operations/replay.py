@@ -405,7 +405,11 @@ class BrowserReplayOperations:
             url_contains=matcher.url_contains,
             method=matcher.method,
             resource_types=matcher.resource_types,
-            mime_types=[source_content_type] if source_content_type else [],
+            # Response MIME is an observed outcome, not request identity. A
+            # valid replay can change from a stream 2xx response to a JSON 4xx
+            # response after mutation, so inheriting source MIME here would
+            # hide the exact replay request that produced the changed outcome.
+            mime_types=[],
             expected_min_matches=1,
             expected_max_matches=5,
             allow_supporting_failures=True,

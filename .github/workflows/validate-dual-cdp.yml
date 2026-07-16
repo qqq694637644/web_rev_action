@@ -9,10 +9,12 @@ on:
       - "tools/toolchain_validation.py"
       - "tools/toolchain_validation_server.py"
       - "tests/fixtures/toolchain_validation/**"
-      - "src/skill_temple/browser/adapters/**"
-      - "src/skill_temple/browser/operations/**"
-      - "src/skill_temple/browser/steps.py"
+      - "src/skill_temple/browser/**"
+      - "src/skill_temple/browser_models.py"
       - "src/skill_temple/browser_service.py"
+      - "src/skill_temple/browser_routes.py"
+      - "src/skill_temple/protocol/**"
+      - "src/skill_temple/protocol_evidence.py"
   workflow_dispatch:
     inputs:
       mode:
@@ -94,7 +96,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: qqq694637644/js-reverse-mcp
-          ref: 5e4d61aced29636f8249d5c3bce168ab3aaa6588
+          ref: e58c9e46908b58510cf6f711bc7bd0c2f809b5e4
           path: vendor/js-reverse-mcp
 
       - name: Set up Node.js

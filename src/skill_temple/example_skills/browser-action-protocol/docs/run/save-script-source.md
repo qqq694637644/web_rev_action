@@ -22,7 +22,7 @@ Optional fields and defaults:
 - offset range: `offset` and `length` together; `length` max 200000.
 - `initiator_evidence_id` and `evidence_label`.
 
-Constraints: line and offset ranges are mutually exclusive; the target experiment must belong to the supplied session; an initiator ID must reference network-request evidence.
+Constraints: line and offset ranges are mutually exclusive; the target experiment must belong to the supplied session; an initiator ID must reference network-request evidence. This operation persists JavaScript text only. A WASM metadata response is rejected rather than serialized into a misleading `.js` artifact; use the pinned js-reverse source-save capability when real `.wasm` bytes are required.
 
 Decoded example:
 
@@ -50,7 +50,7 @@ Expected response handles: script-source `evidence_id`, target `experiment_id`, 
 
 Safe retry: validation failures are safe to correct before dispatch. After dispatch started, inspect `list_evidence` on the target experiment before attempting another save to avoid duplicate evidence.
 
-Typical errors: `invalid_operation_payload`, `script_target_session_mismatch`, `initiator_evidence_kind_invalid`, `session_not_found`, `operation_outcome_unknown`.
+Typical errors: `invalid_operation_payload`, `script_target_session_mismatch`, `initiator_evidence_kind_invalid`, `wasm_source_not_saved`, `session_not_found`, `operation_outcome_unknown`.
 
 Next recommended inspect operation: `list_evidence` filtered to `script_source`.
 

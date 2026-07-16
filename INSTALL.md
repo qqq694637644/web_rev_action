@@ -120,7 +120,7 @@ Get-Command playwright-cli
 cd ..
 git clone https://github.com/qqq694637644/js-reverse-mcp.git
 cd js-reverse-mcp
-git checkout 5e4d61aced29636f8249d5c3bce168ab3aaa6588
+git checkout e58c9e46908b58510cf6f711bc7bd0c2f809b5e4
 
 npm ci
 npm run build
@@ -144,7 +144,7 @@ js-reverse-mcp/build/src/index.js
 
 ```powershell
 cd C:\path\to\js-reverse-mcp
-git checkout 5e4d61aced29636f8249d5c3bce168ab3aaa6588
+git checkout e58c9e46908b58510cf6f711bc7bd0c2f809b5e4
 npm ci
 npm run build
 npm link

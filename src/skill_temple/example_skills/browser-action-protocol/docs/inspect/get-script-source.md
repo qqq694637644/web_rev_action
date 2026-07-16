@@ -44,7 +44,7 @@ Decoded example:
 ```
 ## Result and recovery
 
-Expected response handles: bounded source text and script/range metadata. This response is transient; use `save_script_source` to persist selected evidence.
+Expected response handles: bounded source text and script/range metadata. Oversized line ranges return a structured bounded preview with `truncated=true`, offsets, total size, and a recommended offset/length follow-up. WASM responses contain metadata rather than JavaScript text. This response is transient; use `save_script_source` only for JavaScript evidence.
 
 Safe retry: read-only. Refine the range when output is too broad; if the script is no longer loaded, recapture the initiator and script handle.
 

@@ -1,6 +1,6 @@
 ---
 name: current-site-analysis
-description: Use to investigate any current website through evidence-first UI, network, stream, worker, storage, authentication, source, and replay analysis without assuming a product-specific workflow. 中文：用于先观察当前网页，再按证据设计通用协议实验。
+description: Use to investigate any current website through evidence-first UI, network, stream, source, and replay analysis, while explicitly recording worker, storage, authentication, WebSocket, or other dimensions that the available operations cannot directly observe. 中文：用于先观察当前网页，再按证据设计通用协议实验并明确记录能力缺口。
 ---
 
 # Current-site web protocol analysis
@@ -140,7 +140,7 @@ Use at most one idle window. `text_pattern` matches decoded UTF-8 text. HTTP sta
 
 ### 7. Verify state and source claims
 
-Use `verification_flow`, page snapshots, follow-up requests, storage inspection, or bounded source evidence to verify the behavior relevant to the hypothesis. A replay response alone does not prove persistent state or field necessity.
+Use `verification_flow`, page snapshots, follow-up requests, available browser evidence, or bounded source evidence to verify the behavior relevant to the hypothesis. When worker targets, WebSocket frames, storage APIs, or paused stacks are not directly exposed by the current operations, record that limitation as an evidence gap instead of implying full inspection support. A replay response alone does not prove persistent state or field necessity.
 
 ### 8. Report facts, gaps, and next experiments
 

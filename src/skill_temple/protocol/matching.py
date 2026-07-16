@@ -18,6 +18,10 @@ def network_request_matches(request: dict[str, Any], matcher: RequestMatcher) ->
         item.lower() for item in matcher.resource_types
     }:
         return False
+    if matcher.mime_types:
+        mime_type = str(request.get("mimeType", "")).split(";", 1)[0].strip().lower()
+        if mime_type not in {item.lower() for item in matcher.mime_types}:
+            return False
     return True
 
 def network_checkpoint(requests: list[dict[str, Any]], *, generation: int) -> dict[str, Any]:

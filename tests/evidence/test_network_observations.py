@@ -28,6 +28,7 @@ class EvidenceBrowserTests(BrowserActionTestCase):
                         "url_contains": "/api/resource",
                         "method": "POST",
                         "resource_types": ["fetch"],
+                        "mime_types": ["application/json"],
                     },
                     "max_matches": 2,
                     "export_parts": ["all"],
@@ -135,7 +136,12 @@ class EvidenceBrowserTests(BrowserActionTestCase):
                 [item["reqid"] for item in manifest["network_summary"]["requests"]],
                 [2],
             )
+            self.assertEqual(
+                manifest["network_summary"]["requests"][0]["url"],
+                "https://example.test/api/resource",
+            )
             self.assertEqual(network_evidence["request_ids"]["reqid"], 2)
+            self.assertEqual(len(network_evidence["request_url_sha256"]), 64)
             self.assertNotIn("Bearer secret", json.dumps(network_evidence))
             self.assertNotIn("session=secret", json.dumps(network_evidence))
             headers = {
@@ -144,6 +150,10 @@ class EvidenceBrowserTests(BrowserActionTestCase):
             }
             self.assertEqual(headers["authorization"], "<redacted>")
             self.assertEqual(headers["cookie"], "<redacted>")
+            self.assertEqual(
+                network_evidence["summary"]["url"],
+                "https://example.test/api/resource?tracking=<value>",
+            )
             all_artifact_id = next(
                 item for item in network_evidence["artifact_ids"] if item.endswith("_all")
             )
@@ -159,6 +169,12 @@ class EvidenceBrowserTests(BrowserActionTestCase):
             self.assertEqual(console.status_code, 200, console.text)
             self.assertEqual(console.json()["result"]["count"], 1)
             self.assertIn("new error", console.text)
+            console_evidence = console.json()["result"]["console_errors"][0]
+            self.assertEqual(console_evidence["message_id"], 2)
+            self.assertEqual(
+                console_evidence["summary"],
+                {"type": "error", "message": "new error", "argCount": 1},
+            )
             self.assertEqual(scripts.status_code, 200, scripts.text)
             self.assertIn("buildResourceRequest", scripts.text)
             self.assertEqual(source.status_code, 200, source.text)
@@ -176,6 +192,45 @@ class EvidenceBrowserTests(BrowserActionTestCase):
             evidence_kinds = {item["kind"] for item in manifest["evidence"]}
             self.assertIn("page_snapshot", evidence_kinds)
             self.assertIn("console_message", evidence_kinds)
+
+    def test_save_script_source_rejects_wasm_metadata_instead_of_writing_fake_js(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            client, _, _ = self.make_client(root, include_supporting_failure=False)
+            with client:
+                self.open_session(client)
+                captured = client.post("/v1/browser/run", json=self.capture_request())
+                self.assertEqual(captured.status_code, 200, captured.text)
+                experiment_id = captured.json()["experiment_id"]
+                service = client.app.state.browser_action_service
+
+                async def wasm_source(*args: object, **kwargs: object) -> dict[str, object]:
+                    return {
+                        "scriptId": "wasm-one",
+                        "sourceType": "wasm",
+                        "byteLength": 321,
+                    }
+
+                service.js_reverse.get_script_source = wasm_source
+                response = client.post(
+                    "/v1/browser/run",
+                    json=self.browser_request(
+                        "save_script_source",
+                        {
+                            "session_id": "session_one",
+                            "target_experiment_id": experiment_id,
+                            "script_id": "wasm-one",
+                            "evidence_label": "wasm-one",
+                        },
+                    ),
+                )
+
+            self.assertEqual(response.status_code, 409, response.text)
+            error = response.json()["error"]
+            self.assertEqual(error["code"], "wasm_source_not_saved")
+            self.assertFalse(error["dispatch_started"])
+            source_dir = root / "experiments" / experiment_id / "js-reverse" / "sources"
+            self.assertFalse(source_dir.exists())
 
     def test_request_context_hash_detects_cookie_value_change_without_storing_value(
         self,
