@@ -112,6 +112,12 @@ jobs:
           python -m pip install -e ".[dev]"
           python -m pip install -r validation/dual-cdp/requirements.txt
 
+      - name: Install workspace search dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ripgrep
+          rg --version
+
       - name: Build and link pinned playwright-cli fork
         working-directory: vendor/playwright-cli
         run: |
