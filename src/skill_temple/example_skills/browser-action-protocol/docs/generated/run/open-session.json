@@ -1,0 +1,104 @@
+{
+  "action": "run",
+  "consequential": true,
+  "contract_doc_path": "docs/run/open-session.md",
+  "handler_name": "dispatch_open_session",
+  "operation": "open_session",
+  "operation_contract_hash": "sha256:4d59376ce04dad1ac0455239ddbb20d5a2dea63c5cd147ac7dbd196ea1f4ad60",
+  "payload_model": "OpenSessionPayload",
+  "payload_schema": {
+    "$defs": {
+      "BrowserTarget": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_url_contains": {
+            "anyOf": [
+              {
+                "maxLength": 4096,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Expected Url Contains"
+          },
+          "page_index": {
+            "anyOf": [
+              {
+                "maximum": 100,
+                "minimum": 0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Page Index"
+          },
+          "start_url": {
+            "anyOf": [
+              {
+                "maxLength": 8192,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Start Url"
+          }
+        },
+        "title": "BrowserTarget",
+        "type": "object"
+      }
+    },
+    "additionalProperties": false,
+    "properties": {
+      "browser_endpoint": {
+        "anyOf": [
+          {
+            "maxLength": 8192,
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Browser Endpoint"
+      },
+      "deadline_ms": {
+        "default": 15000,
+        "maximum": 42000,
+        "minimum": 1000,
+        "title": "Deadline Ms",
+        "type": "integer"
+      },
+      "session_id": {
+        "anyOf": [
+          {
+            "maxLength": 128,
+            "pattern": "^[a-zA-Z0-9_.-]+$",
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Session Id"
+      },
+      "target": {
+        "$ref": "#/$defs/BrowserTarget"
+      }
+    },
+    "title": "OpenSessionPayload",
+    "type": "object"
+  },
+  "protocol_skill_content_hash": "sha256:786f2331d061583e44fc9dc7344bae933a380d13006b65d1e88f4ae31ad64e6e",
+  "request_model": "OpenSessionRequest"
+}

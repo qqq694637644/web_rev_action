@@ -1,0 +1,22 @@
+# Error recovery
+
+Transport and validation failures return a structured error with `code`,
+`operation`, `message`, `dispatch_started`, and `suggested_next_action`. Validation
+errors may include JSON Pointer `issues`.
+
+Recovery rules:
+
+- `invalid_json`: correct JSON syntax; dispatch did not start.
+- `payload_must_be_object`: encode one object; dispatch did not start.
+- `unknown_operation`: read `docs/operation-index.md` and use the correct Action.
+- `invalid_operation_payload`: read the exact operation contract and correct only
+  the reported paths.
+- `stale_operation_contract`: reload this exact Skill, copy its returned content hash,
+  reread the exact operation doc, and copy the generated contract hash. Dispatch did
+  not start.
+- `browser_busy` or `session_busy`: inspect state and wait for the current owner.
+- `operation_outcome_unknown`, `dispatch_started=true`, or `outcome=unknown`: do not
+  repeat the consequential call. Inspect the session and experiment terminal state.
+
+Only retry automatically when `dispatch_started=false` and the correction is purely
+syntactic or contractual.

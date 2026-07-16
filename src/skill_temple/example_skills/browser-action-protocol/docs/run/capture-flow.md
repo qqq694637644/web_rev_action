@@ -1,0 +1,1480 @@
+# `capture_flow`
+
+## Contract
+
+- **Operation:** `capture_flow`
+- **Action:** `runBrowserExperiment`
+- **Purpose:** run one atomic page-flow experiment while capturing bounded browser, network, stream, console, screenshot, and trace evidence.
+- **Consequential:** yes; steps may navigate or mutate page/server state.
+- **Prerequisites:** an open aligned session; read the exact step and evidence requirements in the workflow Skill before dispatch.
+
+## Decoded payload schema
+
+Required fields:
+
+- `session_id`: safe identifier, max 128 characters.
+- `objective`: non-empty experiment objective, max 2048 characters.
+
+Optional fields and defaults:
+
+- `target`: current-page selector; `start_url` is forbidden for capture.
+- `primary_request`: request matcher and expected count bounds.
+- `flow`: up to 100 typed steps.
+- `wait_for`: one terminal wait condition.
+- `execution_mode`: `job` or `sync`; default `job`.
+- `deadline_ms`: 1000–42000; default 42000.
+- `job_timeout_ms`: 10000–1800000; default 300000.
+- `capture`, `requirements`, `network_evidence` (max 20), and `series`.
+
+Constraints: navigation must be an explicit `navigate` flow step so capture starts first. Step fields are strict and action-specific.
+
+Decoded example:
+
+```json
+{"session_id":"analysis-main","objective":"capture current page baseline","primary_request":{"expected_min_matches":0,"expected_max_matches":100},"flow":[{"step_id":"before","action":"snapshot"}],"execution_mode":"sync"}
+```
+
+## Complete Action envelope
+
+> Generated binding values are build-specific. Copy all six fields exactly.
+
+```json
+{
+  "contract_version": "2.0",
+  "operation": "capture_flow",
+  "operation_contract_hash": "sha256:90fcbfeab8fbabfd4ed9ab01a138cec718d2322dfd5e815be5ced5757b0f5b7e",
+  "payload_json": "{\"execution_mode\":\"sync\",\"flow\":[{\"action\":\"snapshot\",\"step_id\":\"before\"}],\"objective\":\"capture current page baseline\",\"primary_request\":{\"expected_max_matches\":100,\"expected_min_matches\":0},\"session_id\":\"analysis-main\"}",
+  "skill_content_hash": "sha256:786f2331d061583e44fc9dc7344bae933a380d13006b65d1e88f4ae31ad64e6e",
+  "skill_id": "browser-action-protocol"
+}
+```
+## Result and recovery
+
+Expected response handles: `experiment_id`, `session_id`, status, bounded experiment summary, and manifest relative path.
+
+Safe retry: a `running` response is not a failure; poll `get_experiment`. When dispatch started or outcome is unknown, inspect the returned/known experiment and session instead of repeating the flow.
+
+Typical errors: `invalid_operation_payload`, `session_not_found`, `session_busy`, `browser_busy`, `page_alignment_failed`, `operation_outcome_unknown`.
+
+Next recommended inspect operations: `get_experiment`, then `list_evidence`.
+
+Contract hash: `sha256:90fcbfeab8fbabfd4ed9ab01a138cec718d2322dfd5e815be5ced5757b0f5b7e`. Send it in `operation_contract_hash`.
+
+<!-- BEGIN GENERATED CONTRACT -->
+## Generated structural contract
+
+> Generated from `OperationRegistry` and Pydantic. Do not edit this block.
+
+- Request model: `CaptureFlowRequest`
+- Payload model: `CaptureFlowPayload`
+- Registry handler: `dispatch_capture_flow`
+- Consequential: `true`
+- Operation contract hash: `sha256:90fcbfeab8fbabfd4ed9ab01a138cec718d2322dfd5e815be5ced5757b0f5b7e`
+
+```json
+{
+  "$defs": {
+    "AssertStep": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "const": "assert",
+          "title": "Action",
+          "type": "string"
+        },
+        "condition": {
+          "$ref": "#/$defs/WaitCondition"
+        },
+        "step_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.-]+$",
+          "title": "Step Id",
+          "type": "string"
+        },
+        "timeout_ms": {
+          "default": 5000,
+          "maximum": 1800000,
+          "minimum": 1,
+          "title": "Timeout Ms",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "step_id",
+        "action",
+        "condition"
+      ],
+      "title": "AssertStep",
+      "type": "object"
+    },
+    "BrowserTarget": {
+      "additionalProperties": false,
+      "properties": {
+        "expected_url_contains": {
+          "anyOf": [
+            {
+              "maxLength": 4096,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Expected Url Contains"
+        },
+        "page_index": {
+          "anyOf": [
+            {
+              "maximum": 100,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Page Index"
+        },
+        "start_url": {
+          "anyOf": [
+            {
+              "maxLength": 8192,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Start Url"
+        }
+      },
+      "title": "BrowserTarget",
+      "type": "object"
+    },
+    "CaptureOptions": {
+      "additionalProperties": false,
+      "properties": {
+        "console_errors": {
+          "default": true,
+          "title": "Console Errors",
+          "type": "boolean"
+        },
+        "network": {
+          "default": true,
+          "title": "Network",
+          "type": "boolean"
+        },
+        "page_snapshots": {
+          "default": true,
+          "title": "Page Snapshots",
+          "type": "boolean"
+        },
+        "screenshots": {
+          "default": true,
+          "title": "Screenshots",
+          "type": "boolean"
+        },
+        "stream": {
+          "default": true,
+          "title": "Stream",
+          "type": "boolean"
+        },
+        "trace": {
+          "default": true,
+          "title": "Trace",
+          "type": "boolean"
+        }
+      },
+      "title": "CaptureOptions",
+      "type": "object"
+    },
+    "CheckStep": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "const": "check",
+          "title": "Action",
+          "type": "string"
+        },
+        "locator": {
+          "$ref": "#/$defs/Locator"
+        },
+        "step_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.-]+$",
+          "title": "Step Id",
+          "type": "string"
+        },
+        "timeout_ms": {
+          "default": 5000,
+          "maximum": 1800000,
+          "minimum": 1,
+          "title": "Timeout Ms",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "step_id",
+        "action",
+        "locator"
+      ],
+      "title": "CheckStep",
+      "type": "object"
+    },
+    "ClickStep": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "const": "click",
+          "title": "Action",
+          "type": "string"
+        },
+        "intent": {
+          "anyOf": [
+            {
+              "const": "stop_generation",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Intent"
+        },
+        "locator": {
+          "$ref": "#/$defs/Locator"
+        },
+        "step_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.-]+$",
+          "title": "Step Id",
+          "type": "string"
+        },
+        "timeout_ms": {
+          "default": 5000,
+          "maximum": 1800000,
+          "minimum": 1,
+          "title": "Timeout Ms",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "step_id",
+        "action",
+        "locator"
+      ],
+      "title": "ClickStep",
+      "type": "object"
+    },
+    "EventNamePredicate": {
+      "additionalProperties": false,
+      "properties": {
+        "event_name": {
+          "maxLength": 256,
+          "minLength": 1,
+          "title": "Event Name",
+          "type": "string"
+        },
+        "type": {
+          "const": "event_name",
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "event_name"
+      ],
+      "title": "EventNamePredicate",
+      "type": "object"
+    },
+    "ExactDataPredicate": {
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "exact_data",
+          "title": "Type",
+          "type": "string"
+        },
+        "value": {
+          "maxLength": 64000,
+          "title": "Value",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "value"
+      ],
+      "title": "ExactDataPredicate",
+      "type": "object"
+    },
+    "ExperimentSeries": {
+      "additionalProperties": false,
+      "properties": {
+        "analysis_series_id": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "pattern": "^[a-zA-Z0-9_.-]+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Analysis Series Id"
+        },
+        "conversation_key": {
+          "anyOf": [
+            {
+              "maxLength": 512,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Conversation Key"
+        },
+        "predecessor_experiment_id": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "pattern": "^[a-zA-Z0-9_.-]+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Predecessor Experiment Id"
+        },
+        "scenario_type": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Scenario Type"
+        },
+        "sequence_index": {
+          "anyOf": [
+            {
+              "maximum": 100000,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sequence Index"
+        }
+      },
+      "title": "ExperimentSeries",
+      "type": "object"
+    },
+    "FillStep": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "const": "fill",
+          "title": "Action",
+          "type": "string"
+        },
+        "locator": {
+          "$ref": "#/$defs/Locator"
+        },
+        "step_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.-]+$",
+          "title": "Step Id",
+          "type": "string"
+        },
+        "timeout_ms": {
+          "default": 5000,
+          "maximum": 1800000,
+          "minimum": 1,
+          "title": "Timeout Ms",
+          "type": "integer"
+        },
+        "value": {
+          "maxLength": 32000,
+          "title": "Value",
+          "type": "string"
+        }
+      },
+      "required": [
+        "step_id",
+        "action",
+        "locator",
+        "value"
+      ],
+      "title": "FillStep",
+      "type": "object"
+    },
+    "HoverStep": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "const": "hover",
+          "title": "Action",
+          "type": "string"
+        },
+        "locator": {
+          "$ref": "#/$defs/Locator"
+        },
+        "step_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.-]+$",
+          "title": "Step Id",
+          "type": "string"
+        },
+        "timeout_ms": {
+          "default": 5000,
+          "maximum": 1800000,
+          "minimum": 1,
+          "title": "Timeout Ms",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "step_id",
+        "action",
+        "locator"
+      ],
+      "title": "HoverStep",
+      "type": "object"
+    },
+    "JsonPathEqualsPredicate": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "maxLength": 512,
+          "pattern": "^\$\.[A-Za-z0-9_.-]+$",
+          "title": "Path",
+          "type": "string"
+        },
+        "type": {
+          "const": "json_path_equals",
+          "title": "Type",
+          "type": "string"
+        },
+        "value": {
+          "title": "Value"
+        }
+      },
+      "required": [
+        "type",
+        "path",
+        "value"
+      ],
+      "title": "JsonPathEqualsPredicate",
+      "type": "object"
+    },
+    "Locator": {
+      "additionalProperties": false,
+      "properties": {
+        "css": {
+          "anyOf": [
+            {
+              "maxLength": 2048,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Css"
+        },
+        "label": {
+          "anyOf": [
+            {
+              "maxLength": 512,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Label"
+        },
+        "name": {
+          "anyOf": [
+            {
+              "maxLength": 512,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Name"
+        },
+        "placeholder": {
+          "anyOf": [
+            {
+              "maxLength": 512,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Placeholder"
+        },
+        "ref": {
+          "anyOf": [
+            {
+              "maxLength": 256,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Ref"
+        },
+        "role": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Role"
+        },
+        "test_id": {
+          "anyOf": [
+            {
+              "maxLength": 512,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Test Id"
+        },
+        "text": {
+          "anyOf": [
+            {
+              "maxLength": 1024,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Text"
+        }
+      },
+      "title": "Locator",
+      "type": "object"
+    },
+    "NavigateStep": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "const": "navigate",
+          "title": "Action",
+          "type": "string"
+        },
+        "step_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.-]+$",
+          "title": "Step Id",
+          "type": "string"
+        },
+        "timeout_ms": {
+          "default": 5000,
+          "maximum": 1800000,
+          "minimum": 1,
+          "title": "Timeout Ms",
+          "type": "integer"
+        },
+        "value": {
+          "maxLength": 8192,
+          "minLength": 1,
+          "title": "Value",
+          "type": "string"
+        }
+      },
+      "required": [
+        "step_id",
+        "action",
+        "value"
+      ],
+      "title": "NavigateStep",
+      "type": "object"
+    },
+    "NetworkEvidenceSelector": {
+      "additionalProperties": false,
+      "properties": {
+        "cookie_names": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 20,
+          "title": "Cookie Names",
+          "type": "array"
+        },
+        "export_parts": {
+          "items": {
+            "enum": [
+              "all",
+              "responseHeaders",
+              "responseBody",
+              "requestBody",
+              "queryParams"
+            ],
+            "type": "string"
+          },
+          "maxItems": 5,
+          "minItems": 1,
+          "title": "Export Parts",
+          "type": "array"
+        },
+        "include_cookie_provenance": {
+          "default": false,
+          "title": "Include Cookie Provenance",
+          "type": "boolean"
+        },
+        "include_initiator": {
+          "default": true,
+          "title": "Include Initiator",
+          "type": "boolean"
+        },
+        "matcher": {
+          "$ref": "#/$defs/RequestMatcher"
+        },
+        "max_matches": {
+          "default": 5,
+          "maximum": 50,
+          "minimum": 1,
+          "title": "Max Matches",
+          "type": "integer"
+        },
+        "selector_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.-]+$",
+          "title": "Selector Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "selector_id"
+      ],
+      "title": "NetworkEvidenceSelector",
+      "type": "object"
+    },
+    "NetworkTerminalPredicate": {
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "network_terminal",
+          "title": "Type",
+          "type": "string"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "enum": [
+                "finished",
+                "canceled",
+                "failed",
+                "stopped"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Value"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "title": "NetworkTerminalPredicate",
+      "type": "object"
+    },
+    "ObjectiveRequirements": {
+      "additionalProperties": false,
+      "properties": {
+        "require_artifacts": {
+          "default": true,
+          "title": "Require Artifacts",
+          "type": "boolean"
+        },
+        "require_raw_capture": {
+          "default": true,
+          "title": "Require Raw Capture",
+          "type": "boolean"
+        },
+        "require_request_snapshot": {
+          "default": false,
+          "title": "Require Request Snapshot",
+          "type": "boolean"
+        },
+        "require_semantic_parse": {
+          "default": false,
+          "title": "Require Semantic Parse",
+          "type": "boolean"
+        }
+      },
+      "title": "ObjectiveRequirements",
+      "type": "object"
+    },
+    "PressStep": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "const": "press",
+          "title": "Action",
+          "type": "string"
+        },
+        "step_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.-]+$",
+          "title": "Step Id",
+          "type": "string"
+        },
+        "timeout_ms": {
+          "default": 5000,
+          "maximum": 1800000,
+          "minimum": 1,
+          "title": "Timeout Ms",
+          "type": "integer"
+        },
+        "value": {
+          "maxLength": 256,
+          "minLength": 1,
+          "title": "Value",
+          "type": "string"
+        }
+      },
+      "required": [
+        "step_id",
+        "action",
+        "value"
+      ],
+      "title": "PressStep",
+      "type": "object"
+    },
+    "PrimaryRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "allow_supporting_failures": {
+          "default": true,
+          "title": "Allow Supporting Failures",
+          "type": "boolean"
+        },
+        "expected_max_matches": {
+          "default": 1,
+          "maximum": 100,
+          "minimum": 1,
+          "title": "Expected Max Matches",
+          "type": "integer"
+        },
+        "expected_min_matches": {
+          "default": 1,
+          "maximum": 100,
+          "minimum": 0,
+          "title": "Expected Min Matches",
+          "type": "integer"
+        },
+        "include_in_flight": {
+          "default": false,
+          "title": "Include In Flight",
+          "type": "boolean"
+        },
+        "method": {
+          "anyOf": [
+            {
+              "maxLength": 16,
+              "pattern": "^[A-Z]+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Method"
+        },
+        "mime_types": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 16,
+          "title": "Mime Types",
+          "type": "array"
+        },
+        "resource_types": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 16,
+          "title": "Resource Types",
+          "type": "array"
+        },
+        "url_contains": {
+          "anyOf": [
+            {
+              "maxLength": 4096,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Url Contains"
+        }
+      },
+      "title": "PrimaryRequest",
+      "type": "object"
+    },
+    "ReloadStep": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "const": "reload",
+          "title": "Action",
+          "type": "string"
+        },
+        "step_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.-]+$",
+          "title": "Step Id",
+          "type": "string"
+        },
+        "timeout_ms": {
+          "default": 5000,
+          "maximum": 1800000,
+          "minimum": 1,
+          "title": "Timeout Ms",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "step_id",
+        "action"
+      ],
+      "title": "ReloadStep",
+      "type": "object"
+    },
+    "RequestMatcher": {
+      "additionalProperties": false,
+      "properties": {
+        "method": {
+          "anyOf": [
+            {
+              "maxLength": 16,
+              "pattern": "^[A-Z]+$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Method"
+        },
+        "mime_types": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 16,
+          "title": "Mime Types",
+          "type": "array"
+        },
+        "request_id": {
+          "anyOf": [
+            {
+              "maxLength": 512,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Request Id"
+        },
+        "resource_types": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 16,
+          "title": "Resource Types",
+          "type": "array"
+        },
+        "url_contains": {
+          "anyOf": [
+            {
+              "maxLength": 4096,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Url Contains"
+        }
+      },
+      "title": "RequestMatcher",
+      "type": "object"
+    },
+    "SelectStep": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "const": "select",
+          "title": "Action",
+          "type": "string"
+        },
+        "locator": {
+          "$ref": "#/$defs/Locator"
+        },
+        "step_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.-]+$",
+          "title": "Step Id",
+          "type": "string"
+        },
+        "timeout_ms": {
+          "default": 5000,
+          "maximum": 1800000,
+          "minimum": 1,
+          "title": "Timeout Ms",
+          "type": "integer"
+        },
+        "value": {
+          "maxLength": 32000,
+          "title": "Value",
+          "type": "string"
+        }
+      },
+      "required": [
+        "step_id",
+        "action",
+        "locator",
+        "value"
+      ],
+      "title": "SelectStep",
+      "type": "object"
+    },
+    "SelectorStatePredicate": {
+      "additionalProperties": false,
+      "properties": {
+        "locator": {
+          "$ref": "#/$defs/Locator"
+        },
+        "type": {
+          "const": "selector_state",
+          "title": "Type",
+          "type": "string"
+        },
+        "value": {
+          "enum": [
+            "visible",
+            "hidden"
+          ],
+          "title": "Value",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "locator",
+        "value"
+      ],
+      "title": "SelectorStatePredicate",
+      "type": "object"
+    },
+    "SnapshotStep": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "const": "snapshot",
+          "title": "Action",
+          "type": "string"
+        },
+        "step_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.-]+$",
+          "title": "Step Id",
+          "type": "string"
+        },
+        "timeout_ms": {
+          "default": 5000,
+          "maximum": 1800000,
+          "minimum": 1,
+          "title": "Timeout Ms",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "step_id",
+        "action"
+      ],
+      "title": "SnapshotStep",
+      "type": "object"
+    },
+    "TypeStep": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "const": "type",
+          "title": "Action",
+          "type": "string"
+        },
+        "step_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.-]+$",
+          "title": "Step Id",
+          "type": "string"
+        },
+        "timeout_ms": {
+          "default": 5000,
+          "maximum": 1800000,
+          "minimum": 1,
+          "title": "Timeout Ms",
+          "type": "integer"
+        },
+        "value": {
+          "maxLength": 32000,
+          "title": "Value",
+          "type": "string"
+        }
+      },
+      "required": [
+        "step_id",
+        "action",
+        "value"
+      ],
+      "title": "TypeStep",
+      "type": "object"
+    },
+    "UncheckStep": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "const": "uncheck",
+          "title": "Action",
+          "type": "string"
+        },
+        "locator": {
+          "$ref": "#/$defs/Locator"
+        },
+        "step_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.-]+$",
+          "title": "Step Id",
+          "type": "string"
+        },
+        "timeout_ms": {
+          "default": 5000,
+          "maximum": 1800000,
+          "minimum": 1,
+          "title": "Timeout Ms",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "step_id",
+        "action",
+        "locator"
+      ],
+      "title": "UncheckStep",
+      "type": "object"
+    },
+    "UploadStep": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "const": "upload",
+          "title": "Action",
+          "type": "string"
+        },
+        "locator": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Locator"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "step_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.-]+$",
+          "title": "Step Id",
+          "type": "string"
+        },
+        "timeout_ms": {
+          "default": 5000,
+          "maximum": 1800000,
+          "minimum": 1,
+          "title": "Timeout Ms",
+          "type": "integer"
+        },
+        "values": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 32,
+          "minItems": 1,
+          "title": "Values",
+          "type": "array"
+        }
+      },
+      "required": [
+        "step_id",
+        "action",
+        "values"
+      ],
+      "title": "UploadStep",
+      "type": "object"
+    },
+    "WaitCondition": {
+      "additionalProperties": false,
+      "properties": {
+        "locator": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Locator"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "predicate": {
+          "anyOf": [
+            {
+              "discriminator": {
+                "mapping": {
+                  "event_name": "#/$defs/EventNamePredicate",
+                  "exact_data": "#/$defs/ExactDataPredicate",
+                  "json_path_equals": "#/$defs/JsonPathEqualsPredicate",
+                  "network_terminal": "#/$defs/NetworkTerminalPredicate",
+                  "selector_state": "#/$defs/SelectorStatePredicate"
+                },
+                "propertyName": "type"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/ExactDataPredicate"
+                },
+                {
+                  "$ref": "#/$defs/EventNamePredicate"
+                },
+                {
+                  "$ref": "#/$defs/JsonPathEqualsPredicate"
+                },
+                {
+                  "$ref": "#/$defs/NetworkTerminalPredicate"
+                },
+                {
+                  "$ref": "#/$defs/SelectorStatePredicate"
+                }
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Predicate"
+        },
+        "request_matcher": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RequestMatcher"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "timeout_ms": {
+          "default": 10000,
+          "maximum": 1800000,
+          "minimum": 1,
+          "title": "Timeout Ms",
+          "type": "integer"
+        },
+        "type": {
+          "enum": [
+            "timeout",
+            "selector_visible",
+            "selector_hidden",
+            "request_observed",
+            "response_observed",
+            "request_log_stable",
+            "first_event",
+            "event_predicate",
+            "default_done_marker",
+            "network_finished",
+            "network_canceled",
+            "failed",
+            "page_url"
+          ],
+          "title": "Type",
+          "type": "string"
+        },
+        "value": {
+          "anyOf": [
+            {
+              "maxLength": 4096,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Value"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "title": "WaitCondition",
+      "type": "object"
+    },
+    "WaitStep": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "const": "wait",
+          "title": "Action",
+          "type": "string"
+        },
+        "condition": {
+          "$ref": "#/$defs/WaitCondition"
+        },
+        "step_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9_.-]+$",
+          "title": "Step Id",
+          "type": "string"
+        },
+        "timeout_ms": {
+          "default": 5000,
+          "maximum": 1800000,
+          "minimum": 1,
+          "title": "Timeout Ms",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "step_id",
+        "action",
+        "condition"
+      ],
+      "title": "WaitStep",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "capture": {
+      "$ref": "#/$defs/CaptureOptions"
+    },
+    "deadline_ms": {
+      "default": 42000,
+      "maximum": 42000,
+      "minimum": 1000,
+      "title": "Deadline Ms",
+      "type": "integer"
+    },
+    "execution_mode": {
+      "default": "job",
+      "enum": [
+        "job",
+        "sync"
+      ],
+      "title": "Execution Mode",
+      "type": "string"
+    },
+    "flow": {
+      "items": {
+        "discriminator": {
+          "mapping": {
+            "assert": "#/$defs/AssertStep",
+            "check": "#/$defs/CheckStep",
+            "click": "#/$defs/ClickStep",
+            "fill": "#/$defs/FillStep",
+            "hover": "#/$defs/HoverStep",
+            "navigate": "#/$defs/NavigateStep",
+            "press": "#/$defs/PressStep",
+            "reload": "#/$defs/ReloadStep",
+            "select": "#/$defs/SelectStep",
+            "snapshot": "#/$defs/SnapshotStep",
+            "type": "#/$defs/TypeStep",
+            "uncheck": "#/$defs/UncheckStep",
+            "upload": "#/$defs/UploadStep",
+            "wait": "#/$defs/WaitStep"
+          },
+          "propertyName": "action"
+        },
+        "oneOf": [
+          {
+            "$ref": "#/$defs/NavigateStep"
+          },
+          {
+            "$ref": "#/$defs/ReloadStep"
+          },
+          {
+            "$ref": "#/$defs/ClickStep"
+          },
+          {
+            "$ref": "#/$defs/FillStep"
+          },
+          {
+            "$ref": "#/$defs/TypeStep"
+          },
+          {
+            "$ref": "#/$defs/PressStep"
+          },
+          {
+            "$ref": "#/$defs/SelectStep"
+          },
+          {
+            "$ref": "#/$defs/CheckStep"
+          },
+          {
+            "$ref": "#/$defs/UncheckStep"
+          },
+          {
+            "$ref": "#/$defs/HoverStep"
+          },
+          {
+            "$ref": "#/$defs/UploadStep"
+          },
+          {
+            "$ref": "#/$defs/WaitStep"
+          },
+          {
+            "$ref": "#/$defs/AssertStep"
+          },
+          {
+            "$ref": "#/$defs/SnapshotStep"
+          }
+        ]
+      },
+      "maxItems": 100,
+      "title": "Flow",
+      "type": "array"
+    },
+    "job_timeout_ms": {
+      "default": 300000,
+      "maximum": 1800000,
+      "minimum": 10000,
+      "title": "Job Timeout Ms",
+      "type": "integer"
+    },
+    "network_evidence": {
+      "items": {
+        "$ref": "#/$defs/NetworkEvidenceSelector"
+      },
+      "maxItems": 20,
+      "title": "Network Evidence",
+      "type": "array"
+    },
+    "objective": {
+      "maxLength": 2048,
+      "minLength": 1,
+      "title": "Objective",
+      "type": "string"
+    },
+    "primary_request": {
+      "$ref": "#/$defs/PrimaryRequest"
+    },
+    "requirements": {
+      "$ref": "#/$defs/ObjectiveRequirements"
+    },
+    "series": {
+      "$ref": "#/$defs/ExperimentSeries"
+    },
+    "session_id": {
+      "maxLength": 128,
+      "pattern": "^[a-zA-Z0-9_.-]+$",
+      "title": "Session Id",
+      "type": "string"
+    },
+    "target": {
+      "$ref": "#/$defs/BrowserTarget"
+    },
+    "wait_for": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/WaitCondition"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    }
+  },
+  "required": [
+    "session_id",
+    "objective"
+  ],
+  "title": "CaptureFlowPayload",
+  "type": "object"
+}
+```
+<!-- END GENERATED CONTRACT -->

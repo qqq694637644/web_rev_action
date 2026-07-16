@@ -76,9 +76,9 @@ class ReplayReadersBrowserTests(BrowserActionTestCase):
                 source_id, source_evidence, _ = self.capture_replay_source(client, root)
                 response = client.post(
                     "/v1/browser/run",
-                    json={
-                        "operation": "replay_request",
-                        "payload": {
+                    json=self.browser_request(
+                        "replay_request",
+                        {
                             "session_id": "session_one",
                             "objective": "replay a source without Content-Type",
                             "source": {
@@ -88,7 +88,7 @@ class ReplayReadersBrowserTests(BrowserActionTestCase):
                             "execution_mode": "sync",
                             "deadline_ms": 10_000,
                         },
-                    },
+                    ),
                 )
             self.assertEqual(response.status_code, 200, response.text)
             self.assertEqual(response.json()["status"], "completed")
@@ -133,9 +133,9 @@ class ReplayReadersBrowserTests(BrowserActionTestCase):
                 source_id, source_evidence, _ = self.capture_replay_source(client, root)
                 response = client.post(
                     "/v1/browser/run",
-                    json={
-                        "operation": "replay_request",
-                        "payload": {
+                    json=self.browser_request(
+                        "replay_request",
+                        {
                             "session_id": "session_one",
                             "objective": "lock stream observation to exact replay evidence",
                             "source": {
@@ -151,7 +151,7 @@ class ReplayReadersBrowserTests(BrowserActionTestCase):
                             "execution_mode": "sync",
                             "deadline_ms": 10_000,
                         },
-                    },
+                    ),
                 )
             self.assertEqual(response.status_code, 200, response.text)
             manifest = json.loads(
@@ -182,9 +182,9 @@ class ReplayReadersBrowserTests(BrowserActionTestCase):
                 source_id, source_evidence, _ = self.capture_replay_source(client, root)
                 response = client.post(
                     "/v1/browser/run",
-                    json={
-                        "operation": "replay_request",
-                        "payload": {
+                    json=self.browser_request(
+                        "replay_request",
+                        {
                             "session_id": "session_one",
                             "objective": "read an SSE response explicitly",
                             "source": {
@@ -210,7 +210,7 @@ class ReplayReadersBrowserTests(BrowserActionTestCase):
                             "execution_mode": "sync",
                             "deadline_ms": 10_000,
                         },
-                    },
+                    ),
                 )
             self.assertEqual(response.status_code, 200, response.text)
             manifest = json.loads(
@@ -259,9 +259,9 @@ class ReplayReadersBrowserTests(BrowserActionTestCase):
                 source_id, source_evidence, _ = self.capture_replay_source(client, root)
                 response = client.post(
                     "/v1/browser/run",
-                    json={
-                        "operation": "replay_request",
-                        "payload": {
+                    json=self.browser_request(
+                        "replay_request",
+                        {
                             "session_id": "session_one",
                             "objective": "reject a contradictory observed reader mode",
                             "source": {
@@ -277,7 +277,7 @@ class ReplayReadersBrowserTests(BrowserActionTestCase):
                             "execution_mode": "sync",
                             "deadline_ms": 10_000,
                         },
-                    },
+                    ),
                 )
             self.assertEqual(response.status_code, 200, response.text)
             self.assertEqual(response.json()["status"], "partial")
@@ -305,9 +305,9 @@ class ReplayReadersBrowserTests(BrowserActionTestCase):
                 js.replay_response_status = 500
                 response = client.post(
                     "/v1/browser/run",
-                    json={
-                        "operation": "replay_request",
-                        "payload": {
+                    json=self.browser_request(
+                        "replay_request",
+                        {
                             "session_id": "session_one",
                             "objective": "preserve a complete server-error stream",
                             "source": {
@@ -323,7 +323,7 @@ class ReplayReadersBrowserTests(BrowserActionTestCase):
                             "execution_mode": "sync",
                             "deadline_ms": 10_000,
                         },
-                    },
+                    ),
                 )
             self.assertEqual(response.status_code, 200, response.text)
             self.assertEqual(response.json()["status"], "completed")
@@ -359,9 +359,9 @@ class ReplayReadersBrowserTests(BrowserActionTestCase):
                     js.replay_response_status = 500
                     response = client.post(
                         "/v1/browser/run",
-                        json={
-                            "operation": "replay_request",
-                            "payload": {
+                        json=self.browser_request(
+                            "replay_request",
+                            {
                                 "session_id": "session_one",
                                 "objective": f"preserve a complete HTTP 500 {mode} response",
                                 "source": {
@@ -375,7 +375,7 @@ class ReplayReadersBrowserTests(BrowserActionTestCase):
                                 "execution_mode": "sync",
                                 "deadline_ms": 10_000,
                             },
-                        },
+                        ),
                     )
                 self.assertEqual(response.status_code, 200, response.text)
                 self.assertEqual(response.json()["status"], "completed")
@@ -409,9 +409,9 @@ class ReplayReadersBrowserTests(BrowserActionTestCase):
                     source_id, source_evidence, _ = self.capture_replay_source(client, root)
                     response = client.post(
                         "/v1/browser/run",
-                        json={
-                            "operation": "replay_request",
-                            "payload": {
+                        json=self.browser_request(
+                            "replay_request",
+                            {
                                 "session_id": "session_one",
                                 "objective": f"read {mode} without Content-Type",
                                 "source": {
@@ -425,7 +425,7 @@ class ReplayReadersBrowserTests(BrowserActionTestCase):
                                 "execution_mode": "sync",
                                 "deadline_ms": 10_000,
                             },
-                        },
+                        ),
                     )
                 self.assertEqual(response.status_code, 200, response.text)
                 self.assertEqual(response.json()["status"], "completed")
@@ -452,9 +452,9 @@ class ReplayReadersBrowserTests(BrowserActionTestCase):
                 source_id, source_evidence, _ = self.capture_replay_source(client, root)
                 response = client.post(
                     "/v1/browser/run",
-                    json={
-                        "operation": "replay_request",
-                        "payload": {
+                    json=self.browser_request(
+                        "replay_request",
+                        {
                             "session_id": "session_one",
                             "objective": "detect an auto-reader Content-Type contradiction",
                             "source": {
@@ -468,7 +468,7 @@ class ReplayReadersBrowserTests(BrowserActionTestCase):
                             "execution_mode": "sync",
                             "deadline_ms": 10_000,
                         },
-                    },
+                    ),
                 )
             self.assertEqual(response.status_code, 200, response.text)
             self.assertEqual(response.json()["status"], "partial")
@@ -507,9 +507,9 @@ class ReplayReadersBrowserTests(BrowserActionTestCase):
                     )
                     response = client.post(
                         "/v1/browser/run",
-                        json={
-                            "operation": "replay_request",
-                            "payload": {
+                        json=self.browser_request(
+                            "replay_request",
+                            {
                                 "session_id": "session_one",
                                 "objective": f"auto-detect a JSON to {mode} transition",
                                 "source": {
@@ -521,7 +521,7 @@ class ReplayReadersBrowserTests(BrowserActionTestCase):
                                 "execution_mode": "sync",
                                 "deadline_ms": 10_000,
                             },
-                        },
+                        ),
                     )
                 self.assertEqual(response.status_code, 200, response.text)
                 self.assertEqual(response.json()["status"], "completed")

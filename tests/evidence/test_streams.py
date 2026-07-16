@@ -550,23 +550,23 @@ class StreamsBrowserTests(BrowserActionTestCase):
                 experiment_id = captured.json()["experiment_id"]
                 status = client.post(
                     "/v1/browser/inspect",
-                    json={
-                        "operation": "get_stream_status",
-                        "payload": {
+                    json=self.browser_request(
+                        "get_stream_status",
+                        {
                             "experiment_id": experiment_id,
                             "capture_uuid": "11111111-1111-4111-8111-111111111111",
                         },
-                    },
+                    ),
                 )
                 mismatch = client.post(
                     "/v1/browser/inspect",
-                    json={
-                        "operation": "get_stream_status",
-                        "payload": {
+                    json=self.browser_request(
+                        "get_stream_status",
+                        {
                             "experiment_id": experiment_id,
                             "capture_uuid": "22222222-2222-4222-8222-222222222222",
                         },
-                    },
+                    ),
                 )
             self.assertEqual(status.status_code, 200, status.text)
             self.assertEqual(status.json()["result"]["source"], "manifest")
@@ -653,21 +653,21 @@ class StreamsBrowserTests(BrowserActionTestCase):
             with client:
                 live = client.post(
                     "/v1/browser/inspect",
-                    json={
-                        "operation": "get_stream_status",
-                        "payload": {
+                    json=self.browser_request(
+                        "get_stream_status",
+                        {
                             "experiment_id": experiment_id,
                             "capture_uuid": "55555555-5555-4555-8555-555555555555",
                         },
-                    },
+                    ),
                 )
                 js.generation = 6
                 persisted = client.post(
                     "/v1/browser/inspect",
-                    json={
-                        "operation": "get_stream_status",
-                        "payload": {"experiment_id": experiment_id},
-                    },
+                    json=self.browser_request(
+                        "get_stream_status",
+                        {"experiment_id": experiment_id},
+                    ),
                 )
             self.assertEqual(live.status_code, 200, live.text)
             self.assertEqual(live.json()["result"]["source"], "live-mcp")
@@ -759,9 +759,9 @@ class StreamsBrowserTests(BrowserActionTestCase):
     def test_stream_disabled_has_complete_empty_quality_summary(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             client, _, _ = self.make_client(Path(temp_dir))
-            request = {
-                "operation": "capture_flow",
-                "payload": {
+            request = self.browser_request(
+                "capture_flow",
+                {
                     "session_id": "session_one",
                     "objective": "page-only baseline",
                     "primary_request": {
@@ -778,7 +778,7 @@ class StreamsBrowserTests(BrowserActionTestCase):
                     "execution_mode": "sync",
                     "deadline_ms": 10_000,
                 },
-            }
+            )
             with client:
                 self.open_session(client)
                 response = client.post("/v1/browser/run", json=request)
@@ -894,7 +894,8 @@ class StreamsBrowserTests(BrowserActionTestCase):
                 artifact_integrity="failed",
             )
             capture = self.capture_request()
-            capture["payload"]["network_evidence"] = [
+            payload = self.request_payload(capture)
+            payload["network_evidence"] = [
                 {
                     "selector_id": "resource_submit",
                     "matcher": {
@@ -904,6 +905,7 @@ class StreamsBrowserTests(BrowserActionTestCase):
                     "export_parts": ["all"],
                 }
             ]
+            self.set_request_payload(capture, payload)
             with client:
                 self.open_session(client)
                 response = client.post("/v1/browser/run", json=capture)
@@ -933,9 +935,9 @@ class StreamsBrowserTests(BrowserActionTestCase):
             },
             {"type": "timeout", "timeout_ms": 1_000},
         ]:
-            request = {
-                "operation": "capture_flow",
-                "payload": {
+            request = CaptureFlowRequest(
+                operation="capture_flow",
+                payload={
                     "session_id": "session_one",
                     "objective": "observe Stop without assuming cancel",
                     "primary_request": {"expected_min_matches": 0},
@@ -961,7 +963,6 @@ class StreamsBrowserTests(BrowserActionTestCase):
                         },
                     ],
                 },
-            }
+            )
             with self.subTest(condition=condition["type"]):
-                parsed = CaptureFlowRequest.model_validate(request)
-                self.assertEqual(parsed.payload.flow[-1].condition.type, condition["type"])
+                self.assertEqual(request.payload.flow[-1].condition.type, condition["type"])

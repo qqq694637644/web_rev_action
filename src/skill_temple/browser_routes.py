@@ -1,91 +1,99 @@
-"""FastAPI registration for the two public browser Actions."""
+"""FastAPI registration for the two stable public Browser Actions."""
 
 from __future__ import annotations
 
-from copy import deepcopy
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Request
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 
+from .browser.transport import (
+    BrowserTransportError,
+    decode_inspect_envelope,
+    decode_run_envelope,
+)
 from .browser_models import (
     BrowserActionResponse,
-    InspectBrowserEvidenceRequest,
-    RunBrowserExperimentRequest,
+    InspectBrowserEvidenceEnvelope,
+    RunBrowserExperimentEnvelope,
 )
 from .browser_service import BrowserActionService, BrowserServiceError
+from .telemetry import TelemetryRecorder
+
+_BROWSER_PATHS = {"/v1/browser/inspect", "/v1/browser/run"}
 
 
-def _request_object_schema(
-    openapi_schema: dict[str, Any],
-    generated_request_schema: dict[str, Any],
-) -> dict[str, object]:
-    """Convert a generated discriminated union into an object request envelope."""
+def _validation_path(loc: tuple[Any, ...]) -> str:
+    parts = [str(item) for item in loc if item not in {"body"}]
+    escaped = [part.replace("~", "~0").replace("/", "~1") for part in parts]
+    return "/" + "/".join(escaped) if escaped else "/"
 
-    discriminator = generated_request_schema.get("discriminator", {})
-    mapping = discriminator.get("mapping", {})
-    if not isinstance(mapping, dict) or not mapping:
-        raise RuntimeError("browser request schema is missing its operation discriminator")
 
-    components = openapi_schema["components"]["schemas"]
-    payload_variants: list[dict[str, object]] = []
-    contract_version_schema: dict[str, object] | None = None
-    skill_binding_schema: dict[str, object] | None = None
-    for request_ref in mapping.values():
-        component_name = str(request_ref).rsplit("/", 1)[-1]
-        request_properties = components[component_name]["properties"]
-        if contract_version_schema is None:
-            contract_version_schema = deepcopy(request_properties["contract_version"])
-        payload_schema = deepcopy(request_properties["payload"])
-        if payload_schema not in payload_variants:
-            payload_variants.append(payload_schema)
-        if "skill_binding" in request_properties:
-            skill_binding_schema = deepcopy(request_properties["skill_binding"])
-
-    properties: dict[str, object] = {
-        "contract_version": contract_version_schema or {
-            "type": "string",
-            "enum": ["1.0"],
-            "default": "1.0",
-        },
-        "operation": {
-            "type": "string",
-            "enum": list(mapping),
-            "description": "Selects the operation-specific payload contract.",
-        },
-        "payload": {
-            "type": "object",
-            "oneOf": payload_variants,
-            "description": "Payload fields must match the selected operation.",
-        },
+def _browser_error(
+    *,
+    code: str,
+    operation: str,
+    message: str,
+    dispatch_started: bool,
+    suggested_next_action: str,
+    outcome: str | None = None,
+    issues: list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    error: dict[str, Any] = {
+        "code": code,
+        "operation": operation,
+        "message": message,
+        "dispatch_started": dispatch_started,
+        "suggested_next_action": suggested_next_action,
     }
-    if skill_binding_schema is not None:
-        properties["skill_binding"] = skill_binding_schema
-    return {
-        "type": "object",
-        "additionalProperties": False,
-        "required": ["operation", "payload"],
-        "properties": properties,
-    }
+    if outcome is not None:
+        error["outcome"] = outcome
+    if issues:
+        error["issues"] = issues
+    return {"error": error}
 
 
-_BROWSER_ACTION_PATHS = ("/v1/browser/inspect", "/v1/browser/run")
-
-
-def normalize_browser_action_openapi(schema: dict[str, Any]) -> dict[str, Any]:
-    """Replace top-level request unions with GPT Actions-compatible objects."""
-
-    for path in _BROWSER_ACTION_PATHS:
-        request_body = schema["paths"][path]["post"]["requestBody"]
-        generated_schema = request_body["content"]["application/json"]["schema"]
-        request_body["required"] = True
-        request_body["content"]["application/json"]["schema"] = (
-            _request_object_schema(schema, generated_schema)
-        )
-    return schema
-
-
-def register_browser_actions(app: FastAPI, service: BrowserActionService) -> None:
+def register_browser_actions(
+    app: FastAPI,
+    service: BrowserActionService,
+    telemetry: TelemetryRecorder | None = None,
+    protocol_skill_content_hash: str | None = None,
+) -> None:
     app.state.browser_action_service = service
+
+    @app.exception_handler(RequestValidationError)
+    async def browser_request_validation_handler(
+        request: Request,
+        exc: RequestValidationError,
+    ) -> JSONResponse:
+        if request.url.path not in _BROWSER_PATHS:
+            return await request_validation_exception_handler(request, exc)
+        body = exc.body if isinstance(exc.body, dict) else {}
+        operation = str(body.get("operation") or "unknown")
+        issues = [
+            {
+                "path": _validation_path(tuple(error.get("loc", ()))),
+                "type": str(error.get("type", "validation_error")),
+                "message": str(error.get("msg", "Invalid Browser envelope")),
+            }
+            for error in exc.errors()
+        ]
+        return JSONResponse(
+            status_code=422,
+            content=_browser_error(
+                code="invalid_operation_payload",
+                operation=operation,
+                message="Browser Action envelope is invalid.",
+                dispatch_started=False,
+                issues=issues,
+                suggested_next_action=(
+                    "Read browser-action-protocol/docs/transport-envelope.md and submit "
+                    "the complete six-field version-bound envelope."
+                ),
+            ),
+        )
 
     @app.post(
         "/v1/browser/inspect",
@@ -93,28 +101,72 @@ def register_browser_actions(app: FastAPI, service: BrowserActionService) -> Non
         response_model=BrowserActionResponse,
         response_model_exclude_none=True,
         summary="Inspect saved browser experiment evidence.",
-        description=(
-            "Read browser sessions, experiment manifests, and private stream status. "
-            "Use the workspace Actions to inspect or modify files under the analysis directory."
-        ),
+        description="Decode one inspect operation from payload_json and return bounded evidence.",
         openapi_extra={"x-openai-isConsequential": False},
     )
     async def inspect_browser_evidence(
-        request: InspectBrowserEvidenceRequest,
-    ) -> BrowserActionResponse:
+        envelope: InspectBrowserEvidenceEnvelope,
+    ) -> BrowserActionResponse | JSONResponse:
+        if telemetry is not None:
+            telemetry.record(
+                "browser_request_received",
+                action="inspect",
+                operation=envelope.operation,
+            )
         try:
-            return await service.inspect(request)
+            request = decode_inspect_envelope(
+                envelope,
+                skill_content_hash=protocol_skill_content_hash,
+            )
+        except BrowserTransportError as exc:
+            if telemetry is not None:
+                telemetry.record(
+                    "browser_request_error",
+                    action="inspect",
+                    operation=envelope.operation,
+                    code=exc.code,
+                    dispatch_started=False,
+                )
+            return JSONResponse(status_code=exc.status_code, content=exc.response_content())
+        if telemetry is not None:
+            telemetry.record(
+                "browser_request_valid",
+                action="inspect",
+                operation=envelope.operation,
+            )
+        try:
+            response = await service.inspect(request)
+            if telemetry is not None:
+                telemetry.record(
+                    "browser_request_completed",
+                    action="inspect",
+                    operation=envelope.operation,
+                    status=response.status,
+                )
+            return response
         except BrowserServiceError as exc:
-            raise HTTPException(
+            if telemetry is not None:
+                telemetry.record(
+                    "browser_request_error",
+                    action="inspect",
+                    operation=envelope.operation,
+                    code=exc.code,
+                    dispatch_started=exc.dispatch_started,
+                    outcome=exc.outcome,
+                )
+            return JSONResponse(
                 status_code=exc.status_code,
-                detail={
-                    "error": {
-                        "code": exc.code,
-                        "message": str(exc),
-                        "suggested_next_action": "inspect_request_or_configuration",
-                    }
-                },
-            ) from exc
+                content=_browser_error(
+                    code=exc.code,
+                    operation=envelope.operation,
+                    message=str(exc),
+                    dispatch_started=exc.dispatch_started,
+                    outcome=exc.outcome,
+                    suggested_next_action=(
+                        "Inspect the referenced session, experiment, or evidence handle."
+                    ),
+                ),
+            )
 
     @app.post(
         "/v1/browser/run",
@@ -123,35 +175,96 @@ def register_browser_actions(app: FastAPI, service: BrowserActionService) -> Non
         response_model_exclude_none=True,
         summary="Run one atomic browser experiment.",
         description=(
-            "Open or close a session, capture a baseline, or atomically execute page actions "
-            "between private stream start/wait/stop calls and write one experiment manifest."
+            "Decode one consequential operation from payload_json and execute it "
+            "atomically."
         ),
         openapi_extra={"x-openai-isConsequential": True},
     )
     async def run_browser_experiment(
-        request: RunBrowserExperimentRequest,
-    ) -> BrowserActionResponse:
+        envelope: RunBrowserExperimentEnvelope,
+    ) -> BrowserActionResponse | JSONResponse:
+        if telemetry is not None:
+            telemetry.record(
+                "browser_request_received",
+                action="run",
+                operation=envelope.operation,
+            )
         try:
-            return await service.run(request)
+            request = decode_run_envelope(
+                envelope,
+                skill_content_hash=protocol_skill_content_hash,
+            )
+        except BrowserTransportError as exc:
+            if telemetry is not None:
+                telemetry.record(
+                    "browser_request_error",
+                    action="run",
+                    operation=envelope.operation,
+                    code=exc.code,
+                    dispatch_started=False,
+                )
+            return JSONResponse(status_code=exc.status_code, content=exc.response_content())
+        if telemetry is not None:
+            telemetry.record(
+                "browser_request_valid",
+                action="run",
+                operation=envelope.operation,
+            )
+        try:
+            response = await service.run(request)
+            if telemetry is not None:
+                telemetry.record(
+                    "browser_request_completed",
+                    action="run",
+                    operation=envelope.operation,
+                    status=response.status,
+                )
+            return response
         except BrowserServiceError as exc:
-            raise HTTPException(
+            if telemetry is not None:
+                telemetry.record(
+                    "browser_request_error",
+                    action="run",
+                    operation=envelope.operation,
+                    code=exc.code,
+                    dispatch_started=exc.dispatch_started,
+                    outcome=exc.outcome,
+                )
+            return JSONResponse(
                 status_code=exc.status_code,
-                detail={
-                    "error": {
-                        "code": exc.code,
-                        "message": str(exc),
-                        "suggested_next_action": "inspect_session_or_experiment",
-                    }
-                },
-            ) from exc
+                content=_browser_error(
+                    code=exc.code,
+                    operation=envelope.operation,
+                    message=str(exc),
+                    dispatch_started=exc.dispatch_started,
+                    outcome=exc.outcome,
+                    suggested_next_action=(
+                        "Inspect the session or experiment before retrying when "
+                        "dispatch_started is true."
+                    ),
+                ),
+            )
         except (RuntimeError, OSError) as exc:
-            raise HTTPException(
+            if telemetry is not None:
+                telemetry.record(
+                    "browser_request_error",
+                    action="run",
+                    operation=envelope.operation,
+                    code="operation_outcome_unknown",
+                    dispatch_started=True,
+                    outcome="unknown",
+                )
+            return JSONResponse(
                 status_code=502,
-                detail={
-                    "error": {
-                        "code": "browser_backend_error",
-                        "message": str(exc)[:4000],
-                        "suggested_next_action": "check_private_adapter_configuration",
-                    }
-                },
-            ) from exc
+                content=_browser_error(
+                    code="operation_outcome_unknown",
+                    operation=envelope.operation,
+                    message=str(exc)[:4000],
+                    dispatch_started=True,
+                    outcome="unknown",
+                    suggested_next_action=(
+                        "Inspect the session or experiment terminal state; do not "
+                        "repeat the run operation."
+                    ),
+                ),
+            )

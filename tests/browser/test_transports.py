@@ -129,19 +129,20 @@ class TransportsBrowserTests(BrowserActionTestCase):
             with client:
                 response = client.post(
                     "/v1/browser/run",
-                    json={
-                        "operation": "open_session",
-                        "payload": {
+                    json=self.browser_request(
+                        "open_session",
+                        {
                             "session_id": "session_one",
                             "browser_endpoint": "http://127.0.0.1:9333",
                         },
-                    },
+                    ),
                 )
             self.assertEqual(response.status_code, 409)
             self.assertEqual(
-                response.json()["detail"]["error"]["code"],
+                response.json()["error"]["code"],
                 "browser_endpoint_mismatch",
             )
+            self.assertFalse(response.json()["error"]["dispatch_started"])
 
     def test_private_js_reverse_adapter_calls_stream_primitives_with_namespace(self) -> None:
         class FakeTransport:

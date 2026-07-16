@@ -9,10 +9,20 @@ from typing import Any
 
 
 class BrowserServiceError(RuntimeError):
-    def __init__(self, code: str, message: str, status_code: int = 400) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        status_code: int = 400,
+        *,
+        dispatch_started: bool = False,
+        outcome: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.status_code = status_code
+        self.dispatch_started = dispatch_started
+        self.outcome = outcome
 
 
 class Deadline:

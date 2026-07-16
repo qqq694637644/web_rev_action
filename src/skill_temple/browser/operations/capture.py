@@ -10,7 +10,6 @@ from typing import Any
 
 from ...browser_models import (
     BrowserActionResponse,
-    CaptureBaselineRequest,
     CaptureFlowPayload,
     CaptureFlowRequest,
     FlowStepResult,
@@ -30,7 +29,7 @@ class BrowserCaptureOperations:
 
     def _start_capture_job(
         self,
-        request: CaptureFlowRequest | CaptureBaselineRequest | ReplayRequestRequest,
+        request: CaptureFlowRequest | ReplayRequestRequest,
         *,
         experiment_id: str,
         payload: CaptureFlowPayload,
@@ -46,6 +45,11 @@ class BrowserCaptureOperations:
             objective=payload.objective,
             deadline=deadline,
             experiment_id=experiment_id,
+            action_binding=(
+                request.action_binding.model_dump(mode="json")
+                if request.action_binding is not None
+                else None
+            ),
         )
         manifest.update(
             {
@@ -101,7 +105,7 @@ class BrowserCaptureOperations:
 
     async def _run_capture_job(
         self,
-        request: CaptureFlowRequest | CaptureBaselineRequest | ReplayRequestRequest,
+        request: CaptureFlowRequest | ReplayRequestRequest,
         *,
         deadline: Deadline,
         prepared: tuple[str, Path, dict[str, Any]],
@@ -145,7 +149,7 @@ class BrowserCaptureOperations:
 
     async def _capture_flow(
         self,
-        request: CaptureFlowRequest | CaptureBaselineRequest | ReplayRequestRequest,
+        request: CaptureFlowRequest | ReplayRequestRequest,
         *,
         deadline: Deadline | None = None,
         prepared: tuple[str, Path, dict[str, Any]] | None = None,
@@ -165,6 +169,11 @@ class BrowserCaptureOperations:
                 operation=request.operation,
                 objective=payload.objective,
                 deadline=deadline,
+                action_binding=(
+                    request.action_binding.model_dump(mode="json")
+                    if request.action_binding is not None
+                    else None
+                ),
             )
             manifest["execution_mode"] = "sync"
             manifest["primary_request_matcher"] = payload.primary_request.model_dump(

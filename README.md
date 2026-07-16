@@ -21,9 +21,8 @@ data/analysis-workspace/
 ```text
 GPT
 ├── Skill Actions
-│   ├── retrieveSkillContext
-│   ├── readSkillContent
-│   └── searchSkillDocs
+│   ├── loadSkills
+│   └── readSkillContent
 │
 ├── Browser Actions
 │   ├── inspectBrowserEvidence
@@ -45,6 +44,7 @@ web_rev_action
 │   └── thin public facade
 ├── browser/
 │   ├── dispatcher.py
+│   ├── registry.py / contracts.py / transport.py
 │   ├── core.py / artifacts.py / steps.py
 │   ├── replay_runtime.js
 │   ├── stream_state.py
@@ -144,9 +144,8 @@ network observation；`browser_adapters.py` 已删除。公共 request/response 
 
 | operationId | Consequential | 作用 |
 | --- | --- | --- |
-| `retrieveSkillContext` | false | 发现或加载 Skill。 |
+| `loadSkills` | false | 按静态 catalog 中的精确 ID 加载完整 Skill。 |
 | `readSkillContent` | false | 读取 Skill 文件。 |
-| `searchSkillDocs` | false | 搜索 Skill 文档。 |
 | `inspectBrowserEvidence` | false | 查询 session、experiment 和 stream 状态。 |
 | `runBrowserExperiment` | true | 打开/关闭 session 或运行浏览器实验。 |
 | `workspaceInspect` | false | 一次返回目录树、搜索结果和相关文件片段。 |
@@ -155,6 +154,50 @@ network observation；`browser_adapters.py` 已删除。公共 request/response 
 | `workspaceWriteFile` | true | 创建或替换 UTF-8 文件。 |
 | `workspaceApplyPatch` | true | 应用受控 Codex 文本补丁。 |
 | `workspaceExecPwsh` | true | 在分析目录运行 PowerShell 7。 |
+
+Skill 发现来自构建时静态 catalog。`GPT_ACTION_PROMPT.md` 是模板，发布给 GPT Builder 的
+最终 Instructions 生成到被忽略的 `dist/GPT_INSTRUCTIONS.md`，不作为仓库源文件提交：
+
+```powershell
+skill-temple-build-contracts `
+  --protocol-root src/skill_temple/example_skills/browser-action-protocol
+
+skill-temple-build-prompt `
+  --skills-dir src/skill_temple/example_skills `
+  --template GPT_ACTION_PROMPT.md `
+  --output dist/GPT_INSTRUCTIONS.md
+```
+
+服务端不会根据 query 选择 Skill，也不提供 Skill 文档全文搜索。模型根据静态 description
+选择精确 ID，再调用 `loadSkills`；入口明确引用的资料才通过 `readSkillContent` 读取。
+
+Browser operation 的唯一结构来源是 `browser/registry.py`。Registry 同时驱动 Action
+分类、内部 request model、dispatcher handler、协议文档路径、生成 JSON Schema 和
+`operation_contract_hash`。`skill-temple-build-contracts` 生成逐 operation 合同和
+`docs/generated/operation-contracts.json`；CI 会在生成结果与提交内容不一致时失败。
+
+发布前先运行本地 Builder preflight：
+
+```powershell
+skill-temple-builder-preflight --root .
+```
+
+随后按 `BUILDER_SMOKE_CHECKLIST.md` 在已登录 GPT Builder 中完成真实导入、工具签名、
+Skill 选择、最小 capture、stale-contract 和 outcome-unknown 回归。该人工门槛不能由 CI
+替代。
+
+内置 workflow Skills 包括：
+
+```text
+browser-session-capture
+browser-evidence-inspection
+browser-request-replay
+browser-script-tracing
+browser-stream-diagnostics
+browser-experiment-recovery
+current-site-analysis
+pandora-protocol-reproduction
+```
 
 ## Browser Actions
 
@@ -175,6 +218,10 @@ Analysis workspace
 evidence gap 开始，不预设产品状态机。它不直接执行 fetch，也不读取凭据后自行拼请求；
 只调用结构化 Action。
 
+所有 Browser Action 调用都必须同时加载 `browser-action-protocol`。该 Skill 提供稳定的
+transport envelope、严格 JSON 编码、operation 索引和逐 operation 合同；OpenAPI 不再
+展开内部 payload union。
+
 `pandora-protocol-reproduction` 作为可选专用模板保留。只有当前网页实际呈现对话树、
 regenerate、edit、stop 等语义时，才使用其六场景实验矩阵。
 
@@ -191,10 +238,27 @@ close_session
 cancel_experiment
 ```
 
-旧客户端仍可发送 `capture_baseline`。它只在请求边界应用一个 `capture_flow`
-preset：默认 baseline objective、primary request 允许 0 到 100 个匹配、`flow=[]`。
-随后内部调度和 manifest 都使用 `capture_flow`。非空 flow 会被拒绝；新调用不应再
-生成 `capture_baseline`。
+基线也使用 `capture_flow`：显式填写 baseline objective、允许零个 primary request
+匹配，并使用空 flow 或最小 snapshot/wait flow。旧 alias 已删除，不提供兼容层。
+
+两个 Browser Action 的公共请求固定为六字段、版本绑定的 envelope：
+
+```json
+{
+  "contract_version": "2.0",
+  "operation": "get_session",
+  "payload_json": "{\"session_id\":\"session_one\"}",
+  "skill_id": "browser-action-protocol",
+  "skill_content_hash": "sha256:<loadSkills 返回的当前 content_hash>",
+  "operation_contract_hash": "sha256:<get_session 生成合同中的 hash>"
+}
+```
+
+`payload_json` 必须是严格 JSON 字符串，解码后顶层必须是 object；重复键、NaN、
+Infinity、额外字段、错误 Action 或错误 operation payload 都在 dispatch 前拒绝。
+`skill_content_hash` 必须来自本次加载的 `browser-action-protocol`，operation hash 必须来自
+所选 operation 的生成合同。任一绑定不匹配会在 dispatch 前返回
+`stale_operation_contract`，并给出服务端期望的 hashes。
 
 一次 `capture_flow` 由后端原子执行：
 
@@ -215,23 +279,16 @@ step 类型、checkpoint、超时、失败或取消语义。
 
 GPT 不直接协调 start、click、wait、stop。
 
-一次 `replay_request` 只接受一个通用 payload：
+一次 `replay_request` 只接受一个通用 decoded payload，并通过统一 envelope 传输：
 
 ```json
 {
-  "session_id": "session_one",
-  "objective": "replay one observed request",
-  "source": {
-    "experiment_id": "exp_source",
-    "evidence_id": "ev_network"
-  },
-  "mutations": [],
-  "extractors": [],
-  "bindings": [],
-  "transport": {},
-  "response_reader": {"mode": "auto"},
-  "termination": {"conditions": [{"type": "network_close"}]},
-  "comparison": null
+  "contract_version": "2.0",
+  "operation": "replay_request",
+  "payload_json": "{\"session_id\":\"session_one\",\"objective\":\"replay one observed request\",\"source\":{\"experiment_id\":\"exp_source\",\"evidence_id\":\"ev_network\"},\"mutations\":[],\"extractors\":[],\"bindings\":[],\"response_reader\":{\"mode\":\"auto\"},\"termination\":{\"conditions\":[{\"type\":\"network_close\"}]},\"comparison\":null}",
+  "skill_id": "browser-action-protocol",
+  "skill_content_hash": "sha256:<current protocol Skill hash>",
+  "operation_contract_hash": "sha256:<replay_request contract hash>"
 }
 ```
 
@@ -300,6 +357,22 @@ replay.requested_replay_protocol
 replay.requested_replay_protocol_hash
 replay.replay_protocol
 replay.replay_protocol_hash
+action_transport_version
+skill_id
+skill_content_hash
+operation_contract_hash
+```
+
+## Privacy-safe telemetry
+
+服务在 analysis workspace 的 `telemetry/action-events.jsonl` 记录 bounded metadata：Skill
+加载数量、operation、验证结果、dispatch state、terminal status 和错误 code。它不记录
+`payload_json`、请求/响应正文或凭据。生成汇总：
+
+```powershell
+skill-temple-telemetry-report `
+  data/analysis-workspace/telemetry/action-events.jsonl `
+  --output data/analysis-workspace/reports/action-telemetry-summary.json
 ```
 
 `replay_protocol` 和其 hash 表示应用默认值及 stream 自动升级后的有效配置，包括最终

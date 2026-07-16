@@ -16,9 +16,9 @@ class StepsBrowserTests(BrowserActionTestCase):
                 fail_step="snapshot_only",
                 include_supporting_failure=False,
             )
-            request = {
-                "operation": "capture_flow",
-                "payload": {
+            request = self.browser_request(
+                "capture_flow",
+                {
                     "session_id": "session_one",
                     "objective": "separate execution failure from evidence quality",
                     "primary_request": {
@@ -48,7 +48,7 @@ class StepsBrowserTests(BrowserActionTestCase):
                     "execution_mode": "sync",
                     "deadline_ms": 10_000,
                 },
-            }
+            )
             with client:
                 self.open_session(client)
                 response = client.post("/v1/browser/run", json=request)
@@ -82,7 +82,8 @@ class StepsBrowserTests(BrowserActionTestCase):
                 primary_status="canceled",
             )
             request = self.capture_request()
-            request["payload"]["flow"] = [
+            payload = self.request_payload(request)
+            payload["flow"] = [
                 {
                     "step_id": "wait_stream_started",
                     "action": "wait",
@@ -101,13 +102,14 @@ class StepsBrowserTests(BrowserActionTestCase):
                     "intent": "stop_generation",
                 },
             ]
-            request["payload"]["wait_for"] = {
+            payload["wait_for"] = {
                 "type": "network_canceled",
                 "request_matcher": {
                     "url_contains": "/api/resource",
                     "method": "POST",
                 },
             }
+            self.set_request_payload(request, payload)
             with client:
                 self.open_session(client)
                 response = client.post("/v1/browser/run", json=request)
@@ -138,7 +140,8 @@ class StepsBrowserTests(BrowserActionTestCase):
                 primary_status="canceled",
             )
             request = self.capture_request()
-            request["payload"]["flow"] = [
+            payload = self.request_payload(request)
+            payload["flow"] = [
                 {
                     "step_id": "stop_generation",
                     "action": "click",
@@ -146,10 +149,11 @@ class StepsBrowserTests(BrowserActionTestCase):
                     "intent": "stop_generation",
                 }
             ]
-            request["payload"]["wait_for"] = {
+            payload["wait_for"] = {
                 "type": "network_canceled",
                 "request_matcher": {"url_contains": "/api/resource"},
             }
+            self.set_request_payload(request, payload)
             with client:
                 self.open_session(client)
                 response = client.post("/v1/browser/run", json=request)

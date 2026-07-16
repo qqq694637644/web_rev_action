@@ -20,7 +20,8 @@ class EvidenceBrowserTests(BrowserActionTestCase):
             root = Path(temp_dir)
             client, _, _ = self.make_client(root, include_supporting_failure=False)
             request = self.capture_request()
-            request["payload"]["network_evidence"] = [
+            payload = self.request_payload(request)
+            payload["network_evidence"] = [
                 {
                     "selector_id": "resource_submit",
                     "matcher": {
@@ -33,11 +34,12 @@ class EvidenceBrowserTests(BrowserActionTestCase):
                     "include_initiator": True,
                 }
             ]
-            request["payload"]["series"] = {
+            payload["series"] = {
                 "analysis_series_id": "series_one",
                 "scenario_type": "initial_record",
                 "sequence_index": 1,
             }
+            self.set_request_payload(request, payload)
 
             with client:
                 self.open_session(client)
@@ -47,10 +49,10 @@ class EvidenceBrowserTests(BrowserActionTestCase):
 
                 listed = client.post(
                     "/v1/browser/inspect",
-                    json={
-                        "operation": "list_evidence",
-                        "payload": {"experiment_id": experiment_id},
-                    },
+                    json=self.browser_request(
+                        "list_evidence",
+                        {"experiment_id": experiment_id},
+                    ),
                 )
                 self.assertEqual(listed.status_code, 200, listed.text)
                 network_evidence = next(
@@ -62,58 +64,58 @@ class EvidenceBrowserTests(BrowserActionTestCase):
 
                 network = client.post(
                     "/v1/browser/inspect",
-                    json={
-                        "operation": "get_network_evidence",
-                        "payload": {
+                    json=self.browser_request(
+                        "get_network_evidence",
+                        {
                             "experiment_id": experiment_id,
                             "evidence_id": evidence_id_value,
                         },
-                    },
+                    ),
                 )
                 initiator = client.post(
                     "/v1/browser/inspect",
-                    json={
-                        "operation": "get_request_initiator",
-                        "payload": {
+                    json=self.browser_request(
+                        "get_request_initiator",
+                        {
                             "experiment_id": experiment_id,
                             "evidence_id": evidence_id_value,
                         },
-                    },
+                    ),
                 )
                 console = client.post(
                     "/v1/browser/inspect",
-                    json={
-                        "operation": "list_console_errors",
-                        "payload": {"experiment_id": experiment_id},
-                    },
+                    json=self.browser_request(
+                        "list_console_errors",
+                        {"experiment_id": experiment_id},
+                    ),
                 )
                 scripts = client.post(
                     "/v1/browser/inspect",
-                    json={
-                        "operation": "search_scripts",
-                        "payload": {
+                    json=self.browser_request(
+                        "search_scripts",
+                        {
                             "session_id": "session_one",
                             "query": "buildResourceRequest",
                         },
-                    },
+                    ),
                 )
                 source = client.post(
                     "/v1/browser/inspect",
-                    json={
-                        "operation": "get_script_source",
-                        "payload": {
+                    json=self.browser_request(
+                        "get_script_source",
+                        {
                             "session_id": "session_one",
                             "url": "https://example.test/app.js",
                             "start_line": 10,
                             "end_line": 20,
                         },
-                    },
+                    ),
                 )
                 saved_source = client.post(
                     "/v1/browser/run",
-                    json={
-                        "operation": "save_script_source",
-                        "payload": {
+                    json=self.browser_request(
+                        "save_script_source",
+                        {
                             "session_id": "session_one",
                             "target_experiment_id": experiment_id,
                             "initiator_evidence_id": evidence_id_value,
@@ -122,7 +124,7 @@ class EvidenceBrowserTests(BrowserActionTestCase):
                             "end_line": 20,
                             "evidence_label": "resource-builder",
                         },
-                    },
+                    ),
                 )
 
             manifest = json.loads(

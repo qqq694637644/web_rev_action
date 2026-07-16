@@ -1,0 +1,27 @@
+{
+  "action": "inspect",
+  "consequential": false,
+  "contract_doc_path": "docs/inspect/get-experiment.md",
+  "handler_name": "_inspect_get_experiment",
+  "operation": "get_experiment",
+  "operation_contract_hash": "sha256:90218fa0eeadf8306cbdaad27449244d9d25a31ae8f6ae192eefe0f7e35a6e51",
+  "payload_model": "GetExperimentPayload",
+  "payload_schema": {
+    "additionalProperties": false,
+    "properties": {
+      "experiment_id": {
+        "maxLength": 128,
+        "pattern": "^[a-zA-Z0-9_.-]+$",
+        "title": "Experiment Id",
+        "type": "string"
+      }
+    },
+    "required": [
+      "experiment_id"
+    ],
+    "title": "GetExperimentPayload",
+    "type": "object"
+  },
+  "protocol_skill_content_hash": "sha256:786f2331d061583e44fc9dc7344bae933a380d13006b65d1e88f4ae31ad64e6e",
+  "request_model": "GetExperimentRequest"
+}

@@ -1,0 +1,27 @@
+{
+  "action": "inspect",
+  "consequential": false,
+  "contract_doc_path": "docs/inspect/get-session.md",
+  "handler_name": "_inspect_get_session",
+  "operation": "get_session",
+  "operation_contract_hash": "sha256:678486890fadfab343752c0a7feefd89339b0de41082648ddd59746259eb7031",
+  "payload_model": "GetSessionPayload",
+  "payload_schema": {
+    "additionalProperties": false,
+    "properties": {
+      "session_id": {
+        "maxLength": 128,
+        "pattern": "^[a-zA-Z0-9_.-]+$",
+        "title": "Session Id",
+        "type": "string"
+      }
+    },
+    "required": [
+      "session_id"
+    ],
+    "title": "GetSessionPayload",
+    "type": "object"
+  },
+  "protocol_skill_content_hash": "sha256:786f2331d061583e44fc9dc7344bae933a380d13006b65d1e88f4ae31ad64e6e",
+  "request_model": "GetSessionRequest"
+}

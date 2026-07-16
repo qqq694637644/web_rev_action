@@ -1,0 +1,34 @@
+{
+  "action": "run",
+  "consequential": true,
+  "contract_doc_path": "docs/run/cancel-experiment.md",
+  "handler_name": "dispatch_cancel_experiment",
+  "operation": "cancel_experiment",
+  "operation_contract_hash": "sha256:a7421f7619f8113fbfd5ee71ebf8bf3a9f9c07fa66756d71c801eb29c8b70a74",
+  "payload_model": "CancelExperimentPayload",
+  "payload_schema": {
+    "additionalProperties": false,
+    "properties": {
+      "experiment_id": {
+        "maxLength": 128,
+        "pattern": "^[a-zA-Z0-9_.-]+$",
+        "title": "Experiment Id",
+        "type": "string"
+      },
+      "session_id": {
+        "maxLength": 128,
+        "pattern": "^[a-zA-Z0-9_.-]+$",
+        "title": "Session Id",
+        "type": "string"
+      }
+    },
+    "required": [
+      "experiment_id",
+      "session_id"
+    ],
+    "title": "CancelExperimentPayload",
+    "type": "object"
+  },
+  "protocol_skill_content_hash": "sha256:786f2331d061583e44fc9dc7344bae933a380d13006b65d1e88f4ae31ad64e6e",
+  "request_model": "CancelExperimentRequest"
+}

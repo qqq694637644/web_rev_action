@@ -1,6 +1,6 @@
 [project]
 name = "skill-temple"
-version = "0.3.0"
+version = "0.5.0"
 description = "GPT Action gateway for atomic browser protocol experiments and Skills"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -27,6 +27,11 @@ dev = [
 skill-temple = "skill_temple.app:main"
 web-rev-action = "skill_temple.app:main"
 skill-temple-eval = "skill_temple.evals:main"
+skill-temple-build-prompt = "skill_temple.prompt_builder:main"
+skill-temple-build-contracts = "skill_temple.contract_builder:main"
+skill-temple-telemetry-report = "skill_temple.telemetry:main"
+skill-temple-dead-code-audit = "skill_temple.dead_code_audit:main"
+skill-temple-builder-preflight = "skill_temple.builder_preflight:main"
 
 [build-system]
 requires = ["setuptools>=68.0", "wheel"]
@@ -44,6 +49,12 @@ skill_temple = [
     "browser/*.js",
     "example_skills/*/*.md",
     "example_skills/*/docs/*.md",
+    "example_skills/*/docs/*.json",
+    "example_skills/*/docs/run/*.md",
+    "example_skills/*/docs/inspect/*.md",
+    "example_skills/*/docs/generated/*.json",
+    "example_skills/*/docs/generated/run/*.json",
+    "example_skills/*/docs/generated/inspect/*.json",
 ]
 
 [tool.pytest.ini_options]

@@ -1,0 +1,34 @@
+{
+  "action": "inspect",
+  "consequential": false,
+  "contract_doc_path": "docs/inspect/get-network-evidence.md",
+  "handler_name": "_inspect_get_network_evidence",
+  "operation": "get_network_evidence",
+  "operation_contract_hash": "sha256:45fe0f176119a664fd872bfe1fa61fe0e3b1814021a3a2cb8ded59acd452ba46",
+  "payload_model": "GetNetworkEvidencePayload",
+  "payload_schema": {
+    "additionalProperties": false,
+    "properties": {
+      "evidence_id": {
+        "maxLength": 256,
+        "pattern": "^[a-zA-Z0-9_.-]+$",
+        "title": "Evidence Id",
+        "type": "string"
+      },
+      "experiment_id": {
+        "maxLength": 128,
+        "pattern": "^[a-zA-Z0-9_.-]+$",
+        "title": "Experiment Id",
+        "type": "string"
+      }
+    },
+    "required": [
+      "experiment_id",
+      "evidence_id"
+    ],
+    "title": "GetNetworkEvidencePayload",
+    "type": "object"
+  },
+  "protocol_skill_content_hash": "sha256:786f2331d061583e44fc9dc7344bae933a380d13006b65d1e88f4ae31ad64e6e",
+  "request_model": "GetNetworkEvidenceRequest"
+}

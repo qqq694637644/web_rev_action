@@ -1,0 +1,97 @@
+# `get_stream_status`
+
+## Contract
+
+- **Operation:** `get_stream_status`
+- **Action:** `inspectBrowserEvidence`
+- **Purpose:** return bounded live or persisted stream-collector state for an experiment.
+- **Consequential:** no.
+- **Prerequisites:** an exact experiment ID; use the capture UUID from prior status or manifest metadata when selecting one generation.
+
+## Decoded payload schema
+
+Required fields:
+
+- `experiment_id`: safe identifier, max 128 characters.
+
+Optional fields:
+
+- `capture_uuid`: stable capture-generation selector, max 128 characters.
+
+Constraints: do not send the obsolete numeric capture ID. A supplied UUID must match the experiment capture.
+
+Decoded example:
+
+```json
+{"experiment_id":"exp_capture"}
+```
+
+## Complete Action envelope
+
+> Generated binding values are build-specific. Copy all six fields exactly.
+
+```json
+{
+  "contract_version": "2.0",
+  "operation": "get_stream_status",
+  "operation_contract_hash": "sha256:290b0bd401b56a90a309e9879ee2aecf7f5a0add672c034bcefc301ae1f9aaad",
+  "payload_json": "{\"experiment_id\":\"exp_capture\"}",
+  "skill_content_hash": "sha256:786f2331d061583e44fc9dc7344bae933a380d13006b65d1e88f4ae31ad64e6e",
+  "skill_id": "browser-action-protocol"
+}
+```
+## Result and recovery
+
+Expected response handles: source (`live-mcp` or `manifest`), capture UUID/status, request summaries, collector generation, and persisted runtime metadata.
+
+Safe retry: read-only. A transport-generation mismatch falls back to persisted manifest state rather than mutating the collector.
+
+Typical errors: `invalid_operation_payload`, `experiment_not_found`, `capture_uuid_mismatch`.
+
+Next recommended inspect operation: `get_experiment` for overall terminal/quality state, then `list_evidence` for persisted stream evidence.
+
+Contract hash: `sha256:290b0bd401b56a90a309e9879ee2aecf7f5a0add672c034bcefc301ae1f9aaad`. Send it in `operation_contract_hash`.
+
+<!-- BEGIN GENERATED CONTRACT -->
+## Generated structural contract
+
+> Generated from `OperationRegistry` and Pydantic. Do not edit this block.
+
+- Request model: `GetStreamStatusRequest`
+- Payload model: `GetStreamStatusPayload`
+- Registry handler: `_inspect_get_stream_status`
+- Consequential: `false`
+- Operation contract hash: `sha256:290b0bd401b56a90a309e9879ee2aecf7f5a0add672c034bcefc301ae1f9aaad`
+
+```json
+{
+  "additionalProperties": false,
+  "properties": {
+    "capture_uuid": {
+      "anyOf": [
+        {
+          "maxLength": 128,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Capture Uuid"
+    },
+    "experiment_id": {
+      "maxLength": 128,
+      "pattern": "^[a-zA-Z0-9_.-]+$",
+      "title": "Experiment Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "experiment_id"
+  ],
+  "title": "GetStreamStatusPayload",
+  "type": "object"
+}
+```
+<!-- END GENERATED CONTRACT -->

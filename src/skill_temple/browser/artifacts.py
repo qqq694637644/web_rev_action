@@ -59,6 +59,7 @@ class ExperimentStore:
         objective: str,
         deadline: Deadline,
         experiment_id: str | None = None,
+        action_binding: dict[str, str] | None = None,
     ) -> tuple[str, Path, dict[str, Any]]:
         experiment_id = experiment_id or self.new_experiment_id()
         directory = self.experiment_dir(experiment_id)
@@ -79,6 +80,8 @@ class ExperimentStore:
             "warnings": [],
             "errors": [],
         }
+        if action_binding:
+            manifest.update(action_binding)
         self.write_manifest(experiment_id, manifest)
         return experiment_id, directory, manifest
 

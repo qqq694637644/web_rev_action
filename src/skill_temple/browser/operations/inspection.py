@@ -27,6 +27,7 @@ from ...browser_models import (
 )
 from ...protocol_evidence import evidence_id
 from ..core import BrowserServiceError, Deadline, utc_now
+from ..registry import OPERATION_REGISTRY
 
 
 class BrowserInspectionOperations:
@@ -152,6 +153,17 @@ class BrowserInspectionOperations:
             existing_artifacts = []
             manifest["artifacts"] = existing_artifacts
         existing_artifacts.extend(artifacts)
+        if request.action_binding is not None:
+            invocations = manifest.get("action_invocations")
+            if not isinstance(invocations, list):
+                invocations = []
+                manifest["action_invocations"] = invocations
+            invocations.append(
+                {
+                    **request.action_binding.model_dump(mode="json"),
+                    "recorded_at": utc_now(),
+                }
+            )
         manifest["updated_at"] = utc_now()
         self.experiments.write_manifest(payload.target_experiment_id, manifest)
         return BrowserActionResponse(
@@ -395,6 +407,77 @@ class BrowserInspectionOperations:
         return session
 
     async def inspect(self, request: InspectBrowserEvidenceRequest) -> BrowserActionResponse:
+        spec = OPERATION_REGISTRY.require(request.operation)
+        if spec.action != "inspect":
+            raise BrowserServiceError(
+                "unsupported_operation", "Unsupported inspect operation", 400
+            )
+        handler = getattr(self, spec.handler_name, None)
+        if not callable(handler):
+            raise RuntimeError(
+                f"Operation registry handler is unavailable: "
+                f"{spec.name} -> {spec.handler_name}"
+            )
+        return await handler(request)
+
+    async def _inspect_get_session(
+        self, request: InspectBrowserEvidenceRequest
+    ) -> BrowserActionResponse:
+        return await self._inspect_registered(request)
+
+    async def _inspect_list_experiments(
+        self, request: InspectBrowserEvidenceRequest
+    ) -> BrowserActionResponse:
+        return await self._inspect_registered(request)
+
+    async def _inspect_get_experiment(
+        self, request: InspectBrowserEvidenceRequest
+    ) -> BrowserActionResponse:
+        return await self._inspect_registered(request)
+
+    async def _inspect_get_stream_status(
+        self, request: InspectBrowserEvidenceRequest
+    ) -> BrowserActionResponse:
+        return await self._inspect_registered(request)
+
+    async def _inspect_list_evidence(
+        self, request: InspectBrowserEvidenceRequest
+    ) -> BrowserActionResponse:
+        return await self._inspect_registered(request)
+
+    async def _inspect_get_network_evidence(
+        self, request: InspectBrowserEvidenceRequest
+    ) -> BrowserActionResponse:
+        return await self._inspect_registered(request)
+
+    async def _inspect_get_request_shape(
+        self, request: InspectBrowserEvidenceRequest
+    ) -> BrowserActionResponse:
+        return await self._inspect_registered(request)
+
+    async def _inspect_get_request_initiator(
+        self, request: InspectBrowserEvidenceRequest
+    ) -> BrowserActionResponse:
+        return await self._inspect_registered(request)
+
+    async def _inspect_search_scripts(
+        self, request: InspectBrowserEvidenceRequest
+    ) -> BrowserActionResponse:
+        return await self._inspect_registered(request)
+
+    async def _inspect_get_script_source(
+        self, request: InspectBrowserEvidenceRequest
+    ) -> BrowserActionResponse:
+        return await self._inspect_registered(request)
+
+    async def _inspect_list_console_errors(
+        self, request: InspectBrowserEvidenceRequest
+    ) -> BrowserActionResponse:
+        return await self._inspect_registered(request)
+
+    async def _inspect_registered(
+        self, request: InspectBrowserEvidenceRequest
+    ) -> BrowserActionResponse:
         if isinstance(request, GetSessionRequest):
             session = self._get_session(request.payload.session_id)
             return BrowserActionResponse(
@@ -665,6 +748,7 @@ class BrowserInspectionOperations:
                         "capture_identity_mismatch",
                         "Live MCP capture identity does not match the experiment manifest.",
                         409,
+                        dispatch_started=True,
                     )
                 source = "live-mcp"
             else:

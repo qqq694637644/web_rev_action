@@ -17,6 +17,8 @@ Do not begin with a fixed scenario list. First inventory the current page and av
 - Workspace tools read saved evidence and write only derived reports, schemas, notes, and replay code.
 - The Action records facts, completeness, associations, and optional comparison results. It does not decide business semantics for the analyst.
 - Never copy Cookie, Authorization, CSRF, session, or private response values into chat, reports, diffs, or generated scripts.
+- Before either Browser Action is called, load `browser-action-protocol` and read the
+  exact operation contract. This workflow Skill does not duplicate transport syntax.
 
 ## Required references
 
@@ -25,12 +27,43 @@ Read these files when the matching stage begins:
 - `docs/inventory-checklist.md` before planning experiments.
 - `docs/experiment-design.md` before replay, mutation, or termination configuration.
 - `docs/report-contract.md` before producing final artifacts.
+- From `browser-action-protocol`, read `docs/transport-envelope.md`,
+  `docs/operation-index.md`, and only the operation files used by the experiment.
+
+Load supporting workflow Skills only when their stage begins, keeping each load to the
+minimum set:
+
+- `browser-session-capture` for session, target, baseline, and job polling;
+- `browser-evidence-inspection` for exact evidence selection and claim boundaries;
+- `browser-request-replay` for source selection, bindings, mutation, and comparison;
+- `browser-script-tracing` for initiator-to-source evidence;
+- `browser-stream-diagnostics` for stream completion and interruption;
+- `browser-experiment-recovery` only after stale, busy, interrupted, or unknown state.
+
+## Browser Action call discipline
+
+- Before opening a session, read `browser-action-protocol/docs/inspect/get-session.md`
+  and inspect a known session ID. Use `open_session` only when the session is absent,
+  closed, or intentionally replaced.
+- Before each run operation, read its exact file under
+  `browser-action-protocol/docs/run/`. Before each inspect operation, read its exact
+  file under `browser-action-protocol/docs/inspect/`.
+- Submit the complete six-field public envelope from the exact generated operation
+  document. Copy the protocol Skill hash from `loadSkills`; never reuse an operation
+  hash for another operation. Do not send decoded fields at the Action top level.
+- Job-mode responses with `status=running` are not complete. Poll `get_experiment`
+  until `completed`, `partial`, `failed`, or `interrupted` before citing evidence.
+- When validation fails with `dispatch_started=false`, correct only the reported
+  paths and retry once. When dispatch started or outcome is unknown, inspect session
+  and experiment state before deciding the next action; never repeat the run blindly.
 
 ## Workflow
 
 ### 1. Establish the current analysis context
 
-Open or reuse one browser session and choose one `analysis_series_id`. Record the current page URL, title, page ID, account/session state visible to the user, and the question being investigated.
+Inspect a known session ID first, then open or reuse one browser session and choose
+one `analysis_series_id`. Record the current page URL, title, page ID,
+account/session state visible to the user, and the question being investigated.
 
 Do not infer the target protocol from product names, historical fixtures, or a previously studied website.
 
@@ -82,22 +115,9 @@ State what observation would support or weaken the hypothesis. Do not run a muta
 
 ### 5. Run a generic replay only when useful
 
-A replay explicitly declares its source and behavior:
-
-```json
-{
-  "source": {
-    "experiment_id": "exp_source",
-    "evidence_id": "ev_network_source"
-  },
-  "mutations": [],
-  "extractors": [],
-  "bindings": [],
-  "response_reader": {"mode": "auto"},
-  "termination": {"conditions": [{"type": "network_close"}]},
-  "comparison": null
-}
-```
+Load `browser-request-replay`, then use the complete generated envelope in
+`browser-action-protocol/docs/run/replay-request.md`. Do not maintain a second copy of
+the operation payload or hash in this orchestration Skill.
 
 Use bindings for generated, preserved, extracted, literal, or manual inputs. Bindings run before ordered mutations. Query mutation defaults to `query_serialization=preserve_raw`.
 

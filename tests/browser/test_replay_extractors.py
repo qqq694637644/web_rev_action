@@ -18,9 +18,9 @@ class ReplayExtractorsBrowserTests(BrowserActionTestCase):
                 source_id, source_evidence, _ = self.capture_replay_source(client, root)
                 response = client.post(
                     "/v1/browser/run",
-                    json={
-                        "operation": "replay_request",
-                        "payload": {
+                    json=self.browser_request(
+                        "replay_request",
+                        {
                             "session_id": "session_one",
                             "objective": "extract setup response and bind it",
                             "source": {
@@ -84,7 +84,7 @@ class ReplayExtractorsBrowserTests(BrowserActionTestCase):
                             "execution_mode": "sync",
                             "deadline_ms": 10_000,
                         },
-                    },
+                    ),
                 )
             self.assertEqual(response.status_code, 200, response.text)
             self.assertEqual(response.json()["status"], "completed")
@@ -147,9 +147,9 @@ class ReplayExtractorsBrowserTests(BrowserActionTestCase):
                 source_id, source_evidence, _ = self.capture_replay_source(client, root)
                 response = client.post(
                     "/v1/browser/run",
-                    json={
-                        "operation": "replay_request",
-                        "payload": {
+                    json=self.browser_request(
+                        "replay_request",
+                        {
                             "session_id": "session_one",
                             "objective": "record one required extractor failure",
                             "source": {
@@ -171,7 +171,7 @@ class ReplayExtractorsBrowserTests(BrowserActionTestCase):
                             "execution_mode": "sync",
                             "deadline_ms": 10_000,
                         },
-                    },
+                    ),
                 )
             self.assertEqual(response.status_code, 200, response.text)
             self.assertEqual(response.json()["status"], "failed")

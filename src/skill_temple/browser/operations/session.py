@@ -13,9 +13,7 @@ from typing import Any
 from ...browser_models import (
     BrowserActionResponse,
     CancelExperimentRequest,
-    CaptureBaselineRequest,
     CaptureFlowPayload,
-    CaptureFlowRequest,
     CloseSessionRequest,
     FlowStepResult,
     OpenSessionRequest,
@@ -128,41 +126,32 @@ class BrowserSessionOperations:
                         "Browser session is not open.",
                         409,
                     )
-                page = await self.playwright.current_page(session_id, deadline.child(3_000))
-                alignment = await self.js_reverse.align_page(
-                    page,
-                    deadline.child(3_000),
-                    page_id=(
-                        str(session["js_reverse_page_id"])
-                        if session.get("js_reverse_page_id")
-                        else None
-                    ),
-                )
-                if alignment.status != "aligned":
-                    raise BrowserServiceError(
-                        "page_alignment_failed",
-                        "Playwright and js-reverse pages are not aligned.",
-                        409,
+                try:
+                    page = await self.playwright.current_page(
+                        session_id, deadline.child(3_000)
                     )
-                return await callback(deadline)
+                    alignment = await self.js_reverse.align_page(
+                        page,
+                        deadline.child(3_000),
+                        page_id=(
+                            str(session["js_reverse_page_id"])
+                            if session.get("js_reverse_page_id")
+                            else None
+                        ),
+                    )
+                    if alignment.status != "aligned":
+                        raise BrowserServiceError(
+                            "page_alignment_failed",
+                            "Playwright and js-reverse pages are not aligned.",
+                            409,
+                            dispatch_started=True,
+                        )
+                    return await callback(deadline)
+                except BrowserServiceError as exc:
+                    exc.dispatch_started = True
+                    raise
         finally:
             await self._release_browser_operation(owner_id)
-
-    @staticmethod
-    def _normalize_capture_alias(
-        request: CaptureFlowRequest | CaptureBaselineRequest,
-    ) -> tuple[CaptureFlowRequest, str | None]:
-        if isinstance(request, CaptureFlowRequest):
-            return request, None
-        return (
-            CaptureFlowRequest(
-                contract_version=request.contract_version,
-                operation="capture_flow",
-                payload=request.payload,
-                skill_binding=request.skill_binding,
-            ),
-            request.operation,
-        )
 
     async def _cancel_experiment(
         self,
@@ -181,6 +170,18 @@ class BrowserSessionOperations:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
             manifest = self.experiments.load_manifest(experiment_id)
+        if request.action_binding is not None:
+            invocations = manifest.get("action_invocations")
+            if not isinstance(invocations, list):
+                invocations = []
+                manifest["action_invocations"] = invocations
+            invocations.append(
+                {
+                    **request.action_binding.model_dump(mode="json"),
+                    "recorded_at": utc_now(),
+                }
+            )
+            self.experiments.write_manifest(experiment_id, manifest)
         return BrowserActionResponse(
             operation=request.operation,
             status=(
@@ -250,6 +251,7 @@ class BrowserSessionOperations:
                     "page_alignment_failed",
                     "; ".join(alignment.warnings) or "Could not align browser page",
                     409,
+                    dispatch_started=True,
                 )
             now = utc_now()
             session = {
@@ -271,6 +273,8 @@ class BrowserSessionOperations:
                 "created_at": now,
                 "updated_at": now,
             }
+            if request.action_binding is not None:
+                session["action_contract"] = request.action_binding.model_dump(mode="json")
             self.sessions[session_id] = session
             self.experiments.save_session(session)
         return BrowserActionResponse(
@@ -290,6 +294,8 @@ class BrowserSessionOperations:
                 await self.playwright.close_session(session_id, deadline)
             session["status"] = "closed"
             session["updated_at"] = utc_now()
+            if request.action_binding is not None:
+                session["last_action_contract"] = request.action_binding.model_dump(mode="json")
             self.experiments.save_session(session)
         return BrowserActionResponse(
             operation=request.operation,

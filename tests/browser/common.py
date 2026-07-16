@@ -8,6 +8,8 @@ from typing import Any
 from fastapi.testclient import TestClient
 
 from skill_temple.app import create_app
+from skill_temple.browser.contracts import expected_binding
+from skill_temple.browser.registry import OPERATION_REGISTRY
 from skill_temple.browser_service import (
     BrowserActionService,
     ExperimentStore,
@@ -16,6 +18,37 @@ from tests.fakes.browser import FakeJsReverse, FakePlaywright
 
 
 class BrowserActionTestCase(unittest.TestCase):
+    @staticmethod
+    def browser_request(operation: str, payload: dict[str, Any]) -> dict[str, Any]:
+        spec = OPERATION_REGISTRY.get(operation) or OPERATION_REGISTRY.require("get_session")
+        binding = expected_binding(spec)
+        return {
+            "contract_version": "2.0",
+            "operation": operation,
+            "payload_json": json.dumps(
+                payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+            "skill_id": binding["skill_id"],
+            "skill_content_hash": binding["skill_content_hash"],
+            "operation_contract_hash": binding["operation_contract_hash"],
+        }
+
+    @staticmethod
+    def request_payload(request: dict[str, Any]) -> dict[str, Any]:
+        payload = json.loads(str(request["payload_json"]))
+        assert isinstance(payload, dict)
+        return payload
+
+    @staticmethod
+    def set_request_payload(request: dict[str, Any], payload: dict[str, Any]) -> None:
+        request["payload_json"] = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
     def make_client(
         self,
         root: Path,
@@ -58,13 +91,13 @@ class BrowserActionTestCase(unittest.TestCase):
     def open_session(client: TestClient) -> None:
         response = client.post(
             "/v1/browser/run",
-            json={
-                "operation": "open_session",
-                "payload": {
+            json=BrowserActionTestCase.browser_request(
+                "open_session",
+                {
                     "session_id": "session_one",
                     "target": {"start_url": "https://example.test/app"},
                 },
-            },
+            ),
         )
         assert response.status_code == 200, response.text
 
@@ -79,9 +112,9 @@ class BrowserActionTestCase(unittest.TestCase):
 
     @staticmethod
     def capture_request(*, include_in_flight: bool = False) -> dict[str, Any]:
-        return {
-            "operation": "capture_flow",
-            "payload": {
+        return BrowserActionTestCase.browser_request(
+            "capture_flow",
+            {
                 "session_id": "session_one",
                 "objective": "capture one resource stream",
                 "target": {"expected_url_contains": "/app"},
@@ -117,7 +150,7 @@ class BrowserActionTestCase(unittest.TestCase):
                 "deadline_ms": 10_000,
                 "execution_mode": "sync",
             },
-        }
+        )
 
     def capture_replay_source(
         self,
@@ -125,7 +158,8 @@ class BrowserActionTestCase(unittest.TestCase):
         root: Path,
     ) -> tuple[str, dict[str, Any], dict[str, Any]]:
         capture = self.capture_request()
-        capture["payload"]["network_evidence"] = [
+        payload = self.request_payload(capture)
+        payload["network_evidence"] = [
             {
                 "selector_id": "resource_submit",
                 "matcher": {
@@ -135,6 +169,7 @@ class BrowserActionTestCase(unittest.TestCase):
                 "export_parts": ["all"],
             }
         ]
+        self.set_request_payload(capture, payload)
         response = client.post("/v1/browser/run", json=capture)
         self.assertEqual(response.status_code, 200, response.text)
         experiment_id = response.json()["experiment_id"]

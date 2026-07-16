@@ -69,6 +69,12 @@ git pull --ff-only origin main
 ```powershell
 .\.venv\Scripts\Activate.ps1
 python -m pip install -e ".[dev]"
+skill-temple-build-contracts `
+  --protocol-root src/skill_temple/example_skills/browser-action-protocol
+skill-temple-build-prompt `
+  --skills-dir src/skill_temple/example_skills `
+  --template GPT_ACTION_PROMPT.md `
+  --output dist/GPT_INSTRUCTIONS.md
 ```
 
 ## 4. 创建 Python 虚拟环境
@@ -199,7 +205,9 @@ WEB_REV_WORKSPACE_ALLOW_NETWORK=false
 # 本地调试不需要设置。通过 HTTPS 隧道或反向代理接入 GPT Action 时再填写。
 SKILL_TEMPLE_SERVER_URL=https://your-public-host.example
 
-# 不设置时使用 Python package 内置的 current-site-analysis 等 Skill。
+# 仅在显式部署自定义 Skill 目录时设置；默认使用 Python package 内置 Skills。
+# 自定义目录必须包含 browser-action-protocol。修改其 SKILL.md 后，必须针对该目录
+# 重新运行 skill-temple-build-contracts 和 skill-temple-build-prompt。
 SKILL_TEMPLE_SKILLS_DIR=C:/path/to/custom/skills
 
 # 通常不需要设置。需要追加 js-reverse-mcp 参数时，必须填写 JSON 字符串数组；
@@ -252,16 +260,108 @@ OpenAPI：
 http://127.0.0.1:8765/openapi.json
 ```
 
+Skill 目录已在构建后的 Instructions 中，不通过 Action 动态查询。验证精确加载：
+
+```powershell
+$headers = @{
+  Authorization = "Bearer $env:SKILL_TEMPLE_BEARER_TOKEN"
+  "Content-Type" = "application/json"
+}
+
+Invoke-RestMethod `
+  -Method Post `
+  -Uri http://127.0.0.1:8765/v1/skills/load `
+  -Headers $headers `
+  -Body '{"skill_ids":["browser-action-protocol"]}'
+```
+
+Browser Actions 只接受稳定的六字段、版本绑定 envelope。先取得当前 Skill 和 operation
+hash，再发送请求：
+
+```powershell
+$loaded = Invoke-RestMethod `
+  -Method Post `
+  -Uri http://127.0.0.1:8765/v1/skills/load `
+  -Headers $headers `
+  -Body '{"skill_ids":["browser-action-protocol"]}'
+$skillHash = $loaded.skills[0].content_hash
+
+$contracts = Get-Content `
+  .\src\skill_temple\example_skills\browser-action-protocol\docs\generated\operation-contracts.json `
+  -Raw | ConvertFrom-Json
+$contractHash = ($contracts.operations | Where-Object operation -eq 'list_experiments').operation_contract_hash
+
+$body = @{
+  contract_version = '2.0'
+  operation = 'list_experiments'
+  payload_json = '{"limit":10}'
+  skill_id = 'browser-action-protocol'
+  skill_content_hash = $skillHash
+  operation_contract_hash = $contractHash
+} | ConvertTo-Json -Compress
+
+Invoke-RestMethod `
+  -Method Post `
+  -Uri http://127.0.0.1:8765/v1/browser/inspect `
+  -Headers $headers `
+  -Body $body
+```
+
+`stale_operation_contract` 表示 dispatch 尚未开始。重新加载协议 Skill、读取精确 operation
+合同并重建六字段 envelope；不要猜测或截断 hash。
+
+旧的 Skill retrieve/search endpoint、Browser 顶层 `payload` 对象和 baseline alias 均已删除，
+不会自动转换。
+
+## 10. 更新 GPT Builder
+
+每次 Skill、description 或根 Instructions 修改后执行：
+
+```powershell
+skill-temple-build-contracts `
+  --protocol-root src/skill_temple/example_skills/browser-action-protocol
+
+skill-temple-build-prompt `
+  --skills-dir src/skill_temple/example_skills `
+  --template GPT_ACTION_PROMPT.md `
+  --output dist/GPT_INSTRUCTIONS.md
+```
+
+把生成的 `dist/GPT_INSTRUCTIONS.md` 完整复制到 GPT Builder 的 Instructions，然后重新导入
+`http://127.0.0.1:8765/openapi.json`。重新导入后确认公开 operationId 只有新 Skill Actions、
+两个 Browser Actions 和 Workspace Actions。
+
+导入前运行：
+
+```powershell
+skill-temple-builder-preflight --root .
+```
+
+导入后逐项执行 `BUILDER_SMOKE_CHECKLIST.md`。真实 Builder smoke 是发布硬门槛；本地
+preflight 和 CI 只验证输入与 schema，不能证明 Builder 缓存、模型选择和登录态浏览器调用。
+
 服务监听 `127.0.0.1` 时仅本机可访问。需要远程接入 GPT Action 时，应自行准备 HTTPS
 反向代理或隧道，并设置 `SKILL_TEMPLE_SERVER_URL`。不要直接把无 TLS 的 8765 端口暴露到公网。
 
-## 10. 可选验证
+## 11. 可选验证
 
 ```powershell
 python -m ruff check .
 python -m pytest
 node --test tests/runtime/replay_runtime.test.js
 python -m skill_temple.evals evals/skill_queries.jsonl
+python -m skill_temple.dead_code_audit --root .
+python -m skill_temple.builder_preflight --root .
+skill-temple-build-contracts --protocol-root src/skill_temple/example_skills/browser-action-protocol
+skill-temple-build-prompt --skills-dir src/skill_temple/example_skills --template GPT_ACTION_PROMPT.md --output dist/GPT_INSTRUCTIONS.md
+git diff --exit-code -- src/skill_temple/example_skills/browser-action-protocol
+```
+
+Telemetry 只保存 metadata，不保存 payload 或凭据。查看汇总：
+
+```powershell
+skill-temple-telemetry-report `
+  .\data\analysis-workspace\telemetry\action-events.jsonl
 ```
 
 真实浏览器工具链验证：

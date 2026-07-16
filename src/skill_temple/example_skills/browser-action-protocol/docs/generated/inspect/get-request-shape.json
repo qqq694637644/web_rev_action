@@ -1,0 +1,74 @@
+{
+  "action": "inspect",
+  "consequential": false,
+  "contract_doc_path": "docs/inspect/get-request-shape.md",
+  "handler_name": "_inspect_get_request_shape",
+  "operation": "get_request_shape",
+  "operation_contract_hash": "sha256:c45c7c6374acbf91a7c66ce3baa9e10f609900a8f8c51212158541edaeb60ce5",
+  "payload_model": "GetRequestShapePayload",
+  "payload_schema": {
+    "additionalProperties": false,
+    "properties": {
+      "evidence_id": {
+        "maxLength": 256,
+        "pattern": "^[a-zA-Z0-9_.-]+$",
+        "title": "Evidence Id",
+        "type": "string"
+      },
+      "experiment_id": {
+        "maxLength": 128,
+        "pattern": "^[a-zA-Z0-9_.-]+$",
+        "title": "Experiment Id",
+        "type": "string"
+      },
+      "include_redacted_body": {
+        "default": false,
+        "title": "Include Redacted Body",
+        "type": "boolean"
+      },
+      "max_array_items": {
+        "default": 20,
+        "maximum": 200,
+        "minimum": 1,
+        "title": "Max Array Items",
+        "type": "integer"
+      },
+      "max_depth": {
+        "default": 6,
+        "maximum": 32,
+        "minimum": 0,
+        "title": "Max Depth",
+        "type": "integer"
+      },
+      "page_idx": {
+        "default": 0,
+        "maximum": 100000,
+        "minimum": 0,
+        "title": "Page Idx",
+        "type": "integer"
+      },
+      "page_size": {
+        "default": 100,
+        "maximum": 500,
+        "minimum": 1,
+        "title": "Page Size",
+        "type": "integer"
+      },
+      "path_prefix": {
+        "default": "/",
+        "maxLength": 512,
+        "minLength": 1,
+        "title": "Path Prefix",
+        "type": "string"
+      }
+    },
+    "required": [
+      "experiment_id",
+      "evidence_id"
+    ],
+    "title": "GetRequestShapePayload",
+    "type": "object"
+  },
+  "protocol_skill_content_hash": "sha256:786f2331d061583e44fc9dc7344bae933a380d13006b65d1e88f4ae31ad64e6e",
+  "request_model": "GetRequestShapeRequest"
+}

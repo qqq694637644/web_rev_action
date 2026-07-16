@@ -1,0 +1,47 @@
+{
+  "action": "inspect",
+  "consequential": false,
+  "contract_doc_path": "docs/inspect/list-evidence.md",
+  "handler_name": "_inspect_list_evidence",
+  "operation": "list_evidence",
+  "operation_contract_hash": "sha256:f98fc845165362d1e76f45faaa9c403e4607db2c5df930c87fdc017a4ca740f9",
+  "payload_model": "ListEvidencePayload",
+  "payload_schema": {
+    "additionalProperties": false,
+    "properties": {
+      "experiment_id": {
+        "maxLength": 128,
+        "pattern": "^[a-zA-Z0-9_.-]+$",
+        "title": "Experiment Id",
+        "type": "string"
+      },
+      "kind": {
+        "anyOf": [
+          {
+            "maxLength": 128,
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Kind"
+      },
+      "limit": {
+        "default": 100,
+        "maximum": 500,
+        "minimum": 1,
+        "title": "Limit",
+        "type": "integer"
+      }
+    },
+    "required": [
+      "experiment_id"
+    ],
+    "title": "ListEvidencePayload",
+    "type": "object"
+  },
+  "protocol_skill_content_hash": "sha256:786f2331d061583e44fc9dc7344bae933a380d13006b65d1e88f4ae31ad64e6e",
+  "request_model": "ListEvidenceRequest"
+}

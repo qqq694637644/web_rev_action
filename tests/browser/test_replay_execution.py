@@ -66,10 +66,7 @@ class ReplayExecutionBrowserTests(BrowserActionTestCase):
                 }
                 response = client.post(
                     "/v1/browser/run",
-                    json={
-                        "operation": "replay_request",
-                        "payload": payload,
-                    },
+                    json=self.browser_request("replay_request", payload),
                 )
             self.assertEqual(response.status_code, 200, response.text)
             self.assertEqual(response.json()["status"], "completed")
@@ -116,9 +113,9 @@ class ReplayExecutionBrowserTests(BrowserActionTestCase):
                 source_id, source_evidence, _ = self.capture_replay_source(client, root)
                 response = client.post(
                     "/v1/browser/run",
-                    json={
-                        "operation": "replay_request",
-                        "payload": {
+                    json=self.browser_request(
+                        "replay_request",
+                        {
                             "session_id": "session_one",
                             "objective": "capture exact replay plus supporting traffic",
                             "source": {
@@ -138,7 +135,7 @@ class ReplayExecutionBrowserTests(BrowserActionTestCase):
                             "execution_mode": "sync",
                             "deadline_ms": 10_000,
                         },
-                    },
+                    ),
                 )
             self.assertEqual(response.status_code, 200, response.text)
             self.assertEqual(response.json()["status"], "completed")
@@ -179,9 +176,9 @@ class ReplayExecutionBrowserTests(BrowserActionTestCase):
                 source_id, source_evidence, _ = self.capture_replay_source(client, root)
                 response = client.post(
                     "/v1/browser/run",
-                    json={
-                        "operation": "replay_request",
-                        "payload": {
+                    json=self.browser_request(
+                        "replay_request",
+                        {
                             "session_id": "session_one",
                             "objective": "audit ordered overlapping replay operations",
                             "source": {
@@ -212,7 +209,7 @@ class ReplayExecutionBrowserTests(BrowserActionTestCase):
                             "execution_mode": "sync",
                             "deadline_ms": 10_000,
                         },
-                    },
+                    ),
                 )
             self.assertEqual(response.status_code, 200, response.text)
             self.assertEqual(response.json()["status"], "completed")
@@ -248,9 +245,9 @@ class ReplayExecutionBrowserTests(BrowserActionTestCase):
                 js.duplicate_next_replay_requests = 1
                 response = client.post(
                     "/v1/browser/run",
-                    json={
-                        "operation": "replay_request",
-                        "payload": {
+                    json=self.browser_request(
+                        "replay_request",
+                        {
                             "session_id": "session_one",
                             "objective": "reject ambiguous exact replay candidates",
                             "source": {
@@ -260,7 +257,7 @@ class ReplayExecutionBrowserTests(BrowserActionTestCase):
                             "execution_mode": "sync",
                             "deadline_ms": 10_000,
                         },
-                    },
+                    ),
                 )
             self.assertEqual(response.status_code, 200, response.text)
             self.assertEqual(response.json()["status"], "failed")
@@ -284,9 +281,9 @@ class ReplayExecutionBrowserTests(BrowserActionTestCase):
                 js.omit_observed_at_reqids.add(3)
                 response = client.post(
                     "/v1/browser/run",
-                    json={
-                        "operation": "replay_request",
-                        "payload": {
+                    json=self.browser_request(
+                        "replay_request",
+                        {
                             "session_id": "session_one",
                             "objective": "require a bounded correlation timestamp",
                             "source": {
@@ -296,7 +293,7 @@ class ReplayExecutionBrowserTests(BrowserActionTestCase):
                             "execution_mode": "sync",
                             "deadline_ms": 10_000,
                         },
-                    },
+                    ),
                 )
             self.assertEqual(response.status_code, 200, response.text)
             self.assertEqual(response.json()["status"], "failed")
