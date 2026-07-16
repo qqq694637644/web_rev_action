@@ -290,11 +290,12 @@ def apply_text_patch(root: Path, operations: list[TextPatchOperation]) -> list[s
             )
             lines, trailing = _split_text_lines(original_text)
             new_lines = _apply_hunks(lines, operation.hunks, operation.path)
-            file_path.write_text(
+            new_text = normalize_line_endings(
                 _join_lines(new_lines, trailing_newline=trailing),
-                encoding="utf-8",
-                newline="",
+                line_ending="preserve",
+                previous_bytes=original,
             )
+            file_path.write_bytes(new_text.encode("utf-8"))
         changed_paths.append(operation.path)
     return changed_paths
 
