@@ -46,7 +46,7 @@ Expected response handles: source (`live-mcp` or `manifest`), capture UUID/statu
 
 Safe retry: read-only. A transport-generation mismatch falls back to persisted manifest state rather than mutating the collector.
 
-Typical errors: `invalid_operation_payload`, `experiment_not_found`, `capture_uuid_mismatch`.
+Typical errors: `invalid_operation_payload`, `experiment_not_found`, `capture_uuid_mismatch`, `invalid_adapter_response`. Missing or invalid live `capture`, `requests`, or `pagination` fields are protocol failures, not empty stream state.
 
 Next recommended inspect operation: `get_experiment` for overall terminal/quality state, then `list_evidence` for persisted stream evidence.
 

@@ -586,7 +586,7 @@ page或认证上下文时不能用 `None == None` 冒充相等。
 
 Header和query mutation比较完整有序值列表并记录 multiplicity；不会只取第一个同名值。
 
-Stream 和普通 network status 都会读取全部分页，并在执行 event predicate 前锁定具体 primary request ID；`matchedRequestId` 不属于该 request 时不会满足等待。同一 session 重复提交返回 `409 session_busy`，其他 browser operation 返回 `409 browser_busy`。Protected workspace mutation 与 browser operation 通过同一 RuntimeCoordinator 双向互斥，避免 TOCTOU。
+Stream 和普通 network status 都会读取全部分页，并在执行 event predicate 前锁定具体 primary request ID；`matchedRequestId` 不属于该 request 时不会满足等待。同一 session 重复提交实验返回 `409 session_busy`，其他 browser operation 返回 `409 browser_busy`。重复 `open_session` 使用仍处于非终态的同名 session 时，在任何 adapter dispatch 前返回 `session_id_in_use`；后端不会覆盖、复用或自动关闭原记录。Protected workspace mutation 与 browser operation 通过同一 RuntimeCoordinator 双向互斥，避免 TOCTOU。
 
 ## Background job
 
@@ -697,7 +697,7 @@ Collector 同时维护 source-specific `event index → JSONL byte offset`。每
 
 每个会改变页面或请求状态的动作前，后端记录每个 request 的 response 状态、terminal wall time、raw event index 和 semantic event index。后续 wait 只匹配 checkpoint 后新出现或发生状态转换的 request/event；raw 与 EventSource semantic mirror 使用独立游标和 source-specific offset。
 
-取消执行型 step 时会终止本地 Playwright 进程树并停止后续 step，但已经送达页面的 click、navigate 或 upload 无法通用回滚。该 step 在 manifest 中标记为 `canceled_outcome_unknown`，不会自动重试。取消 `wait`、`assert` 或 `snapshot` 等只读 step 时标记为 `canceled`。
+取消执行型 step 时会终止本地 Playwright 进程树并停止后续 step。若取消发生在 stream checkpoint、MCP 排队或 Playwright 子进程创建之前，step 标记为 `canceled`；只有 adapter 明确记录命令或 MCP call 已发送时才标记为 `canceled_outcome_unknown`。已经送达页面的 click、navigate 或 upload 无法通用回滚，也不会自动重试。Replay 使用相同发送边界。
 
 Stream start 显式建模为：
 
@@ -705,7 +705,11 @@ Stream start 显式建模为：
 not_attempted | failed_before_send | failed_after_dispatch | confirmed | outcome_unknown
 ```
 
-Start 已 dispatch 但调用超时或取消时，后端扫描 experiment namespace 中的 `capture.json` 恢复持久身份，但 `collector_stopped=false`、`collector_cleanup=unknown`，不会把旧数字 ID 当作新 MCP generation 中的 live capture。
+Start 已 dispatch 但调用超时、取消或返回无效结构时，后端扫描 experiment namespace 中的 `capture.json` 恢复持久身份。未发现可信 capture handle 时记录 `collector_stopped=false`、`collector_cleanup=unknown`；发现同 generation handle 时尝试现有 stop 路径。无效成功响应标记为 `failed_after_dispatch`，不会写成未发送。
+
+Playwright 的 `selector_hidden` 和 `request_log_stable` 只有在 CLI 命令成功后才判断页面条件；任意非零退出直接成为 adapter error。js-reverse 的 page listing、stream/network/console 分页和 stream start 都在各自 adapter 方法边界验证关键字段，缺失或类型错误返回 `invalid_adapter_response`，不会被解释为零结果、分页结束或 collector 未启动。
+
+Session 生命周期使用三个简单集合共享 shutdown/restart 判断：可能持有 attachment 的状态会在当前进程关闭时尝试 detach；来自旧 service instance 的同类状态在读取时标记为 `stale` 并保留 `previous_status`。Session 还分别保存 `attach_outcome`、`page_selection_outcome`、`alignment_outcome` 和 `close_outcome`；attach 已确认但 alignment 结果未知时保持 `open_unaligned`，并记录 `alignment_outcome=unknown`。
 
 Objective 可以分别声明：
 

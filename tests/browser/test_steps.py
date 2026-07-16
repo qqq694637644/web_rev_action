@@ -1,13 +1,128 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import tempfile
 from pathlib import Path
 
+from skill_temple.browser.adapters.contracts import StreamCheckpoint
+from skill_temple.browser.core import Deadline
+from skill_temple.browser.steps import StepExecutor
+from skill_temple.browser_models import ClickStep, RequestMatcher
 from tests.browser.common import BrowserActionTestCase
 
 
 class StepsBrowserTests(BrowserActionTestCase):
+    def test_mutation_cancellation_before_checkpoint_dispatch_is_not_unknown(self) -> None:
+        class Experiments:
+            @staticmethod
+            def relative_path(value: str) -> str:
+                return value
+
+        class Playwright:
+            async def execute_step(self, *args: object, **kwargs: object) -> dict[str, object]:
+                raise AssertionError("mutation must not be dispatched")
+
+        class Service:
+            experiments = Experiments()
+            playwright = Playwright()
+
+            @staticmethod
+            def _ensure_finalize_reserve(deadline: Deadline, label: str) -> None:
+                return None
+
+            @staticmethod
+            def _operation_deadline(
+                deadline: Deadline, requested_ms: int, label: str
+            ) -> Deadline:
+                return deadline
+
+            @staticmethod
+            async def _stream_checkpoint(*args: object, **kwargs: object) -> StreamCheckpoint:
+                raise asyncio.CancelledError
+
+        results: list[object] = []
+
+        async def exercise() -> None:
+            with self.assertRaises(asyncio.CancelledError):
+                await StepExecutor.execute_many(
+                    Service(),
+                    phase="action",
+                    steps=[
+                        ClickStep(
+                            step_id="click_after_checkpoint",
+                            action="click",
+                            locator={"role": "button", "name": "Send"},
+                        )
+                    ],
+                    session_id="session_one",
+                    experiment_dir=Path("."),
+                    deadline=Deadline(5_000),
+                    capture_id=1,
+                    request_matcher=RequestMatcher(),
+                    stream_checkpoint=StreamCheckpoint(),
+                    first_mutation_wall_time_ms=None,
+                    step_results=results,
+                    wait_observations=[],
+                )
+
+        asyncio.run(exercise())
+        self.assertEqual(results[0].status, "canceled")
+        self.assertIn("before confirmed dispatch", results[0].error)
+
+    def test_mutation_cancellation_after_adapter_dispatch_is_unknown(self) -> None:
+        class Experiments:
+            @staticmethod
+            def relative_path(value: str) -> str:
+                return value
+
+        class Playwright:
+            async def execute_step(self, *args: object, **kwargs: object) -> dict[str, object]:
+                error = asyncio.CancelledError()
+                error.adapter_dispatch_started = True
+                raise error
+
+        class Service:
+            experiments = Experiments()
+            playwright = Playwright()
+
+            @staticmethod
+            def _ensure_finalize_reserve(deadline: Deadline, label: str) -> None:
+                return None
+
+            @staticmethod
+            def _operation_deadline(
+                deadline: Deadline, requested_ms: int, label: str
+            ) -> Deadline:
+                return deadline
+
+        results: list[object] = []
+
+        async def exercise() -> None:
+            with self.assertRaises(asyncio.CancelledError):
+                await StepExecutor.execute_many(
+                    Service(),
+                    phase="action",
+                    steps=[
+                        ClickStep(
+                            step_id="sent_click",
+                            action="click",
+                            locator={"role": "button", "name": "Send"},
+                        )
+                    ],
+                    session_id="session_one",
+                    experiment_dir=Path("."),
+                    deadline=Deadline(5_000),
+                    capture_id=None,
+                    request_matcher=RequestMatcher(),
+                    stream_checkpoint=StreamCheckpoint(),
+                    first_mutation_wall_time_ms=None,
+                    step_results=results,
+                    wait_observations=[],
+                )
+
+        asyncio.run(exercise())
+        self.assertEqual(results[0].status, "canceled_outcome_unknown")
     def test_step_failure_does_not_pollute_empty_quality_requirements(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

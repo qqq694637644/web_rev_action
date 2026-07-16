@@ -304,6 +304,7 @@ class StdioMcpToolTransport:
         except asyncio.CancelledError as exc:
             future.cancel()
             exc.mcp_outcome_unknown = call.sent
+            exc.adapter_dispatch_started = call.sent
             exc.mcp_transport_generation = call.generation
             if name in self.SIDE_EFFECTING_TOOLS:
                 cleanup = asyncio.create_task(self._abort_worker())

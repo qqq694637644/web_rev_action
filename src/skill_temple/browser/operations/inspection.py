@@ -28,6 +28,7 @@ from ...browser_models import (
 from ...protocol_evidence import evidence_id
 from ..core import BrowserServiceError, Deadline, utc_now
 from ..registry import OPERATION_REGISTRY
+from ..session_states import STALE_ON_SERVICE_CHANGE
 
 
 class BrowserInspectionOperations:
@@ -431,9 +432,10 @@ class BrowserInspectionOperations:
         if not session:
             raise BrowserServiceError("session_not_found", "Browser session was not found", 404)
         if (
-            session.get("status") == "open"
+            session.get("status") in STALE_ON_SERVICE_CHANGE
             and session.get("service_instance_id") != self.service_instance_id
         ):
+            session["previous_status"] = session.get("status")
             session["status"] = "stale"
             session["stale_reason"] = "service_instance_changed"
             session["updated_at"] = utc_now()

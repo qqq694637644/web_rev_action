@@ -17,8 +17,17 @@ Recovery rules:
   reread the exact operation doc, and copy the generated contract hash. Dispatch did
   not start.
 - `browser_busy` or `session_busy`: inspect state and wait for the current owner.
+- `session_id_in_use`: inspect the returned session ID or choose a new ID. Dispatch did
+  not start and the existing record was not overwritten.
+- `invalid_adapter_response`: inspect the returned session/experiment handles. The
+  adapter call completed or was sent, but its operation-specific result shape was not
+  trustworthy; do not reinterpret it as an empty result.
 - `operation_outcome_unknown`, `dispatch_started=true`, or `outcome=unknown`: do not
   repeat the consequential call. Inspect the returned session and experiment handles.
+
+Cancellation is factual: `canceled` means no adapter dispatch was confirmed;
+`canceled_outcome_unknown` is used only when the adapter recorded that the consequential
+command or MCP call had been sent.
 
 Only retry automatically when `dispatch_started=false` and the correction is purely
 syntactic or contractual.

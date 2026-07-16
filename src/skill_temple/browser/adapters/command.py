@@ -111,6 +111,9 @@ class SubprocessCommandRunner:
                 stderr=asyncio.subprocess.PIPE,
                 creationflags=creationflags,
             )
+        except asyncio.CancelledError as exc:
+            exc.adapter_dispatch_started = False
+            raise
         except OSError as exc:
             raise AdapterError(
                 f"Command could not be started: {argv[0]}: {exc}",
@@ -122,6 +125,9 @@ class SubprocessCommandRunner:
                 process,
                 deadline.remaining_seconds(),
             )
+        except asyncio.CancelledError as exc:
+            exc.adapter_dispatch_started = True
+            raise
         except TimeoutError as exc:
             raise AdapterError(
                 f"Command timed out: {argv[0]} {argv[-1]}",

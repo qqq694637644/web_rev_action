@@ -627,16 +627,30 @@ class BrowserReplayOperations:
         replay_observed_response_mode: str | None = None
         post_response_alignment: AlignmentResult | None = None
         replay_artifacts: list[dict[str, Any]] = []
+        started = utc_now()
         if capture_id is not None:
-            stream_checkpoint = await self._stream_checkpoint(
-                capture_id,
-                request_matcher,
-                self._operation_deadline(
-                    deadline,
-                    1_500,
-                    "checkpoint before replay",
-                ),
-            )
+            try:
+                stream_checkpoint = await self._stream_checkpoint(
+                    capture_id,
+                    request_matcher,
+                    self._operation_deadline(
+                        deadline,
+                        1_500,
+                        "checkpoint before replay",
+                    ),
+                )
+            except asyncio.CancelledError:
+                step_results.append(
+                    FlowStepResult(
+                        step_id="replay_request",
+                        phase="replay",
+                        status="canceled",
+                        started_at=started,
+                        ended_at=utc_now(),
+                        error="Replay was canceled before browser dispatch.",
+                    )
+                )
+                raise
         first_mutation_wall_time_ms = int(time.time() * 1000)
         replay_dir = experiment_dir / "replay"
         replay_dir.mkdir(parents=True, exist_ok=True)
@@ -651,7 +665,6 @@ class BrowserReplayOperations:
             json.dumps(replay_plan["diff"], ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
-        started = utc_now()
         try:
             replay_plan["dispatch_wall_time_ms"] = int(time.time() * 1000)
             replay_plan["correlation_window_end_wall_time_ms"] = replay_plan[
@@ -761,15 +774,25 @@ class BrowserReplayOperations:
                 manifest_relative_path=self._manifest_relative_path(experiment_id),
             )
             raise service_error from exc
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as exc:
+            dispatch_started = bool(
+                getattr(exc, "mcp_outcome_unknown", False)
+                or getattr(exc, "adapter_dispatch_started", False)
+            )
             step_results.append(
                 FlowStepResult(
                     step_id="replay_request",
                     phase="replay",
-                    status="canceled_outcome_unknown",
+                    status=(
+                        "canceled_outcome_unknown" if dispatch_started else "canceled"
+                    ),
                     started_at=started,
                     ended_at=utc_now(),
-                    error="Browser-context replay was canceled after dispatch.",
+                    error=(
+                        "Browser-context replay was canceled after dispatch."
+                        if dispatch_started
+                        else "Browser-context replay was canceled before confirmed dispatch."
+                    ),
                 )
             )
             raise

@@ -44,7 +44,7 @@ Expected response handles: bounded console-message evidence, timestamps, severit
 
 Safe retry: read-only. Increase the limit only when needed and preserve experiment association.
 
-Typical errors: `invalid_operation_payload`, `experiment_not_found`.
+Typical errors: `invalid_operation_payload`, `experiment_not_found`, `invalid_adapter_response`. Missing or invalid live `messages` or `pagination` fields are protocol failures, not an empty console result.
 
 Next recommended inspect operation: `get_experiment` or the evidence operation relevant to the error's associated request/script.
 

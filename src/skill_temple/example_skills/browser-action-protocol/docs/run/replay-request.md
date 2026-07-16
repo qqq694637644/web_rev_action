@@ -51,9 +51,9 @@ Decoded example:
 
 Expected response handles: `experiment_id`, replay network evidence ID in the terminal manifest, mutation/binding observations, optional comparison results, and response artifacts.
 
-Safe retry: poll `get_experiment` for job mode. Never repeat a state-changing replay when dispatch started or outcome is unknown; inspect the experiment, exact replay evidence, and persistent state first.
+Safe retry: poll `get_experiment` for job mode. Never repeat a state-changing replay when dispatch started or outcome is unknown; inspect the experiment, exact replay evidence, and persistent state first. Cancellation before MCP send is `canceled`; cancellation after the transport records send is `canceled_outcome_unknown`.
 
-Typical errors: `invalid_operation_payload`, `source_evidence_not_found`, `source_snapshot_incomplete`, `session_busy`, `browser_busy`, `operation_outcome_unknown`.
+Typical errors: `invalid_operation_payload`, `source_evidence_not_found`, `source_snapshot_incomplete`, `session_busy`, `browser_busy`, `invalid_adapter_response`, `operation_outcome_unknown`.
 
 Next recommended inspect operations: `get_experiment`, `list_evidence`, and `get_network_evidence` for the exact replay request.
 

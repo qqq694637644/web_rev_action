@@ -65,7 +65,7 @@ def service_error_from_adapter(
             outcome="unknown",
         )
     return BrowserServiceError(
-        "browser_adapter_failed",
+        exc.code,
         f"{operation} failed at the browser adapter boundary: {exc}",
         502,
         dispatch_started=dispatch_started,

@@ -1,15 +1,79 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import tempfile
 from pathlib import Path
 
 from skill_temple.browser.adapters.contracts import AdapterError
+from skill_temple.browser_models import ReplayRequestRequest
 from tests.browser.common import BrowserActionTestCase
 from tests.fakes.browser import FakeJsReverse
 
 
 class ReplayExecutionBrowserTests(BrowserActionTestCase):
+    def test_replay_cancellation_uses_adapter_dispatch_fact(self) -> None:
+        for sent, expected_status in [
+            (False, "canceled"),
+            (True, "canceled_outcome_unknown"),
+        ]:
+            with self.subTest(sent=sent), tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                client, events, _ = self.make_client(
+                    root,
+                    include_supporting_failure=False,
+                )
+                with client:
+                    self.open_session(client)
+                    source_id, source_evidence, _ = self.capture_replay_source(client, root)
+
+                    class CanceledReplayJs(FakeJsReverse):
+                        dispatched = sent
+
+                        async def evaluate_browser_replay(
+                            self,
+                            spec_file: Path,
+                            output_file: Path,
+                            deadline: object,
+                        ) -> dict[str, object]:
+                            error = asyncio.CancelledError()
+                            error.mcp_outcome_unknown = self.dispatched
+                            error.adapter_dispatch_started = self.dispatched
+                            raise error
+
+                    service = client.app.state.browser_action_service
+                    service.js_reverse = CanceledReplayJs(
+                        events,
+                        root,
+                        include_supporting_failure=False,
+                    )
+                    before = set((root / "experiments").iterdir())
+                    request = ReplayRequestRequest(
+                        operation="replay_request",
+                        payload={
+                            "session_id": "session_one",
+                            "objective": "classify replay cancellation boundary",
+                            "source": {
+                                "experiment_id": source_id,
+                                "evidence_id": source_evidence["evidence_id"],
+                            },
+                            "execution_mode": "sync",
+                            "deadline_ms": 10_000,
+                        },
+                    )
+                    with self.assertRaises(asyncio.CancelledError):
+                        asyncio.run(service.run(request))
+
+                created = list(set((root / "experiments").iterdir()) - before)
+                self.assertEqual(len(created), 1)
+                manifest = json.loads(
+                    (created[0] / "manifest.json").read_text(encoding="utf-8")
+                )
+                replay_step = next(
+                    item for item in manifest["steps"] if item["step_id"] == "replay_request"
+                )
+                self.assertEqual(replay_step["status"], expected_status)
+
     def test_replay_adapter_failure_preserves_real_dispatch_fact_and_manifest(self) -> None:
         for dispatch_started, outcome_unknown, expected_code, expected_status in [
             (False, False, "browser_adapter_failed", "failed"),

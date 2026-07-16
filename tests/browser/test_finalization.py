@@ -147,7 +147,11 @@ class FinalizationBrowserTests(BrowserActionTestCase):
                 deadline: Deadline,
             ) -> dict[str, Any]:
                 self.started.set()
-                await asyncio.Event().wait()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError as exc:
+                    exc.adapter_dispatch_started = True
+                    raise
                 raise AssertionError("unreachable")
 
         with tempfile.TemporaryDirectory() as temp_dir:

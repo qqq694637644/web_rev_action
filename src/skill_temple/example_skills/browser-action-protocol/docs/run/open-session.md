@@ -19,7 +19,7 @@ Optional fields and defaults:
 - `target`: page selector with optional `start_url`, `expected_url_contains`, or `page_index`.
 - `deadline_ms`: 1000–42000; default 15000.
 
-Constraints: when the private MCP endpoint is configured, `browser_endpoint` must match it. Prefer page selection over navigation unless navigation is intentional.
+Constraints: when the private MCP endpoint is configured, `browser_endpoint` must match it. Prefer page selection over navigation unless navigation is intentional. A supplied `session_id` already present in any nonterminal state is rejected with `session_id_in_use` before adapter dispatch.
 
 Decoded example:
 
@@ -43,11 +43,11 @@ Decoded example:
 ```
 ## Result and recovery
 
-Expected response handles: `session_id`, session status, selected page metadata, and alignment metadata. The session record is created before adapter dispatch and may expose `opening`, `aligning`, `open_failed_before_dispatch`, `open_failed`, `open_unaligned`, `open_outcome_unknown`, `alignment_failed`, `close_failed`, or `close_outcome_unknown` when setup does not reach a confirmed open state.
+Expected response handles: `session_id`, session status, selected page metadata, and alignment metadata. The session record is created before adapter dispatch and may expose `opening`, `aligning`, `open_failed_before_dispatch`, `open_failed`, `open_unaligned`, `open_outcome_unknown`, `alignment_failed`, `close_failed`, or `close_outcome_unknown` when setup does not reach a confirmed open state. Separate `attach_outcome`, `page_selection_outcome`, `alignment_outcome`, and `close_outcome` fields preserve confirmed stage facts.
 
 Safe retry: correct validation errors only when `dispatch_started=false`. If dispatch started or the outcome is unknown, use the returned `session_id` with `get_session` before deciding whether to retry.
 
-Typical errors: `invalid_operation_payload`, `browser_endpoint_mismatch`, `browser_busy`, `page_alignment_failed`, `operation_outcome_unknown`.
+Typical errors: `invalid_operation_payload`, `session_id_in_use`, `browser_endpoint_mismatch`, `browser_busy`, `page_alignment_failed`, `invalid_adapter_response`, `operation_outcome_unknown`.
 
 Next recommended inspect operation: `get_session`.
 

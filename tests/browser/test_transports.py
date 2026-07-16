@@ -213,6 +213,10 @@ class TransportsBrowserTests(BrowserActionTestCase):
                                 "semanticEventCount": 0,
                             }
                         ],
+                        "pagination": {
+                            "hasNextPage": False,
+                            "totalPages": 1,
+                        },
                     }
                     if "eventPredicate" in arguments:
                         payload["eventMatch"] = {
@@ -497,6 +501,25 @@ class TransportsBrowserTests(BrowserActionTestCase):
         self.assertTrue(classified.dispatch_started)
         self.assertEqual(classified.outcome, "unknown")
 
+    def test_subprocess_runner_cancellation_records_process_creation_boundary(self) -> None:
+        async def before_creation() -> asyncio.CancelledError:
+            runner = SubprocessCommandRunner()
+            with patch(
+                "asyncio.create_subprocess_exec",
+                side_effect=asyncio.CancelledError(),
+            ):
+                try:
+                    await runner.run(
+                        [sys.executable, "-c", "print('never started')"],
+                        deadline=Deadline(1_000),
+                    )
+                except asyncio.CancelledError as exc:
+                    return exc
+            raise AssertionError("cancellation was not propagated")
+
+        error = asyncio.run(before_creation())
+        self.assertFalse(error.adapter_dispatch_started)
+
     @unittest.skipUnless(os.name == "nt", "Windows process-tree behavior")
     def test_playwright_runner_timeout_terminates_child_process_tree(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -586,8 +609,12 @@ class TransportsBrowserTests(BrowserActionTestCase):
                         break
                     await asyncio.sleep(0.02)
                 task.cancel()
-                with self.assertRaises(asyncio.CancelledError):
+                try:
                     await task
+                except asyncio.CancelledError as exc:
+                    self.assertTrue(exc.adapter_dispatch_started)
+                else:
+                    raise AssertionError("cancellation was not propagated")
 
             asyncio.run(exercise())
             child_pid = child_pid_file.read_text(encoding="utf-8").strip()

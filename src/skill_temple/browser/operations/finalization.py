@@ -41,13 +41,13 @@ class BrowserFinalizationOperations:
             "collector_stopped": (
                 not payload.capture.stream
                 or stream_start_status
-                in {"not_attempted", "failed_before_send", "failed_after_dispatch"}
+                in {"not_attempted", "failed_before_send"}
             ),
             "collector_cleanup": (
                 "not_required"
                 if not payload.capture.stream
                 or stream_start_status
-                in {"not_attempted", "failed_before_send", "failed_after_dispatch"}
+                in {"not_attempted", "failed_before_send"}
                 else "unknown"
             ),
             "orphan_capture_id": None,
@@ -57,7 +57,8 @@ class BrowserFinalizationOperations:
         }
         can_stop_live_capture = (
             capture_id is not None
-            and stream_start_status == "confirmed"
+            and stream_start_status
+            in {"confirmed", "outcome_unknown", "failed_after_dispatch"}
             and capture_transport_generation == self._transport_generation()
         )
         if can_stop_live_capture:
@@ -89,6 +90,7 @@ class BrowserFinalizationOperations:
         elif payload.capture.stream and stream_start_status in {
             "confirmed",
             "outcome_unknown",
+            "failed_after_dispatch",
         }:
             result["collector_stopped"] = False
             result["collector_cleanup"] = "unknown"

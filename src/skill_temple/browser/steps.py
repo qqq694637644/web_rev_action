@@ -139,11 +139,15 @@ class StepExecutor:
                     )
                 )
                 raise service_error from exc
-            except asyncio.CancelledError:
+            except asyncio.CancelledError as exc:
+                dispatch_started = bool(
+                    getattr(exc, "adapter_dispatch_started", False)
+                    or getattr(exc, "mcp_outcome_unknown", False)
+                )
                 canceled_status = (
-                    "canceled"
-                    if step.action in cls.READ_ONLY_ACTIONS
-                    else "canceled_outcome_unknown"
+                    "canceled_outcome_unknown"
+                    if step.action not in cls.READ_ONLY_ACTIONS and dispatch_started
+                    else "canceled"
                 )
                 step_results.append(
                     FlowStepResult(
@@ -153,7 +157,7 @@ class StepExecutor:
                         started_at=started,
                         ended_at=utc_now(),
                         error=(
-                            f"The {phase} read-only step was canceled."
+                            f"The {phase} step was canceled before confirmed dispatch."
                             if canceled_status == "canceled"
                             else (
                                 f"The {phase} mutation step was canceled after dispatch; "

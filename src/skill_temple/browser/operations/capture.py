@@ -415,7 +415,8 @@ class BrowserCaptureOperations:
                                 manifest,
                                 warnings,
                             )
-                            if stream_start_status == "outcome_unknown"
+                            if stream_start_status
+                            in {"outcome_unknown", "failed_after_dispatch"}
                             else None
                         )
                         if discovered:
@@ -508,11 +509,7 @@ class BrowserCaptureOperations:
                             "stream capture start",
                             consequential=True,
                         ) from exc
-                    capture = start_payload.get("capture")
-                    if not isinstance(capture, dict) or not capture.get("captureId"):
-                        raise BrowserServiceError(
-                            "stream_start_invalid", "Stream collector returned no capture ID", 502
-                        )
+                    capture = start_payload["capture"]
                     capture_id = int(capture["captureId"])
                     capture_transport_generation = self._transport_generation()
                     stream_start_status = "confirmed"
@@ -687,6 +684,7 @@ class BrowserCaptureOperations:
                 if exc.code in {
                     "operation_outcome_unknown",
                     "browser_adapter_failed",
+                    "invalid_adapter_response",
                 }:
                     terminal_service_error = exc
                 errors.append(str(exc)[:4000])

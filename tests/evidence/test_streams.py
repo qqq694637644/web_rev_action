@@ -53,6 +53,7 @@ class StreamsBrowserTests(BrowserActionTestCase):
                             "semanticEventCount": 1,
                         }
                     ],
+                    "pagination": {"hasNextPage": False, "totalPages": 1},
                 }
 
             async def close(self) -> None:
@@ -129,6 +130,7 @@ class StreamsBrowserTests(BrowserActionTestCase):
                             "semanticEventCount": 0,
                         }
                     ],
+                    "pagination": {"hasNextPage": False, "totalPages": 1},
                 }
 
             async def close(self) -> None:

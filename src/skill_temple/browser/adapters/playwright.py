@@ -232,9 +232,8 @@ class PlaywrightCliAdapter:
                     target,
                     deadline=deadline,
                     raw=True,
-                    allow_failure=True,
                 )
-                visible = result.returncode == 0 and bool(result.stdout.strip())
+                visible = bool(result.stdout.strip())
                 if visible == (condition.type == "selector_visible"):
                     return {"condition_met": True, "type": condition.type}
             elif condition.type == "request_log_stable":
@@ -243,7 +242,6 @@ class PlaywrightCliAdapter:
                     "requests",
                     deadline=deadline,
                     raw=True,
-                    allow_failure=True,
                 )
                 signature = result.stdout.strip()
                 if signature != network_signature:

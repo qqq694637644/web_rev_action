@@ -122,6 +122,50 @@ class SessionsBrowserTests(BrowserActionTestCase):
             self.assertEqual(error.session_id, "open_unaligned")
             self.assertEqual(saved["status"], "open_unaligned")
             self.assertEqual(saved["playwright_page_url"], "https://example.test/app")
+            self.assertEqual(saved["attach_outcome"], "confirmed")
+            self.assertEqual(saved["alignment_outcome"], "failed")
+
+    def test_confirmed_attach_with_unknown_alignment_keeps_both_facts(self) -> None:
+        class UnknownAlignJs(FakeJsReverse):
+            async def align_page(
+                self,
+                page: PageState,
+                deadline: Deadline,
+                page_id: str | None = None,
+            ) -> Any:
+                raise AdapterError(
+                    "alignment transport disconnected",
+                    dispatch_started=True,
+                    outcome_unknown=True,
+                )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            events: list[str] = []
+            service = BrowserActionService(
+                playwright=FakePlaywright(events),
+                js_reverse=UnknownAlignJs(events, root),
+                experiments=ExperimentStore(root),
+                default_browser_endpoint="http://127.0.0.1:9222",
+            )
+
+            async def exercise() -> tuple[BrowserServiceError, dict[str, Any]]:
+                with self.assertRaises(BrowserServiceError) as raised:
+                    await service.run(
+                        OpenSessionRequest(
+                            operation="open_session",
+                            payload={"session_id": "alignment_unknown"},
+                        )
+                    )
+                saved = service.experiments.load_session("alignment_unknown")
+                assert saved is not None
+                return raised.exception, saved
+
+            error, saved = asyncio.run(exercise())
+            self.assertEqual(error.code, "operation_outcome_unknown")
+            self.assertEqual(saved["status"], "open_unaligned")
+            self.assertEqual(saved["attach_outcome"], "confirmed")
+            self.assertEqual(saved["alignment_outcome"], "unknown")
 
     def test_close_unknown_persists_non_open_state_and_context(self) -> None:
         class UnknownClosePlaywright(FakePlaywright):
@@ -273,6 +317,110 @@ class SessionsBrowserTests(BrowserActionTestCase):
             )
             self.assertEqual(saved["status"], "closed")
             self.assertEqual(saved["close_reason"], "service_shutdown")
+
+    def test_service_shutdown_detaches_all_states_that_may_hold_attachment(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            events: list[str] = []
+            store = ExperimentStore(root)
+            service = BrowserActionService(
+                playwright=FakePlaywright(events),
+                js_reverse=FakeJsReverse(events, root),
+                experiments=store,
+                default_browser_endpoint="http://127.0.0.1:9222",
+            )
+            statuses = [
+                "open_unaligned",
+                "open_outcome_unknown",
+                "close_failed",
+                "close_outcome_unknown",
+            ]
+            for index, status in enumerate(statuses):
+                session_id = f"shutdown_uncertain_{index}"
+                session = {
+                    "session_id": session_id,
+                    "status": status,
+                    "service_instance_id": service.service_instance_id,
+                    "updated_at": service.process_started_at,
+                }
+                service.sessions[session_id] = session
+                store.save_session(session)
+
+            asyncio.run(service.close())
+
+            self.assertEqual(events.count("playwright.close"), len(statuses))
+            for index in range(len(statuses)):
+                saved = store.load_session(f"shutdown_uncertain_{index}")
+                assert saved is not None
+                self.assertEqual(saved["status"], "closed")
+                self.assertEqual(saved["close_outcome"], "confirmed")
+
+    def test_old_service_uncertain_sessions_are_marked_stale_on_inspection(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = ExperimentStore(root)
+            for index, status in enumerate(["opening", "open_unaligned", "close_failed"]):
+                store.save_session(
+                    {
+                        "session_id": f"old_{index}",
+                        "status": status,
+                        "service_instance_id": "svc_old",
+                        "updated_at": "2026-01-01T00:00:00Z",
+                    }
+                )
+            service = BrowserActionService(
+                playwright=FakePlaywright([]),
+                js_reverse=FakeJsReverse([], root),
+                experiments=store,
+                default_browser_endpoint="http://127.0.0.1:9222",
+            )
+
+            async def exercise() -> list[dict[str, Any]]:
+                return [
+                    (
+                        await service.inspect(
+                            GetSessionRequest(
+                                operation="get_session",
+                                payload={"session_id": f"old_{index}"},
+                            )
+                        )
+                    ).result["session"]
+                    for index in range(3)
+                ]
+
+            inspected = asyncio.run(exercise())
+            self.assertEqual([item["status"] for item in inspected], ["stale"] * 3)
+            self.assertEqual(
+                [item["previous_status"] for item in inspected],
+                ["opening", "open_unaligned", "close_failed"],
+            )
+
+    def test_duplicate_nonterminal_session_id_is_rejected_before_dispatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            events: list[str] = []
+            service = BrowserActionService(
+                playwright=FakePlaywright(events),
+                js_reverse=FakeJsReverse(events, root),
+                experiments=ExperimentStore(root),
+                default_browser_endpoint="http://127.0.0.1:9222",
+            )
+
+            async def exercise() -> BrowserServiceError:
+                request = OpenSessionRequest(
+                    operation="open_session",
+                    payload={"session_id": "duplicate_session"},
+                )
+                await service.run(request)
+                with self.assertRaises(BrowserServiceError) as raised:
+                    await service.run(request)
+                return raised.exception
+
+            error = asyncio.run(exercise())
+            self.assertEqual(error.code, "session_id_in_use")
+            self.assertFalse(error.dispatch_started)
+            self.assertEqual(error.session_id, "duplicate_session")
+            self.assertEqual(events.count("playwright.open"), 1)
 
     def test_runtime_coordinator_atomically_blocks_browser_and_workspace_operations(self) -> None:
         class BlockingOpenPlaywright(FakePlaywright):
