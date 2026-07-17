@@ -1,13 +1,4 @@
-"""FastAPI gateway for Codex-style Skills adapted to GPT Actions.
-
-The public GPT Action surface is intentionally small:
-
-- retrieveSkillContext: return a bounded catalog or load explicit SKILL.md files.
-- searchSkillDocs: search resources within one selected skill.
-- readSkillContent: read an exact safe relative path with continuation metadata.
-
-Debug list/resolve routes and the development console are hidden from OpenAPI.
-"""
+"""FastAPI gateway for exact Skills, atomic browser experiments, and workspace evidence."""
 
 from __future__ import annotations
 
@@ -19,14 +10,14 @@ import secrets
 import tempfile
 import threading
 from pathlib import Path
-from typing import Any, BinaryIO, Literal
+from typing import Any, BinaryIO
 from urllib.parse import urlparse
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from .browser_routes import normalize_browser_action_openapi, register_browser_actions
+from .browser_routes import register_browser_actions
 from .browser_service import (
     BrowserActionService,
     analysis_workspace_root_from_environment,
@@ -34,8 +25,10 @@ from .browser_service import (
 )
 from .runtime import (
     DEFAULT_MAX_SKILLS,
+    SkillLineLimitError,
     SkillNotFoundError,
     SkillPathError,
+    SkillRuntimeError,
     env_value_from_environment_or_dotenv,
     load_runtime,
 )
@@ -110,52 +103,15 @@ class StrictRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class ResolveSkillRequest(StrictRequest):
-    query: str = Field(..., description="The user's task or request text.")
-    hinted_skill_ids: list[str] = Field(
-        default_factory=list,
-        description="Explicit skill selection handles, for example ['example-skill'].",
-    )
-    max_results: int = Field(default=3, ge=1, le=10)
-
-
-class RetrieveSkillContextRequest(StrictRequest):
-    query: str = Field(..., description="The user's original task or request text.")
-    hinted_skill_ids: list[str] = Field(
-        default_factory=list,
-        description="Explicit skill selection handles chosen from available_skills.",
-    )
-    allow_skill_chaining: bool = Field(
-        default=False,
-        description=(
-            "Backward-compatible hint. Multiple explicit selections are always loaded "
-            "together when within the response limit."
-        ),
-    )
-
-
-class ConsoleRetrieveRequest(RetrieveSkillContextRequest):
-    include_debug: bool = Field(
-        default=False,
-        description="Return hidden routing diagnostics for the development console.",
-    )
-
-
-class SearchSkillDocsRequest(StrictRequest):
-    skill_id: str = Field(..., description="Selection handle of the skill to search.")
-    query: str = Field(..., description="Search query for the skill documentation.")
-    paths: list[str] | None = Field(
-        default=None,
-        description="Optional safe relative file paths to restrict the search.",
-    )
-    limit: int = Field(default=5, ge=1, le=30)
+class LoadSkillsRequest(StrictRequest):
+    skill_ids: list[str] = Field(min_length=1, max_length=DEFAULT_MAX_SKILLS)
 
 
 class ReadSkillContentRequest(StrictRequest):
-    skill_id: str = Field(..., description="Selection handle of the skill to read.")
+    skill_id: str = Field(..., description="Exact skill_id from the compiled catalog.")
     path: str = Field(
         ...,
-        description="Safe relative path inside the skill, for example docs/reference.md.",
+        description="Safe relative path inside the Skill, for example docs/reference.md.",
     )
     start_line: int = Field(default=1, ge=1)
     max_lines: int = Field(default=2000, ge=1, le=5000)
@@ -165,88 +121,28 @@ class ErrorDetail(BaseModel):
     code: str
     message: str
     suggested_next_action: str
+    line_number: int | None = None
+    actual_chars: int | None = None
+    max_chars: int | None = None
 
 
 class StructuredErrorResponse(BaseModel):
     error: ErrorDetail
 
 
-class SelectedSkillPacket(BaseModel):
+class LoadedSkill(BaseModel):
     skill_id: str
     name: str
     description: str
-    role: Literal["primary", "secondary"]
     source_path: str
-    instructions: str
+    content: str
     content_hash: str
-    total_lines: int
-    truncated: bool
-    next_start_line: int | None = None
     referenced_paths: list[str] = Field(default_factory=list)
 
 
-class AvailableSkillMetadata(BaseModel):
-    skill_id: str = Field(..., description="Selection handle used in hinted_skill_ids.")
-    name: str
-    description: str
-    description_truncated: bool = False
-    entrypoint: str
-    content_hash: str
-
-
-class Decision(BaseModel):
-    selected: bool
-    next_action: Literal[
-        "followSkillInstructions",
-        "readSkillContent",
-        "selectSkillOrAnswer",
-        "retryWithFewerSkills",
-        "answerWithoutSkill",
-    ]
-    reason: str
-    stop_retrieval: bool
-
-
-class RetrieveSkillContextResponse(BaseModel):
-    selected_skills: list[SelectedSkillPacket] = Field(default_factory=list)
-    available_skills: list[AvailableSkillMetadata] = Field(default_factory=list)
-    available_skill_count: int
-    included_skill_count: int
-    omitted_skill_count: int
-    descriptions_truncated: bool
-    catalog_char_limit: int
-    catalog_included: bool
-    explicit_skill_ids: list[str] = Field(default_factory=list)
-    unknown_skill_mentions: list[str] = Field(default_factory=list)
-    omitted_explicit_skill_ids: list[str] = Field(default_factory=list)
-    decision: Decision
-
-
-class SearchMatch(BaseModel):
-    skill_id: str
-    path: str
-    title: str
-    heading_path: str
-    score: float
-    mode: str
-    engine: str
-    start_line: int
-    end_line: int
-    excerpt: str
-    symbols: list[str] = Field(default_factory=list)
-    document_symbols: list[str] = Field(default_factory=list)
-    rank_features: dict[str, Any] = Field(default_factory=dict)
-    why_relevant: str
-    content_hash: str
-
-
-class SearchSkillDocsResponse(BaseModel):
-    skill_id: str
-    query: str
-    mode: str
-    engine: str
-    matches: list[SearchMatch] = Field(default_factory=list)
-    recommended_next_action: Literal["readSkillContent", "none"]
+class LoadSkillsResponse(BaseModel):
+    skills: list[LoadedSkill]
+    loaded_skill_ids: list[str]
 
 
 class ReadSkillContentResponse(BaseModel):
@@ -287,8 +183,9 @@ def _request_server_url(request: Request) -> str:
     forwarded_host = _first_header_value(request.headers.get("x-forwarded-host"))
     forwarded_prefix = _first_header_value(request.headers.get("x-forwarded-prefix")) or ""
     if forwarded_proto and forwarded_host:
-        forwarded_url = f"{forwarded_proto}://{forwarded_host}{forwarded_prefix}"
-        return _normalize_server_url(forwarded_url) or ""
+        return _normalize_server_url(
+            f"{forwarded_proto}://{forwarded_host}{forwarded_prefix}"
+        ) or ""
     return _normalize_server_url(str(request.base_url)) or ""
 
 
@@ -300,7 +197,7 @@ def _normalize_bearer_token(token: str | None) -> str | None:
 
 
 def _requires_bearer_auth(path: str) -> bool:
-    return path.startswith("/v1/") or path == "/console/retrieve"
+    return path.startswith("/v1/")
 
 
 def _valid_bearer_authorization(authorization: str | None, expected_token: str) -> bool:
@@ -332,6 +229,24 @@ def create_app(
     workspace_service: AnalysisWorkspaceService | None = None,
 ) -> FastAPI:
     runtime = load_runtime(skills_dir)
+    protocol_skill = next(
+        (
+            item
+            for item in runtime.list_skills()["skills"]
+            if item["skill_id"] == "browser-action-protocol"
+        ),
+        None,
+    )
+    if protocol_skill is None:
+        raise SkillRuntimeError(
+            "The configured Skills directory must contain browser-action-protocol."
+        )
+    protocol_skill_content_hash = str(protocol_skill["content_hash"])
+    evidence_root = (
+        browser_service.experiments.root
+        if browser_service is not None
+        else analysis_workspace_root_from_environment()
+    )
     configured_server_url = _normalize_server_url(
         server_url or env_value_from_environment_or_dotenv("SKILL_TEMPLE_SERVER_URL")
     )
@@ -341,19 +256,18 @@ def create_app(
 
     app = FastAPI(
         title="Web Reverse Action Gateway",
-        version="0.3.0",
+        version="0.5.0",
         description=(
-            "Codex-style Skill retrieval plus two browser-analysis Actions. Browser experiments "
-            "atomically coordinate playwright-cli, private js-reverse-mcp, and workspace evidence."
+            "Exact Skill loading plus two stable browser-analysis Actions. Browser operation "
+            "contracts are progressively disclosed by Skills and strictly validated server-side."
         ),
         openapi_url=None,
         servers=([{"url": configured_server_url}] if configured_server_url else None),
     )
-
     original_openapi = app.openapi
 
     def openapi_with_optional_bearer_auth() -> dict[str, Any]:
-        schema = normalize_browser_action_openapi(original_openapi())
+        schema = original_openapi()
         if bearer_token:
             _add_bearer_auth_security(schema)
         return schema
@@ -392,18 +306,6 @@ def create_app(
             }
         }
 
-    def retrieve_context(
-        request: RetrieveSkillContextRequest,
-        include_debug: bool = False,
-    ) -> dict[str, object]:
-        return runtime.retrieve(
-            query=request.query,
-            hinted_skill_ids=request.hinted_skill_ids,
-            max_skills=DEFAULT_MAX_SKILLS,
-            allow_skill_chaining=request.allow_skill_chaining,
-            include_debug=include_debug,
-        )
-
     @app.get("/openapi.json", include_in_schema=False)
     def openapi_json(request: Request) -> dict[str, Any]:
         schema = copy.deepcopy(app.openapi())
@@ -415,113 +317,84 @@ def create_app(
     def health_check() -> dict[str, object]:
         return {"status": "ok", "skills_dir": str(runtime.skills_dir)}
 
-    @app.get("/v1/skills", include_in_schema=False)
-    def list_skills() -> dict[str, object]:
-        return runtime.list_skills()
-
-    @app.post("/v1/skills/resolve", include_in_schema=False)
-    def resolve_skill(request: ResolveSkillRequest) -> dict[str, object]:
-        return runtime.resolve(
-            query=request.query,
-            hinted_skill_ids=request.hinted_skill_ids,
-            max_results=request.max_results,
-        )
-
-    @app.get("/console", response_class=HTMLResponse, include_in_schema=False)
-    def console() -> HTMLResponse:
-        return HTMLResponse(CONSOLE_HTML)
-
-    @app.post("/console/retrieve", include_in_schema=False)
-    def console_retrieve(request: ConsoleRetrieveRequest) -> dict[str, object]:
-        try:
-            return retrieve_context(request, include_debug=request.include_debug)
-        except SkillNotFoundError as exc:
-            detail = structured_error("skill_not_found", str(exc), "check_skill_id")
-            raise HTTPException(status_code=404, detail=detail) from exc
-
     @app.post(
-        "/v1/skills/retrieve",
-        operation_id="retrieveSkillContext",
-        response_model=RetrieveSkillContextResponse,
-        response_model_exclude_none=True,
-        responses={404: {"model": StructuredErrorResponse}},
-        summary="Discover or load explicitly selected skills.",
+        "/v1/skills/load",
+        operation_id="loadSkills",
+        response_model=LoadSkillsResponse,
+        responses={
+            404: {"model": StructuredErrorResponse},
+            422: {"model": StructuredErrorResponse},
+        },
+        summary="Load complete Skills by exact id.",
         description=(
-            "Return a bounded skill catalog, or load exact hinted skills and explicit "
-            "$skill mentions. @skill is also supported as a gateway extension."
+            "Load up to three exact skill_ids selected from the compiled "
+            "Instructions catalog."
         ),
         openapi_extra={"x-openai-isConsequential": False},
     )
-    def retrieve_skill_context(
-        request: RetrieveSkillContextRequest,
-    ) -> RetrieveSkillContextResponse:
+    def load_skills(request: LoadSkillsRequest) -> LoadSkillsResponse | JSONResponse:
         try:
-            return RetrieveSkillContextResponse.model_validate(retrieve_context(request))
+            result = runtime.load_skills(request.skill_ids)
+            return LoadSkillsResponse.model_validate(result)
         except SkillNotFoundError as exc:
             detail = structured_error("skill_not_found", str(exc), "check_skill_id")
-            raise HTTPException(status_code=404, detail=detail) from exc
-
-    @app.post(
-        "/v1/skills/search",
-        operation_id="searchSkillDocs",
-        response_model=SearchSkillDocsResponse,
-        responses={404: {"model": StructuredErrorResponse}},
-        summary="Search documentation for a specific skill.",
-        description="Search indexed resources within one selected skill.",
-        openapi_extra={"x-openai-isConsequential": False},
-    )
-    def search_skill_docs(request: SearchSkillDocsRequest) -> SearchSkillDocsResponse:
-        try:
-            return SearchSkillDocsResponse.model_validate(
-                runtime.search(
-                    skill_id=request.skill_id,
-                    query=request.query,
-                    paths=request.paths,
-                    limit=request.limit,
-                    mode="keyword",
-                    max_chars_per_match=2000,
-                    include_manifest=False,
-                )
-            )
-        except SkillNotFoundError as exc:
-            detail = structured_error("skill_not_found", str(exc), "check_skill_id")
-            raise HTTPException(status_code=404, detail=detail) from exc
-        except SkillPathError as exc:
-            detail = structured_error("unsafe_or_missing_path", str(exc), "check_path")
-            raise HTTPException(status_code=404, detail=detail) from exc
+            return JSONResponse(status_code=404, content=detail)
+        except SkillRuntimeError as exc:
+            detail = structured_error("invalid_skill_request", str(exc), "reduce_skill_ids")
+            return JSONResponse(status_code=422, content=detail)
 
     @app.post(
         "/v1/skills/read",
         operation_id="readSkillContent",
         response_model=ReadSkillContentResponse,
-        responses={404: {"model": StructuredErrorResponse}},
-        summary="Read a skill file by safe relative path.",
-        description="Read an exact safe relative path within one selected skill.",
+        responses={
+            404: {"model": StructuredErrorResponse},
+            422: {"model": StructuredErrorResponse},
+        },
+        summary="Read a Skill file by exact safe relative path.",
+        description=(
+            "Read one exact safe file path inside the selected Skill directory. "
+            "Use referenced_paths as recommended entry points, not as an access allowlist."
+        ),
         openapi_extra={"x-openai-isConsequential": False},
     )
-    def read_skill_content(request: ReadSkillContentRequest) -> ReadSkillContentResponse:
+    def read_skill_content(
+        request: ReadSkillContentRequest,
+    ) -> ReadSkillContentResponse | JSONResponse:
         try:
-            return ReadSkillContentResponse.model_validate(
-                runtime.read(
-                    skill_id=request.skill_id,
-                    path=request.path,
-                    start_line=request.start_line,
-                    max_lines=request.max_lines,
-                )
+            result = runtime.read(
+                skill_id=request.skill_id,
+                path=request.path,
+                start_line=request.start_line,
+                max_lines=request.max_lines,
             )
+            return ReadSkillContentResponse.model_validate(result)
         except SkillNotFoundError as exc:
             detail = structured_error("skill_not_found", str(exc), "check_skill_id")
-            raise HTTPException(status_code=404, detail=detail) from exc
+            return JSONResponse(status_code=404, content=detail)
+        except SkillLineLimitError as exc:
+            detail = {
+                "error": {
+                    "code": "skill_line_exceeds_limit",
+                    "message": str(exc),
+                    "suggested_next_action": (
+                        "Use Workspace tools for this file or split the oversized line."
+                    ),
+                    "line_number": exc.line_number,
+                    "actual_chars": exc.actual_chars,
+                    "max_chars": exc.max_chars,
+                }
+            }
+            return JSONResponse(status_code=422, content=detail)
         except SkillPathError as exc:
             detail = structured_error("unsafe_or_missing_path", str(exc), "check_path")
-            raise HTTPException(status_code=404, detail=detail) from exc
+            return JSONResponse(status_code=404, content=detail)
 
     guard_key: str | None = None
     coordinator = (
         browser_service.coordinator if browser_service is not None else RuntimeCoordinator()
     )
     if browser_service is None:
-        evidence_root = analysis_workspace_root_from_environment()
         guard_key = _acquire_single_process_guard(evidence_root)
         app.state.single_process_guard_key = guard_key
         try:
@@ -534,15 +407,16 @@ def create_app(
             raise
     else:
         resolved_browser_service = browser_service
-    register_browser_actions(app, resolved_browser_service)
+    register_browser_actions(
+        app,
+        resolved_browser_service,
+        protocol_skill_content_hash=protocol_skill_content_hash,
+    )
     resolved_workspace_service = workspace_service or AnalysisWorkspaceService(
         resolved_browser_service.experiments.root,
-        shell=(
-            env_value_from_environment_or_dotenv("WEB_REV_WORKSPACE_SHELL") or "pwsh"
-        ),
+        shell=(env_value_from_environment_or_dotenv("WEB_REV_WORKSPACE_SHELL") or "pwsh"),
         allow_network=(
-            env_value_from_environment_or_dotenv("WEB_REV_WORKSPACE_ALLOW_NETWORK")
-            or "false"
+            env_value_from_environment_or_dotenv("WEB_REV_WORKSPACE_ALLOW_NETWORK") or "false"
         ).lower()
         in {"1", "true", "yes", "on"},
         coordinator=coordinator,
@@ -560,90 +434,18 @@ def create_app(
     return app
 
 
-CONSOLE_HTML = """<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Skill Temple Console</title>
-  <style>
-    body { font-family: system-ui, sans-serif; margin: 2rem; max-width: 980px; }
-    label { display: block; font-weight: 600; margin-top: 1rem; }
-    input, select, textarea { width: 100%; box-sizing: border-box; padding: .55rem; }
-    textarea { min-height: 7rem; }
-    button { margin-top: 1rem; padding: .65rem 1rem; }
-    pre { background: #111827; color: #e5e7eb; padding: 1rem; overflow: auto; }
-    .row { display: flex; gap: 1rem; align-items: center; }
-    .row label { font-weight: 400; }
-  </style>
-</head>
-<body>
-  <h1>Skill Temple Console</h1>
-  <p>This debug console is hidden from the GPT Action OpenAPI schema.</p>
-  <label for="token">Bearer token</label>
-  <input id="token" type="password" placeholder="Optional token from .env" />
-  <label for="query">Query</label>
-  <textarea id="query">Use $current-site-analysis to inspect the current website</textarea>
-  <label for="hints">Hinted skill ids, comma-separated</label>
-  <input id="hints" type="text" value="current-site-analysis" />
-  <div class="row">
-    <label><input id="allow_chain" type="checkbox" /> Compatibility chaining flag</label>
-    <label><input id="include_debug" type="checkbox" checked /> Include debug</label>
-  </div>
-  <button id="run">Retrieve</button>
-  <h2>Result</h2>
-  <pre id="result">Ready.</pre>
-  <script>
-    document.getElementById('run').addEventListener('click', async () => {
-      const result = document.getElementById('result');
-      const hinted = document.getElementById('hints').value
-        .split(',').map(v => v.trim()).filter(Boolean);
-      const token = document.getElementById('token').value.trim();
-      const headers = {'Content-Type': 'application/json'};
-      if (token) headers.Authorization = `Bearer ${token}`;
-      const body = {
-        query: document.getElementById('query').value,
-        hinted_skill_ids: hinted,
-        allow_skill_chaining: document.getElementById('allow_chain').checked,
-        include_debug: document.getElementById('include_debug').checked
-      };
-      result.textContent = 'Loading...';
-      try {
-        const response = await fetch('/console/retrieve', {
-          method: 'POST', headers, body: JSON.stringify(body)
-        });
-        const data = await response.json();
-        result.textContent = JSON.stringify(data, null, 2);
-      } catch (error) {
-        result.textContent = String(error);
-      }
-    });
-  </script>
-</body>
-</html>
-"""
-
-
 app = create_app()
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the Skill Temple GPT Action gateway.")
-    parser.add_argument(
-        "--skills-dir",
-        type=Path,
-        default=None,
-        help="Directory containing skill folders.",
-    )
+    parser.add_argument("--skills-dir", type=Path, default=None)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument(
         "--server-url",
         default=None,
-        help=(
-            "Public absolute http(s) URL to publish in OpenAPI servers. "
-            "Can also be set with SKILL_TEMPLE_SERVER_URL."
-        ),
+        help="Public absolute http(s) URL to publish in OpenAPI servers.",
     )
     args = parser.parse_args()
 

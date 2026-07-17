@@ -8,8 +8,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ..browser_models import FlowStep, FlowStepResult, RequestMatcher
-from .adapters import StreamCheckpoint
-from .core import BrowserServiceError, Deadline, utc_now
+from .adapters import AdapterError, StreamCheckpoint
+from .core import BrowserServiceError, Deadline, service_error_from_adapter, utc_now
 
 if TYPE_CHECKING:
     from ..browser_service import BrowserActionService
@@ -18,6 +18,20 @@ class StepExecutor:
     """Execute setup, action, and verification steps with one lifecycle."""
 
     READ_ONLY_ACTIONS = {"wait", "assert", "snapshot"}
+    STREAM_WAIT_TYPES = {
+        "request_observed",
+        "response_observed",
+        "first_event",
+        "event_predicate",
+        "default_done_marker",
+        "network_finished",
+        "network_canceled",
+        "failed",
+    }
+
+    @classmethod
+    def uses_stream_checkpoint(cls, condition_type: str | None) -> bool:
+        return condition_type in cls.STREAM_WAIT_TYPES
 
     @classmethod
     async def execute_many(
@@ -67,10 +81,12 @@ class StepExecutor:
                         checkpoint=stream_checkpoint,
                         deadline=step_deadline,
                     )
-                    stream_checkpoint = service._checkpoint_from_wait_result(
-                        result,
-                        stream_checkpoint,
-                    )
+                    if cls.uses_stream_checkpoint(
+                        step.condition.type if step.condition else None
+                    ):
+                        stream_checkpoint = service._checkpoint_from_wait_result(
+                            result,
+                        )
                     wait_observations.append(
                         {
                             "phase": phase,
@@ -119,11 +135,36 @@ class StepExecutor:
                         snapshot_ref=snapshot_ref,
                     )
                 )
-            except asyncio.CancelledError:
+            except AdapterError as exc:
+                service_error = service_error_from_adapter(
+                    exc,
+                    f"{phase} step {step.step_id}",
+                    consequential=step.action not in cls.READ_ONLY_ACTIONS,
+                )
+                step_results.append(
+                    FlowStepResult(
+                        step_id=step.step_id,
+                        phase=phase,
+                        status=(
+                            "outcome_unknown"
+                            if service_error.code == "operation_outcome_unknown"
+                            else "failed"
+                        ),
+                        started_at=started,
+                        ended_at=utc_now(),
+                        error=str(service_error)[:4000],
+                    )
+                )
+                raise service_error from exc
+            except asyncio.CancelledError as exc:
+                dispatch_started = bool(
+                    getattr(exc, "adapter_dispatch_started", False)
+                    or getattr(exc, "mcp_outcome_unknown", False)
+                )
                 canceled_status = (
-                    "canceled"
-                    if step.action in cls.READ_ONLY_ACTIONS
-                    else "canceled_outcome_unknown"
+                    "canceled_outcome_unknown"
+                    if step.action not in cls.READ_ONLY_ACTIONS and dispatch_started
+                    else "canceled"
                 )
                 step_results.append(
                     FlowStepResult(
@@ -133,7 +174,7 @@ class StepExecutor:
                         started_at=started,
                         ended_at=utc_now(),
                         error=(
-                            f"The {phase} read-only step was canceled."
+                            f"The {phase} step was canceled before confirmed dispatch."
                             if canceled_status == "canceled"
                             else (
                                 f"The {phase} mutation step was canceled after dispatch; "

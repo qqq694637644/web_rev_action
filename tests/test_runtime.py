@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import json
 import os
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,14 +10,15 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from skill_temple.app import create_app
+from skill_temple.browser.registry import OPERATION_REGISTRY
 from skill_temple.evals import evaluate_file
+from skill_temple.prompt_builder import build_instructions, render_catalog
 from skill_temple.runtime import (
-    DEFAULT_MANIFEST_MAX_CHARS,
     DEFAULT_MAX_SKILLS,
-    RETRIEVE_INSTRUCTIONS_MAX_CHARS,
-    SKILL_CATALOG_MAX_CHARS,
     SKILL_DESCRIPTION_MAX_CHARS,
     SKILL_NAME_MAX_CHARS,
+    SkillLineLimitError,
+    SkillNotFoundError,
     SkillPathError,
     SkillRuntime,
     SkillRuntimeError,
@@ -56,309 +57,114 @@ def _write_skill(
 
 
 class RuntimeTests(unittest.TestCase):
-    def test_packaged_skills_use_skill_md_as_the_only_entrypoint(self) -> None:
+    def test_packaged_catalog_has_static_protocol_and_workflow_skills(self) -> None:
         runtime = load_runtime()
-        result = runtime.list_skills()
+        catalog = runtime.list_skills()["skills"]
 
         self.assertEqual(
-            [item["skill_id"] for item in result["skills"]],
-            ["current-site-analysis", "pandora-protocol-reproduction"],
+            [item["skill_id"] for item in catalog],
+            [
+                "browser-action-protocol",
+                "browser-evidence-inspection",
+                "browser-experiment-recovery",
+                "browser-request-replay",
+                "browser-script-tracing",
+                "browser-session-capture",
+                "browser-stream-diagnostics",
+                "current-site-analysis",
+                "pandora-protocol-reproduction",
+            ],
         )
-        for skill in result["skills"]:
-            self.assertEqual(skill["entrypoint"], "SKILL.md")
-            self.assertTrue(skill["content_hash"].startswith("sha256:"))
-            root = Path(runtime.skills_dir) / skill["skill_id"]
-            self.assertTrue((root / "SKILL.md").is_file())
-            self.assertFalse((root / "skill.json").exists())
-            self.assertFalse((root / "INDEX.md").exists())
-        self.assertIn("current website", result["skills"][0]["description"])
+        for item in catalog:
+            self.assertEqual(item["entrypoint"], f"{item['skill_id']}/SKILL.md")
+            self.assertTrue(item["content_hash"].startswith("sha256:"))
+        self.assertFalse(hasattr(runtime, "resolve"))
+        self.assertFalse(hasattr(runtime, "retrieve"))
+        self.assertFalse(hasattr(runtime, "search"))
 
-    def test_current_site_skill_is_the_generic_default_workflow(self) -> None:
+    def test_load_skills_returns_complete_wrapped_entrypoints_and_references(self) -> None:
         runtime = load_runtime()
-        result = runtime.retrieve(
-            "use $current-site-analysis for this website",
-            hinted_skill_ids=["current-site-analysis"],
+        result = runtime.load_skills(
+            ["current-site-analysis", "browser-action-protocol", "current-site-analysis"]
         )
 
-        selected = result["selected_skills"][0]
-        self.assertEqual(selected["skill_id"], "current-site-analysis")
-        self.assertIn("Do not begin with a fixed scenario list", selected["instructions"])
         self.assertEqual(
-            set(selected["referenced_paths"]),
+            result["loaded_skill_ids"],
+            ["current-site-analysis", "browser-action-protocol"],
+        )
+        current, protocol = result["skills"]
+        self.assertEqual(current["source_path"], "current-site-analysis/SKILL.md")
+        self.assertTrue(current["content"].startswith("<skill>\n<name>current-site-analysis</name>"))
+        self.assertTrue(current["content"].endswith("</skill>"))
+        self.assertIn("Do not begin with a fixed scenario list", current["content"])
+        self.assertEqual(
+            set(current["referenced_paths"]),
             {
                 "docs/experiment-design.md",
                 "docs/inventory-checklist.md",
                 "docs/report-contract.md",
             },
         )
-        self.assertIn("current-site-analysis", result["explicit_skill_ids"])
+        self.assertIn("docs/transport-envelope.md", protocol["referenced_paths"])
+        self.assertIn("docs/operation-index.md", protocol["referenced_paths"])
 
-    def test_packaged_pandora_skill_exposes_protocol_reproduction_workflow(self) -> None:
-        runtime = load_runtime()
-        result = runtime.retrieve(
-            "use $pandora-protocol-reproduction for protocol replay",
-            hinted_skill_ids=["pandora-protocol-reproduction"],
-        )
-
-        selected = result["selected_skills"][0]
-        self.assertEqual(selected["skill_id"], "pandora-protocol-reproduction")
-        self.assertIn(
-            "Optional Pandora protocol reproduction template",
-            selected["instructions"],
-        )
-        self.assertIn("current-site-analysis", selected["instructions"])
-        self.assertEqual(
-            set(selected["referenced_paths"]),
-            {
-                "docs/evidence-contract.md",
-                "docs/experiment-matrix.md",
-                "docs/report-templates.md",
-            },
-        )
-        root = Path(runtime.skills_dir) / "pandora-protocol-reproduction"
-        self.assertTrue((root / "SKILL.md").is_file())
-        self.assertTrue((root / "docs" / "experiment-matrix.md").is_file())
-        self.assertTrue((root / "docs" / "evidence-contract.md").is_file())
-        self.assertTrue((root / "docs" / "report-templates.md").is_file())
-
-    def test_packaged_skills_use_current_generic_replay_contract(self) -> None:
-        runtime = load_runtime()
-        content = "\n".join(
-            path.read_text(encoding="utf-8")
-            for skill_id in ["current-site-analysis", "pandora-protocol-reproduction"]
-            for path in sorted((Path(runtime.skills_dir) / skill_id).rglob("*.md"))
-        )
-
-        for removed_field in [
-            "replay_mode",
-            "control_experiment_id",
-            "pair_protocol",
-            "volatile_bindings",
-            "fresh_equivalent",
-            "non_target_fields_equivalent",
-        ]:
-            with self.subTest(removed_field=removed_field):
-                self.assertNotIn(removed_field, content)
-        self.assertIn('"source"', content)
-        self.assertIn('"evidence_id"', content)
-        self.assertIn('"comparison"', content)
-        self.assertIn("text_pattern", content)
-
-    def test_resolve_uses_exact_mentions_and_explicit_hints(self) -> None:
-        runtime = load_runtime()
-        results = [
-            runtime.resolve("@pandora-protocol-reproduction inspect references"),
-            runtime.resolve("use $pandora-protocol-reproduction for this task"),
-            runtime.resolve(
-                "中文任务", hinted_skill_ids=["pandora-protocol-reproduction"]
-            ),
-        ]
-
-        for result in results:
-            self.assertEqual(
-                result["matches"][0]["skill_id"], "pandora-protocol-reproduction"
-            )
-            self.assertNotIn("confidence", result["matches"][0])
-            self.assertEqual(
-                [item["skill_id"] for item in result["available_skills"]],
-                ["current-site-analysis", "pandora-protocol-reproduction"],
-            )
-
-    def test_resolve_does_not_make_server_side_semantic_selection(self) -> None:
-        runtime = load_runtime()
-        for query in [
-            "please use this tool",
-            "decompile a binary",
-            "反编译 main 函数",
-            "函数求导怎么做",
-            "give me a software patch",
-        ]:
-            with self.subTest(query=query):
-                result = runtime.resolve(query)
-                self.assertEqual(result["matches"], [])
-                self.assertEqual(
-                    result["available_skills"][0]["skill_id"],
-                    "current-site-analysis",
-                )
-
-    def test_retrieve_returns_selected_skill_entrypoint_and_references(self) -> None:
-        runtime = load_runtime()
-        result = runtime.retrieve(
-            "use $pandora-protocol-reproduction",
-            hinted_skill_ids=["pandora-protocol-reproduction"],
-        )
-
-        selected = result["selected_skills"][0]
-        self.assertEqual(selected["skill_id"], "pandora-protocol-reproduction")
-        self.assertEqual(selected["role"], "primary")
-        self.assertEqual(selected["source_path"], "SKILL.md")
-        self.assertIn("name: pandora-protocol-reproduction", selected["instructions"])
-        self.assertIn("docs/experiment-matrix.md", selected["referenced_paths"])
-        self.assertIn("docs/evidence-contract.md", selected["referenced_paths"])
-        self.assertFalse(selected["truncated"])
-        self.assertTrue(result["decision"]["selected"])
-        self.assertEqual(result["decision"]["next_action"], "followSkillInstructions")
-        self.assertEqual(result["available_skills"], [])
-        self.assertFalse(result["catalog_included"])
-
-    def test_retrieve_returns_bounded_catalog_before_selection(self) -> None:
-        runtime = load_runtime()
-        result = runtime.retrieve("unselected task")
-
-        self.assertEqual(result["selected_skills"], [])
-        self.assertEqual(result["decision"]["next_action"], "selectSkillOrAnswer")
-        self.assertTrue(result["catalog_included"])
-        self.assertEqual(result["available_skill_count"], 2)
-        self.assertEqual(result["included_skill_count"], 2)
-        self.assertEqual(result["omitted_skill_count"], 0)
-
-    def test_multiple_explicit_skills_auto_chain_and_preserve_order(self) -> None:
+    def test_load_skills_is_ordered_bounded_and_all_or_nothing(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir) / "skills"
-            for skill_id in ["alpha", "beta"]:
-                _write_skill(root, skill_id, f"Use for {skill_id} tasks.", f"# {skill_id}")
+            for skill_id in ["alpha", "beta", "gamma", "delta"]:
+                _write_skill(root, skill_id, f"Use for {skill_id}.", f"# {skill_id}")
             runtime = SkillRuntime(root)
 
-            mentioned = runtime.retrieve("@alpha $beta do work")
-            hinted = runtime.retrieve("do work", hinted_skill_ids=["alpha", "beta"])
-
-            self.assertEqual(
-                [item["skill_id"] for item in mentioned["selected_skills"]],
-                ["alpha", "beta"],
-            )
-            self.assertEqual(len(hinted["selected_skills"]), 2)
-            self.assertEqual(mentioned["selected_skills"][0]["role"], "primary")
-            self.assertEqual(mentioned["selected_skills"][1]["role"], "secondary")
-
-    def test_more_than_three_explicit_skills_are_not_partially_loaded(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir) / "skills"
-            skill_ids = ["alpha", "beta", "gamma", "delta"]
-            for skill_id in skill_ids:
-                _write_skill(root, skill_id, f"Use for {skill_id} tasks.", f"# {skill_id}")
-            runtime = SkillRuntime(root)
-
-            for result in [
-                runtime.retrieve("@alpha @beta @gamma @delta"),
-                runtime.retrieve("work", hinted_skill_ids=skill_ids),
-            ]:
-                self.assertEqual(result["selected_skills"], [])
-                self.assertEqual(result["explicit_skill_ids"], skill_ids)
-                self.assertEqual(
-                    result["omitted_explicit_skill_ids"],
-                    skill_ids[DEFAULT_MAX_SKILLS:],
-                )
-                self.assertEqual(result["decision"]["next_action"], "retryWithFewerSkills")
-
-    def test_unknown_mentions_are_reported(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir) / "skills"
-            _write_skill(root, "alpha", "Use for alpha tasks.", "# Alpha")
-            runtime = SkillRuntime(root)
-
-            missing = runtime.retrieve("@missing do work")
-            mixed = runtime.retrieve("$alpha @missing do work")
-
-            self.assertEqual(missing["unknown_skill_mentions"], ["missing"])
-            self.assertIn("unavailable", missing["decision"]["reason"].lower())
-            self.assertEqual(mixed["selected_skills"][0]["skill_id"], "alpha")
-            self.assertEqual(mixed["unknown_skill_mentions"], ["missing"])
-
-    def test_multiple_skills_share_global_instruction_budget(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir) / "skills"
-            body = "# Large\n\n" + "\n".join("X" * 200 for _ in range(220))
-            ids = ["alpha", "beta", "gamma"]
-            for skill_id in ids:
-                _write_skill(root, skill_id, f"Use for {skill_id}.", body)
-            runtime = SkillRuntime(root)
-
-            result = runtime.retrieve("work", hinted_skill_ids=ids, include_debug=True)
-            lengths = [len(item["instructions"]) for item in result["selected_skills"]]
-
-            self.assertLessEqual(sum(lengths), RETRIEVE_INSTRUCTIONS_MAX_CHARS)
-            self.assertTrue(all(length <= DEFAULT_MANIFEST_MAX_CHARS for length in lengths))
-            self.assertTrue(all(item["truncated"] for item in result["selected_skills"]))
-            self.assertLess(len(json.dumps(result, ensure_ascii=False)), 100_000)
-
-    def test_catalog_has_independent_budget(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir) / "skills"
-            for index in range(140):
-                skill_id = f"skill{index:03d}"
-                _write_skill(
-                    root,
-                    skill_id,
-                    f"Use {skill_id} for specialized work. " + "D" * 850,
-                    f"# {skill_id}",
-                )
-            runtime = SkillRuntime(root)
-            result = runtime.retrieve("discover")
-            catalog = json.dumps(
-                result["available_skills"], ensure_ascii=False, separators=(",", ":")
-            )
-
-            self.assertLessEqual(len(catalog), SKILL_CATALOG_MAX_CHARS)
-            self.assertEqual(result["available_skill_count"], 140)
-            self.assertEqual(
-                result["included_skill_count"] + result["omitted_skill_count"], 140
-            )
-            self.assertLess(result["included_skill_count"], 140)
-            self.assertTrue(result["descriptions_truncated"])
-            self.assertLess(len(json.dumps(result, ensure_ascii=False)), 100_000)
-
-            client = TestClient(create_app(root))
-            response = client.post("/v1/skills/retrieve", json={"query": "discover"})
-            self.assertEqual(response.status_code, 200)
-            self.assertLess(len(response.text), 100_000)
-
-    def test_entrypoint_hash_is_cached(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            root = Path(temp_dir) / "skills"
-            _write_skill(root, "alpha", "Use for alpha tasks.", "# Alpha")
-            runtime = SkillRuntime(root)
-            with patch(
-                "skill_temple.runtime._content_hash",
-                side_effect=AssertionError("entrypoint hash should be cached"),
-            ):
-                catalog = runtime.resolve("discover")
-                selected = runtime.retrieve("$alpha")
-            self.assertTrue(catalog["available_skills"][0]["content_hash"])
-            self.assertEqual(selected["selected_skills"][0]["skill_id"], "alpha")
-
-    def test_search_finds_relevant_reference(self) -> None:
-        runtime = load_runtime()
-        result = runtime.search(
-            "pandora-protocol-reproduction",
-            "replay_protocol_hash",
-            limit=3,
-        )
-
-        self.assertTrue(result["matches"])
-        self.assertEqual(result["engine"], "sqlite_fts5_symbol_index")
-        self.assertIn(
-            "docs/evidence-contract.md",
-            {item["path"] for item in result["matches"]},
-        )
-        self.assertEqual(result["recommended_next_action"], "readSkillContent")
-
-    def test_search_rejects_non_keyword_mode(self) -> None:
-        runtime = load_runtime()
-        with self.assertRaisesRegex(RuntimeError, "Only keyword search mode"):
-            runtime.search("pandora-protocol-reproduction", "pair", mode="hybrid")
+            loaded = runtime.load_skills(["beta", "alpha", "beta"])
+            self.assertEqual(loaded["loaded_skill_ids"], ["beta", "alpha"])
+            with self.assertRaises(SkillRuntimeError):
+                runtime.load_skills(["alpha", "beta", "gamma", "delta"])
+            with self.assertRaises(SkillNotFoundError):
+                runtime.load_skills(["alpha", "missing"])
+            with self.assertRaises(SkillRuntimeError):
+                runtime.load_skills([])
 
     def test_read_returns_continuation_and_rejects_unsafe_paths(self) -> None:
         runtime = load_runtime()
-        result = runtime.read("pandora-protocol-reproduction", "SKILL.md", max_lines=5)
-
-        self.assertTrue(result["truncated"])
-        self.assertEqual(result["next_start_line"], 6)
+        first = runtime.read("browser-action-protocol", "SKILL.md", max_lines=5)
+        self.assertTrue(first["truncated"])
+        self.assertEqual(first["next_start_line"], 6)
+        second = runtime.read(
+            "browser-action-protocol",
+            "SKILL.md",
+            start_line=first["next_start_line"],
+            max_lines=5,
+        )
+        self.assertEqual(second["start_line"], 6)
         for path in ["../README.md", "/etc/passwd", "docs/../../SKILL.md"]:
             with self.subTest(path=path):
                 with self.assertRaises(SkillPathError):
-                    runtime.read("pandora-protocol-reproduction", path)
+                    runtime.read("browser-action-protocol", path)
 
-    def test_read_does_not_lose_an_oversized_single_line(self) -> None:
+    def test_skill_content_hash_ignores_line_ending_style(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "skills"
+            skill_root = _write_skill(
+                root,
+                "demo",
+                "Use for line-ending tests.",
+                "# Demo\n\nExact content.",
+            )
+            skill_path = skill_root / "SKILL.md"
+            lf_text = skill_path.read_text(encoding="utf-8").replace("\r\n", "\n")
+            lf_hash = SkillRuntime(root).list_skills()["skills"][0]["content_hash"]
+
+            skill_path.write_bytes(lf_text.replace("\n", "\r\n").encode("utf-8"))
+            crlf_runtime = SkillRuntime(root)
+            crlf_hash = crlf_runtime.list_skills()["skills"][0]["content_hash"]
+
+            self.assertEqual(crlf_hash, lf_hash)
+            self.assertEqual(
+                crlf_runtime.read("demo", "SKILL.md")["content_hash"],
+                lf_hash,
+            )
+
+    def test_read_rejects_one_oversized_line(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir) / "skills"
             long_line = "X" * 100
@@ -369,10 +175,61 @@ class RuntimeTests(unittest.TestCase):
                 "# Demo",
                 {"docs/long.txt": long_line},
             )
-            runtime = SkillRuntime(root)
-            result = runtime.read("demo", "docs/long.txt", max_chars=10)
-            self.assertEqual(result["content"], long_line)
-            self.assertFalse(result["truncated"])
+            with self.assertRaises(SkillLineLimitError) as raised:
+                SkillRuntime(root).read("demo", "docs/long.txt", max_chars=10)
+            self.assertEqual(raised.exception.line_number, 1)
+            self.assertEqual(raised.exception.actual_chars, 100)
+            self.assertEqual(raised.exception.max_chars, 10)
+
+    def test_read_action_reports_oversized_line_details(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skills = Path(temp_dir) / "skills"
+            shutil.copytree(Path("src/skill_temple/example_skills"), skills)
+            protocol_root = skills / "browser-action-protocol"
+            (protocol_root / "docs/long.txt").write_text("X" * 32_001, encoding="utf-8")
+            skill_path = protocol_root / "SKILL.md"
+            skill_path.write_text(
+                skill_path.read_text(encoding="utf-8") + "\n- `docs/long.txt`\n",
+                encoding="utf-8",
+            )
+
+            with TestClient(create_app(skills_dir=skills)) as client:
+                response = client.post(
+                    "/v1/skills/read",
+                    json={
+                        "skill_id": "browser-action-protocol",
+                        "path": "docs/long.txt",
+                    },
+                )
+
+        self.assertEqual(response.status_code, 422, response.text)
+        error = response.json()["error"]
+        self.assertEqual(error["code"], "skill_line_exceeds_limit")
+        self.assertEqual(error["line_number"], 1)
+        self.assertEqual(error["actual_chars"], 32_001)
+        self.assertEqual(error["max_chars"], 32_000)
+
+    def test_skill_references_fail_fast_for_missing_unsafe_and_directory_paths(self) -> None:
+        cases = [
+            ("`docs/missing.md`", "Missing Skill reference"),
+            ("[unsafe](../outside.md)", "Unsafe Skill reference"),
+            ("`docs/`", "Skill reference is not a file"),
+        ]
+        for body, message in cases:
+            with self.subTest(body=body), tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir) / "skills"
+                skill_root = _write_skill(
+                    root,
+                    "demo",
+                    "Use for strict reference tests.",
+                    f"# Demo\n\n{body}",
+                )
+                (skill_root / "docs").mkdir(exist_ok=True)
+                with self.assertRaisesRegex(
+                    SkillRuntimeError,
+                    f"{message}.*skill_id='demo'.*source='SKILL.md'",
+                ):
+                    SkillRuntime(root)
 
     def test_runtime_loads_skills_from_cwd_dotenv(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -390,17 +247,32 @@ class RuntimeTests(unittest.TestCase):
             finally:
                 os.chdir(previous)
             self.assertEqual(runtime.skills_dir, root.resolve())
-            self.assertEqual(runtime.retrieve("$demo")["selected_skills"][0]["skill_id"], "demo")
+            self.assertEqual(runtime.load_skills(["demo"])["loaded_skill_ids"], ["demo"])
 
-    def test_nested_scan_depth_duplicate_and_frontmatter_limits(self) -> None:
+    def test_runtime_does_not_implicitly_use_a_repository_root_skills_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tmp = Path(temp_dir)
+            _write_skill(tmp / "skills", "shadow", "Do not auto-load.", "# Shadow")
+            previous = Path.cwd()
+            try:
+                os.chdir(tmp)
+                with patch.dict(os.environ, {"SKILL_TEMPLE_SKILLS_DIR": ""}, clear=False):
+                    runtime = load_runtime()
+            finally:
+                os.chdir(previous)
+            self.assertNotIn(
+                "shadow",
+                {item["skill_id"] for item in runtime.list_skills()["skills"]},
+            )
+
+    def test_nested_scan_duplicate_and_frontmatter_limits(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir) / "skills"
             accepted = root.joinpath(*[f"a{index}" for index in range(5)])
             rejected = root.joinpath(*[f"b{index}" for index in range(6)])
             _write_skill(accepted, "accepted", "Use for accepted tasks.", "# Accepted")
             _write_skill(rejected, "rejected", "Use for rejected tasks.", "# Rejected")
-            runtime = SkillRuntime(root)
-            ids = {item["skill_id"] for item in runtime.list_skills()["skills"]}
+            ids = {item["skill_id"] for item in SkillRuntime(root).list_skills()["skills"]}
             self.assertIn("accepted", ids)
             self.assertNotIn("rejected", ids)
 
@@ -433,7 +305,49 @@ class RuntimeTests(unittest.TestCase):
             with self.assertRaisesRegex(SkillRuntimeError, "description exceeds"):
                 SkillRuntime(root)
 
-    def test_openapi_exposes_skill_browser_and_workspace_actions(self) -> None:
+    def test_prompt_builder_is_deterministic_and_requires_placeholder(self) -> None:
+        runtime = load_runtime()
+        catalog = render_catalog(runtime)
+        self.assertEqual(catalog, render_catalog(runtime))
+        self.assertIn("browser-action-protocol", catalog)
+        self.assertNotIn("# Browser Action protocol", catalog)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            template = root / "template.md"
+            output = root / "dist" / "instructions.md"
+            template.write_text("Header\r\n{{SKILL_CATALOG}}\r\n", encoding="utf-8")
+            build_instructions(runtime=runtime, template_path=template, output_path=output)
+            rendered = output.read_bytes()
+            self.assertNotIn(b"\r", rendered)
+            self.assertIn(b"browser-action-protocol", rendered)
+            self.assertNotIn(b"{{SKILL_CATALOG}}", rendered)
+
+            template.write_text("missing", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "missing"):
+                build_instructions(runtime=runtime, template_path=template, output_path=output)
+
+    def test_prompt_builder_output_is_deterministic(self) -> None:
+        runtime = load_runtime(Path("src/skill_temple/example_skills"))
+        with tempfile.TemporaryDirectory() as temp_dir:
+            generated = Path(temp_dir) / "first.md"
+            regenerated = Path(temp_dir) / "second.md"
+            build_instructions(
+                runtime=runtime,
+                template_path=Path("GPT_ACTION_PROMPT.md"),
+                output_path=generated,
+            )
+            build_instructions(
+                runtime=runtime,
+                template_path=Path("GPT_ACTION_PROMPT.md"),
+                output_path=regenerated,
+            )
+            self.assertEqual(
+                generated.read_bytes(),
+                regenerated.read_bytes(),
+            )
+
+    def test_openapi_exposes_only_new_skill_and_stable_browser_actions(self) -> None:
         schema = create_app().openapi()
         operation_ids = {
             operation["operationId"]
@@ -443,8 +357,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(
             operation_ids,
             {
-                "retrieveSkillContext",
-                "searchSkillDocs",
+                "loadSkills",
                 "readSkillContent",
                 "inspectBrowserEvidence",
                 "runBrowserExperiment",
@@ -456,35 +369,13 @@ class RuntimeTests(unittest.TestCase):
                 "workspaceExecPwsh",
             },
         )
-        for path_item in schema["paths"].values():
-            for operation in path_item.values():
-                self.assertLessEqual(len(operation.get("description", "")), 300)
-                expected = operation["operationId"] in {
-                    "runBrowserExperiment",
-                    "workspaceWriteFile",
-                    "workspaceApplyPatch",
-                    "workspaceExecPwsh",
-                }
-                self.assertIs(operation.get("x-openai-isConsequential"), expected)
+        self.assertNotIn("/v1/skills/retrieve", schema["paths"])
+        self.assertNotIn("/v1/skills/search", schema["paths"])
+        load_schema = schema["components"]["schemas"]["LoadSkillsRequest"]
+        self.assertEqual(set(load_schema["properties"]), {"skill_ids"})
+        self.assertEqual(load_schema["properties"]["skill_ids"]["maxItems"], DEFAULT_MAX_SKILLS)
 
-        request_schema = schema["components"]["schemas"]["RetrieveSkillContextRequest"]
-        self.assertEqual(
-            set(request_schema["properties"]),
-            {"query", "hinted_skill_ids", "allow_skill_chaining"},
-        )
-        response = schema["components"]["schemas"]["RetrieveSkillContextResponse"]
-        for field in [
-            "available_skills",
-            "available_skill_count",
-            "omitted_skill_count",
-            "explicit_skill_ids",
-            "unknown_skill_mentions",
-            "omitted_explicit_skill_ids",
-            "decision",
-        ]:
-            self.assertIn(field, response["properties"])
-
-    def test_server_url_and_optional_bearer_auth(self) -> None:
+    def test_server_url_optional_bearer_and_http_endpoints(self) -> None:
         client = TestClient(create_app())
         response = client.get(
             "/openapi.json",
@@ -495,87 +386,120 @@ class RuntimeTests(unittest.TestCase):
         )
         self.assertEqual(response.json()["servers"], [{"url": "https://skills.example.com"}])
 
+        loaded = client.post(
+            "/v1/skills/load",
+            json={"skill_ids": ["browser-action-protocol"]},
+        )
+        read = client.post(
+            "/v1/skills/read",
+            json={
+                "skill_id": "browser-action-protocol",
+                "path": "docs/transport-envelope.md",
+                "max_lines": 5,
+            },
+        )
+        missing = client.post("/v1/skills/load", json={"skill_ids": ["missing"]})
+        unsafe = client.post(
+            "/v1/skills/read",
+            json={"skill_id": "browser-action-protocol", "path": "../README.md"},
+        )
+        invalid = client.post(
+            "/v1/skills/read",
+            json={"skill_id": "browser-action-protocol"},
+        )
+        hidden_catalog = client.get("/v1/skills")
+        console = client.get("/console")
+        console_load = client.post(
+            "/console/load",
+            json={"skill_ids": ["browser-action-protocol"]},
+        )
+        self.assertEqual(loaded.status_code, 200, loaded.text)
+        self.assertEqual(loaded.json()["loaded_skill_ids"], ["browser-action-protocol"])
+        self.assertEqual(read.status_code, 200, read.text)
+        self.assertEqual(missing.status_code, 404)
+        self.assertEqual(missing.json()["error"]["code"], "skill_not_found")
+        self.assertEqual(unsafe.status_code, 404)
+        self.assertEqual(unsafe.json()["error"]["code"], "unsafe_or_missing_path")
+        self.assertEqual(invalid.status_code, 422)
+        self.assertEqual(invalid.json()["error"]["code"], "invalid_skill_request")
+        self.assertIn("/path", invalid.json()["error"]["message"])
+        self.assertNotIn("detail", invalid.json())
+        self.assertEqual(hidden_catalog.status_code, 404)
+        self.assertEqual(console.status_code, 404)
+        self.assertEqual(console_load.status_code, 404)
+
+        read_responses = create_app().openapi()["paths"]["/v1/skills/read"]["post"]["responses"]
+        self.assertIn("404", read_responses)
+        self.assertIn("422", read_responses)
+
+    def test_read_allows_unreferenced_safe_skill_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            skills = Path(temp_dir) / "skills"
+            shutil.copytree(Path("src/skill_temple/example_skills"), skills)
+            extra = skills / "browser-action-protocol" / "docs" / "manual-note.md"
+            extra.write_text("# Manual note\n", encoding="utf-8")
+            with TestClient(create_app(skills_dir=skills)) as client:
+                response = client.post(
+                    "/v1/skills/read",
+                    json={
+                        "skill_id": "browser-action-protocol",
+                        "path": "docs/manual-note.md",
+                    },
+                )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIn("Manual note", response.json()["content"])
+
+    def test_optional_bearer_auth(self) -> None:
         with patch.dict(
             os.environ,
             {"SKILL_TEMPLE_BEARER_TOKEN": "secret-token"},
             clear=False,
         ):
             protected = TestClient(create_app())
-            unauthorized = protected.post("/v1/skills/retrieve", json={"query": "discover"})
+            unauthorized = protected.post(
+                "/v1/skills/load", json={"skill_ids": ["current-site-analysis"]}
+            )
             authorized = protected.post(
-                "/v1/skills/retrieve",
-                json={"query": "discover"},
+                "/v1/skills/load",
+                json={"skill_ids": ["current-site-analysis"]},
                 headers={"Authorization": "Bearer secret-token"},
             )
             schema = protected.get("/openapi.json").json()
-
         self.assertEqual(unauthorized.status_code, 401)
         self.assertEqual(authorized.status_code, 200)
         self.assertIn("BearerAuth", schema["components"]["securitySchemes"])
 
-    def test_http_endpoints_console_and_structured_errors(self) -> None:
-        client = TestClient(create_app())
-
-        discovery = client.post("/v1/skills/retrieve", json={"query": "discover"})
-        selected = client.post(
-            "/v1/skills/retrieve",
-            json={
-                "query": "task",
-                "hinted_skill_ids": ["pandora-protocol-reproduction"],
-            },
-        )
-        read = client.post(
-            "/v1/skills/read",
-            json={
-                "skill_id": "pandora-protocol-reproduction",
-                "path": "SKILL.md",
-                "max_lines": 5,
-            },
-        )
-        search = client.post(
-            "/v1/skills/search",
-            json={
-                "skill_id": "pandora-protocol-reproduction",
-                "query": "replay_protocol_hash",
-            },
-        )
-        console = client.get("/console")
-        debug = client.post(
-            "/console/retrieve",
-            json={
-                "query": "$pandora-protocol-reproduction",
-                "hinted_skill_ids": ["pandora-protocol-reproduction"],
-                "include_debug": True,
-            },
-        )
-        bad_hint = client.post(
-            "/v1/skills/retrieve",
-            json={"query": "task", "hinted_skill_ids": ["missing"]},
-        )
-        unsafe = client.post(
-            "/v1/skills/read",
-            json={
-                "skill_id": "pandora-protocol-reproduction",
-                "path": "../README.md",
-            },
-        )
-
-        self.assertEqual(discovery.status_code, 200)
-        self.assertEqual(selected.status_code, 200)
-        self.assertEqual(
-            selected.json()["selected_skills"][0]["skill_id"],
-            "pandora-protocol-reproduction",
-        )
-        self.assertEqual(read.status_code, 200)
-        self.assertEqual(search.status_code, 200)
-        self.assertIn("Skill Temple Console", console.text)
-        self.assertIn("Use $current-site-analysis to inspect the current website", console.text)
-        self.assertIn('value="current-site-analysis"', console.text)
-        self.assertIn("debug", debug.json())
-        self.assertEqual(bad_hint.status_code, 404)
-        self.assertEqual(bad_hint.json()["detail"]["error"]["code"], "skill_not_found")
-        self.assertEqual(unsafe.status_code, 404)
-        self.assertEqual(unsafe.json()["detail"]["error"]["code"], "unsafe_or_missing_path")
+    def test_browser_binding_uses_the_configured_runtime_protocol_skill_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            custom_skills = Path(temp_dir) / "skills"
+            shutil.copytree(Path("src/skill_temple/example_skills"), custom_skills)
+            protocol_path = custom_skills / "browser-action-protocol" / "SKILL.md"
+            protocol_path.write_text(
+                protocol_path.read_text(encoding="utf-8")
+                + "\nCustom deployment marker.\n",
+                encoding="utf-8",
+            )
+            with TestClient(create_app(skills_dir=custom_skills)) as client:
+                loaded = client.post(
+                    "/v1/skills/load",
+                    json={"skill_ids": ["browser-action-protocol"]},
+                )
+                self.assertEqual(loaded.status_code, 200, loaded.text)
+                custom_hash = loaded.json()["skills"][0]["content_hash"]
+                response = client.post(
+                    "/v1/browser/inspect",
+                    json={
+                        "contract_version": "2.0",
+                        "operation": "list_experiments",
+                        "payload_json": "{}",
+                        "skill_id": "browser-action-protocol",
+                        "skill_content_hash": custom_hash,
+                        "operation_contract_hash": OPERATION_REGISTRY.contract_hash(
+                            "list_experiments"
+                        ),
+                    },
+                )
+            self.assertEqual(response.status_code, 200, response.text)
 
     def test_eval_file_passes(self) -> None:
         report = evaluate_file(Path("evals/skill_queries.jsonl"))

@@ -26,6 +26,7 @@ from .browser.operations.inspection import BrowserInspectionOperations
 from .browser.operations.replay import BrowserReplayOperations
 from .browser.operations.replay_analysis import BrowserReplayAnalysisOperations
 from .browser.operations.session import BrowserSessionOperations
+from .browser.session_states import MAY_HOLD_ATTACHMENT
 from .browser_models import (
     BrowserActionResponse,
     RunBrowserExperimentRequest,
@@ -110,7 +111,7 @@ class BrowserActionService(
             await self._release_browser_operation(owner.owner_id)
         for session_id, session in list(self.sessions.items()):
             if (
-                session.get("status") != "open"
+                session.get("status") not in MAY_HOLD_ATTACHMENT
                 or session.get("service_instance_id") != self.service_instance_id
             ):
                 continue
@@ -119,12 +120,15 @@ class BrowserActionService(
                 async with self._locked_browser_session(session_id, deadline):
                     await self.playwright.close_session(session_id, deadline)
                     session["status"] = "closed"
+                    session["close_outcome"] = "confirmed"
                     session["close_reason"] = "service_shutdown"
                     session["updated_at"] = utc_now()
                     self.experiments.save_session(session)
             except Exception:
+                session["previous_status"] = session.get("status")
                 session["status"] = "stale"
                 session["stale_reason"] = "shutdown_detach_failed"
+                session["close_outcome"] = "unknown"
                 session["updated_at"] = utc_now()
                 self.experiments.save_session(session)
         await self.js_reverse.close()

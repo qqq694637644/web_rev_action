@@ -66,6 +66,177 @@ class JsReverseMcpAdapter:
             raise AdapterError(f"MCP tool is not in the private adapter allowlist: {name}")
         return await self.transport.call_tool(name, arguments, deadline)
 
+    @staticmethod
+    def _invalid_response(
+        tool: str,
+        path: str,
+        expected: str,
+        *,
+        consequential: bool = False,
+    ) -> AdapterError:
+        return AdapterError(
+            f"Invalid adapter response from {tool} at {path}: expected {expected}",
+            dispatch_started=True,
+            outcome_unknown=consequential,
+            code="invalid_adapter_response",
+        )
+
+    @classmethod
+    def _require_object(
+        cls,
+        payload: dict[str, Any],
+        tool: str,
+        key: str,
+        *,
+        consequential: bool = False,
+    ) -> dict[str, Any]:
+        value = payload.get(key)
+        if not isinstance(value, dict):
+            raise cls._invalid_response(
+                tool,
+                f"/{key}",
+                "object",
+                consequential=consequential,
+            )
+        return value
+
+    @classmethod
+    def _require_object_list(
+        cls,
+        payload: dict[str, Any],
+        tool: str,
+        key: str,
+    ) -> list[dict[str, Any]]:
+        value = payload.get(key)
+        if not isinstance(value, list):
+            raise cls._invalid_response(tool, f"/{key}", "array")
+        if not all(isinstance(item, dict) for item in value):
+            raise cls._invalid_response(tool, f"/{key}/*", "object")
+        return list(value)
+
+    @classmethod
+    def _require_pagination(
+        cls,
+        payload: dict[str, Any],
+        tool: str,
+        expected_page_idx: int,
+    ) -> dict[str, Any]:
+        pagination = cls._require_object(payload, tool, "pagination")
+        page_idx = pagination.get("pageIdx")
+        if (
+            not isinstance(page_idx, int)
+            or isinstance(page_idx, bool)
+            or page_idx != expected_page_idx
+        ):
+            raise cls._invalid_response(
+                tool,
+                "/pagination/pageIdx",
+                f"integer equal to requested page {expected_page_idx}",
+            )
+        if not isinstance(pagination.get("hasNextPage"), bool):
+            raise cls._invalid_response(tool, "/pagination/hasNextPage", "boolean")
+        total_pages = pagination.get("totalPages")
+        if not isinstance(total_pages, int) or isinstance(total_pages, bool) or total_pages < 1:
+            raise cls._invalid_response(tool, "/pagination/totalPages", "positive integer")
+        if page_idx >= total_pages:
+            raise cls._invalid_response(
+                tool,
+                "/pagination/pageIdx",
+                "page index smaller than totalPages",
+            )
+        expected_has_next = page_idx + 1 < total_pages
+        if pagination["hasNextPage"] != expected_has_next:
+            raise cls._invalid_response(
+                tool,
+                "/pagination/hasNextPage",
+                f"{expected_has_next!r} for pageIdx={page_idx}, totalPages={total_pages}",
+            )
+        return pagination
+
+    @classmethod
+    def _require_capture(
+        cls,
+        payload: dict[str, Any],
+        tool: str,
+        *,
+        expected_capture_id: int | None = None,
+        consequential: bool = False,
+    ) -> dict[str, Any]:
+        capture = cls._require_object(
+            payload,
+            tool,
+            "capture",
+            consequential=consequential,
+        )
+        capture_id = capture.get("captureId")
+        if not isinstance(capture_id, int) or isinstance(capture_id, bool) or capture_id < 1:
+            raise cls._invalid_response(
+                tool,
+                "/capture/captureId",
+                "positive integer",
+                consequential=consequential,
+            )
+        if expected_capture_id is not None and capture_id != expected_capture_id:
+            raise cls._invalid_response(
+                tool,
+                "/capture/captureId",
+                f"integer equal to requested capture {expected_capture_id}",
+                consequential=consequential,
+            )
+        return capture
+
+    @classmethod
+    def _require_selected_page(
+        cls,
+        payload: dict[str, Any],
+        *,
+        page_id: str | None,
+        page_idx: int | None,
+    ) -> dict[str, Any]:
+        pages = cls._require_object_list(payload, "select_page", "pages")
+        selected_pages: list[dict[str, Any]] = []
+        for index, candidate in enumerate(pages):
+            selected_value = candidate.get("selected")
+            if not isinstance(selected_value, bool):
+                raise cls._invalid_response(
+                    "select_page",
+                    f"/pages/{index}/selected",
+                    "boolean",
+                    consequential=True,
+                )
+            if selected_value:
+                selected_pages.append(candidate)
+        if len(selected_pages) != 1:
+            raise cls._invalid_response(
+                "select_page",
+                "/pages",
+                "exactly one page with selected=true",
+                consequential=True,
+            )
+        selected = selected_pages[0]
+        if page_id is not None:
+            if selected.get("pageId") != page_id:
+                raise cls._invalid_response(
+                    "select_page",
+                    "/pages/*/pageId",
+                    f"string equal to requested pageId {page_id!r}",
+                    consequential=True,
+                )
+        elif page_idx is not None:
+            selected_idx = selected.get("pageIdx")
+            if (
+                not isinstance(selected_idx, int)
+                or isinstance(selected_idx, bool)
+                or selected_idx != page_idx
+            ):
+                raise cls._invalid_response(
+                    "select_page",
+                    "/pages/*/pageIdx",
+                    f"integer equal to requested pageIdx {page_idx}",
+                    consequential=True,
+                )
+        return selected
+
     async def align_page(
         self,
         page: PageState,
@@ -73,7 +244,20 @@ class JsReverseMcpAdapter:
         page_id: str | None = None,
     ) -> AlignmentResult:
         listing = await self._call("select_page", {"pageSize": 100, "listPageIdx": 0}, deadline)
-        pages = listing.get("pages") if isinstance(listing.get("pages"), list) else []
+        pages = self._require_object_list(listing, "select_page", "pages")
+        for index, item in enumerate(pages):
+            if not isinstance(item.get("pageIdx"), int) or isinstance(item.get("pageIdx"), bool):
+                raise self._invalid_response(
+                    "select_page", f"/pages/{index}/pageIdx", "integer"
+                )
+            if not isinstance(item.get("url"), str):
+                raise self._invalid_response(
+                    "select_page", f"/pages/{index}/url", "string"
+                )
+            if item.get("pageId") is not None and not isinstance(item.get("pageId"), str):
+                raise self._invalid_response(
+                    "select_page", f"/pages/{index}/pageId", "string or null"
+                )
         if page_id:
             stable = [item for item in pages if str(item.get("pageId", "")) == page_id]
             if not stable:
@@ -90,7 +274,10 @@ class JsReverseMcpAdapter:
                     js_reverse_page_id=page_id,
                     warnings=["The saved pageId now points to a different URL."],
                 )
-            await self._call("select_page", {"pageId": page_id, "pageSize": 100}, deadline)
+            selection = await self._call(
+                "select_page", {"pageId": page_id, "pageSize": 100}, deadline
+            )
+            self._require_selected_page(selection, page_id=page_id, page_idx=None)
             return AlignmentResult(
                 status="aligned",
                 playwright_page=page,
@@ -127,7 +314,12 @@ class JsReverseMcpAdapter:
         selector["pageId" if selected_page_id else "pageIdx"] = (
             selected_page_id if selected_page_id else page_index
         )
-        await self._call("select_page", selector, deadline)
+        selection = await self._call("select_page", selector, deadline)
+        self._require_selected_page(
+            selection,
+            page_id=selected_page_id,
+            page_idx=(None if selected_page_id else page_index),
+        )
         return AlignmentResult(
             status="aligned",
             playwright_page=page,
@@ -159,7 +351,13 @@ class JsReverseMcpAdapter:
             arguments["resourceTypes"] = matcher.resource_types
         if matcher.mime_types:
             arguments["mimeTypes"] = matcher.mime_types
-        return await self._call("start_stream_capture", arguments, deadline)
+        payload = await self._call("start_stream_capture", arguments, deadline)
+        self._require_capture(
+            payload,
+            "start_stream_capture",
+            consequential=True,
+        )
+        return payload
 
     async def get_stream_status(
         self,
@@ -207,9 +405,19 @@ class JsReverseMcpAdapter:
                 arguments_for(0),
                 deadline,
             )
+            self._require_capture(
+                payload,
+                "get_stream_status",
+                expected_capture_id=capture_id,
+            )
             request = payload.get("request")
+            if request is not None and not isinstance(request, dict):
+                raise self._invalid_response(
+                    "get_stream_status", "/request", "object or null"
+                )
             if isinstance(request, dict) and not isinstance(payload.get("requests"), list):
                 payload = {**payload, "requests": [request]}
+            self._require_object_list(payload, "get_stream_status", "requests")
             return payload
 
         page_idx = 0
@@ -221,21 +429,29 @@ class JsReverseMcpAdapter:
                 arguments_for(page_idx),
                 deadline,
             )
+            self._require_capture(
+                page,
+                "get_stream_status",
+                expected_capture_id=capture_id,
+            )
             if not combined:
                 combined = {
                     key: value
                     for key, value in page.items()
                     if key not in {"requests", "pagination"}
                 }
-            page_requests = page.get("requests")
-            if isinstance(page_requests, list):
-                requests.extend(item for item in page_requests if isinstance(item, dict))
-            pagination = page.get("pagination") if isinstance(page.get("pagination"), dict) else {}
+            page_requests = self._require_object_list(
+                page, "get_stream_status", "requests"
+            )
+            requests.extend(page_requests)
+            pagination = self._require_pagination(
+                page,
+                "get_stream_status",
+                page_idx,
+            )
             if not pagination.get("hasNextPage"):
                 break
             page_idx += 1
-            if page_idx >= int(pagination.get("totalPages", page_idx + 1)):
-                break
         combined["requests"] = requests
         combined["pagination"] = {
             "pageIdx": 0,
@@ -277,15 +493,18 @@ class JsReverseMcpAdapter:
                     for key, value in page.items()
                     if key not in {"requests", "pagination"}
                 }
-            page_requests = page.get("requests")
-            if isinstance(page_requests, list):
-                requests.extend(item for item in page_requests if isinstance(item, dict))
-            pagination = page.get("pagination") if isinstance(page.get("pagination"), dict) else {}
+            page_requests = self._require_object_list(
+                page, "list_network_requests", "requests"
+            )
+            requests.extend(page_requests)
+            pagination = self._require_pagination(
+                page,
+                "list_network_requests",
+                page_idx,
+            )
             if not pagination.get("hasNextPage"):
                 break
             page_idx += 1
-            if page_idx >= int(pagination.get("totalPages", page_idx + 1)):
-                break
         combined["requests"] = requests
         combined["pagination"] = {
             "pageIdx": 0,
@@ -304,7 +523,7 @@ class JsReverseMcpAdapter:
         output_part: NetworkExportPart,
         deadline: DeadlineLike,
     ) -> dict[str, Any]:
-        return await self._call(
+        payload = await self._call(
             "list_network_requests",
             {
                 "reqid": reqid,
@@ -314,13 +533,44 @@ class JsReverseMcpAdapter:
             },
             deadline,
         )
+        exported = self._require_object(payload, "list_network_requests", "export")
+        if not isinstance(exported.get("filename"), str):
+            raise self._invalid_response(
+                "list_network_requests", "/export/filename", "string"
+            )
+        byte_length = exported.get("byteLength")
+        if (
+            not isinstance(byte_length, int)
+            or isinstance(byte_length, bool)
+            or byte_length < 0
+        ):
+            raise self._invalid_response(
+                "list_network_requests",
+                "/export/byteLength",
+                "non-negative integer",
+            )
+        return payload
 
     async def get_request_initiator(self, reqid: int, deadline: DeadlineLike) -> dict[str, Any]:
-        return await self._call(
+        payload = await self._call(
             "get_request_initiator",
             {"requestId": reqid},
             deadline,
         )
+        if payload.get("requestId") != reqid:
+            raise self._invalid_response(
+                "get_request_initiator",
+                "/requestId",
+                f"integer equal to requested request {reqid}",
+            )
+        initiator = payload.get("initiator")
+        if initiator is not None and not isinstance(initiator, dict):
+            raise self._invalid_response(
+                "get_request_initiator",
+                "/initiator",
+                "object or null",
+            )
+        return payload
 
     async def search_scripts(
         self,
@@ -338,7 +588,18 @@ class JsReverseMcpAdapter:
         }
         if url_filter:
             arguments["urlFilter"] = url_filter
-        return await self._call("search_in_sources", arguments, deadline)
+        payload = await self._call("search_in_sources", arguments, deadline)
+        self._require_object_list(payload, "search_in_sources", "matches")
+        total_matches = payload.get("totalMatches")
+        if (
+            not isinstance(total_matches, int)
+            or isinstance(total_matches, bool)
+            or total_matches < 0
+        ):
+            raise self._invalid_response(
+                "search_in_sources", "/totalMatches", "non-negative integer"
+            )
+        return payload
 
     async def get_script_source(
         self,
@@ -364,7 +625,36 @@ class JsReverseMcpAdapter:
             arguments["offset"] = offset
         if length is not None:
             arguments["length"] = length
-        return await self._call("get_script_source", arguments, deadline)
+        payload = await self._call("get_script_source", arguments, deadline)
+        source_type = payload.get("sourceType")
+        if source_type == "wasm":
+            byte_length = payload.get("byteLength")
+            if (
+                not isinstance(byte_length, int)
+                or isinstance(byte_length, bool)
+                or byte_length < 0
+            ):
+                raise self._invalid_response(
+                    "get_script_source",
+                    "/byteLength",
+                    "non-negative integer for sourceType=wasm",
+                )
+            if not isinstance(payload.get("scriptId"), str):
+                raise self._invalid_response(
+                    "get_script_source",
+                    "/scriptId",
+                    "string for sourceType=wasm",
+                )
+            return payload
+        if source_type != "javascript":
+            raise self._invalid_response(
+                "get_script_source",
+                "/sourceType",
+                "javascript or wasm",
+            )
+        if not isinstance(payload.get("source"), str):
+            raise self._invalid_response("get_script_source", "/source", "string")
+        return payload
 
     async def list_console_messages(
         self,
@@ -391,15 +681,18 @@ class JsReverseMcpAdapter:
                     for key, value in page.items()
                     if key not in {"messages", "pagination"}
                 }
-            page_messages = page.get("messages")
-            if isinstance(page_messages, list):
-                messages.extend(item for item in page_messages if isinstance(item, dict))
-            pagination = page.get("pagination") if isinstance(page.get("pagination"), dict) else {}
+            page_messages = self._require_object_list(
+                page, "list_console_messages", "messages"
+            )
+            messages.extend(page_messages)
+            pagination = self._require_pagination(
+                page,
+                "list_console_messages",
+                page_idx,
+            )
             if not pagination.get("hasNextPage"):
                 break
             page_idx += 1
-            if page_idx >= int(pagination.get("totalPages", page_idx + 1)):
-                break
         combined["messages"] = messages
         combined["pagination"] = {
             "pageIdx": 0,
@@ -426,15 +719,16 @@ class JsReverseMcpAdapter:
                 },
                 deadline,
             )
-            values = page.get("cookieFlow")
-            if isinstance(values, list):
-                entries.extend(item for item in values if isinstance(item, dict))
-            pagination = page.get("pagination") if isinstance(page.get("pagination"), dict) else {}
+            values = self._require_object_list(page, "list_network_requests", "cookieFlow")
+            entries.extend(values)
+            pagination = self._require_pagination(
+                page,
+                "list_network_requests",
+                page_idx,
+            )
             if not pagination.get("hasNextPage"):
                 break
             page_idx += 1
-            if page_idx >= int(pagination.get("totalPages", page_idx + 1)):
-                break
         return {"cookieName": cookie_name, "cookieFlow": entries}
 
     async def evaluate_browser_replay(
@@ -444,7 +738,7 @@ class JsReverseMcpAdapter:
         deadline: DeadlineLike,
     ) -> dict[str, Any]:
         function = load_replay_runtime()
-        return await self._call(
+        payload = await self._call(
             "evaluate_script",
             {
                 "confirm": True,
@@ -456,6 +750,26 @@ class JsReverseMcpAdapter:
             },
             deadline,
         )
+        if not isinstance(payload.get("filename"), str):
+            raise self._invalid_response(
+                "evaluate_script",
+                "/filename",
+                "string",
+                consequential=True,
+            )
+        byte_length = payload.get("byteLength")
+        if (
+            not isinstance(byte_length, int)
+            or isinstance(byte_length, bool)
+            or byte_length < 0
+        ):
+            raise self._invalid_response(
+                "evaluate_script",
+                "/byteLength",
+                "non-negative integer",
+                consequential=True,
+            )
+        return payload
 
     @classmethod
     def _event_match_belongs_to_request(
@@ -696,11 +1010,18 @@ class JsReverseMcpAdapter:
 
     async def stop_stream_capture(self, capture_id: int, deadline: DeadlineLike) -> dict[str, Any]:
         remaining_ms = max(100, min(34_000, int(deadline.remaining_seconds() * 1000)))
-        return await self._call(
+        payload = await self._call(
             "stop_stream_capture",
             {"captureId": capture_id, "finalizeTimeoutMs": remaining_ms},
             deadline,
         )
+        self._require_capture(
+            payload,
+            "stop_stream_capture",
+            expected_capture_id=capture_id,
+            consequential=True,
+        )
+        return payload
 
     async def close(self) -> None:
         await self.transport.close()

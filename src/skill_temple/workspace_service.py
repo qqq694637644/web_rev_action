@@ -167,14 +167,29 @@ class AnalysisWorkspaceService:
         finally:
             await self.coordinator.release_workspace(owner_id)
 
+    def _read_experiment_manifest(self, manifest: Path) -> dict[str, Any]:
+        relative = manifest.relative_to(self.root).as_posix()
+        try:
+            value = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise WorkspaceToolError(
+                "manifest_invalid",
+                f"Invalid experiment manifest {relative}: {type(exc).__name__}: {exc}",
+                500,
+            ) from exc
+        if not isinstance(value, dict):
+            raise WorkspaceToolError(
+                "manifest_invalid",
+                f"Invalid experiment manifest {relative}: TypeError: expected JSON object",
+                500,
+            )
+        return value
+
     def _experiment_status(self, experiment_id: str) -> str | None:
         manifest = self.root / "experiments" / experiment_id / "manifest.json"
         if not manifest.is_file():
             return None
-        try:
-            value = json.loads(manifest.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return None
+        value = self._read_experiment_manifest(manifest)
         return str(value.get("status")) if value.get("status") else None
 
     def _assert_writable_path(self, path: str) -> None:
@@ -221,8 +236,11 @@ class AnalysisWorkspaceService:
     def _has_running_experiment(self) -> bool:
         for manifest in (self.root / "experiments").glob("*/manifest.json"):
             try:
-                value = json.loads(manifest.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
+                value = self._read_experiment_manifest(manifest)
+            except WorkspaceToolError as exc:
+                if exc.code != "manifest_invalid":
+                    raise
+                # Browser list_experiments exposes this file in manifest_errors.
                 continue
             if value.get("status") == "running":
                 return True

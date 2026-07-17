@@ -333,6 +333,7 @@ class FakeJsReverse:
                     "url": "https://example.test/telemetry",
                     "method": "POST",
                     "resourceType": "fetch",
+                    "mimeType": "text/plain",
                     "status": "failed",
                     "integrityStatus": "failed",
                 }
@@ -393,6 +394,7 @@ class FakeJsReverse:
                     "url": "https://example.test/api/resource",
                     "method": "POST",
                     "resourceType": "fetch",
+                    "mimeType": self.network_response_content_type,
                     "status": "[success - 200]",
                     "pending": False,
                 }
@@ -415,11 +417,13 @@ class FakeJsReverse:
                     "url": "https://example.test/api/setup-resource",
                     "method": "POST",
                     "resourceType": "fetch",
+                    "mimeType": "application/json",
                     "status": "[success - 200]",
                     "pending": False,
                 }
             )
         for reqid in sorted(self.replay_specs):
+            replay_spec = self.replay_specs[reqid]
             requests.append(
                 {
                     "reqid": reqid,
@@ -427,9 +431,13 @@ class FakeJsReverse:
                     "cdpRequestId": f"cdp-{reqid}",
                     "persistentRequestId": f"persistent-{reqid}",
                     "collectorGeneration": 1,
-                    "url": "https://example.test/api/resource",
+                    "url": str(
+                        replay_spec.get("url")
+                        or "https://example.test/api/resource"
+                    ),
                     "method": "POST",
                     "resourceType": "fetch",
+                    "mimeType": self.network_response_content_type,
                     "status": "[success - 200]",
                     "pending": False,
                 }
@@ -540,7 +548,14 @@ class FakeJsReverse:
             output_file.write_bytes(snapshot[key]["text"].encode("utf-8"))
         else:
             output_file.write_text(json.dumps(snapshot), encoding="utf-8")
-        return {"filename": output_file.as_posix(), "byteLength": output_file.stat().st_size}
+        return {
+            "reqid": reqid,
+            "export": {
+                "outputPart": output_part,
+                "filename": output_file.as_posix(),
+                "byteLength": output_file.stat().st_size,
+            },
+        }
 
     async def get_request_initiator(self, reqid: int, deadline: Deadline) -> dict[str, Any]:
         return {
@@ -578,7 +593,13 @@ class FakeJsReverse:
         deadline: Deadline,
         **kwargs: Any,
     ) -> dict[str, Any]:
-        return {"source": "function buildResourceRequest(payload) { return payload; }"}
+        return {
+            "scriptId": "script-1",
+            "sourceType": "javascript",
+            "totalChars": 58,
+            "source": "function buildResourceRequest(payload) { return payload; }",
+            "truncated": False,
+        }
 
     async def list_console_messages(
         self,
@@ -590,20 +611,19 @@ class FakeJsReverse:
         self.console_calls += 1
         messages = [
             {
-                "msgid": 1,
+                "consoleMessageStableId": 1,
                 "type": "warn",
-                "text": "old warning",
-                "url": "https://example.test/app.js",
+                "message": "old warning",
+                "argCount": 1,
             }
         ]
         if self.console_calls > 1:
             messages.append(
                 {
-                    "msgid": 2,
+                    "consoleMessageStableId": 2,
                     "type": "error",
-                    "text": "new error",
-                    "url": "https://example.test/app.js",
-                    "lineNumber": 20,
+                    "message": "new error",
+                    "argCount": 1,
                 }
             )
         return {"messages": messages, "pagination": {"hasNextPage": False}}

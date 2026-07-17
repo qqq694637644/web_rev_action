@@ -16,8 +16,14 @@ def test_gpt56_action_prompt_stays_lean() -> None:
 def test_gpt56_action_prompt_routes_details_to_skills() -> None:
     content = PROMPT_PATH.read_text(encoding="utf-8")
 
-    assert "current-site-analysis" in content
-    assert "pandora-protocol-reproduction" in content
+    assert "{{SKILL_CATALOG}}" in content
+    assert "loadSkills" in content
+    assert "readSkillContent" in content
+    assert "browser-action-protocol" in content
+    assert "workspaceSearch" in content
+    assert "workspaceListArtifacts" not in content
+    assert "retrieve" + "SkillContext" not in content
+    assert "search" + "SkillDocs" not in content
 
     detailed_workflow_terms = {
         "requested_replay_protocol",

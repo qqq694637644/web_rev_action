@@ -40,6 +40,7 @@ class StdioMcpToolTransport:
             "pause_or_resume",
             "start_stream_capture",
             "stop_stream_capture",
+            "evaluate_script",
         }
     )
 
@@ -185,13 +186,29 @@ class StdioMcpToolTransport:
                         delivered: BaseException = exc
                         if transport_failure:
                             delivered = McpTransportError(
-                                f"MCP transport failed during {call.name}: {exc}"
+                                f"MCP transport failed during {call.name}: {exc}",
+                                dispatch_started=call.sent,
+                                outcome_unknown=(
+                                    call.sent and call.name in self.SIDE_EFFECTING_TOOLS
+                                ),
                             )
+                            delivered.transport_generation = generation
+                        elif isinstance(exc, AdapterError):
+                            delivered = exc
+                            delivered.dispatch_started = call.sent
+                            delivered.transport_generation = generation
                         elif call.name in self.SIDE_EFFECTING_TOOLS:
                             delivered = McpToolCallError(
                                 f"MCP tool failed after dispatch: {call.name}: {exc}",
-                                outcome_unknown=call.sent,
+                                outcome_unknown=False,
+                                dispatch_started=call.sent,
                                 transport_generation=generation,
+                            )
+                        else:
+                            delivered = AdapterError(
+                                f"MCP tool failed after dispatch: {call.name}: {exc}",
+                                dispatch_started=call.sent,
+                                outcome_unknown=False,
                             )
                         if not call.future.done():
                             call.future.set_exception(delivered)
@@ -221,18 +238,45 @@ class StdioMcpToolTransport:
 
     @staticmethod
     def _normalize_result(name: str, result: Any) -> dict[str, Any]:
-        if getattr(result, "isError", False) or getattr(result, "is_error", False):
-            raise AdapterError(f"MCP tool failed: {name}")
         structured = getattr(result, "structuredContent", None)
         if structured is None:
             structured = getattr(result, "structured_content", None)
         if isinstance(structured, dict):
             if structured.get("ok") is False:
-                error = structured.get("error") or {}
-                raise AdapterError(str(error.get("message") or f"MCP tool failed: {name}"))
+                error = structured.get("error")
+                remote_code = None
+                retryable = None
+                message = f"MCP tool failed: {name}"
+                if isinstance(error, dict):
+                    raw_code = error.get("code")
+                    raw_message = error.get("message")
+                    raw_retryable = error.get("retryable")
+                    if isinstance(raw_code, str):
+                        remote_code = raw_code[:128]
+                    if isinstance(raw_message, str):
+                        message = raw_message[:2000]
+                    if isinstance(raw_retryable, bool):
+                        retryable = raw_retryable
+                raise AdapterError(
+                    f"MCP tool {name} failed"
+                    + (f" [{remote_code}]" if remote_code else "")
+                    + f": {message}",
+                    dispatch_started=True,
+                    outcome_unknown=False,
+                    remote_code=remote_code,
+                    retryable=retryable,
+                )
             data = structured.get("data")
             return data if isinstance(data, dict) else structured
+        if getattr(result, "isError", False) or getattr(result, "is_error", False):
+            raise AdapterError(
+                f"MCP tool failed without structured error details: {name}",
+                dispatch_started=True,
+                outcome_unknown=False,
+            )
+        content_types: list[str] = []
         for block in getattr(result, "content", []):
+            content_types.append(type(block).__name__)
             text = getattr(block, "text", None)
             if not isinstance(text, str):
                 continue
@@ -241,8 +285,15 @@ class StdioMcpToolTransport:
             except json.JSONDecodeError:
                 continue
             if isinstance(parsed, dict):
-                return parsed.get("data", parsed)
-        return {}
+                data = parsed.get("data")
+                return data if isinstance(data, dict) else parsed
+        summary = ",".join(content_types[:10]) or "none"
+        raise AdapterError(
+            f"MCP tool {name} returned no structured JSON object; "
+            f"content_types={summary}",
+            dispatch_started=True,
+            outcome_unknown=False,
+        )
 
     async def call_tool(
         self, name: str, arguments: dict[str, Any], deadline: DeadlineLike
@@ -275,12 +326,14 @@ class StdioMcpToolTransport:
                 await self._abort_worker()
             raise McpToolCallError(
                 f"MCP tool timed out: {name}",
-                outcome_unknown=call.sent,
+                outcome_unknown=(call.sent and name in self.SIDE_EFFECTING_TOOLS),
+                dispatch_started=call.sent,
                 transport_generation=call.generation,
             ) from exc
         except asyncio.CancelledError as exc:
             future.cancel()
             exc.mcp_outcome_unknown = call.sent
+            exc.adapter_dispatch_started = call.sent
             exc.mcp_transport_generation = call.generation
             if name in self.SIDE_EFFECTING_TOOLS:
                 cleanup = asyncio.create_task(self._abort_worker())
@@ -292,9 +345,15 @@ class StdioMcpToolTransport:
         except BaseException as exc:
             if self._is_transport_failure(exc):
                 await self._abort_worker()
-                raise AdapterError(
-                    f"MCP transport failed and was restarted: {name}: {exc}"
-                ) from exc
+                if isinstance(exc, AdapterError):
+                    raise
+                error = McpTransportError(
+                    f"MCP transport failed and was restarted: {name}: {exc}",
+                    dispatch_started=call.sent,
+                    outcome_unknown=(call.sent and name in self.SIDE_EFFECTING_TOOLS),
+                )
+                error.transport_generation = call.generation
+                raise error from exc
             raise
 
     async def _abort_worker(self) -> None:

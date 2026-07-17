@@ -8,6 +8,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
@@ -17,6 +18,7 @@ from skill_temple.app import create_app
 from skill_temple.browser.adapters.command import SubprocessCommandRunner
 from skill_temple.browser.adapters.contracts import (
     AdapterError,
+    CommandResult,
     StreamCheckpoint,
     StreamRequestCheckpoint,
     StreamWaitResult,
@@ -27,6 +29,7 @@ from skill_temple.browser.adapters.playwright import (
     PlaywrightCliAdapter,
     build_playwright_attach_args,
 )
+from skill_temple.browser.core import service_error_from_adapter
 from skill_temple.browser_models import (
     ExactDataPredicate,
     Locator,
@@ -44,6 +47,77 @@ from tests.fakes.browser import FakeJsReverse, FakePlaywright
 
 
 class TransportsBrowserTests(BrowserActionTestCase):
+    def test_playwright_raw_page_output_does_not_fallback_to_cli_text(self) -> None:
+        class TextOnlyRunner:
+            async def run(
+                self,
+                argv: list[str],
+                *,
+                deadline: Deadline,
+                cwd: Path | None = None,
+                allow_failure: bool = False,
+            ) -> CommandResult:
+                return CommandResult(
+                    argv=argv,
+                    returncode=0,
+                    stdout="- Page URL: https://example.test\n- Page Title: Example\n",
+                    stderr="",
+                )
+
+        adapter = PlaywrightCliAdapter(runner=TextOnlyRunner())
+        with self.assertRaises(AdapterError) as raised:
+            asyncio.run(adapter.current_page("strict-output", Deadline(1_000)))
+        self.assertIn("not valid JSON", str(raised.exception))
+        self.assertTrue(raised.exception.dispatch_started)
+        self.assertFalse(raised.exception.outcome_unknown)
+
+    def test_mcp_result_without_json_object_fails_instead_of_returning_empty_object(self) -> None:
+        class TextBlock:
+            text = "not-json"
+
+        result = SimpleNamespace(
+            isError=False,
+            structuredContent=None,
+            content=[TextBlock()],
+        )
+
+        with self.assertRaises(AdapterError) as raised:
+            StdioMcpToolTransport._normalize_result("search_scripts", result)
+        self.assertIn("search_scripts", str(raised.exception))
+        self.assertIn("TextBlock", str(raised.exception))
+        self.assertTrue(raised.exception.dispatch_started)
+        self.assertFalse(raised.exception.outcome_unknown)
+
+    def test_mcp_structured_error_preserves_fork_code_message_and_retryability(self) -> None:
+        result = SimpleNamespace(
+            isError=True,
+            structuredContent={
+                "ok": False,
+                "tool": "get_request_initiator",
+                "summary": "Request was not retained",
+                "error": {
+                    "code": "NOT_FOUND",
+                    "message": "Request 12 was not found in the retained queue.",
+                    "retryable": False,
+                },
+            },
+            content=[],
+        )
+
+        with self.assertRaises(AdapterError) as raised:
+            StdioMcpToolTransport._normalize_result("get_request_initiator", result)
+        self.assertIn("[NOT_FOUND]", str(raised.exception))
+        self.assertIn("Request 12", str(raised.exception))
+        self.assertEqual(raised.exception.remote_code, "NOT_FOUND")
+        self.assertFalse(raised.exception.retryable)
+        classified = service_error_from_adapter(
+            raised.exception,
+            "get request initiator",
+            consequential=False,
+        )
+        self.assertEqual(classified.adapter_error_code, "NOT_FOUND")
+        self.assertFalse(classified.retryable)
+
     def test_environment_builder_binds_mcp_to_workspace_and_same_cdp_endpoint(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             with patch.dict(
@@ -129,19 +203,20 @@ class TransportsBrowserTests(BrowserActionTestCase):
             with client:
                 response = client.post(
                     "/v1/browser/run",
-                    json={
-                        "operation": "open_session",
-                        "payload": {
+                    json=self.browser_request(
+                        "open_session",
+                        {
                             "session_id": "session_one",
                             "browser_endpoint": "http://127.0.0.1:9333",
                         },
-                    },
+                    ),
                 )
             self.assertEqual(response.status_code, 409)
             self.assertEqual(
-                response.json()["detail"]["error"]["code"],
+                response.json()["error"]["code"],
                 "browser_endpoint_mismatch",
             )
+            self.assertFalse(response.json()["error"]["dispatch_started"])
 
     def test_private_js_reverse_adapter_calls_stream_primitives_with_namespace(self) -> None:
         class FakeTransport:
@@ -168,6 +243,11 @@ class TransportsBrowserTests(BrowserActionTestCase):
                                 "semanticEventCount": 0,
                             }
                         ],
+                        "pagination": {
+                            "pageIdx": 0,
+                            "hasNextPage": False,
+                            "totalPages": 1,
+                        },
                     }
                     if "eventPredicate" in arguments:
                         payload["eventMatch"] = {
@@ -414,6 +494,63 @@ class TransportsBrowserTests(BrowserActionTestCase):
             200,
         )
 
+    def test_subprocess_runner_distinguishes_before_and_after_dispatch_failures(self) -> None:
+        async def before_send() -> AdapterError:
+            runner = SubprocessCommandRunner()
+            try:
+                await runner.run(
+                    ["definitely-not-a-real-browser-command-42"],
+                    deadline=Deadline(1_000),
+                )
+            except AdapterError as exc:
+                return exc
+            raise AssertionError("missing command unexpectedly started")
+
+        async def after_send() -> AdapterError:
+            runner = SubprocessCommandRunner()
+            try:
+                await runner.run(
+                    [sys.executable, "-c", "import time; time.sleep(5)"],
+                    deadline=Deadline(100),
+                )
+            except AdapterError as exc:
+                return exc
+            raise AssertionError("timed command unexpectedly completed")
+
+        not_sent = asyncio.run(before_send())
+        sent_unknown = asyncio.run(after_send())
+        self.assertFalse(not_sent.dispatch_started)
+        self.assertFalse(not_sent.outcome_unknown)
+        self.assertTrue(sent_unknown.dispatch_started)
+        self.assertTrue(sent_unknown.outcome_unknown)
+        classified = service_error_from_adapter(
+            sent_unknown,
+            "playwright page mutation",
+            consequential=True,
+        )
+        self.assertEqual(classified.code, "operation_outcome_unknown")
+        self.assertTrue(classified.dispatch_started)
+        self.assertEqual(classified.outcome, "unknown")
+
+    def test_subprocess_runner_cancellation_records_process_creation_boundary(self) -> None:
+        async def before_creation() -> asyncio.CancelledError:
+            runner = SubprocessCommandRunner()
+            with patch(
+                "asyncio.create_subprocess_exec",
+                side_effect=asyncio.CancelledError(),
+            ):
+                try:
+                    await runner.run(
+                        [sys.executable, "-c", "print('never started')"],
+                        deadline=Deadline(1_000),
+                    )
+                except asyncio.CancelledError as exc:
+                    return exc
+            raise AssertionError("cancellation was not propagated")
+
+        error = asyncio.run(before_creation())
+        self.assertFalse(error.adapter_dispatch_started)
+
     @unittest.skipUnless(os.name == "nt", "Windows process-tree behavior")
     def test_playwright_runner_timeout_terminates_child_process_tree(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -503,8 +640,12 @@ class TransportsBrowserTests(BrowserActionTestCase):
                         break
                     await asyncio.sleep(0.02)
                 task.cancel()
-                with self.assertRaises(asyncio.CancelledError):
+                try:
                     await task
+                except asyncio.CancelledError as exc:
+                    self.assertTrue(exc.adapter_dispatch_started)
+                else:
+                    raise AssertionError("cancellation was not propagated")
 
             asyncio.run(exercise())
             child_pid = child_pid_file.read_text(encoding="utf-8").strip()
@@ -634,6 +775,9 @@ class TransportsBrowserTests(BrowserActionTestCase):
                         exc,
                         (KeyboardInterrupt, SystemExit, asyncio.CancelledError),
                     )
+                    self.assertIsInstance(exc, AdapterError)
+                    self.assertTrue(exc.dispatch_started)
+                    self.assertFalse(exc.outcome_unknown)
                 else:
                     self.fail("The first MCP process should have exited")
                 self.assertTrue(marker.is_file())
@@ -652,6 +796,103 @@ class TransportsBrowserTests(BrowserActionTestCase):
             generation, result = asyncio.run(exercise())
             self.assertGreaterEqual(generation, 2)
             self.assertEqual(result["capture"]["captureId"], 42)
+
+    def test_side_effecting_mcp_crash_reports_sent_unknown_outcome(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            server = root / "crash_side_effect_mcp_server.py"
+            server.write_text(
+                "\n".join(
+                    [
+                        "import os",
+                        "from mcp.server.fastmcp import FastMCP",
+                        "server = FastMCP('crash-side-effect-test')",
+                        "@server.tool()",
+                        "def evaluate_script(script: str) -> dict:",
+                        "    os._exit(23)",
+                        "if __name__ == '__main__':",
+                        "    server.run(transport='stdio')",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            transport = StdioMcpToolTransport(
+                command=sys.executable,
+                args=[str(server)],
+                cwd=root,
+            )
+
+            async def exercise() -> AdapterError:
+                try:
+                    await transport.call_tool(
+                        "evaluate_script",
+                        {"script": "fetch('/api/replay')"},
+                        Deadline(5_000),
+                    )
+                except AdapterError as exc:
+                    return exc
+                finally:
+                    await transport.close()
+                raise AssertionError("crashing MCP call unexpectedly completed")
+
+            error = asyncio.run(exercise())
+            self.assertTrue(error.dispatch_started)
+            self.assertTrue(error.outcome_unknown)
+            classified = service_error_from_adapter(
+                error,
+                "browser fetch replay",
+                consequential=True,
+            )
+            self.assertEqual(classified.code, "operation_outcome_unknown")
+
+    def test_side_effecting_mcp_explicit_error_is_known_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            server = root / "known_failure_mcp_server.py"
+            server.write_text(
+                "\n".join(
+                    [
+                        "from mcp.server.fastmcp import FastMCP",
+                        "server = FastMCP('known-failure-test')",
+                        "@server.tool()",
+                        "def evaluate_script(script: str) -> dict:",
+                        "    raise ValueError('script rejected')",
+                        "if __name__ == '__main__':",
+                        "    server.run(transport='stdio')",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            transport = StdioMcpToolTransport(
+                command=sys.executable,
+                args=[str(server)],
+                cwd=root,
+            )
+
+            async def exercise() -> AdapterError:
+                try:
+                    await transport.call_tool(
+                        "evaluate_script",
+                        {"script": "throw new Error('rejected')"},
+                        Deadline(5_000),
+                    )
+                except AdapterError as exc:
+                    return exc
+                finally:
+                    await transport.close()
+                raise AssertionError("failing MCP call unexpectedly completed")
+
+            error = asyncio.run(exercise())
+            self.assertTrue(error.dispatch_started)
+            self.assertFalse(error.outcome_unknown)
+            classified = service_error_from_adapter(
+                error,
+                "browser fetch replay",
+                consequential=True,
+            )
+            self.assertEqual(classified.code, "browser_adapter_failed")
+            self.assertTrue(classified.dispatch_started)
+            self.assertEqual(classified.outcome, "failed")
 
     def test_playwright_locator_rendering_uses_supported_cli_locators(self) -> None:
         adapter = PlaywrightCliAdapter()

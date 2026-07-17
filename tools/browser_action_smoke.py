@@ -30,10 +30,11 @@ from skill_temple.browser_models import (
     CaptureFlowRequest,
     CloseSessionRequest,
     GetRequestShapeRequest,
+    ListConsoleErrorsRequest,
     OpenSessionRequest,
     ReplayRequestRequest,
 )
-from skill_temple.browser_service import BrowserActionService, ExperimentStore
+from skill_temple.browser_service import BrowserActionService, Deadline, ExperimentStore
 from skill_temple.workspace_models import (
     WorkspaceExecPwshRequest,
     WorkspaceInspectRequest,
@@ -116,6 +117,40 @@ def find_field(value: Any, field: str) -> Any:
 
 
 def process_matches(patterns: list[str], excluded_pid: int) -> list[str]:
+    if os.name != "nt":
+        completed = subprocess.run(
+            ["ps", "-eo", "pid=,comm=,args="],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(completed.stderr or completed.stdout)
+        lowered_patterns = [item.lower() for item in patterns if item]
+        matches: list[str] = []
+        for line in completed.stdout.splitlines():
+            fields = line.strip().split(None, 2)
+            if len(fields) != 3:
+                continue
+            pid_text, name, command_line = fields
+            try:
+                pid = int(pid_text)
+            except ValueError:
+                continue
+            lowered_command = command_line.lower()
+            if (
+                pid == excluded_pid
+                or name.lower().startswith("pwsh")
+                or "browser_action_smoke.py" in lowered_command
+            ):
+                continue
+            if any(pattern in lowered_command for pattern in lowered_patterns):
+                matches.append(f"{pid}|{name}|{command_line}")
+        return matches
+
     escaped = [item.replace("'", "''") for item in patterns]
     pattern_array = ",".join(f"'{item}'" for item in escaped)
     script = f"""
@@ -372,6 +407,116 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
         if f"sha256={expected_sha}" not in binary.stdout:
             raise AssertionError(binary.stdout)
 
+        initial_console = await service.js_reverse.list_console_messages(
+            Deadline(5_000),
+            types=["error", "warn"],
+        )
+        if initial_console.get("messages"):
+            raise AssertionError(initial_console)
+        await transport.call_tool(
+            "click_element",
+            {
+                "confirm": True,
+                "selector": "#emit-warning",
+            },
+            Deadline(10_000),
+        )
+
+        async def emit_console_error_during_capture() -> None:
+            await asyncio.sleep(3.0)
+            await transport.call_tool(
+                "click_element",
+                {
+                    "confirm": True,
+                    "selector": "#emit-error",
+                },
+                Deadline(10_000),
+            )
+
+        console_emitter = asyncio.create_task(emit_console_error_during_capture())
+        console_capture = await service.run(
+            CaptureFlowRequest(
+                operation="capture_flow",
+                payload={
+                    "session_id": SESSION_ID,
+                    "objective": "capture only console errors after the current checkpoint",
+                    "primary_request": {
+                        "expected_min_matches": 0,
+                        "expected_max_matches": 1,
+                    },
+                    "flow": [
+                        {
+                            "step_id": "wait_for_console_error_marker",
+                            "action": "wait",
+                            "condition": {
+                                "type": "selector_visible",
+                                "locator": {"css": "#console-error-emitted"},
+                                "timeout_ms": 15_000,
+                            },
+                        }
+                    ],
+                    "execution_mode": "sync",
+                    "deadline_ms": 30_000,
+                    "capture": {
+                        "network": False,
+                        "stream": False,
+                        "trace": False,
+                        "screenshots": False,
+                        "page_snapshots": False,
+                        "console_errors": True,
+                    },
+                    "requirements": {
+                        "require_raw_capture": False,
+                        "require_semantic_parse": False,
+                        "require_request_snapshot": False,
+                        "require_artifacts": True,
+                    },
+                },
+            )
+        )
+        await console_emitter
+        if console_capture.status != "completed":
+            raise AssertionError(console_capture.model_dump())
+        console_manifest = json.loads(
+            (
+                evidence_root
+                / str(console_capture.result["manifest_relative_path"])
+            ).read_text(encoding="utf-8")
+        )
+        console_evidence = [
+            item
+            for item in console_manifest.get("evidence", [])
+            if isinstance(item, dict) and item.get("kind") == "console_message"
+        ]
+        if len(console_evidence) != 1:
+            live_console = await service.js_reverse.list_console_messages(
+                Deadline(5_000),
+                include_preserved_messages=True,
+            )
+            raise AssertionError(
+                {
+                    "evidence": console_evidence,
+                    "checkpoint": console_manifest.get("console_checkpoint"),
+                    "live_console": live_console,
+                }
+            )
+        if console_evidence[0].get("summary", {}).get("message") != (
+            "fixture-console-after-checkpoint"
+        ):
+            raise AssertionError(console_evidence)
+        listed_console = await service.inspect(
+            ListConsoleErrorsRequest(
+                operation="list_console_errors",
+                payload={"experiment_id": console_capture.experiment_id},
+            )
+        )
+        listed_errors = listed_console.result.get("console_errors", [])
+        if len(listed_errors) != 1 or (
+            listed_errors[0].get("summary", {}).get("message")
+            != "fixture-console-after-checkpoint"
+        ):
+            raise AssertionError(listed_console.model_dump())
+
         stateful_capture = await service.run(
             CaptureFlowRequest(
                 operation="capture_flow",
@@ -620,13 +765,25 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
                     },
                 )
             )
-            if replay.status != "completed":
-                raise AssertionError(replay.model_dump())
             replay_manifest = json.loads(
                 (
                     evidence_root / "experiments" / str(replay.experiment_id) / "manifest.json"
                 ).read_text(encoding="utf-8")
             )
+            if replay.status not in {"completed", "partial"}:
+                raise AssertionError(replay.model_dump())
+            execution = replay_manifest.get("execution")
+            if not isinstance(execution, dict) or execution.get("status") != "complete":
+                raise AssertionError(replay_manifest)
+            if replay.status == "partial":
+                quality = replay_manifest.get("quality_summary")
+                missing = (
+                    set(quality.get("missing_evidence", []))
+                    if isinstance(quality, dict)
+                    else set()
+                )
+                if missing - {"request_headers"}:
+                    raise AssertionError(replay_manifest)
             response_artifact = artifact_by_kind(replay_manifest, "replay_response")
             response_value = json.loads(
                 (evidence_root / relative_path(response_artifact)).read_text(encoding="utf-8")
@@ -759,8 +916,6 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
                 },
             )
         )
-        if duplicate_replay.status != "completed":
-            raise AssertionError(duplicate_replay.model_dump())
         duplicate_manifest = json.loads(
             (
                 evidence_root
@@ -769,6 +924,23 @@ async def run_smoke(repo_root: Path, js_reverse_entry: Path) -> dict[str, Any]:
                 / "manifest.json"
             ).read_text(encoding="utf-8")
         )
+        if duplicate_replay.status not in {"completed", "partial"}:
+            raise AssertionError(duplicate_replay.model_dump())
+        duplicate_execution = duplicate_manifest.get("execution")
+        if (
+            not isinstance(duplicate_execution, dict)
+            or duplicate_execution.get("status") != "complete"
+        ):
+            raise AssertionError(duplicate_manifest)
+        if duplicate_replay.status == "partial":
+            duplicate_quality = duplicate_manifest.get("quality_summary")
+            duplicate_missing = (
+                set(duplicate_quality.get("missing_evidence", []))
+                if isinstance(duplicate_quality, dict)
+                else set()
+            )
+            if duplicate_missing - {"request_headers"}:
+                raise AssertionError(duplicate_manifest)
         if duplicate_manifest.get("replay_http_status") != 409:
             raise AssertionError(duplicate_manifest)
         duplicate_analysis = replay_response_analysis(duplicate_manifest)

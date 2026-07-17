@@ -1,0 +1,126 @@
+{
+  "format": "browser-operation-registry-v2",
+  "operations": [
+    {
+      "action": "run",
+      "consequential": true,
+      "contract_doc_path": "docs/run/cancel-experiment.md",
+      "operation": "cancel_experiment",
+      "operation_contract_hash": "sha256:543ebcf7a9fa084976d4dddfd305a6d6b7cf4d7ea911edb71fe478452eb1f86c"
+    },
+    {
+      "action": "run",
+      "consequential": true,
+      "contract_doc_path": "docs/run/capture-flow.md",
+      "operation": "capture_flow",
+      "operation_contract_hash": "sha256:aeebdec176e744912811b9ccddf74643c07af5a0c430dcc4fb6e655228cd0d0b"
+    },
+    {
+      "action": "run",
+      "consequential": true,
+      "contract_doc_path": "docs/run/close-session.md",
+      "operation": "close_session",
+      "operation_contract_hash": "sha256:2a89746555a4222c4d3c8c703645de9add82c3582f2bf95b75cf71cd86795983"
+    },
+    {
+      "action": "inspect",
+      "consequential": false,
+      "contract_doc_path": "docs/inspect/get-experiment.md",
+      "operation": "get_experiment",
+      "operation_contract_hash": "sha256:21eea9b220bf312f26fc0d04b91696db3c670c9766397d1768e3b95859e43cd3"
+    },
+    {
+      "action": "inspect",
+      "consequential": false,
+      "contract_doc_path": "docs/inspect/get-network-evidence.md",
+      "operation": "get_network_evidence",
+      "operation_contract_hash": "sha256:c36fae4a178b20cbe8576ce6269877fc0cb41be81645e4d031f9d086fb8a10ce"
+    },
+    {
+      "action": "inspect",
+      "consequential": false,
+      "contract_doc_path": "docs/inspect/get-request-initiator.md",
+      "operation": "get_request_initiator",
+      "operation_contract_hash": "sha256:840368a8b4e8bfc424e6ff6ba7fdf099741a3a4ae727d23a65a30c8885b60699"
+    },
+    {
+      "action": "inspect",
+      "consequential": false,
+      "contract_doc_path": "docs/inspect/get-request-shape.md",
+      "operation": "get_request_shape",
+      "operation_contract_hash": "sha256:e6ce42c0b0d3be8ce4910547a11b7a137153bb17b4ff38c99bbfc0cdeddaa2c2"
+    },
+    {
+      "action": "inspect",
+      "consequential": false,
+      "contract_doc_path": "docs/inspect/get-script-source.md",
+      "operation": "get_script_source",
+      "operation_contract_hash": "sha256:aab8f48653050d5584cc62659e38daa0895ac6f4a928e0761fd27e3844861b96"
+    },
+    {
+      "action": "inspect",
+      "consequential": false,
+      "contract_doc_path": "docs/inspect/get-session.md",
+      "operation": "get_session",
+      "operation_contract_hash": "sha256:050522a6e549f9ad84ae9959e5c6b1f8955fd46ef3e5b10a25e48d7633e5bd29"
+    },
+    {
+      "action": "inspect",
+      "consequential": false,
+      "contract_doc_path": "docs/inspect/get-stream-status.md",
+      "operation": "get_stream_status",
+      "operation_contract_hash": "sha256:6685b4128e1f0a2d19b2abe1a5e2afef9d48b4ff4c357bb4a328928732140278"
+    },
+    {
+      "action": "inspect",
+      "consequential": false,
+      "contract_doc_path": "docs/inspect/list-console-errors.md",
+      "operation": "list_console_errors",
+      "operation_contract_hash": "sha256:eb17de31b00a3bce940d691c4b29530ae193fc2d61bcc32273ab3dff336b7826"
+    },
+    {
+      "action": "inspect",
+      "consequential": false,
+      "contract_doc_path": "docs/inspect/list-evidence.md",
+      "operation": "list_evidence",
+      "operation_contract_hash": "sha256:562bef93cea0a9ad9502a97e1b31b6e240000834f9e4adeeaaad9a8992c4b073"
+    },
+    {
+      "action": "inspect",
+      "consequential": false,
+      "contract_doc_path": "docs/inspect/list-experiments.md",
+      "operation": "list_experiments",
+      "operation_contract_hash": "sha256:c25eb04e31f242889cf19123558bc7131f7ed1ca1056851ab4e380f547edfc05"
+    },
+    {
+      "action": "run",
+      "consequential": true,
+      "contract_doc_path": "docs/run/open-session.md",
+      "operation": "open_session",
+      "operation_contract_hash": "sha256:ffad1100a262f17bb106b9584a2d7d839a1b1d0e6b3d6e863dbe9b279639c941"
+    },
+    {
+      "action": "run",
+      "consequential": true,
+      "contract_doc_path": "docs/run/replay-request.md",
+      "operation": "replay_request",
+      "operation_contract_hash": "sha256:659a7a6590b724450d4a209514ae1c00b818ffeb43a8d7ec5ad69092d3815203"
+    },
+    {
+      "action": "run",
+      "consequential": true,
+      "contract_doc_path": "docs/run/save-script-source.md",
+      "operation": "save_script_source",
+      "operation_contract_hash": "sha256:1437910f39f4b14bceb15d9a8dcff9e7b06781f2d5e2e2b5a503183f0574ccd1"
+    },
+    {
+      "action": "inspect",
+      "consequential": false,
+      "contract_doc_path": "docs/inspect/search-scripts.md",
+      "operation": "search_scripts",
+      "operation_contract_hash": "sha256:2b7ccf6dbfa18f1f2928629dbbaadfcb222efc5feb0740e264ecdc1ee209641a"
+    }
+  ],
+  "protocol_skill_content_hash": "sha256:c946be3a448d82b76d66ab102a92b09185bf02beda384e1db695c229ab3a45ba",
+  "transport_version": "2.0"
+}

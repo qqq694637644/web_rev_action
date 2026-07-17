@@ -1,13 +1,189 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import tempfile
 from pathlib import Path
 
+from skill_temple.browser.adapters.contracts import StreamCheckpoint
+from skill_temple.browser.core import Deadline
+from skill_temple.browser.steps import StepExecutor
+from skill_temple.browser_models import ClickStep, RequestMatcher, WaitStep
 from tests.browser.common import BrowserActionTestCase
 
 
 class StepsBrowserTests(BrowserActionTestCase):
+    def test_page_wait_does_not_require_stream_checkpoint(self) -> None:
+        class Experiments:
+            @staticmethod
+            def relative_path(value: str) -> str:
+                return value
+
+        class Service:
+            experiments = Experiments()
+            playwright = object()
+
+            @staticmethod
+            def _ensure_finalize_reserve(deadline: Deadline, label: str) -> None:
+                return None
+
+            @staticmethod
+            def _operation_deadline(
+                deadline: Deadline, requested_ms: int, label: str
+            ) -> Deadline:
+                return deadline
+
+            @staticmethod
+            async def _wait_condition(**kwargs: object) -> dict[str, object]:
+                return {"condition_met": True, "visible": True}
+
+            @staticmethod
+            def _checkpoint_from_wait_result(result: dict[str, object]) -> StreamCheckpoint:
+                raise AssertionError("page wait must not parse a stream checkpoint")
+
+        initial = StreamCheckpoint(version=7)
+        results: list[object] = []
+
+        async def exercise() -> StreamCheckpoint:
+            checkpoint, _ = await StepExecutor.execute_many(
+                Service(),
+                phase="action",
+                steps=[
+                    WaitStep(
+                        step_id="page_visible",
+                        action="wait",
+                        condition={
+                            "type": "selector_visible",
+                            "locator": {"role": "button", "name": "Send"},
+                        },
+                    )
+                ],
+                session_id="session_one",
+                experiment_dir=Path("."),
+                deadline=Deadline(5_000),
+                capture_id=1,
+                request_matcher=RequestMatcher(),
+                stream_checkpoint=initial,
+                first_mutation_wall_time_ms=None,
+                step_results=results,
+                wait_observations=[],
+            )
+            return checkpoint
+
+        checkpoint = asyncio.run(exercise())
+        self.assertIs(checkpoint, initial)
+        self.assertEqual(results[0].status, "completed")
+
+    def test_mutation_cancellation_before_checkpoint_dispatch_is_not_unknown(self) -> None:
+        class Experiments:
+            @staticmethod
+            def relative_path(value: str) -> str:
+                return value
+
+        class Playwright:
+            async def execute_step(self, *args: object, **kwargs: object) -> dict[str, object]:
+                raise AssertionError("mutation must not be dispatched")
+
+        class Service:
+            experiments = Experiments()
+            playwright = Playwright()
+
+            @staticmethod
+            def _ensure_finalize_reserve(deadline: Deadline, label: str) -> None:
+                return None
+
+            @staticmethod
+            def _operation_deadline(
+                deadline: Deadline, requested_ms: int, label: str
+            ) -> Deadline:
+                return deadline
+
+            @staticmethod
+            async def _stream_checkpoint(*args: object, **kwargs: object) -> StreamCheckpoint:
+                raise asyncio.CancelledError
+
+        results: list[object] = []
+
+        async def exercise() -> None:
+            with self.assertRaises(asyncio.CancelledError):
+                await StepExecutor.execute_many(
+                    Service(),
+                    phase="action",
+                    steps=[
+                        ClickStep(
+                            step_id="click_after_checkpoint",
+                            action="click",
+                            locator={"role": "button", "name": "Send"},
+                        )
+                    ],
+                    session_id="session_one",
+                    experiment_dir=Path("."),
+                    deadline=Deadline(5_000),
+                    capture_id=1,
+                    request_matcher=RequestMatcher(),
+                    stream_checkpoint=StreamCheckpoint(),
+                    first_mutation_wall_time_ms=None,
+                    step_results=results,
+                    wait_observations=[],
+                )
+
+        asyncio.run(exercise())
+        self.assertEqual(results[0].status, "canceled")
+        self.assertIn("before confirmed dispatch", results[0].error)
+
+    def test_mutation_cancellation_after_adapter_dispatch_is_unknown(self) -> None:
+        class Experiments:
+            @staticmethod
+            def relative_path(value: str) -> str:
+                return value
+
+        class Playwright:
+            async def execute_step(self, *args: object, **kwargs: object) -> dict[str, object]:
+                error = asyncio.CancelledError()
+                error.adapter_dispatch_started = True
+                raise error
+
+        class Service:
+            experiments = Experiments()
+            playwright = Playwright()
+
+            @staticmethod
+            def _ensure_finalize_reserve(deadline: Deadline, label: str) -> None:
+                return None
+
+            @staticmethod
+            def _operation_deadline(
+                deadline: Deadline, requested_ms: int, label: str
+            ) -> Deadline:
+                return deadline
+
+        results: list[object] = []
+
+        async def exercise() -> None:
+            with self.assertRaises(asyncio.CancelledError):
+                await StepExecutor.execute_many(
+                    Service(),
+                    phase="action",
+                    steps=[
+                        ClickStep(
+                            step_id="sent_click",
+                            action="click",
+                            locator={"role": "button", "name": "Send"},
+                        )
+                    ],
+                    session_id="session_one",
+                    experiment_dir=Path("."),
+                    deadline=Deadline(5_000),
+                    capture_id=None,
+                    request_matcher=RequestMatcher(),
+                    stream_checkpoint=StreamCheckpoint(),
+                    first_mutation_wall_time_ms=None,
+                    step_results=results,
+                    wait_observations=[],
+                )
+
+        asyncio.run(exercise())
+        self.assertEqual(results[0].status, "canceled_outcome_unknown")
     def test_step_failure_does_not_pollute_empty_quality_requirements(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -16,9 +192,9 @@ class StepsBrowserTests(BrowserActionTestCase):
                 fail_step="snapshot_only",
                 include_supporting_failure=False,
             )
-            request = {
-                "operation": "capture_flow",
-                "payload": {
+            request = self.browser_request(
+                "capture_flow",
+                {
                     "session_id": "session_one",
                     "objective": "separate execution failure from evidence quality",
                     "primary_request": {
@@ -48,7 +224,7 @@ class StepsBrowserTests(BrowserActionTestCase):
                     "execution_mode": "sync",
                     "deadline_ms": 10_000,
                 },
-            }
+            )
             with client:
                 self.open_session(client)
                 response = client.post("/v1/browser/run", json=request)
@@ -82,7 +258,8 @@ class StepsBrowserTests(BrowserActionTestCase):
                 primary_status="canceled",
             )
             request = self.capture_request()
-            request["payload"]["flow"] = [
+            payload = self.request_payload(request)
+            payload["flow"] = [
                 {
                     "step_id": "wait_stream_started",
                     "action": "wait",
@@ -101,13 +278,14 @@ class StepsBrowserTests(BrowserActionTestCase):
                     "intent": "stop_generation",
                 },
             ]
-            request["payload"]["wait_for"] = {
+            payload["wait_for"] = {
                 "type": "network_canceled",
                 "request_matcher": {
                     "url_contains": "/api/resource",
                     "method": "POST",
                 },
             }
+            self.set_request_payload(request, payload)
             with client:
                 self.open_session(client)
                 response = client.post("/v1/browser/run", json=request)
@@ -138,7 +316,8 @@ class StepsBrowserTests(BrowserActionTestCase):
                 primary_status="canceled",
             )
             request = self.capture_request()
-            request["payload"]["flow"] = [
+            payload = self.request_payload(request)
+            payload["flow"] = [
                 {
                     "step_id": "stop_generation",
                     "action": "click",
@@ -146,10 +325,11 @@ class StepsBrowserTests(BrowserActionTestCase):
                     "intent": "stop_generation",
                 }
             ]
-            request["payload"]["wait_for"] = {
+            payload["wait_for"] = {
                 "type": "network_canceled",
                 "request_matcher": {"url_contains": "/api/resource"},
             }
+            self.set_request_payload(request, payload)
             with client:
                 self.open_session(client)
                 response = client.post("/v1/browser/run", json=request)

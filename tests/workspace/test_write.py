@@ -16,6 +16,33 @@ from tests.workspace.common import WorkspaceTestCase
 
 
 class WriteWorkspaceTests(WorkspaceTestCase):
+    def test_invalid_manifest_blocks_only_that_experiment(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            bad = root / "experiments" / "exp_bad" / "manifest.json"
+            bad.parent.mkdir(parents=True)
+            bad.write_text("{broken", encoding="utf-8")
+            service = AnalysisWorkspaceService(root)
+
+            with self.assertRaises(WorkspaceToolError) as raised:
+                asyncio.run(
+                    service.write_file(
+                        WorkspaceWriteFileRequest(
+                            path="experiments/exp_bad/reports/note.md",
+                            content="note\n",
+                        )
+                    )
+                )
+            self.assertEqual(raised.exception.code, "manifest_invalid")
+            self.assertIn("experiments/exp_bad/manifest.json", str(raised.exception))
+
+            result = asyncio.run(
+                service.write_file(
+                    WorkspaceWriteFileRequest(path="reports/other.md", content="ok\n")
+                )
+            )
+            self.assertTrue(result.written)
+
     def test_write_read_search_and_inspect_share_the_analysis_root(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

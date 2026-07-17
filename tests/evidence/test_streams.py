@@ -19,7 +19,6 @@ from skill_temple.browser.adapters.js_reverse import JsReverseMcpAdapter
 from skill_temple.browser_models import (
     CaptureFlowRequest,
     ExactDataPredicate,
-    OpenSessionRequest,
     RequestMatcher,
     WaitCondition,
 )
@@ -54,6 +53,7 @@ class StreamsBrowserTests(BrowserActionTestCase):
                             "semanticEventCount": 1,
                         }
                     ],
+                    "pagination": {"pageIdx": 0, "hasNextPage": False, "totalPages": 1},
                 }
 
             async def close(self) -> None:
@@ -130,6 +130,11 @@ class StreamsBrowserTests(BrowserActionTestCase):
                             "semanticEventCount": 0,
                         }
                     ],
+                    "pagination": {
+                        "pageIdx": 0,
+                        "hasNextPage": False,
+                        "totalPages": 1,
+                    },
                 }
 
             async def close(self) -> None:
@@ -385,7 +390,11 @@ class StreamsBrowserTests(BrowserActionTestCase):
                             "primaryEventSource": "raw-stream",
                         },
                     ],
-                    "pagination": {"hasNextPage": False, "totalPages": 1},
+                    "pagination": {
+                        "pageIdx": 0,
+                        "hasNextPage": False,
+                        "totalPages": 1,
+                    },
                 }
 
             async def close(self) -> None:
@@ -459,7 +468,11 @@ class StreamsBrowserTests(BrowserActionTestCase):
                 return {
                     "capture": {"captureId": 10, "version": 22},
                     "requests": [request],
-                    "pagination": {"hasNextPage": False, "totalPages": 1},
+                    "pagination": {
+                        "pageIdx": 0,
+                        "hasNextPage": False,
+                        "totalPages": 1,
+                    },
                 }
 
             async def close(self) -> None:
@@ -519,6 +532,7 @@ class StreamsBrowserTests(BrowserActionTestCase):
                 return {
                     "requests": requests,
                     "pagination": {
+                        "pageIdx": page,
                         "hasNextPage": has_next,
                         "totalPages": 2,
                     },
@@ -550,23 +564,23 @@ class StreamsBrowserTests(BrowserActionTestCase):
                 experiment_id = captured.json()["experiment_id"]
                 status = client.post(
                     "/v1/browser/inspect",
-                    json={
-                        "operation": "get_stream_status",
-                        "payload": {
+                    json=self.browser_request(
+                        "get_stream_status",
+                        {
                             "experiment_id": experiment_id,
                             "capture_uuid": "11111111-1111-4111-8111-111111111111",
                         },
-                    },
+                    ),
                 )
                 mismatch = client.post(
                     "/v1/browser/inspect",
-                    json={
-                        "operation": "get_stream_status",
-                        "payload": {
+                    json=self.browser_request(
+                        "get_stream_status",
+                        {
                             "experiment_id": experiment_id,
                             "capture_uuid": "22222222-2222-4222-8222-222222222222",
                         },
-                    },
+                    ),
                 )
             self.assertEqual(status.status_code, 200, status.text)
             self.assertEqual(status.json()["result"]["source"], "manifest")
@@ -653,21 +667,21 @@ class StreamsBrowserTests(BrowserActionTestCase):
             with client:
                 live = client.post(
                     "/v1/browser/inspect",
-                    json={
-                        "operation": "get_stream_status",
-                        "payload": {
+                    json=self.browser_request(
+                        "get_stream_status",
+                        {
                             "experiment_id": experiment_id,
                             "capture_uuid": "55555555-5555-4555-8555-555555555555",
                         },
-                    },
+                    ),
                 )
                 js.generation = 6
                 persisted = client.post(
                     "/v1/browser/inspect",
-                    json={
-                        "operation": "get_stream_status",
-                        "payload": {"experiment_id": experiment_id},
-                    },
+                    json=self.browser_request(
+                        "get_stream_status",
+                        {"experiment_id": experiment_id},
+                    ),
                 )
             self.assertEqual(live.status_code, 200, live.text)
             self.assertEqual(live.json()["result"]["source"], "live-mcp")
@@ -710,6 +724,7 @@ class StreamsBrowserTests(BrowserActionTestCase):
                 raise McpToolCallError(
                     "start outcome unknown",
                     outcome_unknown=True,
+                    dispatch_started=True,
                     transport_generation=7,
                 )
 
@@ -723,29 +738,44 @@ class StreamsBrowserTests(BrowserActionTestCase):
                 default_browser_endpoint="http://127.0.0.1:9222",
             )
 
-            async def exercise() -> dict[str, Any]:
-                await service.run(
-                    OpenSessionRequest(
-                        operation="open_session",
-                        payload={"session_id": "unknown_start"},
-                    )
+            client = TestClient(create_app(browser_service=service))
+            with client:
+                opened = client.post(
+                    "/v1/browser/run",
+                    json=self.browser_request(
+                        "open_session",
+                        {"session_id": "unknown_start"},
+                    ),
                 )
-                request = CaptureFlowRequest(
-                    operation="capture_flow",
-                    payload={
-                        "session_id": "unknown_start",
-                        "objective": "unknown start",
-                        "primary_request": {"expected_min_matches": 0},
-                        "execution_mode": "sync",
-                        "deadline_ms": 10_000,
-                    },
+                response = client.post(
+                    "/v1/browser/run",
+                    json=self.browser_request(
+                        "capture_flow",
+                        {
+                            "session_id": "unknown_start",
+                            "objective": "unknown start",
+                            "primary_request": {"expected_min_matches": 0},
+                            "execution_mode": "sync",
+                            "deadline_ms": 10_000,
+                        },
+                    ),
                 )
-                response = await service.run(request)
-                manifest = service.experiments.load_manifest(response.experiment_id)
-                await service.close()
-                return manifest
-
-            manifest = asyncio.run(exercise())
+            self.assertEqual(opened.status_code, 200, opened.text)
+            self.assertEqual(response.status_code, 502, response.text)
+            error = response.json()["error"]
+            manifest = service.experiments.load_manifest(error["experiment_id"])
+            self.assertEqual(error["code"], "operation_outcome_unknown")
+            self.assertTrue(error["dispatch_started"])
+            self.assertEqual(error["outcome"], "unknown")
+            self.assertEqual(error["session_id"], "unknown_start")
+            self.assertEqual(error["experiment_id"], manifest["experiment_id"])
+            self.assertEqual(
+                error["manifest_relative_path"],
+                f"experiments/{manifest['experiment_id']}/manifest.json",
+            )
+            self.assertEqual(manifest["status"], "partial")
+            self.assertEqual(manifest["operation_outcome"], "unknown")
+            self.assertEqual(manifest["execution"]["status"], "unknown")
             health = manifest["capture_health"]
             self.assertEqual(health["stream_start_status"], "outcome_unknown")
             self.assertFalse(health["collector_stopped"])
@@ -759,9 +789,9 @@ class StreamsBrowserTests(BrowserActionTestCase):
     def test_stream_disabled_has_complete_empty_quality_summary(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             client, _, _ = self.make_client(Path(temp_dir))
-            request = {
-                "operation": "capture_flow",
-                "payload": {
+            request = self.browser_request(
+                "capture_flow",
+                {
                     "session_id": "session_one",
                     "objective": "page-only baseline",
                     "primary_request": {
@@ -778,7 +808,7 @@ class StreamsBrowserTests(BrowserActionTestCase):
                     "execution_mode": "sync",
                     "deadline_ms": 10_000,
                 },
-            }
+            )
             with client:
                 self.open_session(client)
                 response = client.post("/v1/browser/run", json=request)
@@ -793,98 +823,6 @@ class StreamsBrowserTests(BrowserActionTestCase):
             self.assertEqual(manifest["quality_summary"]["observation_count"], 0)
             self.assertNotIn("collector_integrity", manifest)
 
-    def test_stream_association_prefers_stable_ids_and_fails_ambiguous_fallback(
-        self,
-    ) -> None:
-        entries = [
-            {
-                "evidence_id": "ev_one",
-                "kind": "network_request",
-                "request_ids": {
-                    "network_request_id": "network-one",
-                    "collector_generation": 7,
-                    "cdp_request_id": "cdp-one",
-                },
-                "summary": {"url": "https://example.test/api/resource", "method": "POST"},
-            },
-            {
-                "evidence_id": "ev_two",
-                "kind": "network_request",
-                "request_ids": {
-                    "network_request_id": "network-two",
-                    "collector_generation": 7,
-                    "cdp_request_id": "cdp-two",
-                },
-                "summary": {"url": "https://example.test/api/resource", "method": "POST"},
-            },
-        ]
-        matched, association = BrowserActionService._associate_stream_network_evidence(
-            {
-                "networkRequestId": "network-two",
-                "collectorGeneration": 7,
-                "cdpRequestId": "cdp-two",
-                "url": "https://example.test/api/resource",
-                "method": "POST",
-            },
-            entries,
-        )
-        ambiguous, fallback = BrowserActionService._associate_stream_network_evidence(
-            {
-                "url": "https://example.test/api/resource",
-                "method": "POST",
-            },
-            entries,
-        )
-
-        self.assertEqual(matched["evidence_id"], "ev_two")
-        self.assertEqual(
-            association["method"],
-            "network_request_id+cdp_request_id",
-        )
-        self.assertIsNone(ambiguous)
-        self.assertEqual(fallback["status"], "ambiguous")
-        self.assertEqual(fallback["candidate_count"], 2)
-
-        duplicate_network_ids = [
-            {
-                "evidence_id": "ev_a",
-                "request_ids": {
-                    "network_request_id": "shared",
-                    "cdp_request_id": "cdp-a",
-                },
-                "summary": {
-                    "url": "https://example.test/api/resource",
-                    "method": "POST",
-                },
-            },
-            {
-                "evidence_id": "ev_b",
-                "request_ids": {
-                    "network_request_id": "shared",
-                    "cdp_request_id": "cdp-b",
-                },
-                "summary": {
-                    "url": "https://example.test/api/resource",
-                    "method": "POST",
-                },
-            },
-        ]
-        disambiguated, combined = BrowserActionService._associate_stream_network_evidence(
-            {
-                "networkRequestId": "shared",
-                "cdpRequestId": "cdp-b",
-                "url": "https://example.test/api/resource",
-                "method": "POST",
-            },
-            duplicate_network_ids,
-        )
-        self.assertEqual(disambiguated["evidence_id"], "ev_b")
-        self.assertEqual(combined["status"], "matched")
-        self.assertEqual(
-            combined["method"],
-            "network_request_id+cdp_request_id",
-        )
-
     def test_network_snapshot_does_not_upgrade_stream_artifact_integrity(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -894,7 +832,8 @@ class StreamsBrowserTests(BrowserActionTestCase):
                 artifact_integrity="failed",
             )
             capture = self.capture_request()
-            capture["payload"]["network_evidence"] = [
+            payload = self.request_payload(capture)
+            payload["network_evidence"] = [
                 {
                     "selector_id": "resource_submit",
                     "matcher": {
@@ -904,6 +843,7 @@ class StreamsBrowserTests(BrowserActionTestCase):
                     "export_parts": ["all"],
                 }
             ]
+            self.set_request_payload(capture, payload)
             with client:
                 self.open_session(client)
                 response = client.post("/v1/browser/run", json=capture)
@@ -933,9 +873,9 @@ class StreamsBrowserTests(BrowserActionTestCase):
             },
             {"type": "timeout", "timeout_ms": 1_000},
         ]:
-            request = {
-                "operation": "capture_flow",
-                "payload": {
+            request = CaptureFlowRequest(
+                operation="capture_flow",
+                payload={
                     "session_id": "session_one",
                     "objective": "observe Stop without assuming cancel",
                     "primary_request": {"expected_min_matches": 0},
@@ -961,7 +901,6 @@ class StreamsBrowserTests(BrowserActionTestCase):
                         },
                     ],
                 },
-            }
+            )
             with self.subTest(condition=condition["type"]):
-                parsed = CaptureFlowRequest.model_validate(request)
-                self.assertEqual(parsed.payload.flow[-1].condition.type, condition["type"])
+                self.assertEqual(request.payload.flow[-1].condition.type, condition["type"])

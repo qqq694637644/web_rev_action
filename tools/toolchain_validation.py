@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -21,9 +22,16 @@ from urllib.request import urlopen
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-from toolchain_validation_server import SSE_EVENTS, start_server
 
 from skill_temple.browser.adapters.playwright import build_playwright_attach_args
+
+_server_module = importlib.import_module(
+    "tools.toolchain_validation_server"
+    if __package__
+    else "toolchain_validation_server"
+)
+SSE_EVENTS = _server_module.SSE_EVENTS
+start_server = _server_module.start_server
 
 PLAYWRIGHT_PACKAGE = "@playwright/cli@0.1.17"
 JS_REVERSE_COMMAND = "js-reverse-mcp"
@@ -379,7 +387,7 @@ class Stage0Validation:
                     "captureId": capture_id,
                     "eventPredicate": {
                         "type": "exact_data",
-                        "value": "[DONE]",
+                        "value": "fixture-complete",
                     },
                     "afterEventIndex": -1,
                     "pageIdx": 0,
@@ -391,7 +399,9 @@ class Stage0Validation:
                 break
             await asyncio.sleep(0.05)
         if stream_status is None or event_match is None:
-            raise TimeoutError("Raw stream collector did not match the [DONE] event.")
+            raise TimeoutError(
+                "Raw stream collector did not match the fixture-complete event."
+            )
 
         stream_stop = await client.call(
             "stop_stream_capture",
@@ -452,7 +462,7 @@ class Stage0Validation:
 
         request_json = json.loads(request_body.decode("utf-8"))
         response_json = json.loads(response_body.decode("utf-8"))
-        if request_json.get("marker") != "stage0-request":
+        if request_json.get("marker") != "synthetic-request":
             raise AssertionError(f"Unexpected request body: {request_json}")
         if response_json.get("marker") != "stage0-response":
             raise AssertionError(f"Unexpected response body: {response_json}")
@@ -493,12 +503,14 @@ class Stage0Validation:
         expected_data = [
             '{"sequence":1,"value":"alpha"}',
             '{"sequence":2,"value":"beta"}',
-            "[DONE]",
+            "fixture-complete",
         ]
         if event_data != expected_data:
             raise AssertionError(f"Unexpected ordered SSE events: {event_data}")
         if event_match.get("matchedEventIndex") != 2:
-            raise AssertionError(f"Unexpected [DONE] match metadata: {event_match}")
+            raise AssertionError(
+                f"Unexpected fixture-complete match metadata: {event_match}"
+            )
         relative_paths = [
             str(raw_descriptor["relativePath"]),
             str(events_descriptor["relativePath"]),
@@ -519,8 +531,8 @@ class Stage0Validation:
                 evidence=[
                     "start_stream_capture was armed before the Playwright click.",
                     "raw.bin exactly matched all fixture SSE bytes in order.",
-                    "events.jsonl preserved both message events and the [DONE] event.",
-                    "get_stream_status matched [DONE] internally without returning its body.",
+                    "events.jsonl preserved both message events and fixture-complete.",
+                    "get_stream_status matched fixture-complete inside the collector.",
                     "Artifacts used the stage0-toolchain namespace and relative paths.",
                     f"raw.bin: {len(raw_bytes)} bytes, sha256={sha256_bytes(raw_bytes)}",
                 ],
@@ -567,14 +579,14 @@ class Stage0Validation:
             search = await client.call(
                 "search_in_sources",
                 {
-                    "query": "stage0RequestBuilder",
+                    "query": "buildEchoRequest",
                     "caseSensitive": True,
                     "urlFilter": "app.js",
                     "maxResults": 10,
                 },
             )
             search_text = flatten_text(search)
-            if "stage0RequestBuilder" not in search_text or "app.js" not in search_text:
+            if "buildEchoRequest" not in search_text or "app.js" not in search_text:
                 raise AssertionError(f"Source search did not find fixture function: {search}")
 
             source = await client.call(
@@ -587,8 +599,8 @@ class Stage0Validation:
             )
             source_text = flatten_text(source)
             if (
-                "stage0RequestBuilder" not in source_text
-                or "STAGE0_SOURCE_MARKER" not in source_text
+                "buildEchoRequest" not in source_text
+                or "SYNTHETIC_SOURCE_MARKER" not in source_text
             ):
                 raise AssertionError(f"Source read did not contain expected markers: {source}")
 
@@ -597,7 +609,7 @@ class Stage0Validation:
                     name="Script read and search",
                     passed=True,
                     evidence=[
-                        "search_in_sources located stage0RequestBuilder in app.js.",
+                        "search_in_sources located buildEchoRequest in app.js.",
                         "get_script_source returned the expected source marker.",
                     ],
                 )
@@ -829,7 +841,8 @@ class Stage0Validation:
                     "All required Stage 0 checks passed. The toolchain now validates the actual "
                     "Raw Stream Capture lifecycle: the collector is armed before the browser "
                     "action, exact raw bytes and ordered semantic events are written under an "
-                    "experiment namespace, the [DONE] predicate is matched inside the collector, "
+                    "experiment namespace, the fixture-complete predicate is matched inside "
+                    "the collector, "
                     "and the capture finalizes with relative artifact paths."
                     if all_required_passed
                     else
@@ -840,7 +853,7 @@ class Stage0Validation:
                 "## Limitations",
                 "",
                 "- The SSE check covers a normally completed local EventSource stream with two",
-                "  ordered data events and a `[DONE]` marker.",
+                "  ordered data events and a `fixture-complete` marker.",
                 "- It validates exact normal-completion bytes, event ordering, namespace,",
                 "  collector-side predicate matching, and finalization.",
                 "- Cancellation, network interruption, heartbeats, and incomplete streams remain",
@@ -855,6 +868,14 @@ class Stage0Validation:
 
 def build_npx_command(package: str, args: Sequence[str]) -> list[str]:
     node_path = shutil.which("node")
+    pinned_entry = os.environ.get("WEB_REV_PLAYWRIGHT_CLI_ENTRY", "").strip()
+    if pinned_entry:
+        entry = Path(pinned_entry).resolve()
+        if node_path is None:
+            raise RuntimeError("node must be available for WEB_REV_PLAYWRIGHT_CLI_ENTRY.")
+        if not entry.is_file():
+            raise RuntimeError(f"Pinned playwright-cli entry was not found: {entry}")
+        return [node_path, str(entry), *args]
     npx_path = shutil.which("npx.cmd") or shutil.which("npx")
     if node_path is None or npx_path is None:
         raise RuntimeError("node and npx must both be available on PATH.")
@@ -926,6 +947,15 @@ def find_free_port() -> int:
 
 
 def find_chrome() -> Path:
+    configured = os.environ.get("WEB_REV_CHROME_EXECUTABLE", "").strip()
+    if configured:
+        candidate = Path(configured).expanduser().resolve()
+        if candidate.is_file():
+            return candidate
+        raise RuntimeError(
+            f"WEB_REV_CHROME_EXECUTABLE does not point to a file: {candidate}"
+        )
+
     candidates = [
         Path(os.environ.get("PROGRAMFILES", ""))
         / "Google"
@@ -938,24 +968,49 @@ def find_chrome() -> Path:
         / "Application"
         / "chrome.exe",
     ]
+    for command in (
+        "google-chrome",
+        "google-chrome-stable",
+        "chromium",
+        "chromium-browser",
+    ):
+        resolved = shutil.which(command)
+        if resolved:
+            candidates.append(Path(resolved))
     for candidate in candidates:
         if candidate.is_file():
             return candidate
-    raise RuntimeError("Google Chrome executable was not found.")
+    raise RuntimeError(
+        "Chrome/Chromium executable was not found. Set WEB_REV_CHROME_EXECUTABLE."
+    )
 
 
-def start_chrome(port: int, profile_path: Path) -> subprocess.Popen[bytes]:
-    chrome = find_chrome()
+def build_chrome_args(
+    chrome: Path,
+    port: int,
+    profile_path: Path,
+    *,
+    platform_name: str = os.name,
+) -> list[str]:
     args = [
         str(chrome),
         "--headless=new",
+        "--remote-debugging-address=127.0.0.1",
         f"--remote-debugging-port={port}",
         f"--user-data-dir={profile_path}",
         "--no-first-run",
         "--no-default-browser-check",
         "--disable-gpu",
-        "about:blank",
     ]
+    if platform_name != "nt":
+        args.extend(["--no-sandbox", "--disable-dev-shm-usage"])
+    args.append("about:blank")
+    return args
+
+
+def start_chrome(port: int, profile_path: Path) -> subprocess.Popen[bytes]:
+    chrome = find_chrome()
+    args = build_chrome_args(chrome, port, profile_path)
     return subprocess.Popen(
         args,
         stdout=subprocess.DEVNULL,

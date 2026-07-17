@@ -21,6 +21,8 @@ Follow this separation throughout the task:
 - Workspace tools read evidence files and write only derived reports, schemas, notes, and replay scripts.
 - Never reconstruct browser fetches with arbitrary PowerShell or JavaScript when `replay_request` can perform the operation.
 - Never copy Cookie, Authorization, CSRF, or other credential values into chat, reports, diffs, or generated scripts.
+- Load `browser-action-protocol` before any Browser Action call and read only the exact
+  operation contracts needed for the current experiment.
 
 ## Required references
 
@@ -29,6 +31,27 @@ Read these files when the corresponding stage begins:
 - `docs/experiment-matrix.md` for the six scenario sequence and mutation matrix.
 - `docs/evidence-contract.md` before interpreting or citing evidence.
 - `docs/report-templates.md` before generating final reports and schemas.
+- From `browser-action-protocol`, read
+  `browser-action-protocol/docs/transport-envelope.md`,
+  `browser-action-protocol/docs/operation-index.md`, and the selected run/inspect
+  operation files.
+- Load `browser-session-capture` for baseline/session work,
+  `browser-evidence-inspection` for exact evidence selection,
+  `browser-request-replay` for one-variable tests, `browser-script-tracing` for source
+  claims, and `browser-stream-diagnostics` for stop/termination experiments. Load
+  `browser-experiment-recovery` only after a recovery-class error.
+
+## Browser Action call discipline
+
+- Inspect a known session with `get_session` before deciding to call `open_session`.
+- Use only complete generated six-field envelopes. Copy the current protocol Skill
+  hash and exact operation hash; decoded operation fields belong inside serialized
+  `payload_json`, never at the Action top level.
+- For job-mode capture or replay, poll `get_experiment` to a terminal state before
+  interpreting evidence or starting a dependent experiment.
+- A validation error with `dispatch_started=false` may be corrected once from its
+  issue paths. If dispatch started or the outcome is unknown, inspect the session and
+  experiment first and do not repeat the consequential operation.
 
 ## Workflow
 
@@ -50,7 +73,10 @@ Do not infer a predecessor from timestamps. Use the explicit experiment chain.
 
 ### 2. Capture a baseline
 
-Run `capture_baseline` with no mutation and record page snapshots, console errors, and relevant ordinary network selectors. Confirm that the page is aligned and the experiment reaches a terminal manifest.
+Run `capture_flow` with an explicit baseline objective, zero mutation, the minimum
+snapshot/wait steps, and primary request counts that allow zero matches. Record page
+snapshots, console errors, and relevant ordinary network selectors. Confirm that the
+page is aligned and the experiment reaches a terminal manifest.
 
 ### 3. Capture the first message
 
@@ -76,45 +102,16 @@ After completion:
 
 ### 4. Determine field necessity with browser-context replay
 
-Use the generic replay payload for every experiment. A baseline observation and a
+Use the generated `replay_request` contract for every experiment. A baseline observation and a
 mutation observation are separate requests; the backend does not provide Control or
 Treatment modes and does not inherit settings between requests.
-
-```json
-{
-  "source": {
-    "experiment_id": "exp_source",
-    "evidence_id": "ev_network_source"
-  },
-  "mutations": [],
-  "extractors": [],
-  "bindings": [],
-  "response_reader": {"mode": "auto"},
-  "termination": {"conditions": [{"type": "network_close"}]},
-  "comparison": null
-}
-```
 
 For a mutation experiment, submit the same explicit source, setup, reader,
 termination, binding, and capture settings again. Add the mutation and point the
 comparison at an exact evidence or observation source:
 
-```json
-{
-  "mutations": [
-    {"type": "remove_json_path", "path": "/messages/0/id"}
-  ],
-  "comparison": {
-    "references": [
-      {
-        "experiment_id": "exp_baseline",
-        "evidence_id": "ev_network_baseline"
-      }
-    ],
-    "dimensions": ["request_body", "response_status"]
-  }
-}
-```
+Build both the zero-mutation and one-variable requests from the exact generated
+operation document so their transport and contract hashes remain current.
 
 Never reference only an experiment ID. A capture or replay can contain multiple
 requests, so every comparison reference must include exactly one `evidence_id` or
@@ -270,7 +267,9 @@ Use `list_evidence` to discover stable IDs. Use workspace tools only when the ac
 
 ### 7. Produce the reproduction package
 
-Create the outputs in `docs/report-templates.md`. Reports and scripts belong under `reports/`, `schemas/`, `scripts/`, or `notes/`; never modify original evidence.
+Create the outputs in `docs/report-templates.md`. Reports and scripts belong in the
+analysis workspace report, schema, script, or note directories; never modify original
+evidence.
 
 The generated HTTP replay script must use placeholders or environment variables for credentials. Browser-context replay remains the source of truth for authenticated behavior.
 

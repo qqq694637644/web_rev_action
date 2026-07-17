@@ -7,12 +7,78 @@ import time
 from datetime import UTC, datetime
 from typing import Any
 
+from .adapters.contracts import AdapterError
+
 
 class BrowserServiceError(RuntimeError):
-    def __init__(self, code: str, message: str, status_code: int = 400) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        status_code: int = 400,
+        *,
+        dispatch_started: bool = False,
+        outcome: str | None = None,
+        session_id: str | None = None,
+        experiment_id: str | None = None,
+        manifest_relative_path: str | None = None,
+        adapter_error_code: str | None = None,
+        retryable: bool | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.status_code = status_code
+        self.dispatch_started = dispatch_started
+        self.outcome = outcome
+        self.session_id = session_id
+        self.experiment_id = experiment_id
+        self.manifest_relative_path = manifest_relative_path
+        self.adapter_error_code = adapter_error_code
+        self.retryable = retryable
+
+    def with_context(
+        self,
+        *,
+        session_id: str | None = None,
+        experiment_id: str | None = None,
+        manifest_relative_path: str | None = None,
+    ) -> BrowserServiceError:
+        if session_id is not None:
+            self.session_id = session_id
+        if experiment_id is not None:
+            self.experiment_id = experiment_id
+        if manifest_relative_path is not None:
+            self.manifest_relative_path = manifest_relative_path
+        return self
+
+
+def service_error_from_adapter(
+    exc: AdapterError,
+    operation: str,
+    *,
+    consequential: bool,
+) -> BrowserServiceError:
+    dispatch_started = bool(exc.dispatch_started)
+    outcome_unknown = bool(exc.outcome_unknown) if consequential else False
+    if outcome_unknown:
+        return BrowserServiceError(
+            "operation_outcome_unknown",
+            f"{operation} was dispatched but no trustworthy terminal result was received: {exc}",
+            502,
+            dispatch_started=True,
+            outcome="unknown",
+            adapter_error_code=exc.remote_code,
+            retryable=exc.retryable,
+        )
+    return BrowserServiceError(
+        exc.code,
+        f"{operation} failed at the browser adapter boundary: {exc}",
+        502,
+        dispatch_started=dispatch_started,
+        outcome="failed",
+        adapter_error_code=exc.remote_code,
+        retryable=exc.retryable,
+    )
 
 
 class Deadline:

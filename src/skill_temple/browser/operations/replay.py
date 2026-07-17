@@ -36,11 +36,12 @@ from ...protocol.mutations import (
 )
 from ...protocol_evidence import (
     load_snapshot,
+    public_alignment_summary,
     response_content_type,
     response_value_from_snapshot,
 )
-from ..adapters.contracts import AlignmentResult, StreamCheckpoint
-from ..core import BrowserServiceError, Deadline, utc_now
+from ..adapters.contracts import AdapterError, AlignmentResult, StreamCheckpoint
+from ..core import BrowserServiceError, Deadline, service_error_from_adapter, utc_now
 from ..steps import StepExecutor
 from .context import ReplayDispatchResult, ReplayPreparationResult
 
@@ -405,7 +406,11 @@ class BrowserReplayOperations:
             url_contains=matcher.url_contains,
             method=matcher.method,
             resource_types=matcher.resource_types,
-            mime_types=[source_content_type] if source_content_type else [],
+            # Response MIME is an observed outcome, not request identity. A
+            # valid replay can change from a stream 2xx response to a JSON 4xx
+            # response after mutation, so inheriting source MIME here would
+            # hide the exact replay request that produced the changed outcome.
+            mime_types=[],
             expected_min_matches=1,
             expected_max_matches=5,
             allow_supporting_failures=True,
@@ -627,16 +632,30 @@ class BrowserReplayOperations:
         replay_observed_response_mode: str | None = None
         post_response_alignment: AlignmentResult | None = None
         replay_artifacts: list[dict[str, Any]] = []
+        started = utc_now()
         if capture_id is not None:
-            stream_checkpoint = await self._stream_checkpoint(
-                capture_id,
-                request_matcher,
-                self._operation_deadline(
-                    deadline,
-                    1_500,
-                    "checkpoint before replay",
-                ),
-            )
+            try:
+                stream_checkpoint = await self._stream_checkpoint(
+                    capture_id,
+                    request_matcher,
+                    self._operation_deadline(
+                        deadline,
+                        1_500,
+                        "checkpoint before replay",
+                    ),
+                )
+            except asyncio.CancelledError:
+                step_results.append(
+                    FlowStepResult(
+                        step_id="replay_request",
+                        phase="replay",
+                        status="canceled",
+                        started_at=started,
+                        ended_at=utc_now(),
+                        error="Replay was canceled before browser dispatch.",
+                    )
+                )
+                raise
         first_mutation_wall_time_ms = int(time.time() * 1000)
         replay_dir = experiment_dir / "replay"
         replay_dir.mkdir(parents=True, exist_ok=True)
@@ -651,7 +670,6 @@ class BrowserReplayOperations:
             json.dumps(replay_plan["diff"], ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
-        started = utc_now()
         try:
             replay_plan["dispatch_wall_time_ms"] = int(time.time() * 1000)
             replay_plan["correlation_window_end_wall_time_ms"] = replay_plan[
@@ -720,15 +738,66 @@ class BrowserReplayOperations:
                     ended_at=utc_now(),
                 )
             )
-        except asyncio.CancelledError:
+        except AdapterError as exc:
+            service_error = service_error_from_adapter(
+                exc,
+                "browser-context replay",
+                consequential=True,
+            )
+            unknown = service_error.code == "operation_outcome_unknown"
             step_results.append(
                 FlowStepResult(
                     step_id="replay_request",
                     phase="replay",
-                    status="canceled_outcome_unknown",
+                    status="outcome_unknown" if unknown else "failed",
                     started_at=started,
                     ended_at=utc_now(),
-                    error="Browser-context replay was canceled after dispatch.",
+                    error=str(service_error)[:4000],
+                )
+            )
+            replay_manifest = manifest.get("replay")
+            if isinstance(replay_manifest, dict):
+                replay_manifest["dispatch_status"] = (
+                    "outcome_unknown" if unknown else "failed_before_completion"
+                )
+            manifest.update(
+                {
+                    "status": "partial" if unknown else "failed",
+                    "operation_outcome": "unknown" if unknown else "failed",
+                    "steps": [item.model_dump(mode="json") for item in step_results],
+                    "execution": {
+                        "status": "unknown" if unknown else "failed",
+                        "errors": [str(service_error)[:4000]],
+                    },
+                    "errors": [str(service_error)[:4000]],
+                }
+            )
+            self.experiments.write_manifest(experiment_id, manifest)
+            service_error.with_context(
+                session_id=session_id,
+                experiment_id=experiment_id,
+                manifest_relative_path=self._manifest_relative_path(experiment_id),
+            )
+            raise service_error from exc
+        except asyncio.CancelledError as exc:
+            dispatch_started = bool(
+                getattr(exc, "mcp_outcome_unknown", False)
+                or getattr(exc, "adapter_dispatch_started", False)
+            )
+            step_results.append(
+                FlowStepResult(
+                    step_id="replay_request",
+                    phase="replay",
+                    status=(
+                        "canceled_outcome_unknown" if dispatch_started else "canceled"
+                    ),
+                    started_at=started,
+                    ended_at=utc_now(),
+                    error=(
+                        "Browser-context replay was canceled after dispatch."
+                        if dispatch_started
+                        else "Browser-context replay was canceled before confirmed dispatch."
+                    ),
                 )
             )
             raise
@@ -934,7 +1003,82 @@ class BrowserReplayOperations:
                 ),
             )
         except Exception as exc:
-            warnings.append(f"pre-dispatch alignment: {str(exc)[:1000]}")
+            message = f"Replay pre-dispatch alignment failed: {str(exc)[:1000]}"
+            step_results.append(
+                FlowStepResult(
+                    step_id="replay_pre_dispatch_alignment",
+                    phase="replay",
+                    status="failed",
+                    started_at=utc_now(),
+                    ended_at=utc_now(),
+                    error=message,
+                )
+            )
+            replay_manifest = manifest.get("replay")
+            if isinstance(replay_manifest, dict):
+                replay_manifest.update(
+                    {
+                        "dispatch_status": "not_started",
+                        "pre_dispatch_alignment": {
+                            "status": "failed",
+                            "error": message,
+                        },
+                    }
+                )
+                self.experiments.write_manifest(experiment_id, manifest)
+            raise BrowserServiceError(
+                "replay_pre_dispatch_alignment_failed",
+                message,
+                409,
+                dispatch_started=False,
+                outcome="failed",
+                session_id=session_id,
+                experiment_id=experiment_id,
+                manifest_relative_path=self._manifest_relative_path(experiment_id),
+            ) from exc
+        if pre_dispatch_alignment.status != "aligned":
+            message = (
+                "; ".join(pre_dispatch_alignment.warnings)
+                or "Replay page did not align with the selected js-reverse page."
+            )
+            step_results.append(
+                FlowStepResult(
+                    step_id="replay_pre_dispatch_alignment",
+                    phase="replay",
+                    status="failed",
+                    started_at=utc_now(),
+                    ended_at=utc_now(),
+                    error=message,
+                )
+            )
+            replay_manifest = manifest.get("replay")
+            if isinstance(replay_manifest, dict):
+                replay_manifest.update(
+                    {
+                        "dispatch_status": "not_started",
+                        "pre_dispatch_alignment": {
+                            "status": pre_dispatch_alignment.status,
+                            "warnings": list(pre_dispatch_alignment.warnings),
+                        },
+                    }
+                )
+                self.experiments.write_manifest(experiment_id, manifest)
+            raise BrowserServiceError(
+                "replay_pre_dispatch_alignment_failed",
+                message,
+                409,
+                dispatch_started=False,
+                outcome="failed",
+                session_id=session_id,
+                experiment_id=experiment_id,
+                manifest_relative_path=self._manifest_relative_path(experiment_id),
+            )
+        replay_manifest = manifest.get("replay")
+        if isinstance(replay_manifest, dict):
+            replay_manifest["pre_dispatch_alignment"] = public_alignment_summary(
+                pre_dispatch_alignment
+            )
+            self.experiments.write_manifest(experiment_id, manifest)
         return ReplayPreparationResult(
             stream_checkpoint=stream_checkpoint,
             first_mutation_wall_time_ms=first_mutation_wall_time_ms,

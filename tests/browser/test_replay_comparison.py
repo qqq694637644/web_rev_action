@@ -213,9 +213,9 @@ class ReplayComparisonBrowserTests(BrowserActionTestCase):
                 source_id, source_evidence, _ = self.capture_replay_source(client, root)
                 response = client.post(
                     "/v1/browser/run",
-                    json={
-                        "operation": "replay_request",
-                        "payload": {
+                    json=self.browser_request(
+                        "replay_request",
+                        {
                             "session_id": "session_one",
                             "objective": "compare replay with its exact capture source",
                             "source": {
@@ -233,7 +233,7 @@ class ReplayComparisonBrowserTests(BrowserActionTestCase):
                             "execution_mode": "sync",
                             "deadline_ms": 10_000,
                         },
-                    },
+                    ),
                 )
             self.assertEqual(response.status_code, 200, response.text)
             manifest = json.loads(
@@ -278,10 +278,7 @@ class ReplayComparisonBrowserTests(BrowserActionTestCase):
                 }
                 baseline = client.post(
                     "/v1/browser/run",
-                    json={
-                        "operation": "replay_request",
-                        "payload": baseline_payload,
-                    },
+                    json=self.browser_request("replay_request", baseline_payload),
                 )
                 self.assertEqual(baseline.status_code, 200, baseline.text)
                 baseline_manifest = json.loads(
@@ -324,10 +321,7 @@ class ReplayComparisonBrowserTests(BrowserActionTestCase):
                 }
                 compared = client.post(
                     "/v1/browser/run",
-                    json={
-                        "operation": "replay_request",
-                        "payload": compared_payload,
-                    },
+                    json=self.browser_request("replay_request", compared_payload),
                 )
             self.assertEqual(compared.status_code, 200, compared.text)
             manifest = json.loads(
@@ -361,9 +355,9 @@ class ReplayComparisonBrowserTests(BrowserActionTestCase):
                 js.replay_response_status = 422
                 baseline = client.post(
                     "/v1/browser/run",
-                    json={
-                        "operation": "replay_request",
-                        "payload": {
+                    json=self.browser_request(
+                        "replay_request",
+                        {
                             "session_id": "session_one",
                             "objective": "observe a validation response",
                             "source": {
@@ -379,7 +373,7 @@ class ReplayComparisonBrowserTests(BrowserActionTestCase):
                             "execution_mode": "sync",
                             "deadline_ms": 10_000,
                         },
-                    },
+                    ),
                 )
                 self.assertEqual(baseline.status_code, 200, baseline.text)
                 self.assertEqual(baseline.json()["status"], "completed")
@@ -397,9 +391,9 @@ class ReplayComparisonBrowserTests(BrowserActionTestCase):
                 js.replay_response_status = 500
                 compared = client.post(
                     "/v1/browser/run",
-                    json={
-                        "operation": "replay_request",
-                        "payload": {
+                    json=self.browser_request(
+                        "replay_request",
+                        {
                             "session_id": "session_one",
                             "objective": "compare a server response with validation",
                             "source": {
@@ -424,7 +418,7 @@ class ReplayComparisonBrowserTests(BrowserActionTestCase):
                             "execution_mode": "sync",
                             "deadline_ms": 10_000,
                         },
-                    },
+                    ),
                 )
             self.assertEqual(compared.status_code, 200, compared.text)
             self.assertEqual(compared.json()["status"], "completed")

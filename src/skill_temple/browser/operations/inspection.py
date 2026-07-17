@@ -25,8 +25,10 @@ from ...browser_models import (
     SaveScriptSourceRequest,
     SearchScriptsRequest,
 )
-from ...protocol_evidence import evidence_id
+from ...protocol_evidence import evidence_id, public_url_summary
 from ..core import BrowserServiceError, Deadline, utc_now
+from ..registry import OPERATION_REGISTRY
+from ..session_states import STALE_ON_SERVICE_CHANGE
 
 
 class BrowserInspectionOperations:
@@ -72,9 +74,54 @@ class BrowserInspectionOperations:
             operation=request.operation,
             callback=source,
         )
-        source_text = result.get("source") or result.get("scriptSource")
+        if result.get("sourceType") == "wasm":
+            raise BrowserServiceError(
+                "wasm_source_not_saved",
+                "save_script_source does not persist WASM metadata as JavaScript. "
+                "Use the pinned js-reverse-mcp save_script_source tool to save real .wasm bytes.",
+                409,
+                dispatch_started=False,
+                session_id=payload.session_id,
+                experiment_id=payload.target_experiment_id,
+                manifest_relative_path=self._manifest_relative_path(
+                    payload.target_experiment_id
+                ),
+            )
+        if result.get("truncated") is True:
+            raise BrowserServiceError(
+                "script_source_truncated",
+                "The adapter returned a bounded script preview. Read a specific "
+                "offset and length before saving source evidence.",
+                409,
+                dispatch_started=False,
+                session_id=payload.session_id,
+                experiment_id=payload.target_experiment_id,
+                manifest_relative_path=self._manifest_relative_path(
+                    payload.target_experiment_id
+                ),
+            )
+        source_value = result.get("source")
+        script_source_value = result.get("scriptSource")
+        source_text = (
+            source_value
+            if isinstance(source_value, str)
+            else script_source_value
+            if isinstance(script_source_value, str)
+            else None
+        )
         if not isinstance(source_text, str):
-            source_text = json.dumps(result, ensure_ascii=False, indent=2)
+            raise BrowserServiceError(
+                "script_source_missing",
+                "The adapter response did not contain JavaScript source text.",
+                502,
+                dispatch_started=True,
+                outcome="failed",
+                session_id=payload.session_id,
+                experiment_id=payload.target_experiment_id,
+                manifest_relative_path=self._manifest_relative_path(
+                    payload.target_experiment_id
+                ),
+            )
         digest = hashlib.sha256(source_text.encode("utf-8")).hexdigest()
         label = (
             re.sub(
@@ -102,7 +149,7 @@ class BrowserInspectionOperations:
         metadata_file = source_dir / f"{ev_id}.metadata.json"
         source_file.write_text(source_text, encoding="utf-8")
         metadata = {
-            "script_url": payload.url,
+            "script_url": public_url_summary(payload.url),
             "script_id": payload.script_id,
             "start_line": payload.start_line,
             "end_line": payload.end_line,
@@ -136,7 +183,7 @@ class BrowserInspectionOperations:
             "artifact_ids": [item["artifactId"] for item in artifacts],
             "artifact_paths": {item["kind"]: item["relativePath"] for item in artifacts},
             "initiator_evidence_id": payload.initiator_evidence_id,
-            "script_url": payload.url,
+            "script_url": public_url_summary(payload.url),
             "script_id": payload.script_id,
             "sha256": digest,
             "range": {
@@ -152,6 +199,17 @@ class BrowserInspectionOperations:
             existing_artifacts = []
             manifest["artifacts"] = existing_artifacts
         existing_artifacts.extend(artifacts)
+        if request.action_binding is not None:
+            invocations = manifest.get("action_invocations")
+            if not isinstance(invocations, list):
+                invocations = []
+                manifest["action_invocations"] = invocations
+            invocations.append(
+                {
+                    **request.action_binding.model_dump(mode="json"),
+                    "recorded_at": utc_now(),
+                }
+            )
         manifest["updated_at"] = utc_now()
         self.experiments.write_manifest(payload.target_experiment_id, manifest)
         return BrowserActionResponse(
@@ -169,7 +227,12 @@ class BrowserInspectionOperations:
     def _transport_generation(self) -> int:
         return int(getattr(self.js_reverse, "transport_generation", 0))
 
-    def _discover_capture_metadata(self, experiment_id: str) -> dict[str, Any] | None:
+    def _discover_capture_metadata(
+        self,
+        experiment_id: str,
+        manifest: dict[str, Any] | None = None,
+        runtime_warnings: list[str] | None = None,
+    ) -> dict[str, Any] | None:
         base = self.experiments.experiment_dir(experiment_id) / "js-reverse"
         candidates = sorted(
             base.glob("capture-*/capture.json"),
@@ -179,9 +242,39 @@ class BrowserInspectionOperations:
         for path in candidates:
             try:
                 value = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
+            except (OSError, json.JSONDecodeError) as exc:
+                relative = self.experiments.relative_path(str(path)) or path.as_posix()
+                warning = (
+                    f"capture metadata invalid: {relative}: "
+                    f"{type(exc).__name__}: {str(exc)[:1000]}"
+                )
+                if runtime_warnings is not None and warning not in runtime_warnings:
+                    runtime_warnings.append(warning)
+                if manifest is not None:
+                    warnings = manifest.get("warnings")
+                    if not isinstance(warnings, list):
+                        warnings = []
+                        manifest["warnings"] = warnings
+                    if warning not in warnings:
+                        warnings.append(warning)
+                        self.experiments.write_manifest(experiment_id, manifest)
                 continue
             if not isinstance(value, dict):
+                relative = self.experiments.relative_path(str(path)) or path.as_posix()
+                warning = (
+                    f"capture metadata invalid: {relative}: "
+                    "TypeError: expected JSON object"
+                )
+                if runtime_warnings is not None and warning not in runtime_warnings:
+                    runtime_warnings.append(warning)
+                if manifest is not None:
+                    warnings = manifest.get("warnings")
+                    if not isinstance(warnings, list):
+                        warnings = []
+                        manifest["warnings"] = warnings
+                    if warning not in warnings:
+                        warnings.append(warning)
+                        self.experiments.write_manifest(experiment_id, manifest)
                 continue
             relative = self.experiments.relative_path(str(path.parent))
             return {
@@ -384,9 +477,10 @@ class BrowserInspectionOperations:
         if not session:
             raise BrowserServiceError("session_not_found", "Browser session was not found", 404)
         if (
-            session.get("status") == "open"
+            session.get("status") in STALE_ON_SERVICE_CHANGE
             and session.get("service_instance_id") != self.service_instance_id
         ):
+            session["previous_status"] = session.get("status")
             session["status"] = "stale"
             session["stale_reason"] = "service_instance_changed"
             session["updated_at"] = utc_now()
@@ -395,6 +489,77 @@ class BrowserInspectionOperations:
         return session
 
     async def inspect(self, request: InspectBrowserEvidenceRequest) -> BrowserActionResponse:
+        spec = OPERATION_REGISTRY.require(request.operation)
+        if spec.action != "inspect":
+            raise BrowserServiceError(
+                "unsupported_operation", "Unsupported inspect operation", 400
+            )
+        handler = getattr(self, spec.handler_name, None)
+        if not callable(handler):
+            raise RuntimeError(
+                f"Operation registry handler is unavailable: "
+                f"{spec.name} -> {spec.handler_name}"
+            )
+        return await handler(request)
+
+    async def _inspect_get_session(
+        self, request: InspectBrowserEvidenceRequest
+    ) -> BrowserActionResponse:
+        return await self._inspect_registered(request)
+
+    async def _inspect_list_experiments(
+        self, request: InspectBrowserEvidenceRequest
+    ) -> BrowserActionResponse:
+        return await self._inspect_registered(request)
+
+    async def _inspect_get_experiment(
+        self, request: InspectBrowserEvidenceRequest
+    ) -> BrowserActionResponse:
+        return await self._inspect_registered(request)
+
+    async def _inspect_get_stream_status(
+        self, request: InspectBrowserEvidenceRequest
+    ) -> BrowserActionResponse:
+        return await self._inspect_registered(request)
+
+    async def _inspect_list_evidence(
+        self, request: InspectBrowserEvidenceRequest
+    ) -> BrowserActionResponse:
+        return await self._inspect_registered(request)
+
+    async def _inspect_get_network_evidence(
+        self, request: InspectBrowserEvidenceRequest
+    ) -> BrowserActionResponse:
+        return await self._inspect_registered(request)
+
+    async def _inspect_get_request_shape(
+        self, request: InspectBrowserEvidenceRequest
+    ) -> BrowserActionResponse:
+        return await self._inspect_registered(request)
+
+    async def _inspect_get_request_initiator(
+        self, request: InspectBrowserEvidenceRequest
+    ) -> BrowserActionResponse:
+        return await self._inspect_registered(request)
+
+    async def _inspect_search_scripts(
+        self, request: InspectBrowserEvidenceRequest
+    ) -> BrowserActionResponse:
+        return await self._inspect_registered(request)
+
+    async def _inspect_get_script_source(
+        self, request: InspectBrowserEvidenceRequest
+    ) -> BrowserActionResponse:
+        return await self._inspect_registered(request)
+
+    async def _inspect_list_console_errors(
+        self, request: InspectBrowserEvidenceRequest
+    ) -> BrowserActionResponse:
+        return await self._inspect_registered(request)
+
+    async def _inspect_registered(
+        self, request: InspectBrowserEvidenceRequest
+    ) -> BrowserActionResponse:
         if isinstance(request, GetSessionRequest):
             session = self._get_session(request.payload.session_id)
             return BrowserActionResponse(
@@ -404,13 +569,20 @@ class BrowserInspectionOperations:
                 result={"session": session},
             )
         if isinstance(request, ListExperimentsRequest):
-            items = self.experiments.list_experiments(
+            listing = self.experiments.list_experiments(
                 request.payload.session_id, request.payload.limit
             )
+            items = listing["experiments"]
+            manifest_errors = listing["manifest_errors"]
             return BrowserActionResponse(
                 operation=request.operation,
                 status="completed",
-                result={"experiments": items, "count": len(items)},
+                result={
+                    "experiments": items,
+                    "count": len(items),
+                    "manifest_errors": manifest_errors,
+                    "manifest_error_count": len(manifest_errors),
+                },
             )
         if isinstance(request, GetExperimentRequest):
             manifest = self.experiments.load_manifest(request.payload.experiment_id)
@@ -665,6 +837,7 @@ class BrowserInspectionOperations:
                         "capture_identity_mismatch",
                         "Live MCP capture identity does not match the experiment manifest.",
                         409,
+                        dispatch_started=True,
                     )
                 source = "live-mcp"
             else:

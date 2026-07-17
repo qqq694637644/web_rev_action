@@ -113,3 +113,14 @@ async function runCapture() {
 document.querySelector("#run-capture").addEventListener("click", runCapture);
 document.querySelector("#send-echo").addEventListener("click", sendEcho);
 document.querySelector("#send-stateful-stream").addEventListener("click", sendAuthenticatedStream);
+document.querySelector("#emit-warning").addEventListener("click", () => {
+  console.warn("fixture-console-before-checkpoint");
+});
+document.querySelector("#emit-error").addEventListener("click", () => {
+  console.error("fixture-console-after-checkpoint");
+  const marker = document.createElement("div");
+  marker.id = "console-error-emitted";
+  marker.textContent = "console-error-emitted";
+  marker.style.display = "block";
+  document.body.append(marker);
+});

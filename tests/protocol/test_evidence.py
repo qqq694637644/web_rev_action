@@ -9,7 +9,9 @@ from skill_temple.protocol.shapes import (
 from skill_temple.protocol_evidence import (
     aggregate_observation_completeness,
     build_network_observation,
+    public_alignment_summary,
     public_network_summary,
+    public_url_summary,
 )
 from tests.protocol.common import ProtocolTestCase
 
@@ -117,7 +119,13 @@ class EvidenceProtocolTests(ProtocolTestCase):
         self.assertEqual(missing, ["semantic_stream"])
 
     def test_public_network_summary_redacts_credentials_and_omits_bodies(self) -> None:
-        summary = public_network_summary(self.snapshot())
+        snapshot = self.snapshot()
+        snapshot["url"] = (
+            "https://example.test/api/resource?access_token=token-secret"
+            "&signature=sig-secret&session=session-secret&csrf=csrf-secret"
+            "&api_key=key-secret&tag=one&tag=two#private-fragment"
+        )
+        summary = public_network_summary(snapshot)
         request_headers = {
             item["name"].lower(): item["value"] for item in summary["request_headers"]
         }
@@ -128,6 +136,21 @@ class EvidenceProtocolTests(ProtocolTestCase):
         self.assertEqual(request_headers["authorization"], "<redacted>")
         self.assertEqual(request_headers["cookie"], "<redacted>")
         self.assertEqual(response_headers["set-cookie"], "<redacted>")
+        self.assertEqual(
+            summary["url"],
+            "https://example.test/api/resource?access_token=<value>"
+            "&signature=<value>&session=<value>&csrf=<value>"
+            "&api_key=<value>&tag=<value>&tag=<value>",
+        )
+        for secret in [
+            "token-secret",
+            "sig-secret",
+            "session-secret",
+            "csrf-secret",
+            "key-secret",
+            "private-fragment",
+        ]:
+            self.assertNotIn(secret, json.dumps(summary))
         self.assertNotIn("text", summary["request_body"])
         self.assertNotIn("text", summary["response_body"])
         self.assertIn("/records/0/id", summary["request_shape"]["paths"])
@@ -135,6 +158,25 @@ class EvidenceProtocolTests(ProtocolTestCase):
             summary["request_shape"]["paths"]["/records/0/id"]["value"],
             "<identifier>",
         )
+
+    def test_public_url_and_alignment_drop_userinfo_values_and_fragments(self) -> None:
+        raw = "https://alice:secret@example.test:8443/app?token=abc&tag=one#frag"
+        self.assertEqual(
+            public_url_summary(raw),
+            "https://example.test:8443/app?token=<value>&tag=<value>",
+        )
+        alignment = public_alignment_summary(
+            {
+                "status": "aligned",
+                "playwright_page": {"url": raw, "title": "App", "page_index": 0},
+                "js_reverse_page_url": raw,
+                "js_reverse_page_id": "page-one",
+                "warnings": [],
+            }
+        )
+        serialized = json.dumps(alignment)
+        for forbidden in ["alice", "secret", "abc", "tag=one", "frag"]:
+            self.assertNotIn(forbidden, serialized)
 
     def test_request_shape_and_redacted_body_preserve_structure_without_values(self) -> None:
         shape = request_shape_from_snapshot(self.snapshot())

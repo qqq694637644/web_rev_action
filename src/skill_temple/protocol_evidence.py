@@ -7,6 +7,7 @@ import json
 import re
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from .evidence_name_rules import is_sensitive_header
 from .protocol import shapes
@@ -49,11 +50,79 @@ def redact_header_entries(entries: list[dict[str, Any]]) -> list[dict[str, str]]
     return redacted
 
 
+def public_url_summary(value: Any) -> str:
+    raw = str(value or "")
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return ""
+    query_parts: list[str] = []
+    if parsed.query:
+        for part in parsed.query.split("&"):
+            name = part.split("=", 1)[0]
+            query_parts.append(f"{name}=<value>")
+    hostname = parsed.hostname or ""
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    authority = f"{hostname}:{port}" if hostname and port is not None else hostname
+    return urlunsplit(
+        (
+            parsed.scheme,
+            authority,
+            parsed.path,
+            "&".join(query_parts),
+            "",
+        )
+    )[:8192]
+
+
+def public_page_summary(value: Any) -> dict[str, Any]:
+    def field(name: str) -> Any:
+        if isinstance(value, dict):
+            return value.get(name)
+        return getattr(value, name, None)
+
+    return {
+        key: item
+        for key, item in {
+            "url": public_url_summary(field("url")),
+            "title": field("title"),
+            "page_index": field("page_index"),
+            "snapshot_ref": field("snapshot_ref"),
+        }.items()
+        if item is not None
+    }
+
+
+def public_alignment_summary(value: Any) -> dict[str, Any]:
+    def field(name: str) -> Any:
+        if isinstance(value, dict):
+            return value.get(name)
+        return getattr(value, name, None)
+
+    return {
+        key: item
+        for key, item in {
+            "status": field("status"),
+            "playwright_page": public_page_summary(field("playwright_page")),
+            "js_reverse_page_index": field("js_reverse_page_index"),
+            "js_reverse_page_id": field("js_reverse_page_id"),
+            "js_reverse_page_url": public_url_summary(field("js_reverse_page_url")),
+            "warnings": list(field("warnings") or []),
+        }.items()
+        if item is not None
+    }
+
+
 def public_network_summary(snapshot: dict[str, Any]) -> dict[str, Any]:
     request_headers = snapshot.get("requestHeadersArray")
     response_headers = snapshot.get("responseHeadersArray")
     return {
-        "url": str(snapshot.get("url", ""))[:8192],
+        "url": public_url_summary(snapshot.get("url")),
         "method": snapshot.get("method"),
         "resource_type": snapshot.get("resourceType"),
         "status": snapshot.get("status"),
@@ -71,6 +140,26 @@ def public_network_summary(snapshot: dict[str, Any]) -> dict[str, Any]:
         "observed_at": snapshot.get("observedAt"),
         "timing": snapshot.get("timing"),
         "snapshot_integrity": network_snapshot_dimensions(snapshot),
+    }
+
+
+def public_network_request_summary(request: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in {
+            "reqid": request.get("reqid"),
+            "url": public_url_summary(request.get("url")),
+            "method": request.get("method"),
+            "resourceType": request.get("resourceType"),
+            "mimeType": request.get("mimeType"),
+            "status": request.get("status"),
+            "pending": request.get("pending"),
+            "networkRequestId": request.get("networkRequestId"),
+            "collectorGeneration": request.get("collectorGeneration"),
+            "cdpRequestId": request.get("cdpRequestId"),
+            "persistentRequestId": request.get("persistentRequestId"),
+        }.items()
+        if value is not None
     }
 
 
@@ -260,7 +349,7 @@ def build_network_observation(
         "observation_id": observation_id,
         "request_ids": request_ids,
         "facts": {
-            "url": str(summary.get("url") or stream_request.get("url") or "")[:8192],
+            "url": public_url_summary(summary.get("url") or stream_request.get("url")),
             "method": summary.get("method") or stream_request.get("method"),
             "resource_type": summary.get("resource_type"),
             "http_status": (

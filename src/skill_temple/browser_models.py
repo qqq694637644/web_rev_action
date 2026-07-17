@@ -54,11 +54,6 @@ class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class SkillBinding(StrictModel):
-    skill_id: str = Field(min_length=1, max_length=128)
-    content_hash: str = Field(pattern=r"^sha256:[a-f0-9]{64}$")
-
-
 class Locator(StrictModel):
     ref: str | None = Field(default=None, max_length=256)
     role: str | None = Field(default=None, max_length=128)
@@ -833,78 +828,52 @@ class ReplayRequestPayload(StrictModel):
         return self
 
 
-class OpenSessionRequest(StrictModel):
+class ActionContractBinding(StrictModel):
+    action_transport_version: Literal["2.0"] = "2.0"
+    operation: str = Field(min_length=1, max_length=128)
+    skill_id: Literal["browser-action-protocol"]
+    skill_content_hash: str = Field(pattern=r"^sha256:[a-f0-9]{64}$")
+    operation_contract_hash: str = Field(pattern=r"^sha256:[a-f0-9]{64}$")
+
+
+class BoundBrowserRequest(StrictModel):
+    action_binding: ActionContractBinding | None = Field(default=None, exclude=True)
+
+
+class OpenSessionRequest(BoundBrowserRequest):
     contract_version: Literal["1.0"] = "1.0"
     operation: Literal["open_session"]
     payload: OpenSessionPayload
-    skill_binding: SkillBinding | None = None
 
 
-class CaptureBaselineRequest(StrictModel):
-    contract_version: Literal["1.0"] = "1.0"
-    operation: Literal["capture_baseline"]
-    payload: CaptureFlowPayload
-    skill_binding: SkillBinding | None = None
-
-    @model_validator(mode="before")
-    @classmethod
-    def apply_capture_flow_preset(cls, value: Any) -> Any:
-        if not isinstance(value, dict):
-            return value
-        normalized = dict(value)
-        raw_payload = normalized.get("payload")
-        if not isinstance(raw_payload, dict):
-            return value
-        payload = dict(raw_payload)
-        flow = payload.get("flow", [])
-        if flow:
-            raise ValueError("capture_baseline alias requires an empty flow")
-        payload.setdefault("objective", "capture baseline page and network state")
-        payload.setdefault(
-            "primary_request",
-            {
-                "expected_min_matches": 0,
-                "expected_max_matches": 100,
-            },
-        )
-        payload["flow"] = []
-        normalized["payload"] = payload
-        return normalized
-
-
-class CaptureFlowRequest(StrictModel):
+class CaptureFlowRequest(BoundBrowserRequest):
     contract_version: Literal["1.0"] = "1.0"
     operation: Literal["capture_flow"]
     payload: CaptureFlowPayload
-    skill_binding: SkillBinding | None = None
 
 
-class CloseSessionRequest(StrictModel):
+class CloseSessionRequest(BoundBrowserRequest):
     contract_version: Literal["1.0"] = "1.0"
     operation: Literal["close_session"]
     payload: CloseSessionPayload
-    skill_binding: SkillBinding | None = None
 
 
-class CancelExperimentRequest(StrictModel):
+class CancelExperimentRequest(BoundBrowserRequest):
     contract_version: Literal["1.0"] = "1.0"
     operation: Literal["cancel_experiment"]
     payload: CancelExperimentPayload
-    skill_binding: SkillBinding | None = None
 
 
-class ReplayRequestRequest(StrictModel):
+class ReplayRequestRequest(BoundBrowserRequest):
     contract_version: Literal["1.0"] = "1.0"
     operation: Literal["replay_request"]
     payload: ReplayRequestPayload
-    skill_binding: SkillBinding | None = None
 
 
-class SaveScriptSourceRequest(StrictModel):
+class SaveScriptSourceRequest(BoundBrowserRequest):
     contract_version: Literal["1.0"] = "1.0"
     operation: Literal["save_script_source"]
     payload: SaveScriptSourcePayload
-    skill_binding: SkillBinding | None = None
 
 
 class GetSessionPayload(StrictModel):
@@ -998,19 +967,19 @@ class ListConsoleErrorsPayload(StrictModel):
     limit: int = Field(default=100, ge=1, le=500)
 
 
-class GetSessionRequest(StrictModel):
+class GetSessionRequest(BoundBrowserRequest):
     contract_version: Literal["1.0"] = "1.0"
     operation: Literal["get_session"]
     payload: GetSessionPayload
 
 
-class ListExperimentsRequest(StrictModel):
+class ListExperimentsRequest(BoundBrowserRequest):
     contract_version: Literal["1.0"] = "1.0"
     operation: Literal["list_experiments"]
     payload: ListExperimentsPayload = Field(default_factory=ListExperimentsPayload)
 
 
-class GetExperimentRequest(StrictModel):
+class GetExperimentRequest(BoundBrowserRequest):
     contract_version: Literal["1.0"] = "1.0"
     operation: Literal["get_experiment"]
     payload: GetExperimentPayload
@@ -1018,7 +987,6 @@ class GetExperimentRequest(StrictModel):
 
 RunBrowserExperimentRequest = Annotated[
     OpenSessionRequest
-    | CaptureBaselineRequest
     | CaptureFlowRequest
     | CloseSessionRequest
     | CancelExperimentRequest
@@ -1028,49 +996,71 @@ RunBrowserExperimentRequest = Annotated[
 ]
 
 
-class GetStreamStatusRequest(StrictModel):
+class RunBrowserExperimentEnvelope(StrictModel):
+    """Stable public transport for all consequential Browser operations."""
+
+    contract_version: Literal["2.0"]
+    operation: str = Field(min_length=1, max_length=128)
+    payload_json: str = Field(min_length=2, max_length=262_144)
+    skill_id: Literal["browser-action-protocol"]
+    skill_content_hash: str = Field(pattern=r"^sha256:[a-f0-9]{64}$")
+    operation_contract_hash: str = Field(pattern=r"^sha256:[a-f0-9]{64}$")
+
+
+class InspectBrowserEvidenceEnvelope(StrictModel):
+    """Stable public transport for all read-only Browser operations."""
+
+    contract_version: Literal["2.0"]
+    operation: str = Field(min_length=1, max_length=128)
+    payload_json: str = Field(min_length=2, max_length=262_144)
+    skill_id: Literal["browser-action-protocol"]
+    skill_content_hash: str = Field(pattern=r"^sha256:[a-f0-9]{64}$")
+    operation_contract_hash: str = Field(pattern=r"^sha256:[a-f0-9]{64}$")
+
+
+class GetStreamStatusRequest(BoundBrowserRequest):
     contract_version: Literal["1.0"] = "1.0"
     operation: Literal["get_stream_status"]
     payload: GetStreamStatusPayload
 
 
-class ListEvidenceRequest(StrictModel):
+class ListEvidenceRequest(BoundBrowserRequest):
     contract_version: Literal["1.0"] = "1.0"
     operation: Literal["list_evidence"]
     payload: ListEvidencePayload
 
 
-class GetNetworkEvidenceRequest(StrictModel):
+class GetNetworkEvidenceRequest(BoundBrowserRequest):
     contract_version: Literal["1.0"] = "1.0"
     operation: Literal["get_network_evidence"]
     payload: GetNetworkEvidencePayload
 
 
-class GetRequestShapeRequest(StrictModel):
+class GetRequestShapeRequest(BoundBrowserRequest):
     contract_version: Literal["1.0"] = "1.0"
     operation: Literal["get_request_shape"]
     payload: GetRequestShapePayload
 
 
-class GetRequestInitiatorRequest(StrictModel):
+class GetRequestInitiatorRequest(BoundBrowserRequest):
     contract_version: Literal["1.0"] = "1.0"
     operation: Literal["get_request_initiator"]
     payload: GetRequestInitiatorPayload
 
 
-class SearchScriptsRequest(StrictModel):
+class SearchScriptsRequest(BoundBrowserRequest):
     contract_version: Literal["1.0"] = "1.0"
     operation: Literal["search_scripts"]
     payload: SearchScriptsPayload
 
 
-class GetScriptSourceRequest(StrictModel):
+class GetScriptSourceRequest(BoundBrowserRequest):
     contract_version: Literal["1.0"] = "1.0"
     operation: Literal["get_script_source"]
     payload: GetScriptSourcePayload
 
 
-class ListConsoleErrorsRequest(StrictModel):
+class ListConsoleErrorsRequest(BoundBrowserRequest):
     contract_version: Literal["1.0"] = "1.0"
     operation: Literal["list_console_errors"]
     payload: ListConsoleErrorsPayload
@@ -1098,6 +1088,7 @@ class FlowStepResult(StrictModel):
     status: Literal[
         "completed",
         "failed",
+        "outcome_unknown",
         "skipped",
         "timed_out",
         "canceled",

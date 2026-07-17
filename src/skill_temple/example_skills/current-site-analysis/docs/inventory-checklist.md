@@ -49,13 +49,13 @@ Lifecycle values such as `finished`, `canceled`, or `failed` are not HTTP status
 
 Look for evidence of:
 
-- service workers, dedicated workers, or shared workers;
-- IndexedDB, localStorage, sessionStorage, Cache Storage, or cookies;
+- service workers, dedicated workers, or shared workers when exposed by current evidence;
+- IndexedDB, localStorage, sessionStorage, Cache Storage, or cookies when exposed by current evidence;
 - browser-managed versus script-provided authentication state;
 - CSRF or request-context inputs;
 - response values that feed later requests.
 
-Absence of evidence is not evidence of absence. If the collector cannot observe a worker or storage source, record the gap.
+Absence of evidence is not evidence of absence. Current public Browser operations do not directly expose every worker target, WebSocket frame, storage API, or paused runtime stack. When the available evidence cannot observe one of these dimensions, record the capability gap instead of claiming it was fully inspected.
 
 ## Dynamic identifiers
 

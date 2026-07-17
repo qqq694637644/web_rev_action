@@ -80,12 +80,13 @@ class CaptureBrowserTests(BrowserActionTestCase):
             with client:
                 response = client.post(
                     "/v1/browser/run",
-                    json={
-                        "operation": "open_session",
-                        "payload": {"session_id": "session_one"},
-                    },
+                    json=self.browser_request(
+                        "open_session",
+                        {"session_id": "session_one"},
+                    ),
                 )
             self.assertEqual(response.status_code, 409)
+            self.assertTrue(response.json()["error"]["dispatch_started"])
             self.assertNotIn("js.start", events)
             self.assertIn("playwright.close", events)
 
@@ -101,10 +102,10 @@ class CaptureBrowserTests(BrowserActionTestCase):
                 )
                 close = client.post(
                     "/v1/browser/run",
-                    json={
-                        "operation": "close_session",
-                        "payload": {"session_id": "session_one"},
-                    },
+                    json=self.browser_request(
+                        "close_session",
+                        {"session_id": "session_one"},
+                    ),
                 )
             self.assertEqual(response.status_code, 200)
             self.assertTrue(js.start_arguments["include_in_flight"])
@@ -115,7 +116,7 @@ class CaptureBrowserTests(BrowserActionTestCase):
             )
             self.assertEqual(session["status"], "closed")
 
-    def test_baseline_payload_uses_defaults_without_requiring_a_primary_match(self) -> None:
+    def test_explicit_baseline_capture_flow_allows_zero_primary_matches(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             client, _, _ = self.make_client(root, include_supporting_failure=False)
@@ -123,13 +124,19 @@ class CaptureBrowserTests(BrowserActionTestCase):
                 self.open_session(client)
                 response = client.post(
                     "/v1/browser/run",
-                    json={
-                        "operation": "capture_baseline",
-                        "payload": {
+                    json=self.browser_request(
+                        "capture_flow",
+                        {
                             "session_id": "session_one",
+                            "objective": "capture baseline page and network state",
+                            "primary_request": {
+                                "expected_min_matches": 0,
+                                "expected_max_matches": 100,
+                            },
+                            "flow": [],
                             "execution_mode": "sync",
                         },
-                    },
+                    ),
                 )
             self.assertEqual(response.status_code, 200, response.text)
             body = response.json()
@@ -138,38 +145,19 @@ class CaptureBrowserTests(BrowserActionTestCase):
             )
             self.assertEqual(experiment["primary_request_matcher"]["expected_min_matches"], 0)
             self.assertEqual(experiment["steps"], [])
-            self.assertEqual(body["operation"], "capture_baseline")
+            self.assertEqual(body["operation"], "capture_flow")
             self.assertEqual(experiment["operation"], "capture_flow")
             self.assertEqual(response.json()["status"], "completed")
             self.assertEqual(experiment["execution"]["status"], "complete")
             self.assertEqual(experiment["quality_summary"]["status"], "complete")
 
-    def test_baseline_alias_rejects_non_empty_flow(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            client, _, _ = self.make_client(Path(temp_dir), include_supporting_failure=False)
-            with client:
-                response = client.post(
-                    "/v1/browser/run",
-                    json={
-                        "operation": "capture_baseline",
-                        "payload": {
-                            "session_id": "session_one",
-                            "flow": [
-                                {
-                                    "step_id": "not_a_baseline",
-                                    "action": "snapshot",
-                                }
-                            ],
-                        },
-                    },
-                )
-            self.assertEqual(response.status_code, 422, response.text)
-
     def test_supporting_failure_can_be_made_objective_fatal(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             client, _, _ = self.make_client(Path(temp_dir))
             request = self.capture_request()
-            request["payload"]["primary_request"]["allow_supporting_failures"] = False
+            payload = self.request_payload(request)
+            payload["primary_request"]["allow_supporting_failures"] = False
+            self.set_request_payload(request, payload)
             with client:
                 self.open_session(client)
                 response = client.post("/v1/browser/run", json=request)
@@ -188,8 +176,10 @@ class CaptureBrowserTests(BrowserActionTestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             client, _, _ = self.make_client(Path(temp_dir))
             request = self.capture_request()
-            request["payload"].pop("execution_mode")
-            request["payload"]["job_timeout_ms"] = 30_000
+            payload = self.request_payload(request)
+            payload.pop("execution_mode")
+            payload["job_timeout_ms"] = 30_000
+            self.set_request_payload(request, payload)
             with client:
                 self.open_session(client)
                 started = client.post("/v1/browser/run", json=request)
@@ -200,10 +190,10 @@ class CaptureBrowserTests(BrowserActionTestCase):
                 for _ in range(100):
                     inspected = client.post(
                         "/v1/browser/inspect",
-                        json={
-                            "operation": "get_experiment",
-                            "payload": {"experiment_id": experiment_id},
-                        },
+                        json=self.browser_request(
+                            "get_experiment",
+                            {"experiment_id": experiment_id},
+                        ),
                     )
                     self.assertEqual(inspected.status_code, 200, inspected.text)
                     if inspected.json()["status"] != "running":
@@ -254,13 +244,13 @@ class CaptureBrowserTests(BrowserActionTestCase):
             with client:
                 opened = client.post(
                     "/v1/browser/run",
-                    json={
-                        "operation": "open_session",
-                        "payload": {
+                    json=self.browser_request(
+                        "open_session",
+                        {
                             "session_id": "session_one",
                             "target": {"page_index": 2},
                         },
-                    },
+                    ),
                 )
                 self.assertEqual(opened.status_code, 200, opened.text)
                 response = client.post("/v1/browser/run", json=self.capture_request())
@@ -272,7 +262,9 @@ class CaptureBrowserTests(BrowserActionTestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             client, _, _ = self.make_client(Path(temp_dir))
             request = self.capture_request()
-            request["payload"]["target"]["start_url"] = "https://example.test/new"
+            payload = self.request_payload(request)
+            payload["target"]["start_url"] = "https://example.test/new"
+            self.set_request_payload(request, payload)
             with client:
                 self.open_session(client)
                 response = client.post("/v1/browser/run", json=request)
@@ -303,10 +295,10 @@ class CaptureBrowserTests(BrowserActionTestCase):
             with client:
                 response = client.post(
                     "/v1/browser/inspect",
-                    json={
-                        "operation": "get_session",
-                        "payload": {"session_id": "session_old"},
-                    },
+                    json=self.browser_request(
+                        "get_session",
+                        {"session_id": "session_old"},
+                    ),
                 )
             self.assertEqual(response.status_code, 200, response.text)
             self.assertEqual(response.json()["result"]["session"]["status"], "stale")
@@ -367,7 +359,8 @@ class CaptureBrowserTests(BrowserActionTestCase):
                 post_alignment_status="not_aligned",
             )
             request = self.capture_request()
-            request["payload"]["flow"] = [
+            payload = self.request_payload(request)
+            payload["flow"] = [
                 {
                     "step_id": "wait_stream_started",
                     "action": "wait",
@@ -383,10 +376,11 @@ class CaptureBrowserTests(BrowserActionTestCase):
                     "intent": "stop_generation",
                 },
             ]
-            request["payload"]["wait_for"] = {
+            payload["wait_for"] = {
                 "type": "network_canceled",
                 "request_matcher": {"url_contains": "/api/resource"},
             }
+            self.set_request_payload(request, payload)
             with client:
                 self.open_session(client)
                 response = client.post("/v1/browser/run", json=request)

@@ -11,7 +11,11 @@ from ...protocol.mutations import (
     observe_binding_application,
     replay_operation_overwritten_by_later,
 )
-from ...protocol_evidence import response_content_type, response_value_from_snapshot
+from ...protocol_evidence import (
+    public_url_summary,
+    response_content_type,
+    response_value_from_snapshot,
+)
 from ..adapters.contracts import AlignmentResult
 from .context import ReplayAnalysisResult
 
@@ -169,7 +173,7 @@ class BrowserReplayAnalysisOperations:
                         self._extract_response_field(replay_response, "redirected")
                     ),
                     final_url=(
-                        str(value)
+                        public_url_summary(value)
                         if (
                             value := self._extract_response_field(
                                 replay_response,
@@ -178,7 +182,7 @@ class BrowserReplayAnalysisOperations:
                         )
                         else None
                     ),
-                    source_url=str(replay_plan["spec"].get("url", "")),
+                    source_url=public_url_summary(replay_plan["spec"].get("url", "")),
                     source_content_type=replay_plan.get("source_content_type"),
                 )
                 response_analysis["evidence_source"] = response_evidence_source

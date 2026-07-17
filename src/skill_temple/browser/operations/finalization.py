@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 from ...browser_models import BrowserActionResponse, CaptureFlowPayload, RequestMatcher
-from ...protocol_evidence import aggregate_observation_completeness, evidence_id
+from ...protocol_evidence import (
+    aggregate_observation_completeness,
+    evidence_id,
+    public_alignment_summary,
+    public_network_request_summary,
+)
 from ..core import Deadline, utc_now
 from .context import CaptureCompletionContext
 
@@ -40,12 +44,14 @@ class BrowserFinalizationOperations:
             "network_payload": {},
             "collector_stopped": (
                 not payload.capture.stream
-                or stream_start_status in {"not_attempted", "failed_before_send"}
+                or stream_start_status
+                in {"not_attempted", "failed_before_send"}
             ),
             "collector_cleanup": (
                 "not_required"
                 if not payload.capture.stream
-                or stream_start_status in {"not_attempted", "failed_before_send"}
+                or stream_start_status
+                in {"not_attempted", "failed_before_send"}
                 else "unknown"
             ),
             "orphan_capture_id": None,
@@ -55,7 +61,8 @@ class BrowserFinalizationOperations:
         }
         can_stop_live_capture = (
             capture_id is not None
-            and stream_start_status == "confirmed"
+            and stream_start_status
+            in {"confirmed", "outcome_unknown", "failed_after_dispatch"}
             and capture_transport_generation == self._transport_generation()
         )
         if can_stop_live_capture:
@@ -87,6 +94,7 @@ class BrowserFinalizationOperations:
         elif payload.capture.stream and stream_start_status in {
             "confirmed",
             "outcome_unknown",
+            "failed_after_dispatch",
         }:
             result["collector_stopped"] = False
             result["collector_cleanup"] = "unknown"
@@ -563,6 +571,14 @@ class BrowserFinalizationOperations:
                     },
                 }
             )
+        public_network_payload = {
+            **network_payload,
+            "requests": [
+                public_network_request_summary(item)
+                for item in network_payload.get("requests", [])
+                if isinstance(item, dict)
+            ],
+        }
         manifest.update(
             {
                 "status": response_status,
@@ -591,10 +607,10 @@ class BrowserFinalizationOperations:
                 "objective_requirements": payload.requirements.model_dump(mode="json"),
                 "network_observations": network_observations,
                 "cancellation_classifications": cancellation_classifications,
-                "post_flow_alignment": asdict(post_alignment),
+                "post_flow_alignment": public_alignment_summary(post_alignment),
                 "capture_health": capture_health,
                 "network_checkpoint": network_checkpoint_value,
-                "network_summary": network_payload,
+                "network_summary": public_network_payload,
                 "console_checkpoint": console_checkpoint_value,
                 "screenshot_paths": relative_screenshot_paths,
                 "snapshot_paths": relative_snapshot_paths,

@@ -1,4 +1,4 @@
-"""Deterministic eval runner for the Skill Temple GPT Actions runtime."""
+"""Deterministic eval runner for the static catalog and exact Skill loading."""
 
 from __future__ import annotations
 
@@ -30,52 +30,46 @@ def load_cases(path: Path) -> list[dict[str, Any]]:
 
 def evaluate_case(case: dict[str, Any], skills_dir: Path | None = None) -> dict[str, Any]:
     runtime = load_runtime(skills_dir)
-    query = str(case["query"])
     expected_skill = str(case["expected_skill"])
-    hinted_skill_ids = [expected_skill] if case.get("use_hint", True) else []
+    catalog_ids = [str(item["skill_id"]) for item in runtime.list_skills()["skills"]]
+    catalog_ok = expected_skill in catalog_ids
 
-    retrieve = runtime.retrieve(query, hinted_skill_ids=hinted_skill_ids)
-    selected_skills = retrieve.get("selected_skills", [])
-    selected_skill_ids = [skill["skill_id"] for skill in selected_skills]
-    top_skill_ok = bool(selected_skill_ids) and selected_skill_ids[0] == expected_skill
-
-    referenced_paths = {
-        path
-        for skill in selected_skills
-        for path in skill.get("referenced_paths", [])
-    }
+    loaded = runtime.load_skills([expected_skill])
+    packet = loaded["skills"][0]
+    selected_ok = packet["skill_id"] == expected_skill
+    referenced_paths = set(packet.get("referenced_paths", []))
     expected_paths = [str(path) for path in case.get("expected_paths", [])]
     missing_paths = [path for path in expected_paths if path not in referenced_paths]
 
-    search = runtime.search(
-        expected_skill,
-        query,
-        limit=max(5, len(expected_paths) or 5),
-    )
-    search_symbols = {
-        symbol
-        for match in search.get("matches", [])
-        for symbol in (
-            match.get("rank_features", {}).get("symbol_matches", [])
-            + match.get("rank_features", {}).get("document_symbols", [])
-        )
-    }
-    expected_symbols = {str(symbol) for symbol in case.get("expected_symbols", [])}
-    missing_symbols = sorted(expected_symbols - search_symbols)
+    expected_symbols = [str(symbol) for symbol in case.get("expected_symbols", [])]
+    symbol_text = packet["content"]
+    unreadable_paths: list[str] = []
+    for path in expected_paths:
+        try:
+            symbol_text += "\n" + runtime.read(expected_skill, path, max_lines=5000)["content"]
+        except Exception:
+            unreadable_paths.append(path)
+    missing_symbols = [symbol for symbol in expected_symbols if symbol not in symbol_text]
 
-    ok = top_skill_ok and not missing_paths and not missing_symbols
+    ok = (
+        catalog_ok
+        and selected_ok
+        and not missing_paths
+        and not unreadable_paths
+        and not missing_symbols
+    )
     return {
         "id": case["id"],
         "status": PASS if ok else FAIL,
-        "query": query,
+        "query": str(case.get("query", "")),
         "expected_skill": expected_skill,
-        "selected_skill_ids": selected_skill_ids,
-        "top_skill_ok": top_skill_ok,
+        "catalog_ok": catalog_ok,
+        "selected_ok": selected_ok,
         "expected_paths": expected_paths,
         "referenced_paths": sorted(referenced_paths),
         "missing_paths": missing_paths,
-        "expected_symbols": sorted(expected_symbols),
-        "search_symbols": sorted(search_symbols),
+        "unreadable_paths": unreadable_paths,
+        "expected_symbols": expected_symbols,
         "missing_symbols": missing_symbols,
     }
 
@@ -93,7 +87,7 @@ def evaluate_file(path: Path, skills_dir: Path | None = None) -> dict[str, Any]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate Skill Temple retrieval quality.")
+    parser = argparse.ArgumentParser(description="Evaluate static Skill catalog and loading.")
     parser.add_argument("cases", type=Path, help="Path to a JSONL eval file.")
     parser.add_argument("--skills-dir", type=Path, default=None)
     args = parser.parse_args()

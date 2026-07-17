@@ -21,9 +21,8 @@ data/analysis-workspace/
 ```text
 GPT
 ├── Skill Actions
-│   ├── retrieveSkillContext
-│   ├── readSkillContent
-│   └── searchSkillDocs
+│   ├── loadSkills
+│   └── readSkillContent
 │
 ├── Browser Actions
 │   ├── inspectBrowserEvidence
@@ -45,6 +44,7 @@ web_rev_action
 │   └── thin public facade
 ├── browser/
 │   ├── dispatcher.py
+│   ├── registry.py / contracts.py / transport.py
 │   ├── core.py / artifacts.py / steps.py
 │   ├── replay_runtime.js
 │   ├── stream_state.py
@@ -116,6 +116,35 @@ browser.adapters.js_reverse.JsReverseMcpAdapter
 
 只有 `browser_service.py` composition root 负责组装这些实现。
 
+Adapter 错误显式区分事实边界：命令或 MCP call 未发送时
+`dispatch_started=false`；已发送且收到可信失败结果时
+`dispatch_started=true, outcome=failed`；已发送但未获得可信终态的超时、连接中断、
+transport 崩溃或 consequential operation 损坏响应返回
+`operation_outcome_unknown`、`dispatch_started=true`、`outcome=unknown`。只读 operation
+的损坏响应仍是 `invalid_adapter_response, outcome=failed`。Route 不根据异常类型猜测该状态。
+
+当 session 或 experiment 句柄已经创建，结构化错误同时返回可用的 `session_id`、
+`experiment_id` 和 `manifest_relative_path`。Session 在 browser attach 前保存 provisional
+记录；open/close 结果未知时保存 `open_outcome_unknown` 或
+`close_outcome_unknown`，而不是继续声称确定的 `open`。Inspect adapter 失败同样返回
+结构化 `browser_adapter_failed`，不会退化为框架 500。
+
+Playwright `--raw` 输出必须是预期 JSON object；MCP tool 必须返回结构化 JSON object。
+文本格式猜测、无法解析 content block 和隐式空对象不再被当作成功结果。
+js-reverse fork 的结构化错误会保留有限长度的 `adapter_error_code`、message 和
+`retryable`，例如 `NOT_FOUND`、`INVALID_ARGUMENT` 或 `PRECONDITION_FAILED`，供人和模型
+判断是否需要重新触发请求、修正参数或停止重试。
+
+真实 adapter 合同以 CI 固定的两个 fork commit 为准：
+
+```text
+qqq694637644/playwright-cli  793cfb32572733cbcb401e6f28d05a7a914ce408
+qqq694637644/js-reverse-mcp  e58c9e46908b58510cf6f711bc7bd0c2f809b5e4
+```
+
+`validate-dual-cdp.yml` 会直接 checkout/build 这两个 commit，并同时运行 shared-CDP
+validation 与 `browser_action_smoke.py`；adapter 或 browser operation 改动会触发该门禁。
+
 Operation 模块只从 `browser/adapters/contracts.py` 导入 adapter 类型和错误，不从
 `browser.adapters` package facade 或具体 transport 实现导入。js-reverse stream status 的
 request matching 与 checkpoint 转换位于纯函数模块 `browser/stream_state.py`，session 和
@@ -144,9 +173,8 @@ network observation；`browser_adapters.py` 已删除。公共 request/response 
 
 | operationId | Consequential | 作用 |
 | --- | --- | --- |
-| `retrieveSkillContext` | false | 发现或加载 Skill。 |
+| `loadSkills` | false | 按静态 catalog 中的精确 ID 加载完整 Skill。 |
 | `readSkillContent` | false | 读取 Skill 文件。 |
-| `searchSkillDocs` | false | 搜索 Skill 文档。 |
 | `inspectBrowserEvidence` | false | 查询 session、experiment 和 stream 状态。 |
 | `runBrowserExperiment` | true | 打开/关闭 session 或运行浏览器实验。 |
 | `workspaceInspect` | false | 一次返回目录树、搜索结果和相关文件片段。 |
@@ -155,6 +183,54 @@ network observation；`browser_adapters.py` 已删除。公共 request/response 
 | `workspaceWriteFile` | true | 创建或替换 UTF-8 文件。 |
 | `workspaceApplyPatch` | true | 应用受控 Codex 文本补丁。 |
 | `workspaceExecPwsh` | true | 在分析目录运行 PowerShell 7。 |
+
+Skill 发现来自构建时静态 catalog。`GPT_ACTION_PROMPT.md` 是模板，发布给 GPT Builder 的
+最终 Instructions 生成到被忽略的 `dist/GPT_INSTRUCTIONS.md`；仓库提交
+`GPT_INSTRUCTIONS.sha256` 作为可审计漂移门禁：
+
+```powershell
+skill-temple-build-contracts `
+  --protocol-root src/skill_temple/example_skills/browser-action-protocol
+
+skill-temple-build-prompt `
+  --skills-dir src/skill_temple/example_skills `
+  --template GPT_ACTION_PROMPT.md `
+  --output dist/GPT_INSTRUCTIONS.md
+```
+
+服务端不会根据 query 选择 Skill，也不提供 Skill 文档全文搜索。模型根据静态 description
+选择精确 ID，再调用 `loadSkills`。`referenced_paths` 是推荐阅读入口，不是访问 allowlist；
+`readSkillContent` 可以读取该 Skill 目录内任意安全普通文件。
+
+Browser operation 的唯一结构来源是 `browser/registry.py`。Registry 同时驱动 Action
+分类、内部 request model、dispatcher handler和协议文档路径。`operation_contract_hash`
+只绑定 operation、Action 分类、consequential、transport version 和规范化后的公共
+payload JSON Schema，不绑定 Python 类名、handler 名或文档路径。
+`skill-temple-build-contracts` 只刷新简短 operation 文档中的 envelope/hash 与精简的
+`docs/generated/operation-contracts.json` 索引；不再生成重复的逐 operation schema JSON。
+
+发布前先运行本地 Builder preflight：
+
+```powershell
+skill-temple-builder-preflight --root .
+```
+
+随后按 `BUILDER_SMOKE_CHECKLIST.md` 在已登录 GPT Builder 中完成真实导入、工具签名、
+Skill 选择、最小 capture、stale-contract 和 outcome-unknown 回归。该人工门槛不能由 CI
+替代。
+
+内置 workflow Skills 包括：
+
+```text
+browser-session-capture
+browser-evidence-inspection
+browser-request-replay
+browser-script-tracing
+browser-stream-diagnostics
+browser-experiment-recovery
+current-site-analysis
+pandora-protocol-reproduction
+```
 
 ## Browser Actions
 
@@ -175,6 +251,10 @@ Analysis workspace
 evidence gap 开始，不预设产品状态机。它不直接执行 fetch，也不读取凭据后自行拼请求；
 只调用结构化 Action。
 
+所有 Browser Action 调用都必须同时加载 `browser-action-protocol`。该 Skill 提供稳定的
+transport envelope、严格 JSON 编码、operation 索引和逐 operation 合同；OpenAPI 不再
+展开内部 payload union。
+
 `pandora-protocol-reproduction` 作为可选专用模板保留。只有当前网页实际呈现对话树、
 regenerate、edit、stop 等语义时，才使用其六场景实验矩阵。
 
@@ -191,10 +271,29 @@ close_session
 cancel_experiment
 ```
 
-旧客户端仍可发送 `capture_baseline`。它只在请求边界应用一个 `capture_flow`
-preset：默认 baseline objective、primary request 允许 0 到 100 个匹配、`flow=[]`。
-随后内部调度和 manifest 都使用 `capture_flow`。非空 flow 会被拒绝；新调用不应再
-生成 `capture_baseline`。
+基线也使用 `capture_flow`：显式填写 baseline objective、允许零个 primary request
+匹配，并使用空 flow 或最小 snapshot/wait flow。旧 alias 已删除，不提供兼容层。
+
+两个 Browser Action 的公共请求固定为六字段、版本绑定的 envelope：
+
+```json
+{
+  "contract_version": "2.0",
+  "operation": "get_session",
+  "payload_json": "{\"session_id\":\"session_one\"}",
+  "skill_id": "browser-action-protocol",
+  "skill_content_hash": "sha256:<loadSkills 返回的当前 content_hash>",
+  "operation_contract_hash": "sha256:<get_session 生成合同中的 hash>"
+}
+```
+
+`payload_json` 必须是严格 JSON 字符串，解码后顶层必须是 object；重复键、NaN、
+Infinity、额外字段、错误 Action 或错误 operation payload 都在 dispatch 前拒绝。
+`skill_content_hash` 必须来自本次加载的 `browser-action-protocol`，operation hash 必须来自
+所选 operation 的生成合同。任一绑定不匹配会在 dispatch 前返回
+`stale_operation_contract`，并给出服务端期望的 hashes。
+Skill 文本 hash 在计算前统一规范化为 LF，因此 Windows CRLF checkout 与 CI 的 Linux
+checkout 使用相同绑定值。
 
 一次 `capture_flow` 由后端原子执行：
 
@@ -215,23 +314,16 @@ step 类型、checkpoint、超时、失败或取消语义。
 
 GPT 不直接协调 start、click、wait、stop。
 
-一次 `replay_request` 只接受一个通用 payload：
+一次 `replay_request` 只接受一个通用 decoded payload，并通过统一 envelope 传输：
 
 ```json
 {
-  "session_id": "session_one",
-  "objective": "replay one observed request",
-  "source": {
-    "experiment_id": "exp_source",
-    "evidence_id": "ev_network"
-  },
-  "mutations": [],
-  "extractors": [],
-  "bindings": [],
-  "transport": {},
-  "response_reader": {"mode": "auto"},
-  "termination": {"conditions": [{"type": "network_close"}]},
-  "comparison": null
+  "contract_version": "2.0",
+  "operation": "replay_request",
+  "payload_json": "{\"session_id\":\"session_one\",\"objective\":\"replay one observed request\",\"source\":{\"experiment_id\":\"exp_source\",\"evidence_id\":\"ev_network\"},\"mutations\":[],\"extractors\":[],\"bindings\":[],\"response_reader\":{\"mode\":\"auto\"},\"termination\":{\"conditions\":[{\"type\":\"network_close\"}]},\"comparison\":null}",
+  "skill_id": "browser-action-protocol",
+  "skill_content_hash": "sha256:<current protocol Skill hash>",
+  "operation_contract_hash": "sha256:<replay_request contract hash>"
 }
 ```
 
@@ -249,6 +341,7 @@ reader、termination 和 comparison；后端只负责执行、观察和保存。
 → 运行可选 setup_flow
 → 独立运行 extractor 并记录每项 completed / failed
 → 将成功 extractor 输出注入对应 binding
+→ 重新读取当前 Playwright page 并确认 js-reverse alignment=aligned
 → 在当前 browser context 执行 fetch
 → 保存 ordinary network、stream、artifact 和 wire observation
 → 运行可选 verification_flow
@@ -300,6 +393,10 @@ replay.requested_replay_protocol
 replay.requested_replay_protocol_hash
 replay.replay_protocol
 replay.replay_protocol_hash
+action_transport_version
+skill_id
+skill_content_hash
+operation_contract_hash
 ```
 
 `replay_protocol` 和其 hash 表示应用默认值及 stream 自动升级后的有效配置，包括最终
@@ -382,6 +479,11 @@ search_scripts
 get_script_source
 list_console_errors
 ```
+
+`list_experiments` 将可解析实验放在 `experiments`，将损坏 manifest 的相对路径、错误
+类型和消息放在独立的 `manifest_errors`。坏文件不会从列表中消失，也不会占用正常实验
+的 `limit`；`get_experiment` 精确读取该实验时返回 `manifest_invalid`，其他实验和
+Workspace 路径仍可继续使用。
 
 公开 `get_stream_status` 使用：
 
@@ -499,7 +601,15 @@ page或认证上下文时不能用 `None == None` 冒充相等。
 
 Header和query mutation比较完整有序值列表并记录 multiplicity；不会只取第一个同名值。
 
-Stream 和普通 network status 都会读取全部分页，并在执行 event predicate 前锁定具体 primary request ID；`matchedRequestId` 不属于该 request 时不会满足等待。同一 session 重复提交返回 `409 session_busy`，其他 browser operation 返回 `409 browser_busy`。Protected workspace mutation 与 browser operation 通过同一 RuntimeCoordinator 双向互斥，避免 TOCTOU。
+Stream 和普通 network status 都会读取全部分页，并验证响应 page index、`totalPages`、
+`hasNextPage` 与请求一致；矛盾分页不会被合成为完整结果。Stream get/stop 必须返回与
+请求相同的 capture ID，page selection 必须确认实际选中的 page ID/index。执行 event
+predicate 前锁定具体 primary request ID；`matchedRequestId` 不属于该 request 时不会满足
+等待。同一 session 重复提交实验返回 `409 session_busy`，其他 browser operation 返回
+`409 browser_busy`。重复 `open_session` 使用可能持有 attachment 的同名 session 时，在
+任何 adapter dispatch 前返回 `session_id_in_use`；已确认未发送 attach 的
+`open_failed_before_dispatch` / `open_canceled_before_dispatch` 可以本地关闭或直接复用。
+Protected workspace mutation 与 browser operation 通过同一 RuntimeCoordinator 双向互斥，避免 TOCTOU。
 
 ## Background job
 
@@ -610,15 +720,33 @@ Collector 同时维护 source-specific `event index → JSONL byte offset`。每
 
 每个会改变页面或请求状态的动作前，后端记录每个 request 的 response 状态、terminal wall time、raw event index 和 semantic event index。后续 wait 只匹配 checkpoint 后新出现或发生状态转换的 request/event；raw 与 EventSource semantic mirror 使用独立游标和 source-specific offset。
 
-取消执行型 step 时会终止本地 Playwright 进程树并停止后续 step，但已经送达页面的 click、navigate 或 upload 无法通用回滚。该 step 在 manifest 中标记为 `canceled_outcome_unknown`，不会自动重试。取消 `wait`、`assert` 或 `snapshot` 等只读 step 时标记为 `canceled`。
+取消执行型 step 时会终止本地 Playwright 进程树并停止后续 step。若取消发生在 stream checkpoint、MCP 排队或 Playwright 子进程创建之前，step 标记为 `canceled`；只有 adapter 明确记录命令或 MCP call 已发送时才标记为 `canceled_outcome_unknown`。已经送达页面的 click、navigate 或 upload 无法通用回滚，也不会自动重试。Replay 使用相同发送边界。
 
 Stream start 显式建模为：
 
 ```text
-not_attempted | failed_before_send | confirmed | outcome_unknown
+not_attempted | failed_before_send | failed_after_dispatch | confirmed | outcome_unknown
 ```
 
-Start 已 dispatch 但调用超时或取消时，后端扫描 experiment namespace 中的 `capture.json` 恢复持久身份，但 `collector_stopped=false`、`collector_cleanup=unknown`，不会把旧数字 ID 当作新 MCP generation 中的 live capture。
+Start 已 dispatch 但调用超时、取消或返回无效结构时，后端按 unknown outcome 处理，并
+扫描 experiment namespace 中的 `capture.json` 恢复持久身份。未发现可信 capture
+handle 时记录 `collector_stopped=false`、`collector_cleanup=unknown`；发现同 generation
+handle 时尝试现有 stop 路径。该错误不会被写成确定失败或未发送。
+
+Playwright 的 `selector_hidden` 和 `request_log_stable` 只有在 CLI 命令成功后才判断页面
+条件；任意非零退出直接成为 adapter error。js-reverse 的 page listing/selection、
+stream/network/console 分页、capture identity 和 stream start/stop 都在各自 adapter
+方法边界验证关键字段及关联一致性。只读响应损坏返回 `invalid_adapter_response`；
+consequential 响应损坏返回 `operation_outcome_unknown`，不会被解释为零结果、分页结束、
+选页成功或 collector 确定未启动。
+
+Session 生命周期使用简单集合共享 shutdown/restart/reuse 判断：可能持有 attachment 的
+状态会在当前进程关闭时尝试 detach；来自旧 service instance 的同类状态在读取时标记为
+`stale` 并保留 `previous_status`。Session 分别保存 `attach_outcome`、
+`page_selection_outcome`、`alignment_outcome` 和 `close_outcome`。Playwright attach 成功后
+的 navigation/current-page 失败不会回写为 attach 失败；attach 已确认但 alignment 结果
+未知时保持 `open_unaligned` 并记录 `alignment_outcome=unknown`。Open/close 取消同样按
+adapter 是否已发送写入 canceled 或 unknown，而不留下永久 pending。
 
 Objective 可以分别声明：
 
@@ -916,4 +1044,5 @@ Synthetic fixture 使用通用 resource/record/cursor 状态模型和自定义 `
 终止事件。它覆盖 2xx、4xx、5xx、cookie/session、stream、replay、mutation、binding、取消和
 artifact；不代表任何真实网页协议。
 
-详细路线见 `PLAN.md`，Pandora 分析方法见 `PANDORA_REPRODUCTION.md`。
+当前重构路线见 `SKILL_DRIVEN_ACTION_REFACTORING_PLAN.md`，Pandora 分析方法见
+`PANDORA_REPRODUCTION.md`。

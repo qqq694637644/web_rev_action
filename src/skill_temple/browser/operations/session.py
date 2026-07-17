@@ -13,27 +13,58 @@ from typing import Any
 from ...browser_models import (
     BrowserActionResponse,
     CancelExperimentRequest,
-    CaptureBaselineRequest,
     CaptureFlowPayload,
-    CaptureFlowRequest,
     CloseSessionRequest,
     FlowStepResult,
     OpenSessionRequest,
     RequestMatcher,
     WaitCondition,
 )
+from ...protocol_evidence import public_alignment_summary, public_url_summary
 from ...runtime_coordinator import RuntimeOwner, RuntimeReservationError
 from ..adapters.contracts import (
+    AdapterError,
     AlignmentResult,
     StreamCheckpoint,
     StreamRequestCheckpoint,
 )
-from ..core import BrowserServiceError, Deadline, _safe_identifier, utc_now
+from ..core import (
+    BrowserServiceError,
+    Deadline,
+    _safe_identifier,
+    service_error_from_adapter,
+    utc_now,
+)
+from ..session_states import NO_ATTACHMENT_STATES, REUSABLE_SESSION_STATES, TERMINAL_CLOSED
 from ..stream_state import checkpoint_from_status, request_matches_stream_request
 
 
 class BrowserSessionOperations:
     """Own session behavior while the public service remains a facade."""
+
+    @staticmethod
+    def _cancel_dispatch_started(exc: asyncio.CancelledError) -> bool:
+        return bool(
+            getattr(exc, "adapter_dispatch_started", False)
+            or getattr(exc, "mcp_outcome_unknown", False)
+        )
+
+    @staticmethod
+    def _record_open_stage_outcome(
+        session: dict[str, Any],
+        *,
+        stage: str,
+        outcome: str,
+        attached: bool,
+    ) -> None:
+        if attached:
+            session["attach_outcome"] = "confirmed"
+        if stage == "attach":
+            session["attach_outcome"] = outcome
+        elif stage in {"navigation", "current_page", "page_selection"}:
+            session["page_selection_outcome"] = outcome
+        else:
+            session["alignment_outcome"] = outcome
 
     def _session_lock(self, session_id: str) -> asyncio.Lock:
         return self._session_locks.setdefault(session_id, asyncio.Lock())
@@ -128,41 +159,35 @@ class BrowserSessionOperations:
                         "Browser session is not open.",
                         409,
                     )
-                page = await self.playwright.current_page(session_id, deadline.child(3_000))
-                alignment = await self.js_reverse.align_page(
-                    page,
-                    deadline.child(3_000),
-                    page_id=(
-                        str(session["js_reverse_page_id"])
-                        if session.get("js_reverse_page_id")
-                        else None
-                    ),
-                )
-                if alignment.status != "aligned":
-                    raise BrowserServiceError(
-                        "page_alignment_failed",
-                        "Playwright and js-reverse pages are not aligned.",
-                        409,
+                try:
+                    page = await self.playwright.current_page(
+                        session_id, deadline.child(3_000)
                     )
-                return await callback(deadline)
+                    alignment = await self.js_reverse.align_page(
+                        page,
+                        deadline.child(3_000),
+                        page_id=(
+                            str(session["js_reverse_page_id"])
+                            if session.get("js_reverse_page_id")
+                            else None
+                        ),
+                    )
+                    if alignment.status != "aligned":
+                        raise BrowserServiceError(
+                            "page_alignment_failed",
+                            "Playwright and js-reverse pages are not aligned.",
+                            409,
+                            dispatch_started=True,
+                        )
+                    return await callback(deadline)
+                except AdapterError as exc:
+                    raise service_error_from_adapter(
+                        exc,
+                        operation,
+                        consequential=False,
+                    ).with_context(session_id=session_id) from exc
         finally:
             await self._release_browser_operation(owner_id)
-
-    @staticmethod
-    def _normalize_capture_alias(
-        request: CaptureFlowRequest | CaptureBaselineRequest,
-    ) -> tuple[CaptureFlowRequest, str | None]:
-        if isinstance(request, CaptureFlowRequest):
-            return request, None
-        return (
-            CaptureFlowRequest(
-                contract_version=request.contract_version,
-                operation="capture_flow",
-                payload=request.payload,
-                skill_binding=request.skill_binding,
-            ),
-            request.operation,
-        )
 
     async def _cancel_experiment(
         self,
@@ -181,6 +206,18 @@ class BrowserSessionOperations:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
             manifest = self.experiments.load_manifest(experiment_id)
+        if request.action_binding is not None:
+            invocations = manifest.get("action_invocations")
+            if not isinstance(invocations, list):
+                invocations = []
+                manifest["action_invocations"] = invocations
+            invocations.append(
+                {
+                    **request.action_binding.model_dump(mode="json"),
+                    "recorded_at": utc_now(),
+                }
+            )
+            self.experiments.write_manifest(experiment_id, manifest)
         return BrowserActionResponse(
             operation=request.operation,
             status=(
@@ -231,53 +268,273 @@ class BrowserSessionOperations:
                 409,
             )
         async with self._locked_browser_session(session_id, deadline):
-            page = await self.playwright.open_session(
-                session_id, endpoint, payload.target.start_url, deadline
+            existing = self.sessions.get(session_id) or self.experiments.load_session(
+                session_id
             )
-            if (
-                payload.target.page_index is not None
-                and payload.target.page_index != page.page_index
-            ):
-                page = await self.playwright.select_page(
-                    session_id,
-                    payload.target.page_index,
-                    deadline,
-                )
-            alignment = await self.js_reverse.align_page(page, deadline)
-            if alignment.status != "aligned":
-                await self.playwright.close_session(session_id, deadline)
+            if existing and existing.get("status") not in REUSABLE_SESSION_STATES:
                 raise BrowserServiceError(
-                    "page_alignment_failed",
-                    "; ".join(alignment.warnings) or "Could not align browser page",
+                    "session_id_in_use",
+                    f"Session ID is already in use with status {existing.get('status')!r}",
                     409,
+                    dispatch_started=False,
+                    session_id=session_id,
                 )
             now = utc_now()
-            session = {
+            session: dict[str, Any] = {
                 "session_id": session_id,
-                "status": "open",
+                "status": "opening",
                 "browser_endpoint_ref": endpoint,
                 "playwright_session_ref": session_id,
-                "playwright_page_index": page.page_index,
-                "playwright_page_url": page.url,
-                "playwright_page_title": page.title,
-                "js_reverse_page_index": alignment.js_reverse_page_index,
-                "js_reverse_page_id": alignment.js_reverse_page_id,
-                "js_reverse_page_url": alignment.js_reverse_page_url,
-                "page_alignment_status": alignment.status,
                 "evidence_store": "local",
                 "evidence_root_ref": ".",
                 "service_instance_id": self.service_instance_id,
                 "process_started_at": self.process_started_at,
                 "created_at": now,
                 "updated_at": now,
+                "attach_outcome": "pending",
+                "page_selection_outcome": "not_started",
+                "alignment_outcome": "not_started",
+                "close_outcome": "not_started",
             }
+            if request.action_binding is not None:
+                session["action_contract"] = request.action_binding.model_dump(mode="json")
             self.sessions[session_id] = session
+            self.experiments.save_session(session)
+            page = None
+            stage = "attach"
+            try:
+                page = await self.playwright.open_session(
+                    session_id, endpoint, payload.target.start_url, deadline
+                )
+                session.update(
+                    {
+                        "status": "aligning",
+                        "playwright_page_index": page.page_index,
+                        "playwright_page_url": public_url_summary(page.url),
+                        "playwright_page_title": page.title,
+                        "attach_outcome": "confirmed",
+                        "page_selection_outcome": "confirmed",
+                        "updated_at": utc_now(),
+                    }
+                )
+                self.experiments.save_session(session)
+                if (
+                    payload.target.page_index is not None
+                    and payload.target.page_index != page.page_index
+                ):
+                    stage = "page_selection"
+                    session["page_selection_outcome"] = "pending"
+                    session["updated_at"] = utc_now()
+                    self.experiments.save_session(session)
+                    page = await self.playwright.select_page(
+                        session_id,
+                        payload.target.page_index,
+                        deadline,
+                    )
+                    session.update(
+                        {
+                            "playwright_page_index": page.page_index,
+                            "playwright_page_url": public_url_summary(page.url),
+                            "playwright_page_title": page.title,
+                            "page_selection_outcome": "confirmed",
+                            "updated_at": utc_now(),
+                        }
+                    )
+                    self.experiments.save_session(session)
+                stage = "alignment"
+                session["alignment_outcome"] = "pending"
+                session["updated_at"] = utc_now()
+                self.experiments.save_session(session)
+                alignment = await self.js_reverse.align_page(page, deadline)
+            except asyncio.CancelledError as exc:
+                failure_stage = str(getattr(exc, "playwright_stage", stage))
+                attached = bool(getattr(exc, "session_attached", page is not None))
+                dispatch_started = self._cancel_dispatch_started(exc)
+                outcome = "unknown" if dispatch_started else "canceled"
+                self._record_open_stage_outcome(
+                    session,
+                    stage=failure_stage,
+                    outcome=outcome,
+                    attached=attached,
+                )
+                session.update(
+                    {
+                        "status": (
+                            "open_unaligned"
+                            if attached
+                            else (
+                                "open_outcome_unknown"
+                                if dispatch_started
+                                else "open_canceled_before_dispatch"
+                            )
+                        ),
+                        "open_error": {
+                            "code": "operation_canceled",
+                            "message": (
+                                "Open session was canceled after adapter dispatch."
+                                if dispatch_started
+                                else "Open session was canceled before adapter dispatch."
+                            ),
+                            "dispatch_started": dispatch_started,
+                            "outcome": "unknown" if dispatch_started else "canceled",
+                            "stage": failure_stage,
+                        },
+                        "updated_at": utc_now(),
+                    }
+                )
+                self.experiments.save_session(session)
+                raise
+            except AdapterError as exc:
+                failure_stage = str(getattr(exc, "playwright_stage", stage))
+                attached = bool(getattr(exc, "session_attached", page is not None))
+                service_error = service_error_from_adapter(
+                    exc,
+                    "open browser session",
+                    consequential=True,
+                ).with_context(session_id=session_id)
+                unknown = service_error.code == "operation_outcome_unknown"
+                self._record_open_stage_outcome(
+                    session,
+                    stage=failure_stage,
+                    outcome="unknown" if unknown else "failed",
+                    attached=attached,
+                )
+                session.update(
+                    {
+                        "status": (
+                            "open_unaligned"
+                            if attached
+                            else (
+                                "open_outcome_unknown"
+                                if unknown
+                                else (
+                                    "open_failed"
+                                    if service_error.dispatch_started
+                                    else "open_failed_before_dispatch"
+                                )
+                            )
+                        ),
+                        "open_error": {
+                            "code": service_error.code,
+                            "message": str(service_error),
+                            "dispatch_started": service_error.dispatch_started,
+                            "outcome": service_error.outcome,
+                            "stage": failure_stage,
+                        },
+                        "updated_at": utc_now(),
+                    }
+                )
+                self.experiments.save_session(session)
+                raise service_error from exc
+            if alignment.status != "aligned":
+                session.update(
+                    {
+                        "status": "alignment_failed",
+                        "alignment_outcome": "failed",
+                        "page_alignment_status": alignment.status,
+                        "alignment_warnings": alignment.warnings,
+                        "updated_at": utc_now(),
+                    }
+                )
+                self.experiments.save_session(session)
+                try:
+                    session["close_outcome"] = "pending"
+                    session["updated_at"] = utc_now()
+                    self.experiments.save_session(session)
+                    await self.playwright.close_session(session_id, deadline)
+                except asyncio.CancelledError as exc:
+                    dispatch_started = self._cancel_dispatch_started(exc)
+                    session.update(
+                        {
+                            "status": (
+                                "close_outcome_unknown"
+                                if dispatch_started
+                                else "alignment_failed"
+                            ),
+                            "close_outcome": (
+                                "unknown" if dispatch_started else "canceled_before_dispatch"
+                            ),
+                            "close_error": {
+                                "code": "operation_canceled",
+                                "message": (
+                                    "Alignment cleanup close was canceled after dispatch."
+                                    if dispatch_started
+                                    else "Alignment cleanup close was canceled before dispatch."
+                                ),
+                                "dispatch_started": dispatch_started,
+                                "outcome": "unknown" if dispatch_started else "canceled",
+                            },
+                            "updated_at": utc_now(),
+                        }
+                    )
+                    self.experiments.save_session(session)
+                    raise
+                except AdapterError as exc:
+                    service_error = service_error_from_adapter(
+                        exc,
+                        "close browser session after alignment failure",
+                        consequential=True,
+                    ).with_context(session_id=session_id)
+                    session.update(
+                        {
+                            "status": (
+                                "close_outcome_unknown"
+                                if service_error.code == "operation_outcome_unknown"
+                                else "close_failed"
+                            ),
+                            "close_error": {
+                                "code": service_error.code,
+                                "message": str(service_error),
+                                "dispatch_started": service_error.dispatch_started,
+                                "outcome": service_error.outcome,
+                            },
+                            "close_outcome": (
+                                "unknown"
+                                if service_error.code == "operation_outcome_unknown"
+                                else "failed"
+                            ),
+                            "updated_at": utc_now(),
+                        }
+                    )
+                    self.experiments.save_session(session)
+                    raise service_error from exc
+                session["status"] = "closed_after_alignment_failure"
+                session["close_outcome"] = "confirmed"
+                session["updated_at"] = utc_now()
+                self.experiments.save_session(session)
+                raise BrowserServiceError(
+                    "page_alignment_failed",
+                    "; ".join(alignment.warnings) or "Could not align browser page",
+                    409,
+                    dispatch_started=True,
+                    outcome="failed",
+                    session_id=session_id,
+                )
+            session.update(
+                {
+                    "status": "open",
+                    "playwright_page_index": page.page_index,
+                    "playwright_page_url": public_url_summary(page.url),
+                    "playwright_page_title": page.title,
+                    "js_reverse_page_index": alignment.js_reverse_page_index,
+                    "js_reverse_page_id": alignment.js_reverse_page_id,
+                    "js_reverse_page_url": public_url_summary(
+                        alignment.js_reverse_page_url
+                    ),
+                    "page_alignment_status": alignment.status,
+                    "alignment_outcome": "confirmed",
+                    "updated_at": utc_now(),
+                }
+            )
             self.experiments.save_session(session)
         return BrowserActionResponse(
             operation=request.operation,
             status="completed",
             session_id=session_id,
-            result={"session": session, "alignment": asdict(alignment)},
+            result={
+                "session": session,
+                "alignment": public_alignment_summary(alignment),
+            },
             warnings=alignment.warnings,
         )
 
@@ -286,10 +543,89 @@ class BrowserSessionOperations:
         session_id = request.payload.session_id
         async with self._locked_browser_session(session_id, deadline):
             session = self._get_session(session_id)
-            if session.get("status") == "open":
-                await self.playwright.close_session(session_id, deadline)
-            session["status"] = "closed"
+            if session.get("status") in NO_ATTACHMENT_STATES:
+                session["status"] = "closed"
+                session["close_outcome"] = "not_required"
+                session["updated_at"] = utc_now()
+            elif session.get("status") not in TERMINAL_CLOSED:
+                previous_status = str(session.get("status") or "unknown")
+                try:
+                    session["close_outcome"] = "pending"
+                    session["updated_at"] = utc_now()
+                    self.experiments.save_session(session)
+                    await self.playwright.close_session(session_id, deadline)
+                except asyncio.CancelledError as exc:
+                    dispatch_started = self._cancel_dispatch_started(exc)
+                    session.update(
+                        {
+                            "status": (
+                                "close_outcome_unknown"
+                                if dispatch_started
+                                else previous_status
+                            ),
+                            "previous_status": previous_status,
+                            "close_outcome": (
+                                "unknown" if dispatch_started else "canceled_before_dispatch"
+                            ),
+                            "close_error": {
+                                "code": "operation_canceled",
+                                "message": (
+                                    "Close session was canceled after adapter dispatch."
+                                    if dispatch_started
+                                    else "Close session was canceled before adapter dispatch."
+                                ),
+                                "dispatch_started": dispatch_started,
+                                "outcome": "unknown" if dispatch_started else "canceled",
+                            },
+                            "updated_at": utc_now(),
+                        }
+                    )
+                    if request.action_binding is not None:
+                        session["last_action_contract"] = request.action_binding.model_dump(
+                            mode="json"
+                        )
+                    self.experiments.save_session(session)
+                    raise
+                except AdapterError as exc:
+                    service_error = service_error_from_adapter(
+                        exc,
+                        "close browser session",
+                        consequential=True,
+                    ).with_context(session_id=session_id)
+                    session.update(
+                        {
+                            "status": (
+                                "close_outcome_unknown"
+                                if service_error.code == "operation_outcome_unknown"
+                                else "close_failed"
+                            ),
+                            "close_error": {
+                                "code": service_error.code,
+                                "message": str(service_error),
+                                "dispatch_started": service_error.dispatch_started,
+                                "outcome": service_error.outcome,
+                            },
+                            "close_outcome": (
+                                "unknown"
+                                if service_error.code == "operation_outcome_unknown"
+                                else "failed"
+                            ),
+                            "updated_at": utc_now(),
+                        }
+                    )
+                    if request.action_binding is not None:
+                        session["last_action_contract"] = request.action_binding.model_dump(
+                            mode="json"
+                        )
+                    self.experiments.save_session(session)
+                    raise service_error from exc
+            if session.get("status") not in TERMINAL_CLOSED:
+                session["status"] = "closed"
+                if session.get("close_outcome") != "not_required":
+                    session["close_outcome"] = "confirmed"
             session["updated_at"] = utc_now()
+            if request.action_binding is not None:
+                session["last_action_contract"] = request.action_binding.model_dump(mode="json")
             self.experiments.save_session(session)
         return BrowserActionResponse(
             operation=request.operation,
@@ -336,12 +672,14 @@ class BrowserSessionOperations:
             )
         session.update(
             {
-                "playwright_page_url": page.url,
+                "playwright_page_url": public_url_summary(page.url),
                 "playwright_page_title": page.title,
                 "playwright_page_index": page.page_index,
                 "js_reverse_page_index": alignment.js_reverse_page_index,
                 "js_reverse_page_id": alignment.js_reverse_page_id,
-                "js_reverse_page_url": alignment.js_reverse_page_url,
+                "js_reverse_page_url": public_url_summary(
+                    alignment.js_reverse_page_url
+                ),
                 "page_alignment_status": alignment.status,
                 "updated_at": utc_now(),
             }
@@ -402,11 +740,14 @@ class BrowserSessionOperations:
                 deadline=condition_deadline,
             )
             return asdict(result)
-        return await self.playwright.wait_for_page_condition(
+        result = await self.playwright.wait_for_page_condition(
             session_ref,
             condition,
             condition_deadline,
         )
+        if condition.type == "page_url" and isinstance(result.get("url"), str):
+            result["url"] = public_url_summary(result["url"])
+        return result
 
     async def _stream_checkpoint(
         self,
@@ -422,51 +763,77 @@ class BrowserSessionOperations:
     @staticmethod
     def _checkpoint_from_wait_result(
         result: dict[str, Any],
-        fallback: StreamCheckpoint,
     ) -> StreamCheckpoint:
+        def invalid(path: str) -> BrowserServiceError:
+            return BrowserServiceError(
+                "invalid_adapter_response",
+                f"Invalid adapter response at {path}",
+                502,
+                dispatch_started=True,
+            )
+
         value = result.get("checkpoint")
         if not isinstance(value, dict):
-            return fallback
+            raise invalid("/checkpoint")
+        if set(value) != {"version", "requests"}:
+            raise invalid("/checkpoint")
+        version = value.get("version")
+        if not isinstance(version, int) or isinstance(version, bool) or version < 0:
+            raise invalid("/checkpoint/version")
         requests_value = value.get("requests")
+        if not isinstance(requests_value, dict):
+            raise invalid("/checkpoint/requests")
         requests: dict[str, StreamRequestCheckpoint] = {}
-        if isinstance(requests_value, dict):
-            for request_id, request_value in requests_value.items():
-                if not isinstance(request_value, dict):
-                    continue
-                requests[str(request_id)] = StreamRequestCheckpoint(
-                    response_observed=bool(request_value.get("response_observed", False)),
-                    status=(
-                        str(request_value["status"])
-                        if request_value.get("status") is not None
-                        else None
-                    ),
-                    terminal_wall_time_ms=(
-                        float(request_value["terminal_wall_time_ms"])
-                        if isinstance(
-                            request_value.get("terminal_wall_time_ms"),
-                            (int, float),
-                        )
-                        else None
-                    ),
-                    raw_event_index=(
-                        int(request_value["raw_event_index"])
-                        if isinstance(request_value.get("raw_event_index"), int)
-                        else -1
-                    ),
-                    semantic_event_index=(
-                        int(request_value["semantic_event_index"])
-                        if isinstance(request_value.get("semantic_event_index"), int)
-                        else -1
-                    ),
-                    primary_event_source=str(request_value.get("primary_event_source") or "none"),
-                )
-        return StreamCheckpoint(
-            version=max(
-                fallback.version,
-                int(value.get("version", result.get("capture_version", 0)) or 0),
-            ),
-            requests=requests or fallback.requests,
-        )
+        expected_fields = {
+            "response_observed",
+            "status",
+            "terminal_wall_time_ms",
+            "raw_event_index",
+            "semantic_event_index",
+            "primary_event_source",
+        }
+        for request_id, request_value in requests_value.items():
+            request_path = f"/checkpoint/requests/{request_id}"
+            if not isinstance(request_id, str) or not request_id:
+                raise invalid("/checkpoint/requests")
+            if not isinstance(request_value, dict) or set(request_value) != expected_fields:
+                raise invalid(request_path)
+            response_observed = request_value["response_observed"]
+            status = request_value["status"]
+            terminal_wall_time_ms = request_value["terminal_wall_time_ms"]
+            raw_event_index = request_value["raw_event_index"]
+            semantic_event_index = request_value["semantic_event_index"]
+            primary_event_source = request_value["primary_event_source"]
+            if not isinstance(response_observed, bool):
+                raise invalid(f"{request_path}/response_observed")
+            if status is not None and not isinstance(status, str):
+                raise invalid(f"{request_path}/status")
+            if terminal_wall_time_ms is not None and (
+                not isinstance(terminal_wall_time_ms, (int, float))
+                or isinstance(terminal_wall_time_ms, bool)
+            ):
+                raise invalid(f"{request_path}/terminal_wall_time_ms")
+            if not isinstance(raw_event_index, int) or isinstance(raw_event_index, bool):
+                raise invalid(f"{request_path}/raw_event_index")
+            if not isinstance(semantic_event_index, int) or isinstance(
+                semantic_event_index, bool
+            ):
+                raise invalid(f"{request_path}/semantic_event_index")
+            if not isinstance(primary_event_source, str):
+                raise invalid(f"{request_path}/primary_event_source")
+            requests[request_id] = StreamRequestCheckpoint(
+                response_observed=response_observed,
+                status=status,
+                terminal_wall_time_ms=(
+                    float(terminal_wall_time_ms)
+                    if terminal_wall_time_ms is not None
+                    else None
+                ),
+                raw_event_index=raw_event_index,
+                semantic_event_index=semantic_event_index,
+                primary_event_source=primary_event_source,
+            )
+        return StreamCheckpoint(version=version, requests=requests)
 
     def _ensure_finalize_reserve(self, deadline: Deadline, operation: str) -> None:
         if deadline.remaining_ms() <= self.FINALIZE_RESERVE_MS:

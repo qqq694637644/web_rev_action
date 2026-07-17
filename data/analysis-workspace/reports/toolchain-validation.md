@@ -11,7 +11,7 @@ No cookie, token, browser profile path, or CDP endpoint is recorded here.
 ## Reproduction
 
 ```powershell
-python tools/toolchain_validation.py --js-reverse-entry <path-to-js-reverse-mcp>/build/src/main.js
+python tools/toolchain_validation.py --js-reverse-entry <path-to-js-reverse-mcp>/build/src/index.js
 ```
 
 The fixture application is stored under
@@ -52,17 +52,17 @@ than constructed inline by the validation runner.
 
 ### Request and response body export: PASS
 
-- Request body: 82 bytes, sha256=126f75c8ae90a5f7a57eb8d65d1ca54ea7b07df75cce43772ce2ddf632a2122b
-- Response body: 132 bytes, sha256=3f3b8dc647c422f8581c8f1e056d2b21cab85d4669e50159faa3b4d903a15b2a
+- Request body: 88 bytes, sha256=179a1efe15cfacc313030d72c086516db71d3e42682413003ca9fdaa2849aadc
+- Response body: 138 bytes, sha256=341ef45f5bac809f42453d72ecbcc065f7fd9a9a645ffc3c35381219cc0ccb36
 
 ### SSE event sequence preservation: PASS
 
 - start_stream_capture was armed before the Playwright click.
 - raw.bin exactly matched all fixture SSE bytes in order.
-- events.jsonl preserved both message events and the [DONE] event.
-- get_stream_status matched [DONE] internally without returning its body.
+- events.jsonl preserved both message events and fixture-complete.
+- get_stream_status matched fixture-complete inside the collector.
 - Artifacts used the stage0-toolchain namespace and relative paths.
-- raw.bin: 131 bytes, sha256=86c529b54b4a660d3ddd6645a1af517578127f5183a78fab699ed8aea79b9398
+- raw.bin: 141 bytes, sha256=4c93f4ed585a9833e0296d1a131f06f54464c3e6136d74baf88e024f70eec5cc
 
 ### Request initiator: PASS
 
@@ -70,7 +70,7 @@ than constructed inline by the validation runner.
 
 ### Script read and search: PASS
 
-- search_in_sources located stage0RequestBuilder in app.js.
+- search_in_sources located buildEchoRequest in app.js.
 - get_script_source returned the expected source marker.
 
 ### XHR/fetch breakpoint pause and resume: PASS
@@ -85,12 +85,12 @@ than constructed inline by the validation runner.
 
 ## Conclusion
 
-All required Stage 0 checks passed. The toolchain now validates the actual Raw Stream Capture lifecycle: the collector is armed before the browser action, exact raw bytes and ordered semantic events are written under an experiment namespace, the [DONE] predicate is matched inside the collector, and the capture finalizes with relative artifact paths.
+All required Stage 0 checks passed. The toolchain now validates the actual Raw Stream Capture lifecycle: the collector is armed before the browser action, exact raw bytes and ordered semantic events are written under an experiment namespace, the fixture-complete predicate is matched inside the collector, and the capture finalizes with relative artifact paths.
 
 ## Limitations
 
 - The SSE check covers a normally completed local EventSource stream with two
-  ordered data events and a `[DONE]` marker.
+  ordered data events and a `fixture-complete` marker.
 - It validates exact normal-completion bytes, event ordering, namespace,
   collector-side predicate matching, and finalization.
 - Cancellation, network interruption, heartbeats, and incomplete streams remain

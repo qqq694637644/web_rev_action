@@ -33,6 +33,7 @@ from ...protocol_evidence import (
     load_snapshot,
     network_snapshot_dimensions,
     public_network_summary,
+    public_url_summary,
     response_content_type,
     stream_request_has_complete_request_headers,
 )
@@ -255,6 +256,14 @@ class BrowserEvidenceOperations:
                             if isinstance(snapshot, dict)
                             else None
                         ),
+                        "request_url_sha256": hashlib.sha256(
+                            str(
+                                snapshot.get("url")
+                                if isinstance(snapshot, dict)
+                                else request.get("url")
+                                or ""
+                            ).encode("utf-8")
+                        ).hexdigest(),
                         "observed_at": (
                             snapshot.get("observedAt")
                             if isinstance(snapshot, dict)
@@ -268,7 +277,7 @@ class BrowserEvidenceOperations:
                             public_network_summary(snapshot)
                             if snapshot is not None
                             else {
-                                "url": str(request.get("url", ""))[:8192],
+                                "url": public_url_summary(request.get("url")),
                                 "method": request.get("method"),
                                 "resource_type": request.get("resourceType"),
                                 "status": request.get("status"),
@@ -289,8 +298,12 @@ class BrowserEvidenceOperations:
             if isinstance(messages, list)
             else []
         )
-        ids = [int(item["msgid"]) for item in values if isinstance(item.get("msgid"), int)]
-        return {"max_msgid": max(ids, default=0)}
+        ids = [
+            int(item["consoleMessageStableId"])
+            for item in values
+            if isinstance(item.get("consoleMessageStableId"), int)
+        ]
+        return {"max_console_message_stable_id": max(ids, default=0)}
 
     async def _export_console_evidence(
         self,
@@ -313,11 +326,12 @@ class BrowserEvidenceOperations:
             if isinstance(messages, list)
             else []
         )
-        max_msgid = int(checkpoint.get("max_msgid", 0) or 0)
+        max_stable_id = int(checkpoint.get("max_console_message_stable_id", 0) or 0)
         selected = [
             item
             for item in values
-            if isinstance(item.get("msgid"), int) and int(item["msgid"]) > max_msgid
+            if isinstance(item.get("consoleMessageStableId"), int)
+            and int(item["consoleMessageStableId"]) > max_stable_id
         ]
         if not selected:
             return [], [], []
@@ -341,11 +355,11 @@ class BrowserEvidenceOperations:
                 "evidence_id": evidence_id(
                     experiment_id,
                     "console_message",
-                    stable_id=item.get("msgid"),
+                    stable_id=item.get("consoleMessageStableId"),
                     ordinal=index,
                 ),
                 "kind": "console_message",
-                "message_id": item.get("msgid"),
+                "message_id": item.get("consoleMessageStableId"),
                 "artifact_ids": [artifact_id] if descriptor else [],
                 "artifact_paths": {"console": descriptor["relativePath"] if descriptor else None},
                 "message_index": index - 1,
@@ -353,11 +367,8 @@ class BrowserEvidenceOperations:
                     key: item.get(key)
                     for key in (
                         "type",
-                        "text",
-                        "url",
-                        "lineNumber",
-                        "columnNumber",
-                        "timestamp",
+                        "message",
+                        "argCount",
                     )
                     if key in item
                 },
@@ -394,6 +405,7 @@ class BrowserEvidenceOperations:
         expected_spec = replay_plan.get("spec")
         expected_spec = expected_spec if isinstance(expected_spec, dict) else {}
         expected_url = str(expected_spec.get("url") or "")
+        expected_url_sha256 = hashlib.sha256(expected_url.encode("utf-8")).hexdigest()
         expected_method = str(expected_spec.get("method") or "GET").upper()
         dispatch_wall_time_ms = replay_plan.get("dispatch_wall_time_ms")
         window_end_wall_time_ms = replay_plan.get("correlation_window_end_wall_time_ms")
@@ -407,7 +419,7 @@ class BrowserEvidenceOperations:
             if item.get("kind") == "network_request"
             and item.get("selector_id") == "replay_request"
             and isinstance(item.get("summary"), dict)
-            and str(item["summary"].get("url") or "") == expected_url
+            and item.get("request_url_sha256") == expected_url_sha256
             and str(item["summary"].get("method") or "").upper() == expected_method
             and (
                 expected_hash is None or item.get("request_body_canonical_sha256") == expected_hash
@@ -501,11 +513,14 @@ class BrowserEvidenceOperations:
                     "collector_generation_constrained": collector_generation is not None,
                 }
             if len(candidates) > 1:
+                request_url_sha256 = hashlib.sha256(
+                    str(request.get("url") or "").encode("utf-8")
+                ).hexdigest()
                 fallback_candidates = [
                     item
                     for item in candidates
-                    if isinstance(item.get("summary"), dict)
-                    and item["summary"].get("url") == request.get("url")
+                    if item.get("request_url_sha256") == request_url_sha256
+                    and isinstance(item.get("summary"), dict)
                     and item["summary"].get("method") == request.get("method")
                 ]
                 if len(fallback_candidates) == 1:
@@ -527,11 +542,14 @@ class BrowserEvidenceOperations:
                 "candidate_count": sum(len(item[1]) for item in usable_constraints),
                 "collector_generation_constrained": collector_generation is not None,
             }
+        request_url_sha256 = hashlib.sha256(
+            str(request.get("url") or "").encode("utf-8")
+        ).hexdigest()
         fallback_candidates = [
             item
             for item in network_entries
-            if isinstance(item.get("summary"), dict)
-            and item["summary"].get("url") == request.get("url")
+            if item.get("request_url_sha256") == request_url_sha256
+            and isinstance(item.get("summary"), dict)
             and item["summary"].get("method") == request.get("method")
         ]
         if len(fallback_candidates) == 1:
@@ -926,9 +944,10 @@ class BrowserEvidenceOperations:
             if alignment is not None
             else None
         )
-        page_split = urlsplit(page_url or "")
+        public_page_url = public_url_summary(page_url)
+        page_split = urlsplit(public_page_url)
         request_url = str(wire_snapshot.get("url", "")) if isinstance(wire_snapshot, dict) else ""
-        request_split = urlsplit(request_url)
+        request_split = urlsplit(public_url_summary(request_url))
         request_context = (
             cls._request_context_hashes(
                 wire_snapshot,
@@ -957,7 +976,7 @@ class BrowserEvidenceOperations:
         return {
             "phase": phase,
             "page_id": page_id,
-            "page_url": page_url,
+            "page_url": public_page_url,
             "page_origin": (
                 f"{page_split.scheme}://{page_split.netloc}"
                 if page_split.scheme and page_split.netloc
@@ -1252,7 +1271,7 @@ class BrowserEvidenceOperations:
                     "artifact_ids": artifact_ids,
                     "artifact_paths": artifact_paths,
                     "summary": {
-                        "url": str(request.get("url", ""))[:8192],
+                        "url": public_url_summary(request.get("url")),
                         "method": request.get("method"),
                         "status": request.get("status"),
                         "terminal_reason": request.get("terminalReason"),
@@ -1348,8 +1367,7 @@ class BrowserEvidenceOperations:
             network_checkpoint_value,
             include_in_flight=payload.primary_request.include_in_flight,
         )
-        network_payload["requests"] = window_requests
-        network_payload["window"] = {
+        network_window = {
             **network_checkpoint_value,
             "matched_request_count": len(window_requests),
             "collector_generation_at_finalize": self._transport_generation(),
@@ -1361,7 +1379,10 @@ class BrowserEvidenceOperations:
                 for item in window_requests
                 if network_request_matches(item, request_matcher)
             ],
+            "window": network_window,
         }
+        network_payload["requests"] = window_requests
+        network_payload["window"] = network_window
         evidence_entries = self._evidence_index(manifest)
         evidence_artifacts: list[dict[str, Any]] = []
         if (
