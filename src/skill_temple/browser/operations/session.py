@@ -20,6 +20,7 @@ from ...browser_models import (
     RequestMatcher,
     WaitCondition,
 )
+from ...protocol_evidence import public_alignment_summary, public_url_summary
 from ...runtime_coordinator import RuntimeOwner, RuntimeReservationError
 from ..adapters.contracts import (
     AdapterError,
@@ -309,7 +310,7 @@ class BrowserSessionOperations:
                     {
                         "status": "aligning",
                         "playwright_page_index": page.page_index,
-                        "playwright_page_url": page.url,
+                        "playwright_page_url": public_url_summary(page.url),
                         "playwright_page_title": page.title,
                         "attach_outcome": "confirmed",
                         "page_selection_outcome": "confirmed",
@@ -333,7 +334,7 @@ class BrowserSessionOperations:
                     session.update(
                         {
                             "playwright_page_index": page.page_index,
-                            "playwright_page_url": page.url,
+                            "playwright_page_url": public_url_summary(page.url),
                             "playwright_page_title": page.title,
                             "page_selection_outcome": "confirmed",
                             "updated_at": utc_now(),
@@ -513,11 +514,13 @@ class BrowserSessionOperations:
                 {
                     "status": "open",
                     "playwright_page_index": page.page_index,
-                    "playwright_page_url": page.url,
+                    "playwright_page_url": public_url_summary(page.url),
                     "playwright_page_title": page.title,
                     "js_reverse_page_index": alignment.js_reverse_page_index,
                     "js_reverse_page_id": alignment.js_reverse_page_id,
-                    "js_reverse_page_url": alignment.js_reverse_page_url,
+                    "js_reverse_page_url": public_url_summary(
+                        alignment.js_reverse_page_url
+                    ),
                     "page_alignment_status": alignment.status,
                     "alignment_outcome": "confirmed",
                     "updated_at": utc_now(),
@@ -528,7 +531,10 @@ class BrowserSessionOperations:
             operation=request.operation,
             status="completed",
             session_id=session_id,
-            result={"session": session, "alignment": asdict(alignment)},
+            result={
+                "session": session,
+                "alignment": public_alignment_summary(alignment),
+            },
             warnings=alignment.warnings,
         )
 
@@ -666,12 +672,14 @@ class BrowserSessionOperations:
             )
         session.update(
             {
-                "playwright_page_url": page.url,
+                "playwright_page_url": public_url_summary(page.url),
                 "playwright_page_title": page.title,
                 "playwright_page_index": page.page_index,
                 "js_reverse_page_index": alignment.js_reverse_page_index,
                 "js_reverse_page_id": alignment.js_reverse_page_id,
-                "js_reverse_page_url": alignment.js_reverse_page_url,
+                "js_reverse_page_url": public_url_summary(
+                    alignment.js_reverse_page_url
+                ),
                 "page_alignment_status": alignment.status,
                 "updated_at": utc_now(),
             }
@@ -732,11 +740,14 @@ class BrowserSessionOperations:
                 deadline=condition_deadline,
             )
             return asdict(result)
-        return await self.playwright.wait_for_page_condition(
+        result = await self.playwright.wait_for_page_condition(
             session_ref,
             condition,
             condition_deadline,
         )
+        if condition.type == "page_url" and isinstance(result.get("url"), str):
+            result["url"] = public_url_summary(result["url"])
+        return result
 
     async def _stream_checkpoint(
         self,

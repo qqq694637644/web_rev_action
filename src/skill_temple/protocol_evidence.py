@@ -61,15 +61,61 @@ def public_url_summary(value: Any) -> str:
         for part in parsed.query.split("&"):
             name = part.split("=", 1)[0]
             query_parts.append(f"{name}=<value>")
+    hostname = parsed.hostname or ""
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    authority = f"{hostname}:{port}" if hostname and port is not None else hostname
     return urlunsplit(
         (
             parsed.scheme,
-            parsed.netloc,
+            authority,
             parsed.path,
             "&".join(query_parts),
             "",
         )
     )[:8192]
+
+
+def public_page_summary(value: Any) -> dict[str, Any]:
+    def field(name: str) -> Any:
+        if isinstance(value, dict):
+            return value.get(name)
+        return getattr(value, name, None)
+
+    return {
+        key: item
+        for key, item in {
+            "url": public_url_summary(field("url")),
+            "title": field("title"),
+            "page_index": field("page_index"),
+            "snapshot_ref": field("snapshot_ref"),
+        }.items()
+        if item is not None
+    }
+
+
+def public_alignment_summary(value: Any) -> dict[str, Any]:
+    def field(name: str) -> Any:
+        if isinstance(value, dict):
+            return value.get(name)
+        return getattr(value, name, None)
+
+    return {
+        key: item
+        for key, item in {
+            "status": field("status"),
+            "playwright_page": public_page_summary(field("playwright_page")),
+            "js_reverse_page_index": field("js_reverse_page_index"),
+            "js_reverse_page_id": field("js_reverse_page_id"),
+            "js_reverse_page_url": public_url_summary(field("js_reverse_page_url")),
+            "warnings": list(field("warnings") or []),
+        }.items()
+        if item is not None
+    }
 
 
 def public_network_summary(snapshot: dict[str, Any]) -> dict[str, Any]:

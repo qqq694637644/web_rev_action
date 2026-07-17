@@ -36,6 +36,7 @@ from ...protocol.mutations import (
 )
 from ...protocol_evidence import (
     load_snapshot,
+    public_alignment_summary,
     response_content_type,
     response_value_from_snapshot,
 )
@@ -1074,13 +1075,9 @@ class BrowserReplayOperations:
             )
         replay_manifest = manifest.get("replay")
         if isinstance(replay_manifest, dict):
-            replay_manifest["pre_dispatch_alignment"] = {
-                "status": pre_dispatch_alignment.status,
-                "js_reverse_page_id": pre_dispatch_alignment.js_reverse_page_id,
-                "js_reverse_page_index": pre_dispatch_alignment.js_reverse_page_index,
-                "js_reverse_page_url": pre_dispatch_alignment.js_reverse_page_url,
-                "warnings": list(pre_dispatch_alignment.warnings),
-            }
+            replay_manifest["pre_dispatch_alignment"] = public_alignment_summary(
+                pre_dispatch_alignment
+            )
             self.experiments.write_manifest(experiment_id, manifest)
         return ReplayPreparationResult(
             stream_checkpoint=stream_checkpoint,

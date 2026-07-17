@@ -232,6 +232,85 @@ class EvidenceBrowserTests(BrowserActionTestCase):
             source_dir = root / "experiments" / experiment_id / "js-reverse" / "sources"
             self.assertFalse(source_dir.exists())
 
+    def test_save_script_source_rejects_truncated_preview(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            client, _, _ = self.make_client(root, include_supporting_failure=False)
+            with client:
+                self.open_session(client)
+                captured = client.post("/v1/browser/run", json=self.capture_request())
+                experiment_id = captured.json()["experiment_id"]
+                service = client.app.state.browser_action_service
+
+                async def truncated_source(*args: object, **kwargs: object) -> dict[str, object]:
+                    return {
+                        "scriptId": "large-one",
+                        "sourceType": "javascript",
+                        "source": "x" * 1000,
+                        "truncated": True,
+                        "startOffset": 0,
+                        "endOffset": 1000,
+                        "totalChars": 5000,
+                    }
+
+                service.js_reverse.get_script_source = truncated_source
+                response = client.post(
+                    "/v1/browser/run",
+                    json=self.browser_request(
+                        "save_script_source",
+                        {
+                            "session_id": "session_one",
+                            "target_experiment_id": experiment_id,
+                            "script_id": "large-one",
+                            "evidence_label": "large-one",
+                        },
+                    ),
+                )
+
+            self.assertEqual(response.status_code, 409, response.text)
+            self.assertEqual(response.json()["error"]["code"], "script_source_truncated")
+            self.assertFalse(
+                (root / "experiments" / experiment_id / "js-reverse" / "sources").exists()
+            )
+
+    def test_save_script_source_accepts_empty_javascript_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            client, _, _ = self.make_client(root, include_supporting_failure=False)
+            with client:
+                self.open_session(client)
+                captured = client.post("/v1/browser/run", json=self.capture_request())
+                experiment_id = captured.json()["experiment_id"]
+                service = client.app.state.browser_action_service
+
+                async def empty_source(*args: object, **kwargs: object) -> dict[str, object]:
+                    return {
+                        "scriptId": "empty-one",
+                        "sourceType": "javascript",
+                        "source": "",
+                        "truncated": False,
+                    }
+
+                service.js_reverse.get_script_source = empty_source
+                response = client.post(
+                    "/v1/browser/run",
+                    json=self.browser_request(
+                        "save_script_source",
+                        {
+                            "session_id": "session_one",
+                            "target_experiment_id": experiment_id,
+                            "url": "https://user:pass@example.test/app.js?token=abc#frag",
+                            "evidence_label": "empty-one",
+                        },
+                    ),
+                )
+
+            self.assertEqual(response.status_code, 200, response.text)
+            evidence = response.json()["result"]["evidence"]
+            self.assertEqual(evidence["script_url"], "https://example.test/app.js?token=<value>")
+            source_path = root / evidence["artifact_paths"]["script_source"]
+            self.assertEqual(source_path.read_text(encoding="utf-8"), "")
+
     def test_request_context_hash_detects_cookie_value_change_without_storing_value(
         self,
     ) -> None:
@@ -301,6 +380,7 @@ class EvidenceBrowserTests(BrowserActionTestCase):
             phase="pre_dispatch",
         )
         self.assertEqual(unavailable["status"], "unavailable")
+
         self.assertIsNone(unavailable["request_context_sha256"])
 
         ordered_one = {
@@ -369,3 +449,27 @@ class EvidenceBrowserTests(BrowserActionTestCase):
             ignored_one_hash["ignored_context_headers"],
             ["x-request-nonce"],
         )
+
+    def test_environment_fingerprint_uses_public_page_url_and_origin(self) -> None:
+        alignment = AlignmentResult(
+            status="aligned",
+            playwright_page=PageState(
+                url="https://user:pass@example.test/app?token=abc#frag"
+            ),
+            js_reverse_page_id="page_one",
+            js_reverse_page_url="https://user:pass@example.test/app?token=abc#frag",
+        )
+        fingerprint = BrowserActionService._environment_fingerprint(
+            alignment,
+            {"url": "https://api:secret@example.test/api?key=value"},
+            phase="pre_dispatch",
+        )
+
+        self.assertEqual(
+            fingerprint["page_url"],
+            "https://example.test/app?token=<value>",
+        )
+        self.assertEqual(fingerprint["page_origin"], "https://example.test")
+        self.assertEqual(fingerprint["request_origin"], "https://example.test")
+        self.assertNotIn("user", json.dumps(fingerprint))
+        self.assertNotIn("secret", json.dumps(fingerprint))

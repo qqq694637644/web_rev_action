@@ -25,7 +25,7 @@ from ...browser_models import (
     SaveScriptSourceRequest,
     SearchScriptsRequest,
 )
-from ...protocol_evidence import evidence_id
+from ...protocol_evidence import evidence_id, public_url_summary
 from ..core import BrowserServiceError, Deadline, utc_now
 from ..registry import OPERATION_REGISTRY
 from ..session_states import STALE_ON_SERVICE_CHANGE
@@ -87,9 +87,41 @@ class BrowserInspectionOperations:
                     payload.target_experiment_id
                 ),
             )
-        source_text = result.get("source") or result.get("scriptSource")
+        if result.get("truncated") is True:
+            raise BrowserServiceError(
+                "script_source_truncated",
+                "The adapter returned a bounded script preview. Read a specific "
+                "offset and length before saving source evidence.",
+                409,
+                dispatch_started=False,
+                session_id=payload.session_id,
+                experiment_id=payload.target_experiment_id,
+                manifest_relative_path=self._manifest_relative_path(
+                    payload.target_experiment_id
+                ),
+            )
+        source_value = result.get("source")
+        script_source_value = result.get("scriptSource")
+        source_text = (
+            source_value
+            if isinstance(source_value, str)
+            else script_source_value
+            if isinstance(script_source_value, str)
+            else None
+        )
         if not isinstance(source_text, str):
-            source_text = json.dumps(result, ensure_ascii=False, indent=2)
+            raise BrowserServiceError(
+                "script_source_missing",
+                "The adapter response did not contain JavaScript source text.",
+                502,
+                dispatch_started=True,
+                outcome="failed",
+                session_id=payload.session_id,
+                experiment_id=payload.target_experiment_id,
+                manifest_relative_path=self._manifest_relative_path(
+                    payload.target_experiment_id
+                ),
+            )
         digest = hashlib.sha256(source_text.encode("utf-8")).hexdigest()
         label = (
             re.sub(
@@ -117,7 +149,7 @@ class BrowserInspectionOperations:
         metadata_file = source_dir / f"{ev_id}.metadata.json"
         source_file.write_text(source_text, encoding="utf-8")
         metadata = {
-            "script_url": payload.url,
+            "script_url": public_url_summary(payload.url),
             "script_id": payload.script_id,
             "start_line": payload.start_line,
             "end_line": payload.end_line,
@@ -151,7 +183,7 @@ class BrowserInspectionOperations:
             "artifact_ids": [item["artifactId"] for item in artifacts],
             "artifact_paths": {item["kind"]: item["relativePath"] for item in artifacts},
             "initiator_evidence_id": payload.initiator_evidence_id,
-            "script_url": payload.url,
+            "script_url": public_url_summary(payload.url),
             "script_id": payload.script_id,
             "sha256": digest,
             "range": {

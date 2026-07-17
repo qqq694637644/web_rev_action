@@ -79,3 +79,9 @@ class MatchingProtocolTests(ProtocolTestCase):
                 RequestMatcher(mime_types=["application/json"]),
             )
         )
+        self.assertTrue(
+            network_request_matches(
+                request,
+                RequestMatcher(mime_types=[" APPLICATION/JSON ; charset=utf-8 "]),
+            )
+        )

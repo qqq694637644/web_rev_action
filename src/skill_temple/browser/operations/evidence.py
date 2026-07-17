@@ -513,11 +513,14 @@ class BrowserEvidenceOperations:
                     "collector_generation_constrained": collector_generation is not None,
                 }
             if len(candidates) > 1:
+                request_url_sha256 = hashlib.sha256(
+                    str(request.get("url") or "").encode("utf-8")
+                ).hexdigest()
                 fallback_candidates = [
                     item
                     for item in candidates
-                    if isinstance(item.get("summary"), dict)
-                    and item["summary"].get("url") == request.get("url")
+                    if item.get("request_url_sha256") == request_url_sha256
+                    and isinstance(item.get("summary"), dict)
                     and item["summary"].get("method") == request.get("method")
                 ]
                 if len(fallback_candidates) == 1:
@@ -539,11 +542,14 @@ class BrowserEvidenceOperations:
                 "candidate_count": sum(len(item[1]) for item in usable_constraints),
                 "collector_generation_constrained": collector_generation is not None,
             }
+        request_url_sha256 = hashlib.sha256(
+            str(request.get("url") or "").encode("utf-8")
+        ).hexdigest()
         fallback_candidates = [
             item
             for item in network_entries
-            if isinstance(item.get("summary"), dict)
-            and item["summary"].get("url") == request.get("url")
+            if item.get("request_url_sha256") == request_url_sha256
+            and isinstance(item.get("summary"), dict)
             and item["summary"].get("method") == request.get("method")
         ]
         if len(fallback_candidates) == 1:
@@ -938,9 +944,10 @@ class BrowserEvidenceOperations:
             if alignment is not None
             else None
         )
-        page_split = urlsplit(page_url or "")
+        public_page_url = public_url_summary(page_url)
+        page_split = urlsplit(public_page_url)
         request_url = str(wire_snapshot.get("url", "")) if isinstance(wire_snapshot, dict) else ""
-        request_split = urlsplit(request_url)
+        request_split = urlsplit(public_url_summary(request_url))
         request_context = (
             cls._request_context_hashes(
                 wire_snapshot,
@@ -969,7 +976,7 @@ class BrowserEvidenceOperations:
         return {
             "phase": phase,
             "page_id": page_id,
-            "page_url": page_url,
+            "page_url": public_page_url,
             "page_origin": (
                 f"{page_split.scheme}://{page_split.netloc}"
                 if page_split.scheme and page_split.netloc
@@ -1264,7 +1271,7 @@ class BrowserEvidenceOperations:
                     "artifact_ids": artifact_ids,
                     "artifact_paths": artifact_paths,
                     "summary": {
-                        "url": str(request.get("url", ""))[:8192],
+                        "url": public_url_summary(request.get("url")),
                         "method": request.get("method"),
                         "status": request.get("status"),
                         "terminal_reason": request.get("terminalReason"),

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +10,7 @@ from ...browser_models import BrowserActionResponse, CaptureFlowPayload, Request
 from ...protocol_evidence import (
     aggregate_observation_completeness,
     evidence_id,
+    public_alignment_summary,
     public_network_request_summary,
 )
 from ..core import Deadline, utc_now
@@ -607,7 +607,7 @@ class BrowserFinalizationOperations:
                 "objective_requirements": payload.requirements.model_dump(mode="json"),
                 "network_observations": network_observations,
                 "cancellation_classifications": cancellation_classifications,
-                "post_flow_alignment": asdict(post_alignment),
+                "post_flow_alignment": public_alignment_summary(post_alignment),
                 "capture_health": capture_health,
                 "network_checkpoint": network_checkpoint_value,
                 "network_summary": public_network_payload,

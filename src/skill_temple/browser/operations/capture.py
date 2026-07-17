@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +17,7 @@ from ...browser_models import (
 from ...protocol.matching import (
     network_checkpoint,
 )
+from ...protocol_evidence import public_alignment_summary
 from ..adapters.contracts import AdapterError, AlignmentResult, StreamCheckpoint
 from ..core import BrowserServiceError, Deadline, service_error_from_adapter, utc_now
 from ..steps import StepExecutor
@@ -308,7 +308,7 @@ class BrowserCaptureOperations:
                     },
                     errors=manifest["errors"],
                 )
-            manifest["page_alignment"] = asdict(alignment)
+            manifest["page_alignment"] = public_alignment_summary(alignment)
             manifest["primary_request_matcher"] = payload.primary_request.model_dump(
                 mode="json", exclude_none=True
             )

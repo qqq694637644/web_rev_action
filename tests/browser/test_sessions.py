@@ -32,6 +32,38 @@ from tests.fakes.browser import FakeJsReverse, FakePlaywright
 
 
 class SessionsBrowserTests(BrowserActionTestCase):
+    def test_session_and_alignment_urls_use_public_page_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client, _, _ = self.make_client(Path(temp_dir))
+            raw_url = "https://user:pass@example.test/app?token=abc#frag"
+            service = client.app.state.browser_action_service
+            service.playwright.page = PageState(url=raw_url, title="App", page_index=0)
+            with client:
+                opened = client.post(
+                    "/v1/browser/run",
+                    json=self.browser_request(
+                        "open_session",
+                        {"session_id": "session_one", "target": {}},
+                    ),
+                )
+                inspected = client.post(
+                    "/v1/browser/inspect",
+                    json=self.browser_request(
+                        "get_session",
+                        {"session_id": "session_one"},
+                    ),
+                )
+
+            self.assertEqual(opened.status_code, 200, opened.text)
+            expected = "https://example.test/app?token=<value>"
+            self.assertEqual(opened.json()["result"]["session"]["playwright_page_url"], expected)
+            self.assertEqual(
+                opened.json()["result"]["alignment"]["js_reverse_page_url"], expected
+            )
+            self.assertEqual(
+                inspected.json()["result"]["session"]["playwright_page_url"], expected
+            )
+
     def test_open_unknown_persists_provisional_session_and_context(self) -> None:
         class UnknownOpenPlaywright(FakePlaywright):
             async def open_session(

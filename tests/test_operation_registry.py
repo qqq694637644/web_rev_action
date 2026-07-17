@@ -50,8 +50,14 @@ EXPECTED_INSPECT = {
 
 
 def _tree_hashes(root: Path) -> dict[str, str]:
+    def normalized_bytes(path: Path) -> bytes:
+        try:
+            return path.read_text(encoding="utf-8").replace("\r\n", "\n").encode("utf-8")
+        except UnicodeDecodeError:
+            return path.read_bytes()
+
     return {
-        path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        path.relative_to(root).as_posix(): hashlib.sha256(normalized_bytes(path)).hexdigest()
         for path in sorted(root.rglob("*"))
         if path.is_file()
     }
@@ -159,6 +165,18 @@ def test_contract_generation_ignores_skill_line_ending_style() -> None:
         )
         assert file_content_hash(skill_path) == expected_skill_hash
         assert catalog["protocol_skill_content_hash"] == expected_skill_hash
+
+
+def test_contract_tree_hashes_ignore_text_line_endings() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        copied = Path(temp_dir) / "browser-action-protocol"
+        shutil.copytree(PROTOCOL_ROOT, copied)
+        for path in copied.rglob("*"):
+            if path.is_file() and path.suffix in {".md", ".json"}:
+                text = path.read_text(encoding="utf-8").replace("\r\n", "\n")
+                path.write_bytes(text.replace("\n", "\r\n").encode("utf-8"))
+
+        assert _tree_hashes(copied) == _tree_hashes(PROTOCOL_ROOT)
 
 
 def test_operation_hash_ignores_internal_metadata() -> None:

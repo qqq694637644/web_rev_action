@@ -9,7 +9,9 @@ from skill_temple.protocol.shapes import (
 from skill_temple.protocol_evidence import (
     aggregate_observation_completeness,
     build_network_observation,
+    public_alignment_summary,
     public_network_summary,
+    public_url_summary,
 )
 from tests.protocol.common import ProtocolTestCase
 
@@ -156,6 +158,25 @@ class EvidenceProtocolTests(ProtocolTestCase):
             summary["request_shape"]["paths"]["/records/0/id"]["value"],
             "<identifier>",
         )
+
+    def test_public_url_and_alignment_drop_userinfo_values_and_fragments(self) -> None:
+        raw = "https://alice:secret@example.test:8443/app?token=abc&tag=one#frag"
+        self.assertEqual(
+            public_url_summary(raw),
+            "https://example.test:8443/app?token=<value>&tag=<value>",
+        )
+        alignment = public_alignment_summary(
+            {
+                "status": "aligned",
+                "playwright_page": {"url": raw, "title": "App", "page_index": 0},
+                "js_reverse_page_url": raw,
+                "js_reverse_page_id": "page-one",
+                "warnings": [],
+            }
+        )
+        serialized = json.dumps(alignment)
+        for forbidden in ["alice", "secret", "abc", "tag=one", "frag"]:
+            self.assertNotIn(forbidden, serialized)
 
     def test_request_shape_and_redacted_body_preserve_structure_without_values(self) -> None:
         shape = request_shape_from_snapshot(self.snapshot())

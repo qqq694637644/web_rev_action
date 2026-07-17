@@ -7,6 +7,10 @@ from typing import Any
 from ..browser_models import NetworkEvidenceSelector, RequestMatcher
 
 
+def normalize_mime(value: Any) -> str:
+    return str(value or "").split(";", 1)[0].strip().lower()
+
+
 def network_request_matches(request: dict[str, Any], matcher: RequestMatcher) -> bool:
     if matcher.request_id and str(request.get("reqid")) != matcher.request_id:
         return False
@@ -19,8 +23,8 @@ def network_request_matches(request: dict[str, Any], matcher: RequestMatcher) ->
     }:
         return False
     if matcher.mime_types:
-        mime_type = str(request.get("mimeType", "")).split(";", 1)[0].strip().lower()
-        if mime_type not in {item.lower() for item in matcher.mime_types}:
+        mime_type = normalize_mime(request.get("mimeType"))
+        if mime_type not in {normalize_mime(item) for item in matcher.mime_types}:
             return False
     return True
 
